@@ -634,4 +634,15 @@ mod tests {
         assert_eq!(p2.hash(&a), p2.hash(&a));
         assert_ne!(p2.hash(&a), p2.hash(&b));
     }
+
+    #[test]
+    fn sub_is_inverse_of_add() {
+        let a = BabyBear::new(12345);
+        let b = BabyBear::new(67890);
+        assert_eq!(a.add(b).sub(b), a);
+        assert_eq!(a.sub(a), BabyBear::ZERO);
+        // b > 0, so a.sub(a) above never reaches neg()'s self.0 == 0 branch;
+        // subtracting ZERO does, via ZERO.neg().
+        assert_eq!(a.sub(BabyBear::ZERO), a);
+    }
 }
