@@ -493,6 +493,23 @@ impl<const WIDTH: usize> Poseidon2BabyBear<WIDTH> {
         let out = self.permute(state);
         out[..8].try_into().unwrap()
     }
+
+    /// `PoseidonCompress_{WIDTH,U}(x) = Truncate_U(permute(x) + x)`: a
+    /// Miyaguchi-Preneel-style feed-forward compression function, following
+    /// the notation and construction in Drake, "Technical Note: LeanSig for
+    /// Post-Quantum Ethereum" (IACR eprint 2025/1332), Section 5. This is the
+    /// hash-call shape that scheme uses throughout a Poseidon2-based WOTS
+    /// (chain hashing, message hashing, etc.) rather than the bare
+    /// permutation or the sponge above.
+    pub fn compress<const U: usize>(&self, input: [BabyBear; WIDTH]) -> [BabyBear; U] {
+        debug_assert!(U <= WIDTH, "compress output width must fit the state");
+        let permuted = self.permute(input);
+        let mut out = [BabyBear::ZERO; U];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = permuted[i] + input[i];
+        }
+        out
+    }
 }
 
 impl Poseidon2BabyBear<16> {
