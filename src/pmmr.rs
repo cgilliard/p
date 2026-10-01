@@ -22,10 +22,28 @@
 //! on and hadn't actually used until now. An ever-growing, randomly-accessed
 //! append-only set like this is exactly what it's for: memory-mapped,
 //! durable, and crash-safe, without holding the whole structure in RAM. Node
-//! hashes and parent/child links live in LMDB; `leaf_count` and the current
+//! hashes live in LMDB, keyed by position; `leaf_count` and the current
 //! `peaks` (at most a few dozen entries even for billions of leaves) are
 //! cached in memory and mirrored into a small metadata table so a reopened
 //! PMMR picks up exactly where it left off.
+//!
+//! # No stored parent/child links
+//!
+//! An earlier version of this module stored an explicit `parent` and
+//! `children` table alongside `nodes`, so a proof's path from leaf to peak
+//! could be found by following links instead of doing arithmetic. That's
+//! simple to get right, but it roughly doubles storage: every node pays for
+//! a links entry on top of its hash. Grin's PMMR avoids this entirely by
+//! computing a position's height, parent, sibling, and left/right side
+//! purely from its integer position -- the postorder numbering scheme makes
+//! this possible with nothing but bit operations (see `peak_map_height`,
+//! `family`, and `is_left_sibling` below, ported from
+//! `core::core::pmmr::pmmr` in Grin's source and credited there). This is
+//! the fiddly part of an MMR implementation to get right, so it's backed by
+//! `bit_arithmetic_matches_reference_structure` below: an exhaustive
+//! differential test comparing it, position by position across hundreds of
+//! tree shapes, against a from-scratch reference that builds the same
+//! links explicitly and independently.
 //!
 //! **Out of scope for now** (noted as explicit follow-up work, not
 //! oversights): pruning/compaction of spent outputs, and rewinding to an
@@ -155,6 +173,62 @@ fn decode_peaks(bytes: &[u8]) -> Result<Vec<(u32, u64)>> {
         .collect())
 }
 
+const ALL_ONES: u64 = u64::MAX;
+
+/// Decomposes `pos0` (treated as a running node count) into a sum of
+/// perfect-subtree sizes (each `2^k - 1`), greedily from largest to
+/// smallest. Returns `(peak_map, height)`: `height` is `pos0`'s own
+/// postorder height (0 for a leaf), and `peak_map`'s bits double as the
+/// left/right turns along the path from `pos0` up to its eventual peak --
+/// bit `h` set means "a subtree of height `h` was already accounted for,"
+/// which turns out to be exactly the left/right indicator `family` needs.
+/// Ported from Grin's `peak_map_height` (`core/src/core/pmmr/pmmr.rs`).
+fn peak_map_height(pos0: u64) -> (u64, u64) {
+    if pos0 == 0 {
+        return (0, 0);
+    }
+    let mut remaining = pos0;
+    let mut peak_size = ALL_ONES >> remaining.leading_zeros();
+    let mut peak_map = 0u64;
+    while peak_size != 0 {
+        peak_map <<= 1;
+        if remaining >= peak_size {
+            remaining -= peak_size;
+            peak_map |= 1;
+        }
+        peak_size >>= 1;
+    }
+    (peak_map, remaining)
+}
+
+/// The postorder height of the node at position `pos0` (0 for a leaf).
+fn bintree_postorder_height(pos0: u64) -> u64 {
+    peak_map_height(pos0).1
+}
+
+fn is_leaf(pos0: u64) -> bool {
+    bintree_postorder_height(pos0) == 0
+}
+
+/// Parent and sibling position of `pos0`, computed purely from `pos0`
+/// itself -- correct regardless of how large the tree later grows, since a
+/// position's local structure never changes once it's built.
+fn family(pos0: u64) -> (u64, u64) {
+    let (peak_map, height) = peak_map_height(pos0);
+    let peak = 1u64 << height;
+    if (peak_map & peak) != 0 {
+        (pos0 + 1, pos0 + 1 - 2 * peak)
+    } else {
+        (pos0 + 2 * peak, pos0 + 2 * peak - 1)
+    }
+}
+
+/// Whether `pos0` is the left (as opposed to right) child of its parent.
+fn is_left_sibling(pos0: u64) -> bool {
+    let (peak_map, height) = peak_map_height(pos0);
+    (peak_map & (1u64 << height)) == 0
+}
+
 /// One step of an inclusion proof's path from a leaf up to the peak that
 /// contains it.
 #[derive(Clone, Copy, Debug)]
@@ -206,15 +280,12 @@ impl Proof {
 }
 
 /// A PMMR of `Output`s, backed by an LMDB environment. Every node (leaf and
-/// internal) is stored by position, along with parent/child links used to
-/// walk a leaf's path up to its peak when generating a proof.
+/// internal) is stored by position; a leaf's path up to its peak, for proof
+/// generation, is computed arithmetically (see `family`/`is_left_sibling`
+/// above) rather than stored.
 pub struct Pmmr {
     env: Env,
     nodes: Database<Bytes, Bytes>,
-    /// Present only for internal nodes: (left_pos, right_pos), 8 bytes each.
-    /// Absence of a key means that position is a leaf.
-    children: Database<Bytes, Bytes>,
-    parent: Database<Bytes, Bytes>,
     meta: Database<Bytes, Bytes>,
     peaks: Vec<(u32, u64)>,
     leaf_count: u64,
@@ -233,14 +304,12 @@ impl Pmmr {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size)
-                .max_dbs(4)
+                .max_dbs(2)
                 .open(path)?
         };
 
         let mut wtxn = env.write_txn()?;
         let nodes = env.create_database(&mut wtxn, Some("nodes"))?;
-        let children = env.create_database(&mut wtxn, Some("children"))?;
-        let parent = env.create_database(&mut wtxn, Some("parent"))?;
         let meta = env.create_database(&mut wtxn, Some("meta"))?;
         wtxn.commit()?;
 
@@ -258,8 +327,6 @@ impl Pmmr {
         Ok(Pmmr {
             env,
             nodes,
-            children,
-            parent,
             meta,
             size: size_for_leaf_count(leaf_count),
             leaf_count,
@@ -308,15 +375,6 @@ impl Pmmr {
             self.nodes
                 .put(&mut wtxn, &encode_pos(parent_pos), &parent_hash)?;
             self.size += 1;
-            let mut child_bytes = [0u8; 16];
-            child_bytes[0..8].copy_from_slice(&encode_pos(pos_second));
-            child_bytes[8..16].copy_from_slice(&encode_pos(pos_top));
-            self.children
-                .put(&mut wtxn, &encode_pos(parent_pos), &child_bytes)?;
-            self.parent
-                .put(&mut wtxn, &encode_pos(pos_second), &encode_pos(parent_pos))?;
-            self.parent
-                .put(&mut wtxn, &encode_pos(pos_top), &encode_pos(parent_pos))?;
 
             self.peaks.push((h_second + 1, parent_pos));
         }
@@ -349,36 +407,27 @@ impl Pmmr {
     pub fn prove(&self, leaf_pos: u64) -> Result<Option<Proof>> {
         let rtxn = self.env.read_txn()?;
 
-        if leaf_pos >= self.size || self.children.get(&rtxn, &encode_pos(leaf_pos))?.is_some() {
+        if leaf_pos >= self.size || !is_leaf(leaf_pos) {
             return Ok(None);
         }
 
         let leaf_hash = self.get_node(&rtxn, leaf_pos)?;
         let mut path = Vec::new();
         let mut pos = leaf_pos;
-        while let Some(parent_bytes) = self.parent.get(&rtxn, &encode_pos(pos))? {
-            let parent_pos = decode_pos(parent_bytes)?;
-            let child_bytes =
-                self.children
-                    .get(&rtxn, &encode_pos(parent_pos))?
-                    .ok_or(Error::Corrupt(
-                        "parent link without matching children entry",
-                    ))?;
-            let left = decode_pos(&child_bytes[0..8])?;
-            let right = decode_pos(&child_bytes[8..16])?;
-            if pos == left {
-                path.push(ProofStep {
-                    sibling_hash: self.get_node(&rtxn, right)?,
-                    sibling_is_left: false,
-                    parent_pos,
-                });
-            } else {
-                path.push(ProofStep {
-                    sibling_hash: self.get_node(&rtxn, left)?,
-                    sibling_is_left: true,
-                    parent_pos,
-                });
+        // Walk from the leaf toward its peak. `family` gives the parent and
+        // sibling positions purely from `pos`'s own value; the loop stops
+        // once the computed parent would fall outside the tree as it
+        // currently stands, i.e. `pos` is itself a peak.
+        while pos + 1 < self.size {
+            let (parent_pos, sibling_pos) = family(pos);
+            if parent_pos >= self.size {
+                break;
             }
+            path.push(ProofStep {
+                sibling_hash: self.get_node(&rtxn, sibling_pos)?,
+                sibling_is_left: !is_left_sibling(pos),
+                parent_pos,
+            });
             pos = parent_pos;
         }
         // `pos` is now the position of the peak containing this leaf.
@@ -418,6 +467,104 @@ mod tests {
     fn output(byte: u8) -> Output {
         let (_, pk) = keygen(&[byte; 32]);
         Output::from_pubkey(&pk)
+    }
+
+    /// Builds the same merge structure `Pmmr::push` does, but as a
+    /// from-scratch, independent reference: explicit `parent_of`/`children_of`
+    /// tables (exactly what this module used to store in LMDB, before this
+    /// turn's change), used only to check the arithmetic functions above
+    /// against. Deliberately separate code from `push`'s peak-merge loop, so
+    /// a bug in one is unlikely to be mirrored in the other.
+    fn build_reference_links(n_leaves: u64) -> (Vec<Option<u64>>, Vec<Option<(u64, u64)>>, u64) {
+        let mut parent_of: Vec<Option<u64>> = Vec::new();
+        let mut children_of: Vec<Option<(u64, u64)>> = Vec::new();
+        let mut peaks: Vec<(u32, u64)> = Vec::new();
+        let mut size = 0u64;
+
+        for _ in 0..n_leaves {
+            let leaf_pos = size;
+            parent_of.push(None);
+            children_of.push(None);
+            size += 1;
+
+            peaks.push((0, leaf_pos));
+            while peaks.len() >= 2 {
+                let (h_top, pos_top) = peaks[peaks.len() - 1];
+                let (h_second, pos_second) = peaks[peaks.len() - 2];
+                if h_top != h_second {
+                    break;
+                }
+                peaks.pop();
+                peaks.pop();
+
+                let parent_pos = size;
+                parent_of.push(None);
+                children_of.push(Some((pos_second, pos_top)));
+                size += 1;
+                parent_of[pos_second as usize] = Some(parent_pos);
+                parent_of[pos_top as usize] = Some(parent_pos);
+
+                peaks.push((h_second + 1, parent_pos));
+            }
+        }
+
+        (parent_of, children_of, size)
+    }
+
+    /// The exhaustive check backing the removal of the stored parent/children
+    /// tables: for 300 different tree shapes (1 to 300 leaves) and every
+    /// single position within each, confirm `is_leaf`, `family`, and
+    /// `is_left_sibling` -- pure position arithmetic -- agree with the
+    /// independent reference structure above, built by a completely separate
+    /// piece of code. This is what justifies trusting the arithmetic instead
+    /// of the explicit tables it replaced.
+    #[test]
+    fn bit_arithmetic_matches_reference_structure() {
+        for n in 1..=300u64 {
+            let (parent_of, children_of, size) = build_reference_links(n);
+
+            for pos in 0..size {
+                let expected_is_leaf = children_of[pos as usize].is_none();
+                assert_eq!(
+                    is_leaf(pos),
+                    expected_is_leaf,
+                    "is_leaf mismatch at n={n} pos={pos}"
+                );
+
+                match parent_of[pos as usize] {
+                    None => {
+                        // `pos` is currently a peak -- `family` must agree
+                        // there's no parent built yet.
+                        let (parent_pos, _) = family(pos);
+                        assert!(
+                            parent_pos >= size,
+                            "n={n} pos={pos}: expected no parent yet, \
+                             family() gave {parent_pos} but size is {size}"
+                        );
+                    }
+                    Some(expected_parent) => {
+                        let (parent_pos, sibling_pos) = family(pos);
+                        assert_eq!(
+                            parent_pos, expected_parent,
+                            "parent mismatch at n={n} pos={pos}"
+                        );
+
+                        let (left, right) = children_of[expected_parent as usize].unwrap();
+                        let expected_sibling = if pos == left { right } else { left };
+                        assert_eq!(
+                            sibling_pos, expected_sibling,
+                            "sibling mismatch at n={n} pos={pos}"
+                        );
+
+                        assert_eq!(
+                            is_left_sibling(pos),
+                            pos == left,
+                            "is_left_sibling mismatch at n={n} pos={pos}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A fresh, uniquely-named temp directory per test, cleaned up on drop.
@@ -460,7 +607,7 @@ mod tests {
     }
 
     #[test]
-        fn single_leaf_root_depends_on_leaf_eq() {
+    fn single_leaf_root_depends_on_leaf_eq() {
         let dir_a = TempDir::new();
         let dir_b = TempDir::new();
         let mut a = Pmmr::open(&dir_a.0).unwrap();
@@ -469,7 +616,6 @@ mod tests {
         b.push(&output(1)).unwrap();
         assert_eq!(a.root().unwrap(), b.root().unwrap());
     }
-
 
     #[test]
     fn structure_sizes_match_known_mmr_shapes() {
