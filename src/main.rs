@@ -1,6 +1,5 @@
-use std::error::Error;
+mod poseidon2;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
     println!("Hello world!");
-    Ok(())
 }
