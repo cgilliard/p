@@ -112,6 +112,65 @@ pub struct Signature {
     pub values: [ChainValue; V],
 }
 
+/// Little-endian-encode a sequence of field elements, 4 bytes each.
+fn encode_elements<'a>(elems: impl IntoIterator<Item = &'a BabyBear>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in elems {
+        out.extend_from_slice(&e.to_bytes());
+    }
+    out
+}
+
+/// Decode exactly `count` field elements (4 bytes each) from `bytes`,
+/// returning `None` if the length doesn't match.
+fn decode_elements(bytes: &[u8], count: usize) -> Option<Vec<BabyBear>> {
+    if bytes.len() != count * 4 {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| BabyBear::from_bytes(c.try_into().unwrap()))
+            .collect(),
+    )
+}
+
+impl PublicKey {
+    /// Serialize to little-endian bytes: `param` (5 elements) followed by
+    /// `tops` (`V` chains of 8 elements each), 4 bytes per element. This is
+    /// the format a real verifier -- a separate process with no access to
+    /// the signer's memory -- would actually receive.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        encode_elements(self.param.iter().chain(self.tops.iter().flatten()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let elems = decode_elements(bytes, PARAM_LEN + V * CHAIN_LEN)?;
+        let mut it = elems.into_iter();
+        let param: Param = std::array::from_fn(|_| it.next().unwrap());
+        let tops: [ChainValue; V] =
+            std::array::from_fn(|_| std::array::from_fn(|_| it.next().unwrap()));
+        Some(PublicKey { param, tops })
+    }
+}
+
+impl Signature {
+    /// Serialize to little-endian bytes: `randomizer` (7 elements) followed
+    /// by `values` (`V` chains of 8 elements each), 4 bytes per element.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        encode_elements(self.randomizer.iter().chain(self.values.iter().flatten()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let elems = decode_elements(bytes, RAND_LEN + V * CHAIN_LEN)?;
+        let mut it = elems.into_iter();
+        let randomizer: [BabyBear; RAND_LEN] = std::array::from_fn(|_| it.next().unwrap());
+        let values: [ChainValue; V] =
+            std::array::from_fn(|_| std::array::from_fn(|_| it.next().unwrap()));
+        Some(Signature { randomizer, values })
+    }
+}
+
 /// Convert a byte seed into exactly `SEED_LEN` field elements (4 bytes -> one
 /// element each, little-endian, reduced mod P). The seed is not hashed first,
 /// so a 32-byte seed maps directly and deterministically onto the 8 elements
@@ -363,5 +422,37 @@ mod tests {
             assert_eq!(digits.iter().sum::<u32>(), TARGET_SUM);
             assert!(digits.iter().all(|&d| d < W));
         }
+    }
+
+    /// Simulates an actual signer/verifier split: the signer's `SecretKey`
+    /// and the original `PublicKey`/`Signature` structs are dropped before
+    /// "verification," leaving only the raw bytes a verifier running in a
+    /// separate process would actually have received. This is the concrete
+    /// check that the verifier never needs -- and structurally cannot use --
+    /// anything beyond the public key and signature bytes.
+    #[test]
+    fn verifier_works_from_serialized_bytes_alone() {
+        let pk_bytes;
+        let sig_bytes;
+        let digest = hash_message(b"sent over the wire");
+        {
+            let (sk, pk) = keygen(&seed(8));
+            let sig = sign(&sk, digest).unwrap();
+            pk_bytes = pk.to_bytes();
+            sig_bytes = sig.to_bytes();
+            // sk, pk, and sig all go out of scope here.
+        }
+
+        let pk = PublicKey::from_bytes(&pk_bytes).expect("valid public key bytes");
+        let sig = Signature::from_bytes(&sig_bytes).expect("valid signature bytes");
+        assert!(verify(&pk, digest, &sig));
+
+        // Corrupting one byte of the serialized public key must break
+        // verification -- confirms the bytes are actually load-bearing, not
+        // just round-tripped.
+        let mut tampered = pk_bytes.clone();
+        tampered[0] ^= 1;
+        let bad_pk = PublicKey::from_bytes(&tampered).unwrap();
+        assert!(!verify(&bad_pk, digest, &sig));
     }
 }

@@ -41,6 +41,16 @@ impl BabyBear {
         self.0
     }
 
+    /// Little-endian byte encoding, for serializing field elements into a
+    /// wire format (see `wots::PublicKey::to_bytes` / `Signature::to_bytes`).
+    pub fn to_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+
+    pub fn from_bytes(bytes: [u8; 4]) -> Self {
+        BabyBear::new(u32::from_le_bytes(bytes))
+    }
+
     pub fn neg(self) -> Self {
         if self.0 == 0 {
             self
