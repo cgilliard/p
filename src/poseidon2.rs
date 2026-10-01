@@ -558,6 +558,44 @@ impl Poseidon2BabyBear<32> {
 /// t = 16 is the standard BabyBear instantiation (Plonky3/SP1's default).
 pub type Poseidon2BabyBear16 = Poseidon2BabyBear<16>;
 
+/// Hash arbitrary-length bytes down to a fixed 8-element digest, via a
+/// simple sponge-style absorption over the width-24 permutation: 4 bytes
+/// become one field element (little-endian, reduced mod P, zero-padded in
+/// the final partial chunk), absorbed in blocks of up to 24 elements with a
+/// permutation call after each block. Shared infrastructure used by
+/// `wots::hash_message` and `output::Output::from_pubkey`, among others.
+pub fn hash_bytes(bytes: &[u8]) -> [BabyBear; 8] {
+    let perm24 = Poseidon2BabyBear::<24>::new();
+    let mut state = [BabyBear::ZERO; 24];
+    let mut filled = 0;
+    for chunk in bytes.chunks(4) {
+        let mut padded = [0u8; 4];
+        padded[..chunk.len()].copy_from_slice(chunk);
+        state[filled] = state[filled] + BabyBear::from_bytes(padded);
+        filled += 1;
+        if filled == 24 {
+            state = perm24.permute(state);
+            filled = 0;
+        }
+    }
+    if filled > 0 {
+        state = perm24.permute(state);
+    }
+    state[..8].try_into().unwrap()
+}
+
+/// `hash_bytes`, flattened to a plain 32-byte array (8 field elements, 4
+/// bytes each, little-endian) -- the digest shape used for `Output` and the
+/// PMMR's node hashes.
+pub fn hash_bytes_32(bytes: &[u8]) -> [u8; 32] {
+    let digest = hash_bytes(bytes);
+    let mut out = [0u8; 32];
+    for (i, elem) in digest.into_iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&elem.to_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

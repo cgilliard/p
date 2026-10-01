@@ -185,37 +185,12 @@ fn seed_to_elements(seed: &[u8; 32]) -> [BabyBear; SEED_LEN] {
     out
 }
 
-/// Convert arbitrary bytes into field elements (4 bytes -> one element each,
-/// little-endian, zero-padded in the last chunk). Used only by the
-/// convenience `hash_message` helper below.
-fn bytes_to_field_elements(bytes: &[u8]) -> Vec<BabyBear> {
-    bytes
-        .chunks(4)
-        .map(|chunk| {
-            let mut padded = [0u8; 4];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            BabyBear::new(u32::from_le_bytes(padded))
-        })
-        .collect()
-}
-
 /// Hash an arbitrary-length message down to the fixed 8-element digest WOTS
-/// signs. A simple sponge-style absorption (not the `compress` used
-/// elsewhere in this module) so messages longer than one permutation's width
-/// are supported. This is purely a convenience for turning real messages
-/// into the fixed-size digest `sign`/`verify` expect; any hash of
-/// equivalent strength would do just as well.
+/// signs. This is purely a convenience for turning real messages into the
+/// fixed-size digest `sign`/`verify` expect; any hash of equivalent strength
+/// would do just as well.
 pub fn hash_message(message: &[u8]) -> [BabyBear; 8] {
-    let perm24 = Poseidon2BabyBear::<24>::new();
-    let elems = bytes_to_field_elements(message);
-    let mut state = [BabyBear::ZERO; 24];
-    for chunk in elems.chunks(24) {
-        for (slot, &e) in state.iter_mut().zip(chunk.iter()) {
-            *slot = *slot + e;
-        }
-        state = perm24.permute(state);
-    }
-    state[..8].try_into().unwrap()
+    crate::poseidon2::hash_bytes(message)
 }
 
 /// One step of a hash chain: `PoseidonCompress_{16,8}(param, tag, chain_index,
