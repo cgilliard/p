@@ -330,17 +330,21 @@ impl Pmmr {
         self.size
     }
 
-    /// Append an output, returning the position its leaf was stored at. The
-    /// leaf hash is the output's own bytes directly -- an `Output` is
-    /// already a Poseidon2 commitment, so there's no need to hash it again
-    /// at the leaf level. Durable once this returns: the write transaction
-    /// backing it is committed before `push` returns.
+    /// Append an output, returning the position its leaf was stored at.
+    /// The leaf hash is `Poseidon2(output.to_bytes())` -- an `Output` is a
+    /// structured (pubkey hash, amount) pair, not already a single 32-byte
+    /// commitment, so it's hashed down to the fixed node-hash width this
+    /// PMMR uses everywhere else. Durable once this returns: the write
+    /// transaction backing it is committed before `push` returns.
     pub fn push(&mut self, output: &Output) -> Result<u64> {
         let mut wtxn = self.storage.write_txn()?;
 
         let leaf_pos = self.size;
-        self.nodes
-            .put(&mut wtxn, &encode_pos(leaf_pos), &output.to_bytes())?;
+        self.nodes.put(
+            &mut wtxn,
+            &encode_pos(leaf_pos),
+            &hash_bytes_32(&output.to_bytes()),
+        )?;
         self.size += 1;
         self.leaf_count += 1;
 
@@ -453,7 +457,7 @@ mod tests {
 
     fn output(byte: u8) -> Output {
         let (_, pk) = keygen(&[byte; 32]);
-        Output::from_pubkey(&pk)
+        Output::new(&pk, 100)
     }
 
     /// Builds the same merge structure `Pmmr::push` does, but as a

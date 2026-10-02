@@ -1,24 +1,33 @@
 //! Transactions: just inputs (spent outputs, identified by their owner's
-//! revealed public key) and outputs, nothing else -- no amounts, no fees,
-//! no scripts. `Output` carries no value field yet (see `output.rs`), so
-//! there's nothing to balance between inputs and outputs; this is a pure
-//! ownership-transfer model for now.
+//! revealed public key, plus the amount being spent) and outputs, nothing
+//! else -- no fees, no scripts.
 //!
 //! This module has **no dependency on `pmmr` or any other output-storage
 //! scheme whatsoever** -- deliberately so. An input is identified purely by
-//! the public key of the output it spends (since `Output::from_pubkey`
-//! already determines that output, there's nothing else to reference), not
-//! by a position or an inclusion proof. That makes `Transaction` a small,
-//! self-contained, reusable primitive: building, signing, and checking a
-//! transaction's own internal correctness never needs to know anything
-//! about where or how outputs are actually indexed, so this same type can
-//! be used wherever a transaction needs handling -- a mempool, a wallet,
-//! a test, block validation -- without dragging any of those contexts'
-//! specifics in. Whether a given output actually, currently exists and is
-//! unspent against some specific chain state is a question for whichever
-//! of those contexts cares, answered separately with whatever
-//! output-lookup mechanism *it* uses -- not something this module does or
-//! could do.
+//! the public key of the output it spends (`Output::new` already
+//! determines the output from a (pubkey, amount) pair, so there's nothing
+//! else to reference), not by a position or an inclusion proof. That makes
+//! `Transaction` a small, self-contained, reusable primitive: building,
+//! signing, and checking a transaction's own internal correctness never
+//! needs to know anything about where or how outputs are actually indexed,
+//! so this same type can be used wherever a transaction needs handling --
+//! a mempool, a wallet, a test, block validation -- without dragging any of
+//! those contexts' specifics in.
+//!
+//! Two things this module checks are internal to the transaction, and two
+//! things it deliberately leaves to the caller:
+//!
+//! - Checked here: every input is signed, no two inputs claim the same
+//!   public key, every signature is valid over the shared message, and
+//!   total input amount equals total output amount (no fee concept yet).
+//! - Left to the caller: whether each claimed (pubkey, amount) input
+//!   actually, currently corresponds to a real, unspent output somewhere.
+//!   That's a question about a specific output set at a specific moment
+//!   (i.e. block/mempool validation against a particular `pmmr`, or
+//!   whatever storage a given context uses), not about the transaction by
+//!   itself -- a `Transaction` can be fully internally valid while every
+//!   one of its claimed inputs turns out to be fabricated, and catching
+//!   that is explicitly not this module's job.
 //!
 //! # Building a transaction
 //!
@@ -26,9 +35,9 @@
 //!
 //! ```ignore
 //! let mut tx = Transaction::new();
-//! let i0 = tx.add_input(pubkey_a);
-//! let i1 = tx.add_input(pubkey_b);
-//! tx.add_output(new_output);
+//! let i0 = tx.add_input(pubkey_a, 100);
+//! let i1 = tx.add_input(pubkey_b, 100);
+//! tx.add_output(new_output); // worth 200
 //! tx.sign_input(i0, &secret_a);
 //! tx.sign_input(i1, &secret_b);
 //! assert!(tx.verify());
@@ -53,14 +62,16 @@ use crate::wots::{self, PublicKey, SecretKey, Signature};
 
 /// Domain separator for the transaction signing message, so it can never be
 /// confused with a hash produced for some other purpose that happens to
-/// reuse the same (pubkeys, outputs) byte shape.
+/// reuse the same (pubkeys, amounts, outputs) byte shape.
 const SIGNING_DOMAIN: &[u8] = b"transaction-v1";
 
-/// One spent output: the owner's revealed public key, and their signature
-/// over the transaction's signing message once they've provided it.
+/// One spent output: the owner's revealed public key, the claimed amount
+/// being spent, and their signature over the transaction's signing message
+/// once they've provided it.
 #[derive(Clone, Debug)]
 pub struct Input {
     pub pubkey: PublicKey,
+    pub amount: u64,
     pub signature: Option<Signature>,
 }
 
@@ -78,11 +89,12 @@ impl Transaction {
         }
     }
 
-    /// Add an input spending the output owned by `pubkey`. Unsigned until
-    /// `sign_input` is called for the returned index.
-    pub fn add_input(&mut self, pubkey: PublicKey) -> usize {
+    /// Add an input spending `amount` from the output owned by `pubkey`.
+    /// Unsigned until `sign_input` is called for the returned index.
+    pub fn add_input(&mut self, pubkey: PublicKey, amount: u64) -> usize {
         self.inputs.push(Input {
             pubkey,
+            amount,
             signature: None,
         });
         self.inputs.len() - 1
@@ -93,14 +105,16 @@ impl Transaction {
     }
 
     /// The message every input's signature must cover: a hash binding
-    /// every input's revealed public key and every output together, so
-    /// nothing can be added, removed, or altered after any input is signed
-    /// without invalidating every signature already on it.
+    /// every input's revealed public key and claimed amount, and every
+    /// output, together -- so nothing can be added, removed, or altered
+    /// (including just the claimed amount of an input) after any input is
+    /// signed without invalidating every signature already on it.
     pub fn signing_message(&self) -> [BabyBear; 8] {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(SIGNING_DOMAIN);
         for input in &self.inputs {
             bytes.extend_from_slice(&input.pubkey.to_bytes());
+            bytes.extend_from_slice(&input.amount.to_le_bytes());
         }
         for output in &self.outputs {
             bytes.extend_from_slice(&output.to_bytes());
@@ -130,11 +144,8 @@ impl Transaction {
         }
     }
 
-    /// Verify this transaction is internally sound and fully authorized:
-    /// every input is signed, no two inputs claim the same public key, and
-    /// every signature is valid over the shared message. This is the
-    /// entire check -- see the module docs for why it deliberately goes no
-    /// further than this.
+    /// Verify this transaction is internally sound and fully authorized --
+    /// see the module docs for exactly what that does and doesn't cover.
     pub fn verify(&self) -> bool {
         for i in 0..self.inputs.len() {
             for j in (i + 1)..self.inputs.len() {
@@ -142,6 +153,16 @@ impl Transaction {
                     return false;
                 }
             }
+        }
+
+        // Total claimed input value must exactly equal total output value
+        // -- there's no fee concept yet, so anything else means either a
+        // mistake or an attempt to mint or destroy value. Accumulated in
+        // u128 so realistic u64 amounts can never overflow this check.
+        let input_total: u128 = self.inputs.iter().map(|i| i.amount as u128).sum();
+        let output_total: u128 = self.outputs.iter().map(|o| o.amount as u128).sum();
+        if input_total != output_total {
+            return false;
         }
 
         let message = self.signing_message();
@@ -172,9 +193,9 @@ mod tests {
         wots::keygen(&[byte; 32])
     }
 
-    fn new_output(byte: u8) -> Output {
+    fn new_output(byte: u8, amount: u64) -> Output {
         let (_, pk) = keypair(byte);
-        Output::from_pubkey(&pk)
+        Output::new(&pk, amount)
     }
 
     #[test]
@@ -183,9 +204,9 @@ mod tests {
         let (sk_b, pk_b) = keypair(2);
 
         let mut tx = Transaction::new();
-        let i0 = tx.add_input(pk_a);
-        let i1 = tx.add_input(pk_b);
-        tx.add_output(new_output(200));
+        let i0 = tx.add_input(pk_a, 100);
+        let i1 = tx.add_input(pk_b, 100);
+        tx.add_output(new_output(200, 200));
 
         assert!(tx.sign_input(i0, &sk_a));
         assert!(tx.sign_input(i1, &sk_b));
@@ -198,9 +219,9 @@ mod tests {
         let (sk_b, pk_b) = keypair(2);
 
         let mut tx = Transaction::new();
-        tx.add_input(pk_a);
-        let i1 = tx.add_input(pk_b);
-        tx.add_output(new_output(200));
+        tx.add_input(pk_a, 100);
+        let i1 = tx.add_input(pk_b, 100);
+        tx.add_output(new_output(200, 200));
 
         // Only input 1 gets signed; input 0 is left unsigned.
         assert!(tx.sign_input(i1, &sk_b));
@@ -212,15 +233,15 @@ mod tests {
         let (sk_a, pk_a) = keypair(1);
 
         let mut tx = Transaction::new();
-        let i0 = tx.add_input(pk_a);
-        tx.add_output(new_output(200));
+        let i0 = tx.add_input(pk_a, 200);
+        tx.add_output(new_output(200, 200));
         assert!(tx.sign_input(i0, &sk_a));
         assert!(tx.verify());
 
         // Swapping in a different output after signing must break the
         // signature, since the signing message commits to the exact
         // output bytes.
-        tx.outputs[0] = new_output(201);
+        tx.outputs[0] = new_output(201, 200);
         assert!(!tx.verify());
     }
 
@@ -229,8 +250,8 @@ mod tests {
         let (sk_a, pk_a) = keypair(1);
 
         let mut tx = Transaction::new();
-        let i0 = tx.add_input(pk_a);
-        tx.add_output(new_output(200));
+        let i0 = tx.add_input(pk_a, 200);
+        tx.add_output(new_output(200, 200));
         tx.sign_input(i0, &sk_a);
 
         tx.inputs[0].signature.as_mut().unwrap().randomizer[0] =
@@ -244,8 +265,8 @@ mod tests {
         let (sk_b, _) = keypair(2);
 
         let mut tx = Transaction::new();
-        let i0 = tx.add_input(pk_a);
-        tx.add_output(new_output(200));
+        let i0 = tx.add_input(pk_a, 200);
+        tx.add_output(new_output(200, 200));
 
         // Signing input 0 (owned by pk_a) with an unrelated secret key
         // succeeds mechanically -- `sign_input` has no way to know the key
@@ -260,9 +281,9 @@ mod tests {
         let (sk_a, pk_a) = keypair(1);
 
         let mut tx = Transaction::new();
-        let i0 = tx.add_input(pk_a.clone());
-        let i1 = tx.add_input(pk_a);
-        tx.add_output(new_output(200));
+        let i0 = tx.add_input(pk_a.clone(), 100);
+        let i1 = tx.add_input(pk_a, 100);
+        tx.add_output(new_output(200, 200));
 
         tx.sign_input(i0, &sk_a);
         // Re-derive the same secret key for the second (duplicate) input --
@@ -282,11 +303,70 @@ mod tests {
 
     #[test]
     fn empty_transaction_verifies() {
-        // No inputs, no outputs, nothing to sign -- trivially valid on its
-        // own. Whether an empty transaction makes sense is a question for
-        // whatever's constructing one, not this module.
+        // No inputs, no outputs, nothing to sign, and 0 == 0 -- trivially
+        // valid on its own. Whether an empty transaction makes sense is a
+        // question for whatever's constructing one, not this module.
         let tx = Transaction::new();
         assert!(tx.verify());
+    }
+
+    #[test]
+    fn input_short_of_output_rejected() {
+        let (sk_a, pk_a) = keypair(1);
+        let mut tx = Transaction::new();
+        let i0 = tx.add_input(pk_a, 100);
+        tx.add_output(new_output(200, 200)); // claims more than is spent
+        tx.sign_input(i0, &sk_a);
+        assert!(!tx.verify());
+    }
+
+    #[test]
+    fn input_exceeding_output_rejected() {
+        let (sk_a, pk_a) = keypair(1);
+        let mut tx = Transaction::new();
+        let i0 = tx.add_input(pk_a, 300);
+        tx.add_output(new_output(200, 200)); // spends more than it creates
+        tx.sign_input(i0, &sk_a);
+        assert!(!tx.verify());
+    }
+
+    #[test]
+    fn tampered_claimed_input_amount_rejected() {
+        let (sk_a, pk_a) = keypair(1);
+        let mut tx = Transaction::new();
+        let i0 = tx.add_input(pk_a, 200);
+        tx.add_output(new_output(200, 200));
+        tx.sign_input(i0, &sk_a);
+        assert!(tx.verify());
+
+        // Bumping the claimed amount after signing breaks the signature
+        // (the message commits to it) even before the balance check would
+        // also now fail.
+        tx.inputs[0].amount += 1;
+        assert!(!tx.verify());
+    }
+
+    /// Redistributing value between two outputs keeps the *total* balanced
+    /// but still has to break verification, since each output's bytes --
+    /// including its individual amount -- are what the signature commits
+    /// to, not just the sum.
+    #[test]
+    fn redistributing_output_amounts_breaks_signatures() {
+        let (sk_a, pk_a) = keypair(1);
+        let (_, pk_out_1) = keypair(201);
+        let (_, pk_out_2) = keypair(202);
+
+        let mut tx = Transaction::new();
+        let i0 = tx.add_input(pk_a, 200);
+        tx.add_output(Output::new(&pk_out_1, 100));
+        tx.add_output(Output::new(&pk_out_2, 100));
+        tx.sign_input(i0, &sk_a);
+        assert!(tx.verify());
+
+        // Same total (200), different split -- still breaks the signature.
+        tx.outputs[0] = Output::new(&pk_out_1, 150);
+        tx.outputs[1] = Output::new(&pk_out_2, 50);
+        assert!(!tx.verify());
     }
 
     /// The actual multi-signer flow: two independent owners, neither of
@@ -298,9 +378,9 @@ mod tests {
         let (sk_b, pk_b) = keypair(20);
 
         let mut tx = Transaction::new();
-        let i_a = tx.add_input(pk_a);
-        let i_b = tx.add_input(pk_b);
-        tx.add_output(new_output(200));
+        let i_a = tx.add_input(pk_a, 100);
+        let i_b = tx.add_input(pk_b, 100);
+        tx.add_output(new_output(200, 200));
 
         // Signer A receives `tx`, signs only their own input, passes it on.
         assert!(tx.sign_input(i_a, &sk_a));
@@ -319,11 +399,11 @@ mod tests {
     /// further input from either of them.
     #[test]
     fn recipient_first_grin_style_flow() {
-        // Recipient's side: generate a keypair, hand only the resulting
-        // `Output` to the sender. No signature, no secret key, leaves
-        // their hands at all.
+        // Recipient's side: generate a keypair, decide the amount they're
+        // meant to receive, hand only the resulting `Output` to the
+        // sender. No signature, no secret key, ever leaves their hands.
         let (_recipient_secret, recipient_pubkey) = keypair(100);
-        let recipient_output = Output::from_pubkey(&recipient_pubkey);
+        let recipient_output = Output::new(&recipient_pubkey, 200);
 
         let mut tx = Transaction::new();
         tx.add_output(recipient_output);
@@ -331,8 +411,8 @@ mod tests {
         // Sender's side: add the input(s) they're spending and sign them.
         let (secret_a, pubkey_a) = keypair(1);
         let (secret_b, pubkey_b) = keypair(2);
-        let i0 = tx.add_input(pubkey_a);
-        let i1 = tx.add_input(pubkey_b);
+        let i0 = tx.add_input(pubkey_a, 100);
+        let i1 = tx.add_input(pubkey_b, 100);
         tx.sign_input(i0, &secret_a);
         tx.sign_input(i1, &secret_b);
 

@@ -41,8 +41,8 @@ impl BabyBear {
         self.0
     }
 
-    /// Little-endian byte encoding, for serializing field elements into a
-    /// wire format (see `wots::PublicKey::to_bytes` / `Signature::to_bytes`).
+    /// Little-endian byte encoding, for serializing a field element into a
+    /// wire format.
     pub fn to_bytes(self) -> [u8; 4] {
         self.0.to_le_bytes()
     }
@@ -562,8 +562,7 @@ pub type Poseidon2BabyBear16 = Poseidon2BabyBear<16>;
 /// simple sponge-style absorption over the width-24 permutation: 4 bytes
 /// become one field element (little-endian, reduced mod P, zero-padded in
 /// the final partial chunk), absorbed in blocks of up to 24 elements with a
-/// permutation call after each block. Shared infrastructure used by
-/// `wots::hash_message` and `output::Output::from_pubkey`, among others.
+/// permutation call after each block.
 pub fn hash_bytes(bytes: &[u8]) -> [BabyBear; 8] {
     let perm24 = Poseidon2BabyBear::<24>::new();
     let mut state = [BabyBear::ZERO; 24];
@@ -585,8 +584,7 @@ pub fn hash_bytes(bytes: &[u8]) -> [BabyBear; 8] {
 }
 
 /// `hash_bytes`, flattened to a plain 32-byte array (8 field elements, 4
-/// bytes each, little-endian) -- the digest shape used for `Output` and the
-/// PMMR's node hashes.
+/// bytes each, little-endian).
 pub fn hash_bytes_32(bytes: &[u8]) -> [u8; 32] {
     let digest = hash_bytes(bytes);
     let mut out = [0u8; 32];
