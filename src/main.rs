@@ -1,4 +1,6 @@
 mod bitmap;
+mod fri;
+mod merkle;
 mod output;
 mod pmmr;
 mod poseidon2;
