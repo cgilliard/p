@@ -100,13 +100,13 @@ pub struct SecretKey {
     chains: [ChainValue; V],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicKey {
     pub param: Param,
     pub tops: [ChainValue; V],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Signature {
     pub randomizer: [BabyBear; RAND_LEN],
     pub values: [ChainValue; V],
