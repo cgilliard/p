@@ -1,3 +1,4 @@
+mod bitmap;
 mod output;
 mod pmmr;
 mod poseidon2;
