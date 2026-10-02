@@ -27,6 +27,11 @@
 //! cached in memory and mirrored into a small metadata table so a reopened
 //! PMMR picks up exactly where it left off.
 //!
+//! The LMDB environment itself is opened by `crate::storage::Storage`, not
+//! by this module -- `Pmmr::open` takes a `&Storage` rather than a path.
+//! This is so the planned spent-output bitmap (for pruning) can later share
+//! the exact same environment instead of opening a second one.
+//!
 //! # No stored parent/child links
 //!
 //! An earlier version of this module stored an explicit `parent` and
@@ -57,29 +62,24 @@
 
 use crate::output::Output;
 use crate::poseidon2::hash_bytes_32;
+use crate::storage::Storage;
+use heed::Database;
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions};
-use std::path::Path;
 
 pub type Hash = [u8; 32];
 
-/// Default LMDB map size: 1 GiB of reserved address space (not disk usage --
-/// LMDB only consumes what's actually written). Plenty for development;
-/// bump this (or reopen with a larger value) before storing more than that.
-const DEFAULT_MAP_SIZE: usize = 1 << 30;
-
 #[derive(Debug)]
 pub enum Error {
-    Io(std::io::Error),
+    Storage(crate::storage::Error),
     Heed(heed::Error),
     /// The on-disk metadata was missing or malformed -- e.g. opening a
     /// directory that isn't actually a PMMR this code created.
     Corrupt(&'static str),
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
+impl From<crate::storage::Error> for Error {
+    fn from(e: crate::storage::Error) -> Self {
+        Error::Storage(e)
     }
 }
 
@@ -92,7 +92,7 @@ impl From<heed::Error> for Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "I/O error: {e}"),
+            Error::Storage(e) => write!(f, "storage error: {e}"),
             Error::Heed(e) => write!(f, "LMDB error: {e}"),
             Error::Corrupt(msg) => write!(f, "corrupt PMMR metadata: {msg}"),
         }
@@ -279,12 +279,13 @@ impl Proof {
     }
 }
 
-/// A PMMR of `Output`s, backed by an LMDB environment. Every node (leaf and
-/// internal) is stored by position; a leaf's path up to its peak, for proof
-/// generation, is computed arithmetically (see `family`/`is_left_sibling`
-/// above) rather than stored.
+/// A PMMR of `Output`s, backed by an LMDB environment (see
+/// `crate::storage::Storage`). Every node (leaf and internal) is stored by
+/// position; a leaf's path up to its peak, for proof generation, is
+/// computed arithmetically (see `family`/`is_left_sibling` above) rather
+/// than stored.
 pub struct Pmmr {
-    env: Env,
+    storage: Storage,
     nodes: Database<Bytes, Bytes>,
     meta: Database<Bytes, Bytes>,
     peaks: Vec<(u32, u64)>,
@@ -293,27 +294,13 @@ pub struct Pmmr {
 }
 
 impl Pmmr {
-    /// Open (creating if absent) a PMMR stored at `path`, with the default
-    /// 1 GiB LMDB map size.
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_map_size(path, DEFAULT_MAP_SIZE)
-    }
+    /// Open this PMMR's tables within the given storage context, creating
+    /// them if they don't already exist.
+    pub fn open(storage: &Storage) -> Result<Self> {
+        let nodes = storage.database("nodes")?;
+        let meta = storage.database("meta")?;
 
-    pub fn open_with_map_size(path: &Path, map_size: usize) -> Result<Self> {
-        std::fs::create_dir_all(path)?;
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(map_size)
-                .max_dbs(2)
-                .open(path)?
-        };
-
-        let mut wtxn = env.write_txn()?;
-        let nodes = env.create_database(&mut wtxn, Some("nodes"))?;
-        let meta = env.create_database(&mut wtxn, Some("meta"))?;
-        wtxn.commit()?;
-
-        let rtxn = env.read_txn()?;
+        let rtxn = storage.read_txn()?;
         let leaf_count = match meta.get(&rtxn, b"leaf_count".as_slice())? {
             Some(bytes) => decode_pos(bytes)?,
             None => 0,
@@ -325,7 +312,7 @@ impl Pmmr {
         rtxn.commit()?;
 
         Ok(Pmmr {
-            env,
+            storage: storage.clone(),
             nodes,
             meta,
             size: size_for_leaf_count(leaf_count),
@@ -349,7 +336,7 @@ impl Pmmr {
     /// at the leaf level. Durable once this returns: the write transaction
     /// backing it is committed before `push` returns.
     pub fn push(&mut self, output: &Output) -> Result<u64> {
-        let mut wtxn = self.env.write_txn()?;
+        let mut wtxn = self.storage.write_txn()?;
 
         let leaf_pos = self.size;
         self.nodes
@@ -394,7 +381,7 @@ impl Pmmr {
     /// The current root: all peaks bagged together. The root of an empty
     /// PMMR is defined as the hash of an empty byte string.
     pub fn root(&self) -> Result<Hash> {
-        let rtxn = self.env.read_txn()?;
+        let rtxn = self.storage.read_txn()?;
         let mut ordered = Vec::with_capacity(self.peaks.len());
         for &(_, pos) in &self.peaks {
             ordered.push((pos, self.get_node(&rtxn, pos)?));
@@ -405,7 +392,7 @@ impl Pmmr {
     /// Build an inclusion proof for the leaf at `leaf_pos`, or `None` if
     /// that position isn't a leaf in this PMMR.
     pub fn prove(&self, leaf_pos: u64) -> Result<Option<Proof>> {
-        let rtxn = self.env.read_txn()?;
+        let rtxn = self.storage.read_txn()?;
 
         if leaf_pos >= self.size || !is_leaf(leaf_pos) {
             return Ok(None);
@@ -590,8 +577,10 @@ mod tests {
     fn empty_root_is_deterministic() {
         let dir_a = TempDir::new();
         let dir_b = TempDir::new();
-        let a = Pmmr::open(&dir_a.0).unwrap();
-        let b = Pmmr::open(&dir_b.0).unwrap();
+        let storage_a = Storage::open(&dir_a.0).unwrap();
+        let a = Pmmr::open(&storage_a).unwrap();
+        let storage_b = Storage::open(&dir_b.0).unwrap();
+        let b = Pmmr::open(&storage_b).unwrap();
         assert_eq!(a.root().unwrap(), b.root().unwrap());
     }
 
@@ -599,9 +588,11 @@ mod tests {
     fn single_leaf_root_depends_on_leaf() {
         let dir_a = TempDir::new();
         let dir_b = TempDir::new();
-        let mut a = Pmmr::open(&dir_a.0).unwrap();
+        let storage_a = Storage::open(&dir_a.0).unwrap();
+        let mut a = Pmmr::open(&storage_a).unwrap();
         a.push(&output(1)).unwrap();
-        let mut b = Pmmr::open(&dir_b.0).unwrap();
+        let storage_b = Storage::open(&dir_b.0).unwrap();
+        let mut b = Pmmr::open(&storage_b).unwrap();
         b.push(&output(2)).unwrap();
         assert_ne!(a.root().unwrap(), b.root().unwrap());
     }
@@ -610,9 +601,11 @@ mod tests {
     fn single_leaf_root_depends_on_leaf_eq() {
         let dir_a = TempDir::new();
         let dir_b = TempDir::new();
-        let mut a = Pmmr::open(&dir_a.0).unwrap();
+        let storage_a = Storage::open(&dir_a.0).unwrap();
+        let mut a = Pmmr::open(&storage_a).unwrap();
         a.push(&output(1)).unwrap();
-        let mut b = Pmmr::open(&dir_b.0).unwrap();
+        let storage_b = Storage::open(&dir_b.0).unwrap();
+        let mut b = Pmmr::open(&storage_b).unwrap();
         b.push(&output(1)).unwrap();
         assert_eq!(a.root().unwrap(), b.root().unwrap());
     }
@@ -625,7 +618,8 @@ mod tests {
         // 3 leaves-> 4 nodes, 2 peaks (heights 1, 0)
         // 4 leaves-> 7 nodes, 1 peak (height 2)
         let dir = TempDir::new();
-        let mut mmr = Pmmr::open(&dir.0).unwrap();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
         let expected_sizes = [1, 3, 4, 7];
         let expected_peak_counts = [1, 1, 2, 1];
         for (i, byte) in (1u8..=4).enumerate() {
@@ -639,7 +633,8 @@ mod tests {
     #[test]
     fn every_leaf_proves_against_the_root() {
         let dir = TempDir::new();
-        let mut mmr = Pmmr::open(&dir.0).unwrap();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
         let mut leaf_positions = Vec::new();
         for byte in 1u8..=9 {
             leaf_positions.push(mmr.push(&output(byte)).unwrap());
@@ -659,13 +654,15 @@ mod tests {
     fn proof_rejects_wrong_root() {
         let dir_a = TempDir::new();
         let dir_b = TempDir::new();
-        let mut mmr = Pmmr::open(&dir_a.0).unwrap();
+        let storage_a = Storage::open(&dir_a.0).unwrap();
+        let mut mmr = Pmmr::open(&storage_a).unwrap();
         let pos = mmr.push(&output(1)).unwrap();
         mmr.push(&output(2)).unwrap();
         mmr.push(&output(3)).unwrap();
         let proof = mmr.prove(pos).unwrap().unwrap();
 
-        let mut other = Pmmr::open(&dir_b.0).unwrap();
+        let storage_b = Storage::open(&dir_b.0).unwrap();
+        let mut other = Pmmr::open(&storage_b).unwrap();
         other.push(&output(9)).unwrap();
         assert!(!proof.verify(other.root().unwrap()));
     }
@@ -673,7 +670,8 @@ mod tests {
     #[test]
     fn proof_rejects_tampered_leaf_hash() {
         let dir = TempDir::new();
-        let mut mmr = Pmmr::open(&dir.0).unwrap();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
         let pos = mmr.push(&output(1)).unwrap();
         mmr.push(&output(2)).unwrap();
         mmr.push(&output(3)).unwrap();
@@ -687,7 +685,8 @@ mod tests {
     #[test]
     fn proof_rejects_tampered_sibling() {
         let dir = TempDir::new();
-        let mut mmr = Pmmr::open(&dir.0).unwrap();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
         let pos = mmr.push(&output(1)).unwrap();
         mmr.push(&output(2)).unwrap();
         mmr.push(&output(3)).unwrap();
@@ -706,7 +705,8 @@ mod tests {
     #[test]
     fn non_leaf_position_is_not_provable() {
         let dir = TempDir::new();
-        let mut mmr = Pmmr::open(&dir.0).unwrap();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
         mmr.push(&output(1)).unwrap();
         mmr.push(&output(2)).unwrap(); // positions 0,1 are leaves; position 2 is their parent
         assert!(mmr.prove(2).unwrap().is_none());
@@ -716,16 +716,19 @@ mod tests {
     fn reopening_resumes_from_persisted_state() {
         let dir = TempDir::new();
         let (root_before, leaf_pos) = {
-            let mut mmr = Pmmr::open(&dir.0).unwrap();
+            let storage = Storage::open(&dir.0).unwrap();
+            let mut mmr = Pmmr::open(&storage).unwrap();
             mmr.push(&output(1)).unwrap();
             mmr.push(&output(2)).unwrap();
             let pos = mmr.push(&output(3)).unwrap();
             (mmr.root().unwrap(), pos)
         };
-        // `mmr` and its `Env` are fully dropped here; everything that
-        // follows comes from what was actually durably written to disk.
+        // `mmr` and `storage` (and the `Env` it held) are fully dropped
+        // here; everything that follows comes from what was actually
+        // durably written to disk.
 
-        let mut reopened = Pmmr::open(&dir.0).unwrap();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut reopened = Pmmr::open(&storage).unwrap();
         assert_eq!(reopened.leaf_count(), 3);
         assert_eq!(reopened.root().unwrap(), root_before);
 
