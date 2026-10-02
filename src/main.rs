@@ -1,4 +1,5 @@
 mod bitmap;
+mod block;
 mod fri;
 mod merkle;
 mod output;
@@ -8,6 +9,7 @@ mod pow;
 mod storage;
 mod transaction;
 mod transcript;
+mod utxo;
 mod wots;
 
 fn main() {

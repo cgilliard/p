@@ -26,8 +26,9 @@ pub const DEFAULT_MAP_SIZE: usize = 1 << 30;
 
 /// Upper bound on how many named databases this environment can ever hold;
 /// LMDB requires declaring this upfront. Currently used: `nodes` and `meta`
-/// (by `Pmmr`). Left with headroom for what's planned next (a spent-output
-/// bitmap) so this doesn't need revisiting the moment that's added.
+/// (by `Pmmr`), `bitmap_pages` and `bitmap_nodes` (by `Bitmap`), and
+/// `utxo_index` (by `UtxoIndex`) -- 5 of 8, leaving some headroom before
+/// this needs revisiting.
 const MAX_DBS: u32 = 8;
 
 #[derive(Debug)]
