@@ -1,6 +1,10 @@
 //! Transactions: just inputs (spent outputs, identified by their owner's
 //! revealed public key, plus the amount being spent) and outputs, nothing
-//! else -- no fees, no scripts.
+//! else -- no scripts. Fees are implicit: if total input amount exceeds
+//! total output amount, the difference is the fee. There's no separate fee
+//! field or recipient for it (e.g. no block-reward-style payout to whoever
+//! includes the transaction) -- that's a question for whatever assembles a
+//! block out of transactions, not this module.
 //!
 //! This module has **no dependency on `pmmr` or any other output-storage
 //! scheme whatsoever** -- deliberately so. An input is identified purely by
@@ -18,38 +22,50 @@
 //! things it deliberately leaves to the caller:
 //!
 //! - Checked here: every input is signed, no two inputs claim the same
-//!   public key, every signature is valid over the shared message, and
-//!   total input amount equals total output amount (no fee concept yet).
+//!   public key, every signature is valid over its own signing message,
+//!   and total input amount is at least total output amount.
 //! - Left to the caller: whether each claimed (pubkey, amount) input
-//!   actually, currently corresponds to a real, unspent output somewhere.
-//!   That's a question about a specific output set at a specific moment
-//!   (i.e. block/mempool validation against a particular `pmmr`, or
-//!   whatever storage a given context uses), not about the transaction by
-//!   itself -- a `Transaction` can be fully internally valid while every
-//!   one of its claimed inputs turns out to be fabricated, and catching
-//!   that is explicitly not this module's job.
+//!   actually, currently corresponds to a real, unspent output somewhere,
+//!   and whether the same output gets spent by more than one transaction
+//!   (double-spending). Both are questions about a specific output set at
+//!   a specific moment (i.e. block validation against a particular `pmmr`,
+//!   or whatever storage a given context uses), not about the transaction
+//!   by itself -- a `Transaction` can be fully internally valid while every
+//!   one of its claimed inputs turns out to be fabricated or already
+//!   spent, and catching that is explicitly not this module's job.
 //!
-//! # Building a transaction
+//! # Building a transaction, with multiple independent signers
 //!
-//! `Transaction` is built incrementally and mutably:
+//! `Transaction` is built incrementally and mutably. The key design point,
+//! and the thing that makes a genuine multi-party flow work: **each
+//! input's signature covers only that input's own (pubkey, amount) plus
+//! the outputs -- not any other input.** A signer is authorizing "I'm
+//! contributing this much, toward these specific outputs," full stop; they
+//! don't need to know or care who else contributes other inputs, or how
+//! many there end up being. That means inputs can be added and signed by
+//! any number of independent parties, interleaved in any order, and adding
+//! one input's signature never invalidates another's.
+//!
+//! The one ordering rule that still matters: **outputs need to be finalized
+//! before any input is signed.** Every input's signature covers the full
+//! current output list, so adding or changing an output after some input
+//! is already signed invalidates that signature (by design -- an input's
+//! owner needs their authorization to actually depend on where the funds
+//! are going). This is exactly the recipient-first flow: the recipient
+//! decides the outputs and contributes them first; only then do one or
+//! more senders add and sign their inputs, in whatever order suits them.
 //!
 //! ```ignore
 //! let mut tx = Transaction::new();
+//! tx.add_output(new_output); // outputs finalized first
+//!
 //! let i0 = tx.add_input(pubkey_a, 100);
-//! let i1 = tx.add_input(pubkey_b, 100);
-//! tx.add_output(new_output); // worth 200
-//! tx.sign_input(i0, &secret_a);
-//! tx.sign_input(i1, &secret_b);
+//! tx.sign_input(i0, &secret_a);       // signer A signs
+//! let i1 = tx.add_input(pubkey_b, 100); // signer B's input arrives later
+//! tx.sign_input(i1, &secret_b);       // signer A's signature above is unaffected
+//!
 //! assert!(tx.verify());
 //! ```
-//!
-//! Each `sign_input` call only ever needs the secret key for *that* input.
-//! Different inputs can be signed by different owners who never share
-//! secret keys with each other or with whoever is assembling the
-//! transaction -- e.g. pass the same (partially-signed) `Transaction`
-//! between parties, each calling `sign_input` for their own input before
-//! passing it on, with `verify()` as the final check once every input is
-//! signed.
 
 // `main.rs` doesn't call into this module yet (it just prints "Hello
 // world!"), so allow dead code here rather than suppressing warnings
@@ -62,11 +78,11 @@ use crate::wots::{self, PublicKey, SecretKey, Signature};
 
 /// Domain separator for the transaction signing message, so it can never be
 /// confused with a hash produced for some other purpose that happens to
-/// reuse the same (pubkeys, amounts, outputs) byte shape.
+/// reuse the same (pubkey, amount, outputs) byte shape.
 const SIGNING_DOMAIN: &[u8] = b"transaction-v1";
 
 /// One spent output: the owner's revealed public key, the claimed amount
-/// being spent, and their signature over the transaction's signing message
+/// being spent, and their signature over that input's own signing message
 /// once they've provided it.
 #[derive(Clone, Debug)]
 pub struct Input {
@@ -104,22 +120,26 @@ impl Transaction {
         self.outputs.push(output);
     }
 
-    /// The message every input's signature must cover: a hash binding
-    /// every input's revealed public key and claimed amount, and every
-    /// output, together -- so nothing can be added, removed, or altered
-    /// (including just the claimed amount of an input) after any input is
-    /// signed without invalidating every signature already on it.
-    pub fn signing_message(&self) -> [BabyBear; 8] {
+    /// The message a signature over `(pubkey, amount)` must cover, given
+    /// this transaction's current outputs: a hash binding that one input's
+    /// own data to every current output, deliberately *not* to any other
+    /// input -- see the module docs for why.
+    fn message_for(&self, pubkey: &PublicKey, amount: u64) -> [BabyBear; 8] {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(SIGNING_DOMAIN);
-        for input in &self.inputs {
-            bytes.extend_from_slice(&input.pubkey.to_bytes());
-            bytes.extend_from_slice(&input.amount.to_le_bytes());
-        }
+        bytes.extend_from_slice(&pubkey.to_bytes());
+        bytes.extend_from_slice(&amount.to_le_bytes());
         for output in &self.outputs {
             bytes.extend_from_slice(&output.to_bytes());
         }
         hash_bytes(&bytes)
+    }
+
+    /// The message the input at `index` must be (or already is) signed
+    /// over, or `None` if `index` is out of range.
+    pub fn input_signing_message(&self, index: usize) -> Option<[BabyBear; 8]> {
+        let input = self.inputs.get(index)?;
+        Some(self.message_for(&input.pubkey, input.amount))
     }
 
     /// Sign the input at `index` with `secret_key`. The caller is
@@ -131,10 +151,9 @@ impl Transaction {
     /// the underlying WOTS signature fails to find a valid randomizer (see
     /// `wots::sign`).
     pub fn sign_input(&mut self, index: usize, secret_key: &SecretKey) -> bool {
-        if index >= self.inputs.len() {
+        let Some(message) = self.input_signing_message(index) else {
             return false;
-        }
-        let message = self.signing_message();
+        };
         match wots::sign(secret_key, message) {
             Some(signature) => {
                 self.inputs[index].signature = Some(signature);
@@ -155,21 +174,22 @@ impl Transaction {
             }
         }
 
-        // Total claimed input value must exactly equal total output value
-        // -- there's no fee concept yet, so anything else means either a
-        // mistake or an attempt to mint or destroy value. Accumulated in
-        // u128 so realistic u64 amounts can never overflow this check.
+        // Total claimed input value must be at least total output value;
+        // any excess is an implicit fee (no separate fee field, and no
+        // payee for it here -- that's for whoever assembles a block).
+        // Accumulated in u128 so realistic u64 amounts can never overflow
+        // this check.
         let input_total: u128 = self.inputs.iter().map(|i| i.amount as u128).sum();
         let output_total: u128 = self.outputs.iter().map(|o| o.amount as u128).sum();
-        if input_total != output_total {
+        if input_total < output_total {
             return false;
         }
 
-        let message = self.signing_message();
         for input in &self.inputs {
             let Some(signature) = &input.signature else {
                 return false;
             };
+            let message = self.message_for(&input.pubkey, input.amount);
             if !wots::verify(&input.pubkey, message, signature) {
                 return false;
             }
@@ -303,7 +323,7 @@ mod tests {
 
     #[test]
     fn empty_transaction_verifies() {
-        // No inputs, no outputs, nothing to sign, and 0 == 0 -- trivially
+        // No inputs, no outputs, nothing to sign, and 0 >= 0 -- trivially
         // valid on its own. Whether an empty transaction makes sense is a
         // question for whatever's constructing one, not this module.
         let tx = Transaction::new();
@@ -315,19 +335,21 @@ mod tests {
         let (sk_a, pk_a) = keypair(1);
         let mut tx = Transaction::new();
         let i0 = tx.add_input(pk_a, 100);
-        tx.add_output(new_output(200, 200)); // claims more than is spent
+        tx.add_output(new_output(200, 200)); // claims to create more than is spent
         tx.sign_input(i0, &sk_a);
         assert!(!tx.verify());
     }
 
+    /// Spending more than the outputs create is allowed -- the difference
+    /// is an implicit fee, not an error.
     #[test]
-    fn input_exceeding_output_rejected() {
+    fn input_exceeding_output_is_an_implicit_fee() {
         let (sk_a, pk_a) = keypair(1);
         let mut tx = Transaction::new();
         let i0 = tx.add_input(pk_a, 300);
-        tx.add_output(new_output(200, 200)); // spends more than it creates
+        tx.add_output(new_output(200, 200)); // 100 goes unaccounted for -- the fee
         tx.sign_input(i0, &sk_a);
-        assert!(!tx.verify());
+        assert!(tx.verify());
     }
 
     #[test]
@@ -340,16 +362,15 @@ mod tests {
         assert!(tx.verify());
 
         // Bumping the claimed amount after signing breaks the signature
-        // (the message commits to it) even before the balance check would
-        // also now fail.
+        // (the message commits to it), independent of the balance check.
         tx.inputs[0].amount += 1;
         assert!(!tx.verify());
     }
 
     /// Redistributing value between two outputs keeps the *total* balanced
     /// but still has to break verification, since each output's bytes --
-    /// including its individual amount -- are what the signature commits
-    /// to, not just the sum.
+    /// including its individual amount -- are part of what every
+    /// signature commits to, not just the sum.
     #[test]
     fn redistributing_output_amounts_breaks_signatures() {
         let (sk_a, pk_a) = keypair(1);
@@ -369,25 +390,78 @@ mod tests {
         assert!(!tx.verify());
     }
 
-    /// The actual multi-signer flow: two independent owners, neither of
-    /// whom ever sees the other's secret key, each sign only their own
-    /// input on a shared `Transaction` passed between them.
+    /// The bug this module used to have: a single shared signing message
+    /// covering every input meant adding a *new* input retroactively
+    /// invalidated every signature already collected. This is the direct
+    /// regression test for the fix -- signer A signs, *then* a brand new
+    /// input (signer B's) is added, and signer A's signature must still be
+    /// intact.
     #[test]
-    fn multiple_independent_signers() {
-        let (sk_a, pk_a) = keypair(10);
-        let (sk_b, pk_b) = keypair(20);
+    fn adding_a_later_input_does_not_invalidate_an_earlier_signature() {
+        let (sk_a, pk_a) = keypair(1);
+        let (sk_b, pk_b) = keypair(2);
 
         let mut tx = Transaction::new();
-        let i_a = tx.add_input(pk_a, 100);
-        let i_b = tx.add_input(pk_b, 100);
         tx.add_output(new_output(200, 200));
 
-        // Signer A receives `tx`, signs only their own input, passes it on.
+        let i0 = tx.add_input(pk_a.clone(), 100);
+        assert!(tx.sign_input(i0, &sk_a));
+        let message_a_before = tx.input_signing_message(i0).unwrap();
+
+        // A second, independent input arrives and gets signed *after* A.
+        let i1 = tx.add_input(pk_b, 100);
+        assert!(tx.sign_input(i1, &sk_b));
+
+        // A's signing message, and signature, are completely unaffected by
+        // B's input having been added.
+        assert_eq!(tx.input_signing_message(i0).unwrap(), message_a_before);
+        assert!(wots::verify(
+            &pk_a,
+            message_a_before,
+            tx.inputs[i0].signature.as_ref().unwrap()
+        ));
+
+        assert!(tx.verify());
+    }
+
+    /// Three independent parties, adding and signing their own inputs in
+    /// an arbitrarily interleaved order -- not all added up front, not all
+    /// signed at the end. Each only ever needs their own secret key.
+    #[test]
+    fn multiple_parties_interleaving_add_and_sign() {
+        let (sk_a, pk_a) = keypair(1);
+        let (sk_b, pk_b) = keypair(2);
+        let (sk_c, pk_c) = keypair(3);
+
+        let mut tx = Transaction::new();
+        tx.add_output(new_output(200, 300)); // 3 x 100 in, 300 out, no fee
+
+        let i_a = tx.add_input(pk_a, 100);
         assert!(tx.sign_input(i_a, &sk_a));
-        // Signer B receives it next, signs only their own input.
+
+        let i_b = tx.add_input(pk_b, 100);
+        // B signs only after C's input already exists.
+        let i_c = tx.add_input(pk_c, 100);
+        assert!(tx.sign_input(i_c, &sk_c));
         assert!(tx.sign_input(i_b, &sk_b));
 
         assert!(tx.verify());
+    }
+
+    /// The remaining ordering rule, now that inputs are independent of
+    /// each other: outputs still have to be finalized before any input is
+    /// signed, since every input's message covers the full output list.
+    #[test]
+    fn adding_an_output_after_signing_breaks_that_signature() {
+        let (sk_a, pk_a) = keypair(1);
+        let mut tx = Transaction::new();
+        let i0 = tx.add_input(pk_a, 200);
+        tx.add_output(new_output(200, 100));
+        assert!(tx.sign_input(i0, &sk_a));
+
+        // A second output shows up after A already signed.
+        tx.add_output(new_output(201, 100));
+        assert!(!tx.verify());
     }
 
     /// The recipient-first, Grin-style interactive flow: whoever is
