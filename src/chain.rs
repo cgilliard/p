@@ -50,6 +50,7 @@ use heed::types::Bytes;
 pub const GENESIS_PARENT_HASH: [u8; 32] = [0u8; 32];
 
 const TIP_HASH_KEY: &[u8] = b"tip_hash";
+const NEXT_HEIGHT_KEY: &[u8] = b"next_height";
 
 #[derive(Debug)]
 pub enum Error {
@@ -142,8 +143,8 @@ fn hex(bytes: &[u8; 32]) -> String {
 }
 
 /// A full node's chain state: the real `Pmmr`, `Bitmap`, and `UtxoIndex`,
-/// plus the one piece of metadata none of those three know about on their
-/// own -- which header is the current tip.
+/// plus the metadata none of those three know about on their own -- which
+/// header is the current tip, and at what height.
 pub struct Chain {
     storage: Storage,
     pmmr: Pmmr,
@@ -178,6 +179,31 @@ impl Chain {
                 .map_err(|_| Error::Corrupt("tip hash was not 32 bytes")),
             None => Ok(GENESIS_PARENT_HASH),
         }
+    }
+
+    /// The height of the next block this chain will accept: `0` for an
+    /// empty chain (the first block ever applied lands at height `0`),
+    /// incrementing by one with every successful `apply_block`. Kept as
+    /// a side field here rather than on `BlockHeader` -- see
+    /// `block::HEADER_LEN`'s docs: it's fully recoverable from `Chain`'s
+    /// own count of applied blocks (or, more expensively, by walking
+    /// `prev_hash` all the way back), so spending header space on it
+    /// would be pure redundancy.
+    fn next_height(&self, txn: &heed::RoTxn) -> Result<u64> {
+        match self.meta.get(txn, NEXT_HEIGHT_KEY)? {
+            Some(bytes) => bytes
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| Error::Corrupt("next height was not 8 bytes")),
+            None => Ok(0),
+        }
+    }
+
+    /// The current tip's height, or `None` if no block has ever been
+    /// applied (there is no height to report yet).
+    pub fn height(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
+        let next = self.next_height(txn)?;
+        Ok(if next == 0 { None } else { Some(next - 1) })
     }
 
     /// Resolve and apply `body`'s inputs and outputs against real chain
@@ -253,7 +279,9 @@ impl Chain {
             return Err(Error::BitmapRootMismatch);
         }
 
+        let next_height = self.next_height(&wtxn)? + 1;
         self.meta.put(&mut wtxn, TIP_HASH_KEY, &block.header.hash())?;
+        self.meta.put(&mut wtxn, NEXT_HEIGHT_KEY, &next_height.to_be_bytes())?;
         wtxn.commit()?;
         Ok(())
     }
@@ -378,6 +406,31 @@ mod tests {
         let (_dir, storage, chain) = open();
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), GENESIS_PARENT_HASH);
+    }
+
+    #[test]
+    fn empty_chain_has_no_height() {
+        let (_dir, storage, chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.height(&rtxn).unwrap(), None);
+    }
+
+    #[test]
+    fn height_advances_by_one_with_every_applied_block() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&block1).unwrap();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.height(&rtxn).unwrap(), Some(0));
+        drop(rtxn);
+
+        let (_sk2, pk2) = keypair(2);
+        let block2 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk2, 50)]);
+        chain.apply_block(&block2).unwrap();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.height(&rtxn).unwrap(), Some(1));
     }
 
     #[test]
@@ -524,6 +577,7 @@ mod tests {
             pmmr_root: [0u8; 32],
             bitmap_root: [0u8; 32],
             body_hash: body.body_hash(),
+            timestamp: 0,
             nonce: [0u8; 32],
         };
         let mut block = Block { header, body };

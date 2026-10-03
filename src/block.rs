@@ -87,8 +87,13 @@ pub const FIXED_MAX_HASH: [u8; 32] = {
 };
 
 /// `prev_hash`, `pmmr_root`, `bitmap_root`, `body_hash` (32 bytes each),
-/// then `nonce` (32 bytes) -- `BlockHeader`'s fixed encoded width.
-pub const HEADER_LEN: usize = 32 * 5;
+/// then `timestamp` (8 bytes) and `nonce` (32 bytes) -- `BlockHeader`'s
+/// fixed encoded width. Deliberately **no height field**: height is
+/// just "how many blocks came before this one," entirely recoverable by
+/// walking `prev_hash` (or, cheaply, from `chain::Chain`'s own count of
+/// applied blocks -- see that module's docs) without spending any of
+/// the header's own space on a number every node can already derive.
+pub const HEADER_LEN: usize = 32 * 4 + 8 + 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
@@ -96,25 +101,33 @@ pub struct BlockHeader {
     pub pmmr_root: [u8; 32],
     pub bitmap_root: [u8; 32],
     pub body_hash: [u8; 32],
+    /// Unix time (seconds) this header was assembled, as claimed by
+    /// whoever built it -- not yet validated against anything (no
+    /// monotonicity or future-time bound check exists yet; see
+    /// `docs/BLOCK_TODO.md`). Committed to by PoW just like every other
+    /// field, so it can't be altered after mining without invalidating
+    /// the nonce.
+    pub timestamp: u64,
     pub nonce: pow::Nonce,
 }
 
 impl BlockHeader {
-    /// Serialize to exactly `HEADER_LEN` bytes: the five fields,
-    /// concatenated in field-declaration order.
+    /// Serialize to exactly `HEADER_LEN` bytes: the six fields,
+    /// concatenated in field-declaration order (`timestamp` big-endian).
     pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
         out[0..32].copy_from_slice(&self.prev_hash);
         out[32..64].copy_from_slice(&self.pmmr_root);
         out[64..96].copy_from_slice(&self.bitmap_root);
         out[96..128].copy_from_slice(&self.body_hash);
-        out[128..160].copy_from_slice(&self.nonce);
+        out[128..136].copy_from_slice(&self.timestamp.to_be_bytes());
+        out[136..168].copy_from_slice(&self.nonce);
         out
     }
 
     /// Decode from bytes, the inverse of `to_bytes`. Every field is a
-    /// plain 32-byte array, so the only way this can fail is `bytes` not
-    /// being exactly `HEADER_LEN` long -- checked explicitly here
+    /// fixed-width plain value, so the only way this can fail is `bytes`
+    /// not being exactly `HEADER_LEN` long -- checked explicitly here
     /// (rather than taking a `[u8; HEADER_LEN]` and pushing that check
     /// onto every caller) so decoding a buffer of untrusted or
     /// attacker-controlled length can never panic, only return
@@ -128,21 +141,25 @@ impl BlockHeader {
             pmmr_root: bytes[32..64].try_into().unwrap(),
             bitmap_root: bytes[64..96].try_into().unwrap(),
             body_hash: bytes[96..128].try_into().unwrap(),
-            nonce: bytes[128..160].try_into().unwrap(),
+            timestamp: u64::from_be_bytes(bytes[128..136].try_into().unwrap()),
+            nonce: bytes[136..168].try_into().unwrap(),
         })
     }
 
     /// Everything the header commits to except the nonce -- what
     /// `pow::verify`/`pow::mine` actually hash, re-hashed with a new
-    /// nonce on every mining attempt. Doesn't need to separately
-    /// mention the proof: `body_hash` already commits to it (see
-    /// `BlockBody`'s docs), so PoW covers it transitively.
+    /// nonce on every mining attempt. Includes `timestamp` (so it can't
+    /// be altered post-mining without redoing the proof of work, same
+    /// reasoning Bitcoin hashes its timestamp too). Doesn't need to
+    /// separately mention the proof: `body_hash` already commits to it
+    /// (see `BlockBody`'s docs), so PoW covers it transitively.
     pub(crate) fn pow_preimage(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(32 * 4);
+        let mut bytes = Vec::with_capacity(32 * 4 + 8);
         bytes.extend_from_slice(&self.prev_hash);
         bytes.extend_from_slice(&self.pmmr_root);
         bytes.extend_from_slice(&self.bitmap_root);
         bytes.extend_from_slice(&self.body_hash);
+        bytes.extend_from_slice(&self.timestamp.to_be_bytes());
         bytes
     }
 
@@ -387,8 +404,12 @@ impl UnprovenBlock {
     /// Attach `proof` to assemble the real, still-unmined `Block`:
     /// `body_hash` is computed only now, since it commits to the proof
     /// alongside `inputs`/`outputs` (see `BlockBody::body_hash`).
-    /// `nonce` is left at `[0; 32]` -- `pow::mine_block` is the only
-    /// thing that sets it, and only once this has already happened.
+    /// `timestamp` is stamped as "now," at assembly time -- later than
+    /// `Chain::build_block` (which may have run well before proving
+    /// finished, if proving is slow) and right before mining, which is
+    /// the point at which this block is otherwise complete. `nonce` is
+    /// left at `[0; 32]` -- `pow::mine_block` is the only thing that
+    /// sets it, and only once this has already happened.
     pub fn finish(self, proof: Proof) -> Block {
         let body = BlockBody {
             inputs: self.inputs,
@@ -400,10 +421,20 @@ impl UnprovenBlock {
             pmmr_root: self.pmmr_root,
             bitmap_root: self.bitmap_root,
             body_hash: body.body_hash(),
+            timestamp: now_unix(),
             nonce: [0u8; 32],
         };
         Block { header, body }
     }
+}
+
+/// The current Unix time, in seconds -- what `UnprovenBlock::finish`
+/// stamps a new header with.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before 1970")
+        .as_secs()
 }
 
 #[derive(Clone, Debug)]
@@ -548,6 +579,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: BlockBody::new().body_hash(),
+            timestamp: 0,
             nonce: [0u8; 32],
         });
         let block = Block {
@@ -567,6 +599,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [4u8; 32],
+            timestamp: 0,
             nonce: [0u8; 32],
         };
         let failing_nonce = a_failing_nonce(&header.pow_preimage());
@@ -592,6 +625,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [0xABu8; 32], // does not match BlockBody::new()'s hash
+            timestamp: 0,
             nonce: [0u8; 32],
         });
         let block = Block {
@@ -645,9 +679,32 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [4u8; 32],
+            timestamp: 1_700_000_000,
             nonce: [0u8; 32],
         });
         assert_eq!(BlockHeader::from_bytes(&header.to_bytes()).unwrap(), header);
+    }
+
+    /// `timestamp` is part of what PoW hashes over -- changing it after
+    /// mining, without finding a new nonce, must invalidate the proof of
+    /// work, the same way tampering any other committed field would.
+    #[test]
+    fn tampering_timestamp_after_mining_invalidates_pow() {
+        let header = mined_header(BlockHeader {
+            prev_hash: [1u8; 32],
+            pmmr_root: [2u8; 32],
+            bitmap_root: [3u8; 32],
+            body_hash: [4u8; 32],
+            timestamp: 1_700_000_000,
+            nonce: [0u8; 32],
+        });
+        assert!(header.pow_valid());
+
+        let tampered = BlockHeader {
+            timestamp: header.timestamp + 1,
+            ..header
+        };
+        assert!(!tampered.pow_valid());
     }
 
     #[test]
@@ -657,6 +714,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [4u8; 32],
+            timestamp: 0,
             nonce: [0u8; 32],
         });
         let bytes = header.to_bytes();
@@ -714,6 +772,7 @@ mod tests {
             pmmr_root: [8u8; 32],
             bitmap_root: [7u8; 32],
             body_hash: body.body_hash(),
+            timestamp: 0,
             nonce: [0u8; 32],
         });
         let block = Block { header, body };
@@ -808,6 +867,7 @@ mod tests {
             pmmr_root: [0u8; 32],
             bitmap_root: [0u8; 32],
             body_hash: body.body_hash(),
+            timestamp: 0,
             nonce: [0u8; 32],
         });
         let block = Block { header, body };
@@ -838,6 +898,7 @@ mod tests {
             pmmr_root: [0u8; 32],
             bitmap_root: [0u8; 32],
             body_hash: body.body_hash(), // matches honestly, PoW is fine
+            timestamp: 0,
             nonce: [0u8; 32],
         });
         let block = Block { header, body };
