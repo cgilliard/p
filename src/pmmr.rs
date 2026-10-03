@@ -21,21 +21,34 @@
 //! choice, reusing the Poseidon2 primitives already built in this crate
 //! rather than replicating Grin's.
 //!
-//! # Persistence
+//! # Persistence, and why there's no in-memory cache
 //!
-//! Backed by LMDB via `heed` -- the dependency the project pulled in early
-//! on and hadn't actually used until now. An ever-growing, randomly-accessed
-//! append-only set like this is exactly what it's for: memory-mapped,
-//! durable, and crash-safe, without holding the whole structure in RAM. Node
-//! hashes live in LMDB, keyed by position; `leaf_count` and the current
-//! `peaks` (at most a few dozen entries even for billions of leaves) are
-//! cached in memory and mirrored into a small metadata table so a reopened
-//! PMMR picks up exactly where it left off.
+//! Backed by LMDB via `heed`. Node hashes live in `nodes`, keyed by
+//! position; `leaf_count` and the current `peaks` (at most a few dozen
+//! entries even for billions of leaves) live in a small `meta` table --
+//! and that's genuinely the *only* copy of them. An earlier version of
+//! this module cached `leaf_count`/`peaks`/`size` as struct fields,
+//! mirroring them into `meta` on every `push` purely so a reopened PMMR
+//! could pick up where it left off. That cache is gone now: every method
+//! reads `leaf_count`/`peaks` fresh from `meta`, through whichever
+//! transaction the caller hands in, every time.
+//!
+//! That's not a performance regression worth worrying about (`meta`'s
+//! entries are tiny, and writing them was already happening on every
+//! `push` regardless) -- it's what makes this module safely composable
+//! with others inside one shared transaction. `push` no longer opens or
+//! commits a transaction of its own; the caller (`chain.rs`, eventually)
+//! does, and can thread the same transaction through `Bitmap` and
+//! `UtxoIndex` calls too, committing once at the end or dropping
+//! everything on failure. With no cached field of our own, there's
+//! nothing here that could end up out of sync with a transaction that
+//! might still be rolled back -- `self` has no state *to* roll back.
 //!
 //! The LMDB environment itself is opened by `crate::storage::Storage`, not
-//! by this module -- `Pmmr::open` takes a `&Storage` rather than a path.
-//! This is so the planned spent-output bitmap (for pruning) can later share
-//! the exact same environment instead of opening a second one.
+//! by this module -- `Pmmr::open` takes a `&Storage` rather than a path,
+//! which is what lets `Bitmap` and `UtxoIndex` share the exact same
+//! environment (and now, the exact same transaction) instead of each
+//! opening their own.
 //!
 //! # No stored parent/child links
 //!
@@ -287,134 +300,130 @@ impl Proof {
 /// `crate::storage::Storage`). Every node (leaf and internal) is stored by
 /// position; a leaf's path up to its peak, for proof generation, is
 /// computed arithmetically (see `family`/`is_left_sibling` above) rather
-/// than stored.
+/// than stored. Holds no state of its own beyond the database handles --
+/// see the module docs on why.
 pub struct Pmmr {
     storage: Storage,
     nodes: Database<Bytes, Bytes>,
     meta: Database<Bytes, Bytes>,
-    peaks: Vec<(u32, u64)>,
-    leaf_count: u64,
-    size: u64,
 }
 
 impl Pmmr {
     /// Open this PMMR's tables within the given storage context, creating
-    /// them if they don't already exist.
+    /// them if they don't already exist. Doesn't touch a transaction at
+    /// all -- there's no cached state left to seed from `meta`.
     pub fn open(storage: &Storage) -> Result<Self> {
         let nodes = storage.database("nodes")?;
         let meta = storage.database("meta")?;
-
-        let rtxn = storage.read_txn()?;
-        let leaf_count = match meta.get(&rtxn, b"leaf_count".as_slice())? {
-            Some(bytes) => decode_pos(bytes)?,
-            None => 0,
-        };
-        let peaks = match meta.get(&rtxn, b"peaks".as_slice())? {
-            Some(bytes) => decode_peaks(bytes)?,
-            None => Vec::new(),
-        };
-        rtxn.commit()?;
-
         Ok(Pmmr {
             storage: storage.clone(),
             nodes,
             meta,
-            size: size_for_leaf_count(leaf_count),
-            leaf_count,
-            peaks,
         })
     }
 
-    pub fn leaf_count(&self) -> u64 {
-        self.leaf_count
+    /// Number of leaves pushed so far, read fresh from `meta` through
+    /// `txn`. `txn` can be a plain `RoTxn`, or the same `RwTxn` an
+    /// in-progress `push` is using (a write transaction can always read
+    /// its own pending writes).
+    pub fn leaf_count(&self, txn: &heed::RoTxn) -> Result<u64> {
+        match self.meta.get(txn, b"leaf_count".as_slice())? {
+            Some(bytes) => decode_pos(bytes),
+            None => Ok(0),
+        }
     }
 
-    /// Total number of nodes stored (leaves + internal).
-    pub fn size(&self) -> u64 {
-        self.size
+    /// Total number of nodes stored (leaves + internal), derived from
+    /// `leaf_count`.
+    pub fn size(&self, txn: &heed::RoTxn) -> Result<u64> {
+        Ok(size_for_leaf_count(self.leaf_count(txn)?))
+    }
+
+    fn peaks(&self, txn: &heed::RoTxn) -> Result<Vec<(u32, u64)>> {
+        match self.meta.get(txn, b"peaks".as_slice())? {
+            Some(bytes) => decode_peaks(bytes),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Append a leaf hash, returning the position it was stored at. The
     /// caller is responsible for having already hashed whatever the leaf
     /// is supposed to commit to -- this module has no idea, and doesn't
-    /// need to. Durable once this returns: the write transaction backing
-    /// it is committed before `push` returns.
-    pub fn push(&mut self, leaf_hash: Hash) -> Result<u64> {
-        let mut wtxn = self.storage.write_txn()?;
+    /// need to. Reads the current `leaf_count`/`peaks` fresh from `meta`
+    /// through `wtxn` and writes the updated versions back through the
+    /// same transaction -- nothing is committed here; that's the caller's
+    /// call, once (potentially) every other store it's updating in the
+    /// same transaction has also succeeded.
+    pub fn push(&mut self, wtxn: &mut heed::RwTxn, leaf_hash: Hash) -> Result<u64> {
+        let mut leaf_count = self.leaf_count(wtxn)?;
+        let mut size = size_for_leaf_count(leaf_count);
+        let mut peaks = self.peaks(wtxn)?;
 
-        let leaf_pos = self.size;
-        self.nodes.put(&mut wtxn, &encode_pos(leaf_pos), &leaf_hash)?;
-        self.size += 1;
-        self.leaf_count += 1;
+        let leaf_pos = size;
+        self.nodes.put(wtxn, &encode_pos(leaf_pos), &leaf_hash)?;
+        size += 1;
+        leaf_count += 1;
 
-        self.peaks.push((0, leaf_pos));
-        while self.peaks.len() >= 2 {
-            let (h_top, pos_top) = self.peaks[self.peaks.len() - 1];
-            let (h_second, pos_second) = self.peaks[self.peaks.len() - 2];
+        peaks.push((0, leaf_pos));
+        while peaks.len() >= 2 {
+            let (h_top, pos_top) = peaks[peaks.len() - 1];
+            let (h_second, pos_second) = peaks[peaks.len() - 2];
             if h_top != h_second {
                 break;
             }
-            self.peaks.pop();
-            self.peaks.pop();
+            peaks.pop();
+            peaks.pop();
 
-            let left_hash = self.get_node(&wtxn, pos_second)?;
-            let right_hash = self.get_node(&wtxn, pos_top)?;
-            let parent_pos = self.size;
+            let left_hash = self.get_node(wtxn, pos_second)?;
+            let right_hash = self.get_node(wtxn, pos_top)?;
+            let parent_pos = size;
             let parent_hash = node_hash(parent_pos, left_hash, right_hash);
 
-            self.nodes
-                .put(&mut wtxn, &encode_pos(parent_pos), &parent_hash)?;
-            self.size += 1;
+            self.nodes.put(wtxn, &encode_pos(parent_pos), &parent_hash)?;
+            size += 1;
 
-            self.peaks.push((h_second + 1, parent_pos));
+            peaks.push((h_second + 1, parent_pos));
         }
 
-        self.meta.put(
-            &mut wtxn,
-            b"leaf_count".as_slice(),
-            &encode_pos(self.leaf_count),
-        )?;
-        self.meta
-            .put(&mut wtxn, b"peaks".as_slice(), &encode_peaks(&self.peaks))?;
+        self.meta.put(wtxn, b"leaf_count".as_slice(), &encode_pos(leaf_count))?;
+        self.meta.put(wtxn, b"peaks".as_slice(), &encode_peaks(&peaks))?;
 
-        wtxn.commit()?;
         Ok(leaf_pos)
     }
 
     /// The current root: all peaks bagged together. The root of an empty
     /// PMMR is defined as the hash of an empty byte string.
-    pub fn root(&self) -> Result<Hash> {
-        let rtxn = self.storage.read_txn()?;
-        let mut ordered = Vec::with_capacity(self.peaks.len());
-        for &(_, pos) in &self.peaks {
-            ordered.push((pos, self.get_node(&rtxn, pos)?));
+    pub fn root(&self, txn: &heed::RoTxn) -> Result<Hash> {
+        let peaks = self.peaks(txn)?;
+        let mut ordered = Vec::with_capacity(peaks.len());
+        for &(_, pos) in &peaks {
+            ordered.push((pos, self.get_node(txn, pos)?));
         }
         Ok(bag_peaks(&ordered))
     }
 
     /// Build an inclusion proof for the leaf at `leaf_pos`, or `None` if
     /// that position isn't a leaf in this PMMR.
-    pub fn prove(&self, leaf_pos: u64) -> Result<Option<Proof>> {
-        let rtxn = self.storage.read_txn()?;
-
-        if leaf_pos >= self.size || !is_leaf(leaf_pos) {
+    pub fn prove(&self, txn: &heed::RoTxn, leaf_pos: u64) -> Result<Option<Proof>> {
+        let size = self.size(txn)?;
+        if leaf_pos >= size || !is_leaf(leaf_pos) {
             return Ok(None);
         }
 
-        let leaf_hash = self.get_node(&rtxn, leaf_pos)?;
+        let leaf_hash = self.get_node(txn, leaf_pos)?;
         let mut path = Vec::new();
         let mut pos = leaf_pos;
         // Walk from the leaf toward its peak. `family` gives the parent and
         // sibling positions purely from `pos`'s own value; the loop stops
         // once the computed parent would fall outside the tree as it
         // currently stands, i.e. `pos` is itself a peak.
-        while pos + 1 < self.size {
+        while pos + 1 < size {
             let (parent_pos, sibling_pos) = family(pos);
-            if parent_pos >= self.size {
+            if parent_pos >= size {
                 break;
             }
             path.push(ProofStep {
-                sibling_hash: self.get_node(&rtxn, sibling_pos)?,
+                sibling_hash: self.get_node(txn, sibling_pos)?,
                 sibling_is_left: !is_left_sibling(pos),
                 parent_pos,
             });
@@ -422,10 +431,11 @@ impl Pmmr {
         }
         // `pos` is now the position of the peak containing this leaf.
 
+        let peaks = self.peaks(txn)?;
         let mut other_peaks = Vec::new();
-        for &(_, p) in &self.peaks {
+        for &(_, p) in &peaks {
             if p != pos {
-                other_peaks.push((p, self.get_node(&rtxn, p)?));
+                other_peaks.push((p, self.get_node(txn, p)?));
             }
         }
 
@@ -458,6 +468,41 @@ mod tests {
     /// need to route through `Output`/`wots` here at all anymore.
     fn leaf(byte: u8) -> Hash {
         hash_bytes_32(&[byte; 1])
+    }
+
+    /// Push one leaf in its own, immediately-committed transaction --
+    /// most tests below don't care about batching multiple writes into
+    /// one transaction, just about the resulting structure.
+    fn push_committed(storage: &Storage, mmr: &mut Pmmr, leaf_hash: Hash) -> u64 {
+        let mut wtxn = storage.write_txn().unwrap();
+        let pos = mmr.push(&mut wtxn, leaf_hash).unwrap();
+        wtxn.commit().unwrap();
+        pos
+    }
+
+    fn root(storage: &Storage, mmr: &Pmmr) -> Hash {
+        let rtxn = storage.read_txn().unwrap();
+        mmr.root(&rtxn).unwrap()
+    }
+
+    fn size(storage: &Storage, mmr: &Pmmr) -> u64 {
+        let rtxn = storage.read_txn().unwrap();
+        mmr.size(&rtxn).unwrap()
+    }
+
+    fn leaf_count(storage: &Storage, mmr: &Pmmr) -> u64 {
+        let rtxn = storage.read_txn().unwrap();
+        mmr.leaf_count(&rtxn).unwrap()
+    }
+
+    fn peak_count(storage: &Storage, mmr: &Pmmr) -> usize {
+        let rtxn = storage.read_txn().unwrap();
+        mmr.peaks(&rtxn).unwrap().len()
+    }
+
+    fn prove(storage: &Storage, mmr: &Pmmr, leaf_pos: u64) -> Option<Proof> {
+        let rtxn = storage.read_txn().unwrap();
+        mmr.prove(&rtxn, leaf_pos).unwrap()
     }
 
     /// Builds the same merge structure `Pmmr::push` does, but as a
@@ -585,7 +630,7 @@ mod tests {
         let a = Pmmr::open(&storage_a).unwrap();
         let storage_b = Storage::open(&dir_b.0).unwrap();
         let b = Pmmr::open(&storage_b).unwrap();
-        assert_eq!(a.root().unwrap(), b.root().unwrap());
+        assert_eq!(root(&storage_a, &a), root(&storage_b, &b));
     }
 
     #[test]
@@ -594,11 +639,11 @@ mod tests {
         let dir_b = TempDir::new();
         let storage_a = Storage::open(&dir_a.0).unwrap();
         let mut a = Pmmr::open(&storage_a).unwrap();
-        a.push(leaf(1)).unwrap();
+        push_committed(&storage_a, &mut a, leaf(1));
         let storage_b = Storage::open(&dir_b.0).unwrap();
         let mut b = Pmmr::open(&storage_b).unwrap();
-        b.push(leaf(2)).unwrap();
-        assert_ne!(a.root().unwrap(), b.root().unwrap());
+        push_committed(&storage_b, &mut b, leaf(2));
+        assert_ne!(root(&storage_a, &a), root(&storage_b, &b));
     }
 
     #[test]
@@ -607,11 +652,11 @@ mod tests {
         let dir_b = TempDir::new();
         let storage_a = Storage::open(&dir_a.0).unwrap();
         let mut a = Pmmr::open(&storage_a).unwrap();
-        a.push(leaf(1)).unwrap();
+        push_committed(&storage_a, &mut a, leaf(1));
         let storage_b = Storage::open(&dir_b.0).unwrap();
         let mut b = Pmmr::open(&storage_b).unwrap();
-        b.push(leaf(1)).unwrap();
-        assert_eq!(a.root().unwrap(), b.root().unwrap());
+        push_committed(&storage_b, &mut b, leaf(1));
+        assert_eq!(root(&storage_a, &a), root(&storage_b, &b));
     }
 
     #[test]
@@ -627,11 +672,11 @@ mod tests {
         let expected_sizes = [1, 3, 4, 7];
         let expected_peak_counts = [1, 1, 2, 1];
         for (i, byte) in (1u8..=4).enumerate() {
-            mmr.push(leaf(byte)).unwrap();
-            assert_eq!(mmr.size(), expected_sizes[i]);
-            assert_eq!(mmr.peaks.len(), expected_peak_counts[i]);
+            push_committed(&storage, &mut mmr, leaf(byte));
+            assert_eq!(size(&storage, &mmr), expected_sizes[i]);
+            assert_eq!(peak_count(&storage, &mmr), expected_peak_counts[i]);
         }
-        assert_eq!(mmr.leaf_count(), 4);
+        assert_eq!(leaf_count(&storage, &mmr), 4);
     }
 
     #[test]
@@ -641,16 +686,13 @@ mod tests {
         let mut mmr = Pmmr::open(&storage).unwrap();
         let mut leaf_positions = Vec::new();
         for byte in 1u8..=9 {
-            leaf_positions.push(mmr.push(leaf(byte)).unwrap());
+            leaf_positions.push(push_committed(&storage, &mut mmr, leaf(byte)));
         }
-        let root = mmr.root().unwrap();
+        let expected_root = root(&storage, &mmr);
 
         for &pos in &leaf_positions {
-            let proof = mmr
-                .prove(pos)
-                .unwrap()
-                .expect("leaf position should be provable");
-            assert!(proof.verify(root));
+            let proof = prove(&storage, &mmr, pos).expect("leaf position should be provable");
+            assert!(proof.verify(expected_root));
         }
     }
 
@@ -660,15 +702,15 @@ mod tests {
         let dir_b = TempDir::new();
         let storage_a = Storage::open(&dir_a.0).unwrap();
         let mut mmr = Pmmr::open(&storage_a).unwrap();
-        let pos = mmr.push(leaf(1)).unwrap();
-        mmr.push(leaf(2)).unwrap();
-        mmr.push(leaf(3)).unwrap();
-        let proof = mmr.prove(pos).unwrap().unwrap();
+        let pos = push_committed(&storage_a, &mut mmr, leaf(1));
+        push_committed(&storage_a, &mut mmr, leaf(2));
+        push_committed(&storage_a, &mut mmr, leaf(3));
+        let proof = prove(&storage_a, &mmr, pos).unwrap();
 
         let storage_b = Storage::open(&dir_b.0).unwrap();
         let mut other = Pmmr::open(&storage_b).unwrap();
-        other.push(leaf(9)).unwrap();
-        assert!(!proof.verify(other.root().unwrap()));
+        push_committed(&storage_b, &mut other, leaf(9));
+        assert!(!proof.verify(root(&storage_b, &other)));
     }
 
     #[test]
@@ -676,14 +718,14 @@ mod tests {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
         let mut mmr = Pmmr::open(&storage).unwrap();
-        let pos = mmr.push(leaf(1)).unwrap();
-        mmr.push(leaf(2)).unwrap();
-        mmr.push(leaf(3)).unwrap();
-        let root = mmr.root().unwrap();
+        let pos = push_committed(&storage, &mut mmr, leaf(1));
+        push_committed(&storage, &mut mmr, leaf(2));
+        push_committed(&storage, &mut mmr, leaf(3));
+        let expected_root = root(&storage, &mmr);
 
-        let mut proof = mmr.prove(pos).unwrap().unwrap();
+        let mut proof = prove(&storage, &mmr, pos).unwrap();
         proof.leaf_hash[0] ^= 1;
-        assert!(!proof.verify(root));
+        assert!(!proof.verify(expected_root));
     }
 
     #[test]
@@ -691,19 +733,19 @@ mod tests {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
         let mut mmr = Pmmr::open(&storage).unwrap();
-        let pos = mmr.push(leaf(1)).unwrap();
-        mmr.push(leaf(2)).unwrap();
-        mmr.push(leaf(3)).unwrap();
-        mmr.push(leaf(4)).unwrap();
-        let root = mmr.root().unwrap();
+        let pos = push_committed(&storage, &mut mmr, leaf(1));
+        push_committed(&storage, &mut mmr, leaf(2));
+        push_committed(&storage, &mut mmr, leaf(3));
+        push_committed(&storage, &mut mmr, leaf(4));
+        let expected_root = root(&storage, &mmr);
 
-        let mut proof = mmr.prove(pos).unwrap().unwrap();
+        let mut proof = prove(&storage, &mmr, pos).unwrap();
         assert!(
             !proof.path.is_empty(),
             "with 4 leaves, leaf 0 has a non-empty path"
         );
         proof.path[0].sibling_hash[0] ^= 1;
-        assert!(!proof.verify(root));
+        assert!(!proof.verify(expected_root));
     }
 
     #[test]
@@ -711,9 +753,9 @@ mod tests {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
         let mut mmr = Pmmr::open(&storage).unwrap();
-        mmr.push(leaf(1)).unwrap();
-        mmr.push(leaf(2)).unwrap(); // positions 0,1 are leaves; position 2 is their parent
-        assert!(mmr.prove(2).unwrap().is_none());
+        push_committed(&storage, &mut mmr, leaf(1));
+        push_committed(&storage, &mut mmr, leaf(2)); // positions 0,1 are leaves; position 2 is their parent
+        assert!(prove(&storage, &mmr, 2).is_none());
     }
 
     #[test]
@@ -722,10 +764,15 @@ mod tests {
         let (root_before, leaf_pos) = {
             let storage = Storage::open(&dir.0).unwrap();
             let mut mmr = Pmmr::open(&storage).unwrap();
-            mmr.push(leaf(1)).unwrap();
-            mmr.push(leaf(2)).unwrap();
-            let pos = mmr.push(leaf(3)).unwrap();
-            (mmr.root().unwrap(), pos)
+            // All three pushes batched into one transaction, to exercise
+            // that `push` can be called repeatedly against the same
+            // transaction before anything commits.
+            let mut wtxn = storage.write_txn().unwrap();
+            mmr.push(&mut wtxn, leaf(1)).unwrap();
+            mmr.push(&mut wtxn, leaf(2)).unwrap();
+            let pos = mmr.push(&mut wtxn, leaf(3)).unwrap();
+            wtxn.commit().unwrap();
+            (root(&storage, &mmr), pos)
         };
         // `mmr` and `storage` (and the `Env` it held) are fully dropped
         // here; everything that follows comes from what was actually
@@ -733,16 +780,16 @@ mod tests {
 
         let storage = Storage::open(&dir.0).unwrap();
         let mut reopened = Pmmr::open(&storage).unwrap();
-        assert_eq!(reopened.leaf_count(), 3);
-        assert_eq!(reopened.root().unwrap(), root_before);
+        assert_eq!(leaf_count(&storage, &reopened), 3);
+        assert_eq!(root(&storage, &reopened), root_before);
 
-        let proof = reopened.prove(leaf_pos).unwrap().unwrap();
+        let proof = prove(&storage, &reopened, leaf_pos).unwrap();
         assert!(proof.verify(root_before));
 
         // Appending after reopening must continue from the right position,
         // not collide with or overwrite anything already stored.
-        let new_pos = reopened.push(leaf(4)).unwrap();
+        let new_pos = push_committed(&storage, &mut reopened, leaf(4));
         assert_eq!(new_pos, 4);
-        assert_ne!(reopened.root().unwrap(), root_before);
+        assert_ne!(root(&storage, &reopened), root_before);
     }
 }

@@ -198,65 +198,62 @@ impl Bitmap {
         })
     }
 
-    pub fn get(&self, position: u64) -> Result<bool> {
-        let rtxn = self.storage.read_txn()?;
-        let page = self.load_page(&rtxn, page_index(position))?;
+    /// Read the bit at `position` through `txn` -- a plain `RoTxn`, or the
+    /// same `RwTxn` an in-progress `set` is using.
+    pub fn get(&self, txn: &heed::RoTxn, position: u64) -> Result<bool> {
+        let page = self.load_page(txn, page_index(position))?;
         let offset = bit_offset(position);
         Ok((page[offset / 8] >> (offset % 8)) & 1 == 1)
     }
 
     /// Set the bit at `position` to `value`, updating every ancestor hash
-    /// up to the root in the same write transaction.
-    pub fn set(&mut self, position: u64, value: bool) -> Result<()> {
-        let mut wtxn = self.storage.write_txn()?;
-
+    /// up to the root, all through `wtxn`. Nothing is committed here --
+    /// that's the caller's job, once every other store it's updating in
+    /// the same transaction has also succeeded.
+    pub fn set(&mut self, wtxn: &mut heed::RwTxn, position: u64, value: bool) -> Result<()> {
         let pidx = page_index(position);
-        let mut page = self.load_page(&wtxn, pidx)?;
+        let mut page = self.load_page(wtxn, pidx)?;
         let offset = bit_offset(position);
         if value {
             page[offset / 8] |= 1 << (offset % 8);
         } else {
             page[offset / 8] &= !(1u8 << (offset % 8));
         }
-        self.pages.put(&mut wtxn, &encode_page_index(pidx), &page)?;
+        self.pages.put(wtxn, &encode_page_index(pidx), &page)?;
 
         let mut index = pidx;
         let mut hash = hash_bytes_32(&page);
         for level in 1..=DEPTH {
             let sibling_index = index ^ 1;
-            let sibling = self.load_node(&wtxn, level - 1, sibling_index)?;
+            let sibling = self.load_node(wtxn, level - 1, sibling_index)?;
             hash = if index & 1 == 0 {
                 node_hash(level, hash, sibling)
             } else {
                 node_hash(level, sibling, hash)
             };
             index /= 2;
-            self.nodes
-                .put(&mut wtxn, &encode_node_key(level, index), &hash)?;
+            self.nodes.put(wtxn, &encode_node_key(level, index), &hash)?;
         }
 
-        wtxn.commit()?;
         Ok(())
     }
 
     /// The current root: the hash at the top of the tree, `empty_hash[DEPTH]`
     /// if nothing has ever been set.
-    pub fn root(&self) -> Result<Hash> {
-        let rtxn = self.storage.read_txn()?;
-        self.load_node(&rtxn, DEPTH, 0)
+    pub fn root(&self, txn: &heed::RoTxn) -> Result<Hash> {
+        self.load_node(txn, DEPTH, 0)
     }
 
     /// Build an inclusion proof for the page containing `position`.
-    pub fn prove(&self, position: u64) -> Result<Proof> {
-        let rtxn = self.storage.read_txn()?;
+    pub fn prove(&self, txn: &heed::RoTxn, position: u64) -> Result<Proof> {
         let pidx = page_index(position);
-        let page = self.load_page(&rtxn, pidx)?;
+        let page = self.load_page(txn, pidx)?;
 
         let mut siblings = Vec::with_capacity(DEPTH as usize);
         let mut index = pidx;
         for level in 1..=DEPTH {
             let sibling_index = index ^ 1;
-            siblings.push(self.load_node(&rtxn, level - 1, sibling_index)?);
+            siblings.push(self.load_node(txn, level - 1, sibling_index)?);
             index /= 2;
         }
 
@@ -315,77 +312,98 @@ mod tests {
         }
     }
 
-    fn open() -> (TempDir, Bitmap) {
+    fn open() -> (TempDir, Storage, Bitmap) {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
         let bitmap = Bitmap::open(&storage).unwrap();
-        (dir, bitmap)
+        (dir, storage, bitmap)
+    }
+
+    fn set_committed(storage: &Storage, bitmap: &mut Bitmap, position: u64, value: bool) {
+        let mut wtxn = storage.write_txn().unwrap();
+        bitmap.set(&mut wtxn, position, value).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    fn get(storage: &Storage, bitmap: &Bitmap, position: u64) -> bool {
+        let rtxn = storage.read_txn().unwrap();
+        bitmap.get(&rtxn, position).unwrap()
+    }
+
+    fn root(storage: &Storage, bitmap: &Bitmap) -> Hash {
+        let rtxn = storage.read_txn().unwrap();
+        bitmap.root(&rtxn).unwrap()
+    }
+
+    fn prove(storage: &Storage, bitmap: &Bitmap, position: u64) -> Proof {
+        let rtxn = storage.read_txn().unwrap();
+        bitmap.prove(&rtxn, position).unwrap()
     }
 
     #[test]
     fn empty_bitmap_root_is_the_precomputed_empty_hash() {
-        let (_dir, bitmap) = open();
-        assert_eq!(bitmap.root().unwrap(), empty_hashes()[DEPTH as usize]);
+        let (_dir, storage, bitmap) = open();
+        assert_eq!(root(&storage, &bitmap), empty_hashes()[DEPTH as usize]);
     }
 
     #[test]
     fn set_then_get_roundtrips() {
-        let (_dir, mut bitmap) = open();
-        assert!(!bitmap.get(42).unwrap());
-        bitmap.set(42, true).unwrap();
-        assert!(bitmap.get(42).unwrap());
+        let (_dir, storage, mut bitmap) = open();
+        assert!(!get(&storage, &bitmap, 42));
+        set_committed(&storage, &mut bitmap, 42, true);
+        assert!(get(&storage, &bitmap, 42));
     }
 
     #[test]
     fn unrelated_positions_are_unaffected() {
-        let (_dir, mut bitmap) = open();
-        bitmap.set(42, true).unwrap();
-        assert!(!bitmap.get(41).unwrap());
-        assert!(!bitmap.get(43).unwrap());
+        let (_dir, storage, mut bitmap) = open();
+        set_committed(&storage, &mut bitmap, 42, true);
+        assert!(!get(&storage, &bitmap, 41));
+        assert!(!get(&storage, &bitmap, 43));
         // A position in a entirely different page.
-        assert!(!bitmap.get(10_000_000).unwrap());
+        assert!(!get(&storage, &bitmap, 10_000_000));
     }
 
     #[test]
     fn clearing_a_bit_restores_the_empty_root() {
-        let (_dir, mut bitmap) = open();
-        let empty_root = bitmap.root().unwrap();
-        bitmap.set(42, true).unwrap();
-        assert_ne!(bitmap.root().unwrap(), empty_root);
-        bitmap.set(42, false).unwrap();
-        assert_eq!(bitmap.root().unwrap(), empty_root);
+        let (_dir, storage, mut bitmap) = open();
+        let empty_root = root(&storage, &bitmap);
+        set_committed(&storage, &mut bitmap, 42, true);
+        assert_ne!(root(&storage, &bitmap), empty_root);
+        set_committed(&storage, &mut bitmap, 42, false);
+        assert_eq!(root(&storage, &bitmap), empty_root);
     }
 
     #[test]
     fn setting_any_bit_changes_the_root() {
-        let (_dir, mut bitmap) = open();
-        let before = bitmap.root().unwrap();
-        bitmap.set(123_456_789, true).unwrap();
-        assert_ne!(bitmap.root().unwrap(), before);
+        let (_dir, storage, mut bitmap) = open();
+        let before = root(&storage, &bitmap);
+        set_committed(&storage, &mut bitmap, 123_456_789, true);
+        assert_ne!(root(&storage, &bitmap), before);
     }
 
     #[test]
     fn order_of_setting_bits_does_not_affect_the_final_root() {
-        let (dir_a, mut a) = open();
-        let (dir_b, mut b) = open();
-        a.set(1, true).unwrap();
-        a.set(2, true).unwrap();
-        a.set(100_000, true).unwrap();
-        b.set(100_000, true).unwrap();
-        b.set(2, true).unwrap();
-        b.set(1, true).unwrap();
-        assert_eq!(a.root().unwrap(), b.root().unwrap());
+        let (dir_a, storage_a, mut a) = open();
+        let (dir_b, storage_b, mut b) = open();
+        set_committed(&storage_a, &mut a, 1, true);
+        set_committed(&storage_a, &mut a, 2, true);
+        set_committed(&storage_a, &mut a, 100_000, true);
+        set_committed(&storage_b, &mut b, 100_000, true);
+        set_committed(&storage_b, &mut b, 2, true);
+        set_committed(&storage_b, &mut b, 1, true);
+        assert_eq!(root(&storage_a, &a), root(&storage_b, &b));
         drop(dir_a);
         drop(dir_b);
     }
 
     #[test]
     fn touching_a_position_near_u64_max_works() {
-        let (_dir, mut bitmap) = open();
+        let (_dir, storage, mut bitmap) = open();
         let position = u64::MAX - 7;
-        bitmap.set(position, true).unwrap();
-        assert!(bitmap.get(position).unwrap());
-        assert!(!bitmap.get(u64::MAX).unwrap());
+        set_committed(&storage, &mut bitmap, position, true);
+        assert!(get(&storage, &bitmap, position));
+        assert!(!get(&storage, &bitmap, u64::MAX));
     }
 
     #[test]
@@ -394,50 +412,52 @@ mod tests {
         let root_before = {
             let storage = Storage::open(&dir.0).unwrap();
             let mut bitmap = Bitmap::open(&storage).unwrap();
-            bitmap.set(7, true).unwrap();
-            bitmap.set(999_999, true).unwrap();
-            bitmap.root().unwrap()
+            let mut wtxn = storage.write_txn().unwrap();
+            bitmap.set(&mut wtxn, 7, true).unwrap();
+            bitmap.set(&mut wtxn, 999_999, true).unwrap();
+            wtxn.commit().unwrap();
+            root(&storage, &bitmap)
         };
 
         let storage = Storage::open(&dir.0).unwrap();
         let reopened = Bitmap::open(&storage).unwrap();
-        assert!(reopened.get(7).unwrap());
-        assert!(reopened.get(999_999).unwrap());
-        assert_eq!(reopened.root().unwrap(), root_before);
+        assert!(get(&storage, &reopened, 7));
+        assert!(get(&storage, &reopened, 999_999));
+        assert_eq!(root(&storage, &reopened), root_before);
     }
 
     #[test]
     fn proof_verifies_against_the_root() {
-        let (_dir, mut bitmap) = open();
-        bitmap.set(42, true).unwrap();
-        let root = bitmap.root().unwrap();
+        let (_dir, storage, mut bitmap) = open();
+        set_committed(&storage, &mut bitmap, 42, true);
+        let r = root(&storage, &bitmap);
 
-        let proof = bitmap.prove(42).unwrap();
+        let proof = prove(&storage, &bitmap, 42);
         assert!(proof.bit(42));
-        assert!(proof.verify(root));
+        assert!(proof.verify(r));
     }
 
     #[test]
     fn proof_rejects_tampered_page() {
-        let (_dir, mut bitmap) = open();
-        bitmap.set(42, true).unwrap();
-        let root = bitmap.root().unwrap();
+        let (_dir, storage, mut bitmap) = open();
+        set_committed(&storage, &mut bitmap, 42, true);
+        let r = root(&storage, &bitmap);
 
-        let mut proof = bitmap.prove(42).unwrap();
+        let mut proof = prove(&storage, &bitmap, 42);
         proof.page[0] ^= 1;
-        assert!(!proof.verify(root));
+        assert!(!proof.verify(r));
     }
 
     #[test]
     fn proof_rejects_tampered_sibling() {
-        let (_dir, mut bitmap) = open();
-        bitmap.set(42, true).unwrap();
-        bitmap.set(100_000, true).unwrap();
-        let root = bitmap.root().unwrap();
+        let (_dir, storage, mut bitmap) = open();
+        set_committed(&storage, &mut bitmap, 42, true);
+        set_committed(&storage, &mut bitmap, 100_000, true);
+        let r = root(&storage, &bitmap);
 
-        let mut proof = bitmap.prove(42).unwrap();
+        let mut proof = prove(&storage, &bitmap, 42);
         proof.siblings[0][0] ^= 1;
-        assert!(!proof.verify(root));
+        assert!(!proof.verify(r));
     }
 
     /// The core sparse-tree arithmetic, hand-traced independently rather
@@ -449,8 +469,8 @@ mod tests {
     /// just the module's own internal consistency.
     #[test]
     fn single_leftmost_bit_matches_hand_traced_root() {
-        let (_dir, mut bitmap) = open();
-        bitmap.set(0, true).unwrap();
+        let (_dir, storage, mut bitmap) = open();
+        set_committed(&storage, &mut bitmap, 0, true);
 
         let empties = empty_hashes();
         let mut expected = {
@@ -464,7 +484,7 @@ mod tests {
             expected = node_hash(level, expected, empties[(level - 1) as usize]);
         }
 
-        assert_eq!(bitmap.root().unwrap(), expected);
+        assert_eq!(root(&storage, &bitmap), expected);
     }
 
     /// Same idea, but for a page that's a *right* child at the first step
@@ -472,11 +492,11 @@ mod tests {
     /// ordering logic.
     #[test]
     fn single_right_child_page_matches_hand_traced_root() {
-        let (_dir, mut bitmap) = open();
+        let (_dir, storage, mut bitmap) = open();
         // Position within page index 1 (page 1 covers positions
         // [PAGE_BITS, 2*PAGE_BITS)).
         let position = PAGE_BITS;
-        bitmap.set(position, true).unwrap();
+        set_committed(&storage, &mut bitmap, position, true);
 
         let empties = empty_hashes();
         let mut page = [0u8; PAGE_BYTES];
@@ -492,7 +512,7 @@ mod tests {
             index /= 2;
         }
 
-        assert_eq!(bitmap.root().unwrap(), hash);
+        assert_eq!(root(&storage, &bitmap), hash);
     }
 
     /// Two sibling pages (indices 0 and 1) both touched: they must combine
@@ -500,9 +520,9 @@ mod tests {
     /// empty default.
     #[test]
     fn sibling_pages_combine_with_each_other_not_with_empty() {
-        let (_dir, mut bitmap) = open();
-        bitmap.set(0, true).unwrap(); // page 0
-        bitmap.set(PAGE_BITS, true).unwrap(); // page 1
+        let (_dir, storage, mut bitmap) = open();
+        set_committed(&storage, &mut bitmap, 0, true); // page 0
+        set_committed(&storage, &mut bitmap, PAGE_BITS, true); // page 1
 
         let empties = empty_hashes();
         let mut page0 = [0u8; PAGE_BYTES];
@@ -519,6 +539,23 @@ mod tests {
             hash = node_hash(level, hash, empties[(level - 1) as usize]);
         }
 
-        assert_eq!(bitmap.root().unwrap(), hash);
+        assert_eq!(root(&storage, &bitmap), hash);
+    }
+
+    /// `set` composes with another store's write through the same shared
+    /// `RwTxn`, the way `chain::apply_block` will compose it with `pmmr`
+    /// and `utxo` writes -- the whole point of the transactional
+    /// restructuring.
+    #[test]
+    fn set_composes_with_reads_within_one_shared_transaction() {
+        let (_dir, storage, mut bitmap) = open();
+        let mut wtxn = storage.write_txn().unwrap();
+        bitmap.set(&mut wtxn, 42, true).unwrap();
+        assert!(bitmap.get(&wtxn, 42).unwrap());
+        bitmap.set(&mut wtxn, 42, false).unwrap();
+        assert!(!bitmap.get(&wtxn, 42).unwrap());
+        wtxn.commit().unwrap();
+
+        assert!(!get(&storage, &bitmap, 42));
     }
 }

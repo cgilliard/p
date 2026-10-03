@@ -102,35 +102,36 @@ impl UtxoIndex {
         })
     }
 
-    /// Record that the output hashing to `commitment` lives at `position`.
-    /// A plain, unconditional write -- overwrites whatever was there
-    /// before for that key, with no check of whether that's safe. See the
-    /// module docs: that check belongs to the caller.
-    pub fn insert(&mut self, commitment: Hash, position: u64) -> Result<()> {
-        let mut wtxn = self.storage.write_txn()?;
+    /// Record that the output hashing to `commitment` lives at `position`,
+    /// through `wtxn`. A plain, unconditional write -- overwrites whatever
+    /// was there before for that key, with no check of whether that's
+    /// safe. See the module docs: that check belongs to the caller.
+    /// Nothing is committed here -- that's the caller's job, once every
+    /// other store it's updating in the same transaction has also
+    /// succeeded.
+    pub fn insert(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash, position: u64) -> Result<()> {
         self.entries
-            .put(&mut wtxn, &commitment, &encode_pos(position))?;
-        wtxn.commit()?;
+            .put(wtxn, &commitment, &encode_pos(position))?;
         Ok(())
     }
 
     /// The position of the unspent output hashing to `commitment`, or
     /// `None` if there's no such entry -- either it never existed, or it
-    /// was already spent (see `remove`).
-    pub fn get(&self, commitment: Hash) -> Result<Option<u64>> {
-        let rtxn = self.storage.read_txn()?;
-        match self.entries.get(&rtxn, &commitment)? {
+    /// was already spent (see `remove`). Reads through `txn` -- a plain
+    /// `RoTxn`, or the same `RwTxn` an in-progress `insert`/`remove` is
+    /// using.
+    pub fn get(&self, txn: &heed::RoTxn, commitment: Hash) -> Result<Option<u64>> {
+        match self.entries.get(txn, &commitment)? {
             Some(bytes) => Ok(Some(decode_pos(bytes)?)),
             None => Ok(None),
         }
     }
 
     /// Remove the entry for `commitment`, e.g. once it's been spent.
-    /// Harmless no-op if there wasn't one.
-    pub fn remove(&mut self, commitment: Hash) -> Result<()> {
-        let mut wtxn = self.storage.write_txn()?;
-        self.entries.delete(&mut wtxn, &commitment)?;
-        wtxn.commit()?;
+    /// Harmless no-op if there wasn't one. Nothing is committed here --
+    /// see `insert`.
+    pub fn remove(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash) -> Result<()> {
+        self.entries.delete(wtxn, &commitment)?;
         Ok(())
     }
 }
@@ -169,58 +170,75 @@ mod tests {
         hash_bytes_32(&[byte; 32])
     }
 
+    fn insert_committed(storage: &Storage, index: &mut UtxoIndex, commitment: Hash, position: u64) {
+        let mut wtxn = storage.write_txn().unwrap();
+        index.insert(&mut wtxn, commitment, position).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    fn remove_committed(storage: &Storage, index: &mut UtxoIndex, commitment: Hash) {
+        let mut wtxn = storage.write_txn().unwrap();
+        index.remove(&mut wtxn, commitment).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    fn get(storage: &Storage, index: &UtxoIndex, commitment: Hash) -> Option<u64> {
+        let rtxn = storage.read_txn().unwrap();
+        index.get(&rtxn, commitment).unwrap()
+    }
+
     #[test]
     fn unknown_hash_returns_none() {
         let (storage, _dir) = temp_storage();
         let index = UtxoIndex::open(&storage).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), None);
+        assert_eq!(get(&storage, &index, hash_of(1)), None);
     }
 
     #[test]
     fn inserted_entry_is_found() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 42).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), Some(42));
+        insert_committed(&storage, &mut index, hash_of(1), 42);
+        assert_eq!(get(&storage, &index, hash_of(1)), Some(42));
     }
 
     #[test]
     fn removed_entry_is_no_longer_found() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 42).unwrap();
-        index.remove(hash_of(1)).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), None);
+        insert_committed(&storage, &mut index, hash_of(1), 42);
+        remove_committed(&storage, &mut index, hash_of(1));
+        assert_eq!(get(&storage, &index, hash_of(1)), None);
     }
 
     #[test]
     fn removing_an_absent_entry_is_a_harmless_no_op() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.remove(hash_of(1)).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), None);
+        remove_committed(&storage, &mut index, hash_of(1));
+        assert_eq!(get(&storage, &index, hash_of(1)), None);
     }
 
     #[test]
     fn distinct_hashes_are_tracked_independently() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 10).unwrap();
-        index.insert(hash_of(2), 20).unwrap();
+        insert_committed(&storage, &mut index, hash_of(1), 10);
+        insert_committed(&storage, &mut index, hash_of(2), 20);
 
-        index.remove(hash_of(1)).unwrap();
+        remove_committed(&storage, &mut index, hash_of(1));
 
-        assert_eq!(index.get(hash_of(1)).unwrap(), None);
-        assert_eq!(index.get(hash_of(2)).unwrap(), Some(20));
+        assert_eq!(get(&storage, &index, hash_of(1)), None);
+        assert_eq!(get(&storage, &index, hash_of(2)), Some(20));
     }
 
     #[test]
     fn inserting_again_overwrites_the_position() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 10).unwrap();
-        index.insert(hash_of(1), 20).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), Some(20));
+        insert_committed(&storage, &mut index, hash_of(1), 10);
+        insert_committed(&storage, &mut index, hash_of(1), 20);
+        assert_eq!(get(&storage, &index, hash_of(1)), Some(20));
     }
 
     #[test]
@@ -228,9 +246,25 @@ mod tests {
         let (storage, _dir) = temp_storage();
         {
             let mut index = UtxoIndex::open(&storage).unwrap();
-            index.insert(hash_of(1), 42).unwrap();
+            insert_committed(&storage, &mut index, hash_of(1), 42);
         }
         let index = UtxoIndex::open(&storage).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), Some(42));
+        assert_eq!(get(&storage, &index, hash_of(1)), Some(42));
+    }
+
+    #[test]
+    fn insert_and_remove_compose_within_one_shared_transaction() {
+        let (storage, _dir) = temp_storage();
+        let mut index = UtxoIndex::open(&storage).unwrap();
+        let mut wtxn = storage.write_txn().unwrap();
+        index.insert(&mut wtxn, hash_of(1), 10).unwrap();
+        index.insert(&mut wtxn, hash_of(2), 20).unwrap();
+        index.remove(&mut wtxn, hash_of(1)).unwrap();
+        assert_eq!(index.get(&wtxn, hash_of(1)).unwrap(), None);
+        assert_eq!(index.get(&wtxn, hash_of(2)).unwrap(), Some(20));
+        wtxn.commit().unwrap();
+
+        assert_eq!(get(&storage, &index, hash_of(1)), None);
+        assert_eq!(get(&storage, &index, hash_of(2)), Some(20));
     }
 }
