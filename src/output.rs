@@ -48,6 +48,21 @@ impl Output {
         out[PUBKEY_HASH_LEN..].copy_from_slice(&self.amount.to_le_bytes());
         out
     }
+
+    /// Decode from bytes, the inverse of `to_bytes`. `pubkey_hash` is
+    /// opaque bytes and `amount` is a plain `u64`, so the only way this
+    /// can fail is `bytes` not being exactly `OUTPUT_LEN` long --
+    /// checked explicitly here (rather than taking a `[u8; OUTPUT_LEN]`
+    /// and pushing that check onto every caller) so decoding a buffer of
+    /// untrusted or attacker-controlled length -- a block read off the
+    /// wire, say -- can never panic, only return `None`.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes: [u8; OUTPUT_LEN] = bytes.try_into().ok()?;
+        let mut pubkey_hash = [0u8; PUBKEY_HASH_LEN];
+        pubkey_hash.copy_from_slice(&bytes[..PUBKEY_HASH_LEN]);
+        let amount = u64::from_le_bytes(bytes[PUBKEY_HASH_LEN..].try_into().unwrap());
+        Some(Output { pubkey_hash, amount })
+    }
 }
 
 #[cfg(test)]
@@ -92,5 +107,22 @@ mod tests {
         let bytes = out.to_bytes();
         assert_eq!(bytes.len(), OUTPUT_LEN);
         assert_eq!(bytes, out.to_bytes());
+    }
+
+    #[test]
+    fn from_bytes_round_trips_to_bytes() {
+        let (_, pk) = keygen(&seed(4));
+        let out = Output::new(&pk, 54321);
+        assert_eq!(Output::from_bytes(&out.to_bytes()).unwrap(), out);
+    }
+
+    #[test]
+    fn from_bytes_rejects_wrong_length() {
+        let (_, pk) = keygen(&seed(5));
+        let bytes = Output::new(&pk, 1).to_bytes();
+        assert!(Output::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        let mut too_long = bytes.to_vec();
+        too_long.push(0);
+        assert!(Output::from_bytes(&too_long).is_none());
     }
 }

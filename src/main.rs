@@ -1,5 +1,6 @@
 mod bitmap;
 mod block;
+mod chain;
 mod fri;
 mod merkle;
 mod output;

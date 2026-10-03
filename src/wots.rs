@@ -135,6 +135,12 @@ fn decode_elements(bytes: &[u8], count: usize) -> Option<Vec<BabyBear>> {
     )
 }
 
+/// Exact byte length of `PublicKey::to_bytes()` -- fixed at compile time
+/// (`PARAM_LEN` and `V` are both constants), so any caller needing to
+/// chunk a buffer of concatenated public keys can rely on this rather
+/// than re-deriving the arithmetic.
+pub const PUBLIC_KEY_LEN: usize = (PARAM_LEN + V * CHAIN_LEN) * 4;
+
 impl PublicKey {
     /// Serialize to little-endian bytes: `param` (5 elements) followed by
     /// `tops` (`V` chains of 8 elements each), 4 bytes per element. This is
@@ -350,6 +356,12 @@ mod tests {
         let digest = hash_message(b"hello wots");
         let sig = sign(&sk, digest).expect("signing should succeed within MAX_TRIALS");
         assert!(verify(&pk, digest, &sig));
+    }
+
+    #[test]
+    fn public_key_len_matches_actual_encoded_length() {
+        let (_, pk) = keygen(&seed(1));
+        assert_eq!(pk.to_bytes().len(), PUBLIC_KEY_LEN);
     }
 
     #[test]

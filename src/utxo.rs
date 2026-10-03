@@ -1,16 +1,18 @@
-//! A UTXO index: a reverse lookup from an output's hash to its position
-//! in the `pmmr`. This is the piece `block` validation needs to turn a
-//! spent input's claimed (pubkey, amount) into "where in the PMMR is the
-//! real output it's spending" -- without it, there's no way to check an
-//! input against the actual committed leaf, or to know which bit to flip
-//! in the `bitmap`.
+//! A UTXO index: a reverse lookup from a public key's hash to the
+//! position and amount of the unspent output it currently owns. This is
+//! the piece `chain` validation needs to turn a spent input's bare
+//! public key into "where in the `pmmr` is the real output it's
+//! spending, and how much is it actually worth" -- without it, there's
+//! no way to check an input against real chain state at all, since
+//! `transaction::Input` no longer carries anything but the key itself.
 //!
-//! Keyed by the *output's own hash* -- the same `Poseidon2(output.to_bytes())`
-//! hash `pmmr` already uses as a leaf hash -- rather than by a pubkey hash
-//! specifically. An `Output` today is just (pubkey hash, amount), but
-//! that's expected to grow (scripts, HTLCs, ...), and this index should
-//! keep working unchanged no matter what ends up inside an `Output`: its
-//! only job is "given this output's hash, what position is it at."
+//! Keyed by `pubkey_hash` -- the same 32-byte `Poseidon2(pubkey bytes)`
+//! value already stored as `Output::pubkey_hash` -- rather than by a hash
+//! of the whole output (which would also fold in the amount). Using the
+//! owner-identifying part alone, not anything value-specific, means this
+//! index keeps working unchanged no matter what else an `Output` grows to
+//! include later (scripts, HTLCs, ...): its only job is "given this
+//! owner, what position do they currently own, and for how much."
 //!
 //! This is a genuine *unspent* output set, not just a static reverse
 //! index: an entry is inserted when an output is created and removed the
@@ -18,6 +20,17 @@
 //! anything already spent or never created -- the same shape as a real
 //! UTXO set, and a second line of defense against double-spending a
 //! position within a block, on top of whatever the `bitmap` catches.
+//!
+//! Keying by owner alone means reusing the same public key for a second,
+//! *different* output is dangerous: a second `insert` under a
+//! still-live key would silently overwrite the first entry, orphaning
+//! whatever it pointed to (the `pmmr` leaf still exists, but nothing
+//! could find it again). This module doesn't prevent that itself --
+//! `insert` is a plain, unconditional write, no different from any other
+//! key-value store -- that check belongs to whoever decides a new output
+//! is allowed to be created at all, i.e. `chain` validation, which can
+//! (and does) call `get` first and refuse to proceed if an entry is
+//! already live.
 //!
 //! Backed by LMDB via the same shared `storage::Storage` context `pmmr`
 //! and `bitmap` already use, so all three stay in one environment.
@@ -34,8 +47,9 @@ pub type Hash = [u8; 32];
 pub enum Error {
     Storage(crate::storage::Error),
     Heed(heed::Error),
-    /// The on-disk entry wasn't a valid encoded position -- e.g. opening a
-    /// directory that isn't actually a UTXO index this code created.
+    /// The on-disk entry wasn't a validly encoded (position, amount) pair
+    /// -- e.g. opening a directory that isn't actually a UTXO index this
+    /// code created.
     Corrupt(&'static str),
 }
 
@@ -65,15 +79,21 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn encode_pos(pos: u64) -> [u8; 8] {
-    pos.to_be_bytes()
+/// `position` (8 bytes) followed by `amount` (8 bytes), both big-endian.
+fn encode_entry(position: u64, amount: u64) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&position.to_be_bytes());
+    out[8..].copy_from_slice(&amount.to_be_bytes());
+    out
 }
 
-fn decode_pos(bytes: &[u8]) -> Result<u64> {
-    bytes
-        .try_into()
-        .map(u64::from_be_bytes)
-        .map_err(|_| Error::Corrupt("position value was not 8 bytes"))
+fn decode_entry(bytes: &[u8]) -> Result<(u64, u64)> {
+    if bytes.len() != 16 {
+        return Err(Error::Corrupt("entry was not 16 bytes"));
+    }
+    let position = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+    let amount = u64::from_be_bytes(bytes[8..].try_into().unwrap());
+    Ok((position, amount))
 }
 
 pub struct UtxoIndex {
@@ -92,35 +112,35 @@ impl UtxoIndex {
         })
     }
 
-    /// Record that the output hashing to `output_hash` lives at `position`.
-    /// Called when a new output is appended to the `pmmr`. Overwrites
-    /// whatever was there before for that hash -- a collision between two
-    /// genuinely different outputs is astronomically unlikely, and
-    /// re-inserting the same (hash, position) pair is harmless.
-    pub fn insert(&mut self, output_hash: Hash, position: u64) -> Result<()> {
+    /// Record that the owner hashing to `pubkey_hash` currently owns an
+    /// unspent output of `amount`, at `position` in the `pmmr`. A plain,
+    /// unconditional write -- overwrites whatever was there before for
+    /// that key, with no check of whether that's safe. See the module
+    /// docs: that check (is this key already live) belongs to the caller.
+    pub fn insert(&mut self, pubkey_hash: Hash, position: u64, amount: u64) -> Result<()> {
         let mut wtxn = self.storage.write_txn()?;
         self.entries
-            .put(&mut wtxn, &output_hash, &encode_pos(position))?;
+            .put(&mut wtxn, &pubkey_hash, &encode_entry(position, amount))?;
         wtxn.commit()?;
         Ok(())
     }
 
-    /// The position of the unspent output hashing to `output_hash`, or
-    /// `None` if there's no such entry -- either it never existed, or it
-    /// was already spent (see `remove`).
-    pub fn get(&self, output_hash: Hash) -> Result<Option<u64>> {
+    /// The `(position, amount)` of the unspent output owned by
+    /// `pubkey_hash`, or `None` if there's no such entry -- either this
+    /// key never owned anything, or it was already spent (see `remove`).
+    pub fn get(&self, pubkey_hash: Hash) -> Result<Option<(u64, u64)>> {
         let rtxn = self.storage.read_txn()?;
-        match self.entries.get(&rtxn, &output_hash)? {
-            Some(bytes) => Ok(Some(decode_pos(bytes)?)),
+        match self.entries.get(&rtxn, &pubkey_hash)? {
+            Some(bytes) => Ok(Some(decode_entry(bytes)?)),
             None => Ok(None),
         }
     }
 
-    /// Remove the entry for `output_hash`, e.g. once it's been spent.
+    /// Remove the entry for `pubkey_hash`, e.g. once it's been spent.
     /// Harmless no-op if there wasn't one.
-    pub fn remove(&mut self, output_hash: Hash) -> Result<()> {
+    pub fn remove(&mut self, pubkey_hash: Hash) -> Result<()> {
         let mut wtxn = self.storage.write_txn()?;
-        self.entries.delete(&mut wtxn, &output_hash)?;
+        self.entries.delete(&mut wtxn, &pubkey_hash)?;
         wtxn.commit()?;
         Ok(())
     }
@@ -157,7 +177,7 @@ mod tests {
     }
 
     fn hash_of(byte: u8) -> Hash {
-        hash_bytes_32(&[byte; 40])
+        hash_bytes_32(&[byte; 32])
     }
 
     #[test]
@@ -171,15 +191,15 @@ mod tests {
     fn inserted_entry_is_found() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 42).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), Some(42));
+        index.insert(hash_of(1), 42, 100).unwrap();
+        assert_eq!(index.get(hash_of(1)).unwrap(), Some((42, 100)));
     }
 
     #[test]
     fn removed_entry_is_no_longer_found() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 42).unwrap();
+        index.insert(hash_of(1), 42, 100).unwrap();
         index.remove(hash_of(1)).unwrap();
         assert_eq!(index.get(hash_of(1)).unwrap(), None);
     }
@@ -196,22 +216,22 @@ mod tests {
     fn distinct_hashes_are_tracked_independently() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 10).unwrap();
-        index.insert(hash_of(2), 20).unwrap();
+        index.insert(hash_of(1), 10, 100).unwrap();
+        index.insert(hash_of(2), 20, 200).unwrap();
 
         index.remove(hash_of(1)).unwrap();
 
         assert_eq!(index.get(hash_of(1)).unwrap(), None);
-        assert_eq!(index.get(hash_of(2)).unwrap(), Some(20));
+        assert_eq!(index.get(hash_of(2)).unwrap(), Some((20, 200)));
     }
 
     #[test]
-    fn inserting_again_overwrites_the_position() {
+    fn inserting_again_overwrites_the_entry() {
         let (storage, _dir) = temp_storage();
         let mut index = UtxoIndex::open(&storage).unwrap();
-        index.insert(hash_of(1), 10).unwrap();
-        index.insert(hash_of(1), 20).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), Some(20));
+        index.insert(hash_of(1), 10, 100).unwrap();
+        index.insert(hash_of(1), 20, 200).unwrap();
+        assert_eq!(index.get(hash_of(1)).unwrap(), Some((20, 200)));
     }
 
     #[test]
@@ -219,9 +239,9 @@ mod tests {
         let (storage, _dir) = temp_storage();
         {
             let mut index = UtxoIndex::open(&storage).unwrap();
-            index.insert(hash_of(1), 42).unwrap();
+            index.insert(hash_of(1), 42, 100).unwrap();
         }
         let index = UtxoIndex::open(&storage).unwrap();
-        assert_eq!(index.get(hash_of(1)).unwrap(), Some(42));
+        assert_eq!(index.get(hash_of(1)).unwrap(), Some((42, 100)));
     }
 }

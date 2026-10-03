@@ -15,19 +15,34 @@
 //!
 //! `header_bytes` is opaque here -- whatever the eventual `Block`/header
 //! type serializes everything-but-the-nonce into, this module just hashes
-//! whatever bytes it's handed. No dependency on `block` (doesn't exist
-//! yet) or anything else in this crate besides `poseidon2`.
+//! whatever bytes it's handed. No dependency on `block` or anything else
+//! in this crate besides `poseidon2`.
+//!
+//! The nonce itself is a full 32 bytes, not a `u64` -- deliberately wider
+//! than any attempt budget `mine` could plausibly need, so the field's
+//! on-the-wire width never has to change later for a reason as mundane as
+//! "ran out of nonce space." `mine`'s search loop still just increments a
+//! plain `u64` counter internally and encodes it into the low 8 bytes of
+//! the 32-byte field each attempt (the rest stay zero) -- nothing about
+//! how mining actually works depends on the wider type.
 
 #![allow(dead_code)]
 
 use crate::poseidon2::hash_bytes_32;
 
-/// `Poseidon2(header_bytes || nonce)`, with `nonce` appended as 8
-/// little-endian bytes.
-pub fn pow_hash(header_bytes: &[u8], nonce: u64) -> [u8; 32] {
-    let mut bytes = Vec::with_capacity(header_bytes.len() + 8);
+pub type Nonce = [u8; 32];
+
+fn nonce_from_counter(counter: u64) -> Nonce {
+    let mut nonce = [0u8; 32];
+    nonce[..8].copy_from_slice(&counter.to_le_bytes());
+    nonce
+}
+
+/// `Poseidon2(header_bytes || nonce)`.
+pub fn pow_hash(header_bytes: &[u8], nonce: Nonce) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(header_bytes.len() + nonce.len());
     bytes.extend_from_slice(header_bytes);
-    bytes.extend_from_slice(&nonce.to_le_bytes());
+    bytes.extend_from_slice(&nonce);
     hash_bytes_32(&bytes)
 }
 
@@ -42,18 +57,19 @@ pub fn meets_target(hash: &[u8; 32], max_hash: &[u8; 32]) -> bool {
 
 /// Check whether `nonce` is a valid proof of work for `header_bytes`
 /// under target `max_hash`.
-pub fn verify(header_bytes: &[u8], nonce: u64, max_hash: &[u8; 32]) -> bool {
+pub fn verify(header_bytes: &[u8], nonce: Nonce, max_hash: &[u8; 32]) -> bool {
     meets_target(&pow_hash(header_bytes, nonce), max_hash)
 }
 
 /// Search nonces starting at 0, returning the first `(nonce, hash)` that
-/// meets `max_hash`, or `None` if none of `0..max_attempts` do. A real
-/// miner would keep searching indefinitely (or until outrun by a
+/// meets `max_hash`, or `None` if none of the first `max_attempts` do. A
+/// real miner would keep searching indefinitely (or until outrun by a
 /// competing block); the cap here exists only so callers -- tests,
 /// especially -- can bound the work instead of looping forever against an
 /// unreachable target.
-pub fn mine(header_bytes: &[u8], max_hash: &[u8; 32], max_attempts: u64) -> Option<(u64, [u8; 32])> {
-    for nonce in 0..max_attempts {
+pub fn mine(header_bytes: &[u8], max_hash: &[u8; 32], max_attempts: u64) -> Option<(Nonce, [u8; 32])> {
+    for counter in 0..max_attempts {
+        let nonce = nonce_from_counter(counter);
         let hash = pow_hash(header_bytes, nonce);
         if meets_target(&hash, max_hash) {
             return Some((nonce, hash));
@@ -68,12 +84,18 @@ mod tests {
 
     #[test]
     fn pow_hash_differs_across_nonces() {
-        assert_ne!(pow_hash(b"abc", 0), pow_hash(b"abc", 1));
+        assert_ne!(
+            pow_hash(b"abc", nonce_from_counter(0)),
+            pow_hash(b"abc", nonce_from_counter(1))
+        );
     }
 
     #[test]
     fn pow_hash_differs_across_headers() {
-        assert_ne!(pow_hash(b"abc", 0), pow_hash(b"xyz", 0));
+        assert_ne!(
+            pow_hash(b"abc", nonce_from_counter(0)),
+            pow_hash(b"xyz", nonce_from_counter(0))
+        );
     }
 
     #[test]
@@ -97,17 +119,18 @@ mod tests {
     #[test]
     fn verify_accepts_a_hash_used_as_its_own_target() {
         let header = b"block header bytes";
-        let hash = pow_hash(header, 42);
+        let nonce = nonce_from_counter(42);
+        let hash = pow_hash(header, nonce);
         // hash <= hash is always true, so this is valid regardless of how
         // hard the target actually is.
-        assert!(verify(header, 42, &hash));
+        assert!(verify(header, nonce, &hash));
     }
 
     #[test]
     fn verify_rejects_hash_above_an_unreachable_target() {
         let header = b"block header bytes";
         let max_hash = [0u8; 32]; // only an exactly-zero hash would pass
-        assert!(!verify(header, 0, &max_hash));
+        assert!(!verify(header, nonce_from_counter(0), &max_hash));
     }
 
     #[test]
@@ -115,21 +138,21 @@ mod tests {
         let header = b"block header";
         let max_hash = [0xffu8; 32]; // every possible hash qualifies
         let (nonce, hash) = mine(header, &max_hash, 10).expect("should find a solution");
-        assert_eq!(nonce, 0);
-        assert_eq!(hash, pow_hash(header, 0));
+        assert_eq!(nonce, nonce_from_counter(0));
+        assert_eq!(hash, pow_hash(header, nonce_from_counter(0)));
         assert!(verify(header, nonce, &max_hash));
     }
 
     /// `mine` must return the *smallest* nonce that satisfies the target,
     /// not just any satisfying nonce -- checked by setting the target to
-    /// exactly nonce 3's hash (so 3 is guaranteed to satisfy it) and
-    /// confirming the nonce returned is no larger.
+    /// exactly counter 3's hash (so that nonce is guaranteed to satisfy
+    /// it) and confirming mining stops at or before it.
     #[test]
     fn mine_returns_the_smallest_satisfying_nonce() {
         let header = b"abc";
-        let target = pow_hash(header, 3);
-        let (nonce, hash) = mine(header, &target, 10).expect("nonce 3 itself satisfies the target");
-        assert!(nonce <= 3);
+        let target = pow_hash(header, nonce_from_counter(3));
+        let (nonce, hash) = mine(header, &target, 10).expect("counter 3 itself satisfies the target");
+        assert!(u64::from_le_bytes(nonce[..8].try_into().unwrap()) <= 3);
         assert_eq!(hash, pow_hash(header, nonce));
         assert!(meets_target(&hash, &target));
     }
@@ -139,5 +162,12 @@ mod tests {
         let header = b"abc";
         let max_hash = [0u8; 32];
         assert!(mine(header, &max_hash, 1000).is_none());
+    }
+
+    #[test]
+    fn nonce_from_counter_zero_pads_the_upper_bytes() {
+        let nonce = nonce_from_counter(0x0102030405060708);
+        assert_eq!(&nonce[..8], &0x0102030405060708u64.to_le_bytes());
+        assert!(nonce[8..].iter().all(|&b| b == 0));
     }
 }

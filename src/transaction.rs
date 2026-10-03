@@ -1,24 +1,22 @@
-//! Transactions: just inputs (spent outputs, identified by their owner's
-//! revealed public key, plus the amount being spent) and outputs, nothing
-//! else -- no scripts. Fees are implicit: if total input amount exceeds
-//! total output amount, the difference is the fee. There's no separate fee
-//! field or recipient for it (e.g. no block-reward-style payout to whoever
-//! includes the transaction) -- that's a question for whatever assembles a
-//! block out of transactions, not this module.
+//! Transactions: just inputs (spent outputs, identified purely by their
+//! owner's revealed public key) and outputs, nothing else -- no scripts.
 //!
 //! This module has **no notion of `pmmr`, a block, or where in the chain an
 //! output actually lives** -- deliberately so. An input is identified
-//! purely by the public key of the output it spends (`Output::new` already
-//! determines the output from a (pubkey, amount) pair, so there's nothing
-//! else to reference) and nothing else. `Transaction` is a small,
-//! self-contained, reusable primitive: building, signing, and checking a
-//! transaction's own internal correctness never needs to know anything
-//! about how outputs are actually indexed, so this same type can be used
-//! wherever a transaction needs handling -- a mempool, a wallet, a test,
-//! block assembly -- without dragging any of those contexts' specifics in.
-//! Resolving an input against real chain state (does this (pubkey, amount)
-//! correspond to a real, unspent output, and where) is entirely someone
-//! else's problem, for later.
+//! purely by the public key of the output it spends, nothing more.
+//! `Transaction` is a small, self-contained, reusable primitive: building,
+//! signing, and checking a transaction's own internal correctness never
+//! needs to know anything about how outputs are actually indexed, so this
+//! same type can be used wherever a transaction needs handling -- a
+//! mempool, a wallet, a test, block assembly -- without dragging any of
+//! those contexts' specifics in. In particular, this module has **no
+//! notion of amounts moving through inputs at all** -- how much a given
+//! input is actually worth is something only real chain state knows (the
+//! owner doesn't get to just assert a number), so there is nothing for
+//! this module to check a balance against. Resolving an input against
+//! real chain state (does this public key currently own a real, unspent
+//! output, and for how much) is entirely someone else's problem, for
+//! later -- see `chain`.
 //!
 //! Both inputs and outputs are kept sorted automatically -- inputs
 //! ascending by public key, outputs ascending by their own encoded bytes
@@ -38,15 +36,15 @@
 //! # What a signature actually commits to
 //!
 //! Every signer signs the *same* message (`signing_message`): a hash over
-//! the complete, current transaction -- every input's (pubkey, amount), in
-//! their canonical sorted order, followed by every output, also sorted.
-//! This is the strong commitment, not a "just my own input" one: once
-//! anyone has signed, changing the input set *or* the output set in any
-//! way -- adding, removing, or altering either -- invalidates *every*
-//! existing signature, not just whichever part changed. That's
-//! intentional: it's what makes "this transaction" a single, well-defined
-//! thing, rather than a fixed output list that happens to be satisfiable
-//! by many different, interchangeable combinations of inputs.
+//! the complete, current transaction -- every input's public key, in
+//! canonical sorted order, followed by every output, also sorted. This is
+//! the strong commitment, not a "just my own input" one: once anyone has
+//! signed, changing the input set *or* the output set in any way --
+//! adding, removing, or altering either -- invalidates *every* existing
+//! signature, not just whichever part changed. That's intentional: it's
+//! what makes "this transaction" a single, well-defined thing, rather
+//! than a fixed output list that happens to be satisfiable by many
+//! different, interchangeable combinations of inputs.
 //!
 //! (Real Mimblewimble gets this same whole-transaction binding by having
 //! every participant contribute a partial Schnorr signature over one
@@ -80,9 +78,9 @@
 //! ```ignore
 //! let mut tx = Transaction::new();
 //! tx.add_output(output_for_bob).unwrap();
-//! tx.add_input(&pubkey_a, 100).unwrap();
+//! tx.add_input(&pubkey_a).unwrap();
 //! tx.add_output(output_for_carol).unwrap(); // adding more outputs and
-//! tx.add_input(&pubkey_b, 100).unwrap();    // inputs, freely interleaved,
+//! tx.add_input(&pubkey_b).unwrap();         // inputs, freely interleaved,
 //!                                           // is fine -- until anyone signs.
 //!
 //! tx.sign_input(&pubkey_a, &secret_a);
@@ -90,21 +88,22 @@
 //! assert!(tx.verify());
 //! ```
 //!
-//! Two things this module checks are internal to the transaction, and one
-//! thing it deliberately leaves to the caller:
+//! One thing this module checks that's internal to the transaction, and
+//! two things it deliberately leaves to the caller:
 //!
-//! - Checked here: every input is signed over the complete transaction, no
-//!   two inputs claim the same public key, and total input amount is at
-//!   least total output amount.
-//! - Left to the caller: whether each claimed (pubkey, amount) input
-//!   actually, currently corresponds to a real, unspent output somewhere,
-//!   and whether the same output gets spent by more than one transaction
-//!   (double-spending). Both are questions about a specific output set at
-//!   a specific moment (i.e. block validation against a particular `pmmr`
-//!   and bitmap), not about the transaction by itself -- a `Transaction`
-//!   can be fully internally valid while every one of its claimed inputs
-//!   turns out to be fabricated or already spent, and catching that is
-//!   explicitly not this module's job.
+//! - Checked here: every input is signed over the complete transaction,
+//!   and no two inputs claim the same public key.
+//! - Left to the caller: whether each claimed input actually, currently
+//!   corresponds to a real, unspent output somewhere (and for how much),
+//!   whether the whole thing balances once that's known, and whether the
+//!   same output gets spent by more than one transaction
+//!   (double-spending). All three are questions about a specific output
+//!   set at a specific moment (i.e. validation against particular `pmmr`,
+//!   `bitmap`, and `utxo` state), not about the transaction by itself --
+//!   a `Transaction` can be fully internally valid while every one of its
+//!   claimed inputs turns out to be fabricated, already spent, or adding
+//!   up to something that doesn't balance at all, and catching any of
+//!   that is explicitly not this module's job.
 
 // `main.rs` doesn't call into this module yet (it just prints "Hello
 // world!"), so allow dead code here rather than suppressing warnings
@@ -148,13 +147,13 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// One spent output: the owner's revealed public key, the claimed amount
-/// being spent, and their signature over the whole transaction's signing
-/// message once they've provided it.
+/// One spent output: the owner's revealed public key, and their signature
+/// over the whole transaction's signing message once they've provided it.
+/// No amount -- how much this input is actually worth is for real chain
+/// state to say, not this type (see the module docs).
 #[derive(Clone, Debug)]
 pub struct Input {
     pub pubkey: PublicKey,
-    pub amount: u64,
     pub signature: Option<Signature>,
 }
 
@@ -180,12 +179,12 @@ impl Transaction {
         self.finalized
     }
 
-    /// Add an input spending `amount` from the output owned by `pubkey`,
-    /// inserting it into its sorted position among the existing inputs
-    /// (see the module docs) rather than just appending. Returns
-    /// `Err(Error::Finalized)` without adding anything if the transaction
-    /// has already collected a signature.
-    pub fn add_input(&mut self, pubkey: &PublicKey, amount: u64) -> Result<()> {
+    /// Add an input spending the output owned by `pubkey`, inserting it
+    /// into its sorted position among the existing inputs (see the module
+    /// docs) rather than just appending. Returns `Err(Error::Finalized)`
+    /// without adding anything if the transaction has already collected a
+    /// signature.
+    pub fn add_input(&mut self, pubkey: &PublicKey) -> Result<()> {
         if self.finalized {
             return Err(Error::Finalized);
         }
@@ -197,7 +196,6 @@ impl Transaction {
             pos,
             Input {
                 pubkey: pubkey.clone(),
-                amount,
                 signature: None,
             },
         );
@@ -223,16 +221,15 @@ impl Transaction {
     }
 
     /// The single message every signer signs: a hash over the complete
-    /// current transaction -- every input's (pubkey, amount) in their
-    /// canonical sorted order, then every output, also sorted. Identical
-    /// for every signer at any given moment; changes the instant the
-    /// input or output set changes at all (see the module docs).
+    /// current transaction -- every input's public key in canonical
+    /// sorted order, then every output, also sorted. Identical for every
+    /// signer at any given moment; changes the instant the input or
+    /// output set changes at all (see the module docs).
     pub fn signing_message(&self) -> [BabyBear; 8] {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(SIGNING_DOMAIN);
         for input in &self.inputs {
             bytes.extend_from_slice(&input.pubkey.to_bytes());
-            bytes.extend_from_slice(&input.amount.to_le_bytes());
         }
         for output in &self.outputs {
             bytes.extend_from_slice(&output.to_bytes());
@@ -272,6 +269,10 @@ impl Transaction {
 
     /// Verify this transaction is internally sound and fully authorized --
     /// see the module docs for exactly what that does and doesn't cover.
+    /// Notably, this says nothing about whether the transaction
+    /// "balances" -- that requires knowing what each input is actually
+    /// worth, which requires real chain state this type deliberately
+    /// doesn't have access to (see `chain`).
     pub fn verify(&self) -> bool {
         // Inputs are always kept sorted by public key (see `add_input`),
         // so a duplicate claim must sit in an adjacent pair -- no need to
@@ -280,17 +281,6 @@ impl Transaction {
             if self.inputs[i].pubkey == self.inputs[i - 1].pubkey {
                 return false;
             }
-        }
-
-        // Total claimed input value must be at least total output value;
-        // any excess is an implicit fee (no separate fee field, and no
-        // payee for it here -- that's for whoever assembles a block).
-        // Accumulated in u128 so realistic u64 amounts can never overflow
-        // this check.
-        let input_total: u128 = self.inputs.iter().map(|i| i.amount as u128).sum();
-        let output_total: u128 = self.outputs.iter().map(|o| o.amount as u128).sum();
-        if input_total < output_total {
-            return false;
         }
 
         let message = self.signing_message();
@@ -332,8 +322,8 @@ mod tests {
         let (sk_b, pk_b) = keypair(2);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 100).unwrap();
-        tx.add_input(&pk_b, 100).unwrap();
+        tx.add_input(&pk_a).unwrap();
+        tx.add_input(&pk_b).unwrap();
         tx.add_output(new_output(200, 200)).unwrap();
 
         assert!(tx.sign_input(&pk_a, &sk_a));
@@ -347,8 +337,8 @@ mod tests {
         let (sk_b, pk_b) = keypair(2);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 100).unwrap();
-        tx.add_input(&pk_b, 100).unwrap();
+        tx.add_input(&pk_a).unwrap();
+        tx.add_input(&pk_b).unwrap();
         tx.add_output(new_output(200, 200)).unwrap();
 
         // Only pk_b's input gets signed; pk_a's is left unsigned.
@@ -361,7 +351,7 @@ mod tests {
         let (sk_a, pk_a) = keypair(1);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 200).unwrap();
+        tx.add_input(&pk_a).unwrap();
         tx.add_output(new_output(200, 200)).unwrap();
         assert!(tx.sign_input(&pk_a, &sk_a));
         assert!(tx.verify());
@@ -378,7 +368,7 @@ mod tests {
         let (sk_a, pk_a) = keypair(1);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 200).unwrap();
+        tx.add_input(&pk_a).unwrap();
         tx.add_output(new_output(200, 200)).unwrap();
         tx.sign_input(&pk_a, &sk_a);
 
@@ -393,7 +383,7 @@ mod tests {
         let (sk_b, _) = keypair(2);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 200).unwrap();
+        tx.add_input(&pk_a).unwrap();
         tx.add_output(new_output(200, 200)).unwrap();
 
         // Signing pk_a's input with an unrelated secret key succeeds
@@ -413,8 +403,8 @@ mod tests {
         let (_, pk_a) = keypair(1);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 100).unwrap();
-        tx.add_input(&pk_a, 100).unwrap();
+        tx.add_input(&pk_a).unwrap();
+        tx.add_input(&pk_a).unwrap();
         tx.add_output(new_output(200, 200)).unwrap();
 
         assert!(!tx.verify());
@@ -429,55 +419,18 @@ mod tests {
 
     #[test]
     fn empty_transaction_verifies() {
-        // No inputs, no outputs, nothing to sign, and 0 >= 0 -- trivially
-        // valid on its own. Whether an empty transaction makes sense is a
+        // No inputs, no outputs, nothing to sign -- trivially valid on
+        // its own. Whether an empty transaction makes sense is a
         // question for whatever's constructing one, not this module.
         let tx = Transaction::new();
         assert!(tx.verify());
     }
 
-    #[test]
-    fn input_short_of_output_rejected() {
-        let (sk_a, pk_a) = keypair(1);
-        let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 100).unwrap();
-        tx.add_output(new_output(200, 200)).unwrap(); // claims more than is spent
-        tx.sign_input(&pk_a, &sk_a);
-        assert!(!tx.verify());
-    }
-
-    /// Spending more than the outputs create is allowed -- the difference
-    /// is an implicit fee, not an error.
-    #[test]
-    fn input_exceeding_output_is_an_implicit_fee() {
-        let (sk_a, pk_a) = keypair(1);
-        let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 300).unwrap();
-        tx.add_output(new_output(200, 200)).unwrap(); // 100 goes unaccounted for -- the fee
-        tx.sign_input(&pk_a, &sk_a);
-        assert!(tx.verify());
-    }
-
-    #[test]
-    fn tampered_claimed_input_amount_rejected() {
-        let (sk_a, pk_a) = keypair(1);
-        let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 200).unwrap();
-        tx.add_output(new_output(200, 200)).unwrap();
-        tx.sign_input(&pk_a, &sk_a);
-        assert!(tx.verify());
-
-        // Bumping the claimed amount after signing (direct field access,
-        // bypassing add_input) breaks the signature (the message commits
-        // to it), independent of the balance check.
-        tx.inputs[0].amount += 1;
-        assert!(!tx.verify());
-    }
-
-    /// Redistributing value between two outputs keeps the *total* balanced
-    /// but still has to break verification, since each output's bytes --
-    /// including its individual amount -- are part of what the shared
-    /// signature commits to, not just the sum.
+    /// Redistributing value between two outputs still has to break
+    /// verification, since each output's bytes -- including its
+    /// individual amount -- are part of what the shared signature
+    /// commits to, regardless of any input-side accounting (there is
+    /// none, at this layer).
     #[test]
     fn redistributing_output_amounts_breaks_signatures() {
         let (sk_a, pk_a) = keypair(1);
@@ -485,7 +438,7 @@ mod tests {
         let (_, pk_out_2) = keypair(202);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 200).unwrap();
+        tx.add_input(&pk_a).unwrap();
         tx.add_output(Output::new(&pk_out_1, 100)).unwrap();
         tx.add_output(Output::new(&pk_out_2, 100)).unwrap();
         tx.sign_input(&pk_a, &sk_a);
@@ -509,13 +462,13 @@ mod tests {
 
         let mut tx = Transaction::new();
         tx.add_output(new_output(200, 100)).unwrap();
-        tx.add_input(&pk_a, 100).unwrap();
+        tx.add_input(&pk_a).unwrap();
         assert!(tx.sign_input(&pk_a, &sk_a));
         assert!(tx.verify());
         assert!(tx.is_finalized());
 
         // A second input shows up only after A already signed.
-        assert_eq!(tx.add_input(&pk_b, 50), Err(Error::Finalized));
+        assert_eq!(tx.add_input(&pk_b), Err(Error::Finalized));
         assert_eq!(tx.inputs.len(), 1); // nothing was actually added
         assert!(tx.verify()); // A's signature is completely unaffected
 
@@ -529,7 +482,7 @@ mod tests {
     fn is_finalized_reflects_whether_any_input_has_been_signed() {
         let (sk_a, pk_a) = keypair(1);
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 100).unwrap();
+        tx.add_input(&pk_a).unwrap();
         tx.add_output(new_output(200, 100)).unwrap();
         assert!(!tx.is_finalized());
 
@@ -548,10 +501,10 @@ mod tests {
         let (sk_c, pk_c) = keypair(3);
 
         let mut tx = Transaction::new();
-        tx.add_input(&pk_a, 100).unwrap();
+        tx.add_input(&pk_a).unwrap();
         tx.add_output(new_output(200, 150)).unwrap(); // a recipient's output arrives early
-        tx.add_input(&pk_b, 100).unwrap();
-        tx.add_input(&pk_c, 100).unwrap();
+        tx.add_input(&pk_b).unwrap();
+        tx.add_input(&pk_c).unwrap();
         tx.add_output(new_output(201, 150)).unwrap(); // a second recipient, added later
 
         // No one has signed yet, so signing in any order is fine.
@@ -566,7 +519,7 @@ mod tests {
     /// generates their keypair and contributes the new output before the
     /// sender ever touches the transaction; the sender then adds their
     /// own input(s) and signs once everything is in place; finally either
-    /// party -- or a block validator -- can check the result with no
+    /// party -- or chain validation -- can check the result with no
     /// further input from either of them.
     #[test]
     fn recipient_first_grin_style_flow() {
@@ -583,12 +536,12 @@ mod tests {
         // only once both are present.
         let (secret_a, pubkey_a) = keypair(1);
         let (secret_b, pubkey_b) = keypair(2);
-        tx.add_input(&pubkey_a, 100).unwrap();
-        tx.add_input(&pubkey_b, 100).unwrap();
+        tx.add_input(&pubkey_a).unwrap();
+        tx.add_input(&pubkey_b).unwrap();
         tx.sign_input(&pubkey_a, &secret_a);
         tx.sign_input(&pubkey_b, &secret_b);
 
-        // Either the recipient or a block validator can now check it.
+        // Either the recipient or chain validation can now check it.
         assert!(tx.verify());
     }
 
@@ -602,14 +555,14 @@ mod tests {
         let (_, pk_c) = keypair(3);
 
         let mut forward = Transaction::new();
-        forward.add_input(&pk_a, 1).unwrap();
-        forward.add_input(&pk_b, 1).unwrap();
-        forward.add_input(&pk_c, 1).unwrap();
+        forward.add_input(&pk_a).unwrap();
+        forward.add_input(&pk_b).unwrap();
+        forward.add_input(&pk_c).unwrap();
 
         let mut backward = Transaction::new();
-        backward.add_input(&pk_c, 1).unwrap();
-        backward.add_input(&pk_b, 1).unwrap();
-        backward.add_input(&pk_a, 1).unwrap();
+        backward.add_input(&pk_c).unwrap();
+        backward.add_input(&pk_b).unwrap();
+        backward.add_input(&pk_a).unwrap();
 
         let forward_keys: Vec<Vec<u8>> = forward.inputs.iter().map(|i| i.pubkey.to_bytes()).collect();
         let backward_keys: Vec<Vec<u8>> = backward.inputs.iter().map(|i| i.pubkey.to_bytes()).collect();
@@ -654,16 +607,16 @@ mod tests {
         let out_2 = new_output(202, 50);
 
         let mut one_order = Transaction::new();
-        one_order.add_input(&pk_a, 100).unwrap();
+        one_order.add_input(&pk_a).unwrap();
         one_order.add_output(out_1).unwrap();
-        one_order.add_input(&pk_b, 50).unwrap();
+        one_order.add_input(&pk_b).unwrap();
         one_order.add_output(out_2).unwrap();
 
         let mut other_order = Transaction::new();
         other_order.add_output(out_2).unwrap();
         other_order.add_output(out_1).unwrap();
-        other_order.add_input(&pk_b, 50).unwrap();
-        other_order.add_input(&pk_a, 100).unwrap();
+        other_order.add_input(&pk_b).unwrap();
+        other_order.add_input(&pk_a).unwrap();
 
         assert_eq!(one_order.signing_message(), other_order.signing_message());
     }
