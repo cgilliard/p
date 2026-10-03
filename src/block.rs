@@ -58,20 +58,12 @@ pub enum Error {
     /// The buffer ended before a declared record count did, or had
     /// leftover bytes after the last record.
     Truncated,
-    /// Inputs or outputs were not in the canonical sorted order
-    /// `push_input`/`push_output` always produce (see the module docs).
-    /// A raw byte buffer has no way to enforce that on its own, so
-    /// decoding checks it explicitly -- this is what lets anything
-    /// downstream (an eventual circuit, especially) rely on sortedness
-    /// for cheap adjacent-pair checks instead of comparing every pair.
-    NotCanonicallyOrdered,
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Truncated => write!(f, "buffer ended before the declared record count did, or had trailing bytes"),
-            Error::NotCanonicallyOrdered => write!(f, "inputs or outputs were not in canonical sorted order"),
         }
     }
 }
@@ -255,11 +247,14 @@ impl BlockBody {
         out
     }
 
-    /// Decode from bytes, the inverse of `to_bytes` -- but unlike it,
-    /// this can fail: a truncated buffer, trailing garbage after the
-    /// last record, or (critically) inputs or outputs that aren't in
-    /// canonical sorted order are all rejected rather than silently
-    /// accepted or silently re-sorted. See the module docs and `Error`.
+    /// Decode from bytes, the inverse of `to_bytes`. Purely about
+    /// byte-level well-formedness -- a truncated buffer or trailing
+    /// garbage after the last record are rejected, but this does **not**
+    /// check that `inputs`/`outputs` end up canonically ordered. A
+    /// well-formed-but-not-canonical result is a real, meaningful state
+    /// this can produce; whether it's actually an acceptable block is
+    /// `Block::validate`'s job (see `BlockBody::is_canonically_ordered`),
+    /// not a decoding concern.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
             let slice = bytes.get(*offset..*offset + 4).ok_or(Error::Truncated)?;
@@ -267,21 +262,12 @@ impl BlockBody {
             Ok(u32::from_be_bytes(slice.try_into().unwrap()))
         }
 
-        /// Read `count` 32-byte commitments, rejecting anything not in
-        /// non-decreasing order (duplicates allowed -- see the module
-        /// docs on `Error::NotCanonicallyOrdered`).
         fn read_commitments(bytes: &[u8], offset: &mut usize, count: u32) -> Result<Vec<[u8; 32]>> {
             let mut out = Vec::with_capacity(count as usize);
-            let mut prev: Option<[u8; 32]> = None;
             for _ in 0..count {
                 let slice = bytes.get(*offset..*offset + 32).ok_or(Error::Truncated)?;
                 *offset += 32;
-                let value: [u8; 32] = slice.try_into().unwrap();
-                if prev.is_some_and(|p| value < p) {
-                    return Err(Error::NotCanonicallyOrdered);
-                }
-                prev = Some(value);
-                out.push(value);
+                out.push(slice.try_into().unwrap());
             }
             Ok(out)
         }
@@ -298,6 +284,18 @@ impl BlockBody {
 
         Ok(BlockBody { inputs, outputs })
     }
+
+    /// Whether both `inputs` and `outputs` are in canonical sorted order
+    /// (non-decreasing -- duplicates are fine, see the module docs on why
+    /// a position can legitimately be claimed more than once within a
+    /// body). `add_transaction` always maintains this by construction,
+    /// and so does `to_bytes`/`from_bytes` round-tripping *correctly*
+    /// -- but nothing stops a `BlockBody` from being built some other
+    /// way (`inputs`/`outputs` are public fields), so `Block::validate`
+    /// checks this explicitly rather than trusting it.
+    pub fn is_canonically_ordered(&self) -> bool {
+        self.inputs.is_sorted() && self.outputs.is_sorted()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -308,13 +306,26 @@ pub struct Block {
 
 impl Block {
     /// Whether this block is sound *on its own*: proof of work checks
-    /// out, and the header's `body_hash` actually matches the body. This
-    /// is deliberately everything `Block` can check without touching any
-    /// chain state -- see the module docs. Resolving spends, checking
-    /// balance, catching double-spends, and applying updates all live in
-    /// `chain::validate_block` instead.
+    /// out, the body is canonically ordered, and the header's `body_hash`
+    /// actually matches the body. This is deliberately everything `Block`
+    /// can check without touching any chain state -- see the module
+    /// docs. Resolving spends, checking balance, catching double-spends,
+    /// and applying updates all live in `chain::validate_block` instead.
+    ///
+    /// The ordering check matters here, specifically, rather than at
+    /// decode time: `BlockBody::from_bytes` only checks that bytes are
+    /// well-formed, not that they're canonical, and `inputs`/`outputs`
+    /// are public fields a `BlockBody` could in principle be built
+    /// through some other way entirely. Checking it here means
+    /// `validate` is a complete, self-contained answer to "is this
+    /// block acceptable" regardless of how the value in hand was
+    /// constructed, rather than a check that's only honest if you also
+    /// know it arrived via `from_bytes`.
     pub fn validate(&self) -> bool {
         if !self.header.pow_valid() {
+            return false;
+        }
+        if !self.body.is_canonically_ordered() {
             return false;
         }
         if self.body.body_hash() != self.header.body_hash {
@@ -568,59 +579,82 @@ mod tests {
         assert!(decoded.validate());
     }
 
-    /// Two inputs encoded out of order (deliberately swapped from their
-    /// canonical order) are rejected, not silently accepted or re-sorted.
+    /// `BlockBody::from_bytes` only checks byte-level well-formedness --
+    /// it happily decodes an out-of-order body unchanged. The ordering
+    /// check lives in `is_canonically_ordered`/`Block::validate` instead;
+    /// see `validate_rejects_a_block_whose_body_is_not_canonically_ordered`
+    /// below for the end-to-end version of this.
     #[test]
-    fn body_from_bytes_rejects_out_of_order_inputs() {
+    fn from_bytes_does_not_check_ordering() {
         let a = commitment_of(&keypair(1).1, 10);
         let b = commitment_of(&keypair(2).1, 20);
+        let (small, large) = if a < b { (a, b) } else { (b, a) };
 
-        let mut body = BlockBody::new();
-        body.push_input(a);
-        body.push_input(b);
-        // body.inputs is now canonically sorted; swap it out of order.
-        let mut bytes = body.to_bytes();
-        let (first, second) = if a < b { (a, b) } else { (b, a) };
-        // The two commitments sit right after the 4-byte input count.
-        bytes[4..36].copy_from_slice(&second);
-        bytes[36..68].copy_from_slice(&first);
-
-        assert_eq!(BlockBody::from_bytes(&bytes).unwrap_err(), Error::NotCanonicallyOrdered);
-    }
-
-    /// Two outputs encoded out of order are rejected the same way.
-    #[test]
-    fn body_from_bytes_rejects_out_of_order_outputs() {
-        let a = commitment_of(&keypair(1).1, 10);
-        let b = commitment_of(&keypair(2).1, 20);
-
-        let mut body = BlockBody::new();
-        body.push_output(a);
-        body.push_output(b);
-        let mut bytes = body.to_bytes();
-
-        // Input section is empty (just a 4-byte zero count); the output
-        // count (4 bytes) and the two output records follow.
-        let (first, second) = if a < b { (a, b) } else { (b, a) };
-        bytes[8..40].copy_from_slice(&second);
-        bytes[40..72].copy_from_slice(&first);
-
-        assert_eq!(BlockBody::from_bytes(&bytes).unwrap_err(), Error::NotCanonicallyOrdered);
-    }
-
-    /// Duplicate adjacent inputs (same commitment twice, in order) are
-    /// accepted -- `BlockBody` allows duplicates (double-spend detection
-    /// is `chain::validate_block`'s job, not a decoding concern); only
-    /// out-of-order data is rejected here.
-    #[test]
-    fn body_from_bytes_accepts_duplicate_adjacent_inputs() {
-        let a = commitment_of(&keypair(1).1, 10);
-        let mut body = BlockBody::new();
-        body.push_input(a);
-        body.push_input(a);
-
+        let body = BlockBody {
+            inputs: vec![large, small], // deliberately out of order
+            outputs: vec![],
+        };
         let decoded = BlockBody::from_bytes(&body.to_bytes()).unwrap();
-        assert_eq!(decoded.inputs, vec![a, a]);
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn is_canonically_ordered_detects_out_of_order_inputs() {
+        let a = commitment_of(&keypair(1).1, 10);
+        let b = commitment_of(&keypair(2).1, 20);
+        let (small, large) = if a < b { (a, b) } else { (b, a) };
+
+        assert!(BlockBody { inputs: vec![small, large], outputs: vec![] }.is_canonically_ordered());
+        assert!(!BlockBody { inputs: vec![large, small], outputs: vec![] }.is_canonically_ordered());
+    }
+
+    #[test]
+    fn is_canonically_ordered_detects_out_of_order_outputs() {
+        let a = commitment_of(&keypair(1).1, 10);
+        let b = commitment_of(&keypair(2).1, 20);
+        let (small, large) = if a < b { (a, b) } else { (b, a) };
+
+        assert!(BlockBody { inputs: vec![], outputs: vec![small, large] }.is_canonically_ordered());
+        assert!(!BlockBody { inputs: vec![], outputs: vec![large, small] }.is_canonically_ordered());
+    }
+
+    /// Duplicate adjacent commitments (the same value twice, in order)
+    /// are not an ordering violation -- `BlockBody` allows duplicates
+    /// (double-spend detection is `chain::validate_block`'s job, not an
+    /// ordering concern); only an actual inversion counts as disordered.
+    #[test]
+    fn is_canonically_ordered_allows_duplicates() {
+        let a = commitment_of(&keypair(1).1, 10);
+        assert!(BlockBody { inputs: vec![a, a], outputs: vec![] }.is_canonically_ordered());
+    }
+
+    /// The end-to-end version of the point above: a block whose body is
+    /// well-formed bytes but not canonically ordered decodes fine, but
+    /// `validate` rejects it anyway -- the check doesn't depend on
+    /// whether the `Block` arrived via `from_bytes` or was built some
+    /// other way.
+    #[test]
+    fn validate_rejects_a_block_whose_body_is_not_canonically_ordered() {
+        let a = commitment_of(&keypair(1).1, 10);
+        let b = commitment_of(&keypair(2).1, 20);
+        let (small, large) = if a < b { (a, b) } else { (b, a) };
+
+        let body = BlockBody {
+            inputs: vec![large, small], // deliberately out of order
+            outputs: vec![],
+        };
+        assert!(!body.is_canonically_ordered());
+
+        let header = mined_header(BlockHeader {
+            prev_hash: [0u8; 32],
+            pmmr_root: [0u8; 32],
+            bitmap_root: [0u8; 32],
+            body_hash: body.body_hash(), // matches honestly, PoW is fine
+            nonce: [0u8; 32],
+        });
+        let block = Block { header, body };
+
+        assert!(!block.validate());
     }
 
     #[test]
