@@ -1,7 +1,8 @@
 //! A block: a header committing to a flat, canonically-ordered body of
-//! spent inputs and created outputs, plus (eventually) a proof. See
-//! `docs/BLOCK.md` for the full design discussion; this module is its
-//! implementation.
+//! spent inputs and created outputs, plus the proof attesting to them
+//! (see `BlockBody`'s docs -- the proof lives there, not as a separate
+//! field on `Block`). See `docs/BLOCK.md` for the full design
+//! discussion; this module is its implementation.
 //!
 //! **Both inputs and outputs are bare 32-byte commitment hashes --
 //! `H(H(pubkey) || amount)` -- never a plaintext pubkey or amount.** An
@@ -16,11 +17,11 @@
 //! checks only what's intrinsic to the block itself -- proof of work, and
 //! that the header's `body_hash` actually matches the body -- with no
 //! `Pmmr`, `Bitmap`, or `UtxoIndex` anywhere in sight. Resolving spends
-//! against real chain state, checking the block balances, catching
-//! double-spends, and applying the resulting updates are all a different,
-//! separate concern: `chain::validate_block` builds on top of this module
-//! to do that -- and even that non-succinct version is a *development
-//! reference*, not what a real full node runs. A real full node's job, in
+//! against real chain state, catching double-spends, and applying the
+//! resulting updates are all a different, separate concern:
+//! `chain::Chain::apply_block` builds on top of this module to do that.
+//! Balance is never checked anywhere in plaintext, there or here, now or
+//! later -- see that module's docs for why. A real full node's job, in
 //! the end state, is just: check proof of work, check that a ZK proof
 //! verifies. The proof is what attests that every commitment was properly
 //! authorized and that everything balances; nothing in plaintext needs to
@@ -41,14 +42,16 @@
 //! checks balance at all -- see that module's docs), so a miner can build
 //! their reward-plus-fees claim as an ordinary `Transaction` with no
 //! inputs and feed it through `add_transaction` like anything else.
-//! `chain::validate_block`'s balance equation (or, eventually, the proof)
-//! is what actually constrains how much that's allowed to total.
+//! Nothing on the plaintext side ever constrains how much that's allowed
+//! to total -- that's the future ZK proof's job, permanently (see
+//! `chain`'s module docs).
 
 #![allow(dead_code)]
 
 use crate::output::Output;
 use crate::poseidon2::hash_bytes_32;
 use crate::pow;
+use crate::prover::Proof;
 use crate::transaction::Transaction;
 
 /// Errors from decoding a `BlockBody`/`Block` from bytes. Encoding never
@@ -131,8 +134,9 @@ impl BlockHeader {
 
     /// Everything the header commits to except the nonce -- what
     /// `pow::verify`/`pow::mine` actually hash, re-hashed with a new
-    /// nonce on every mining attempt. Deliberately excludes the proof
-    /// (not present on this type at all yet) -- see the module docs.
+    /// nonce on every mining attempt. Doesn't need to separately
+    /// mention the proof: `body_hash` already commits to it (see
+    /// `BlockBody`'s docs), so PoW covers it transitively.
     pub(crate) fn pow_preimage(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(32 * 4);
         bytes.extend_from_slice(&self.prev_hash);
@@ -163,13 +167,19 @@ fn insert_sorted(list: &mut Vec<[u8; 32]>, value: [u8; 32]) {
 }
 
 /// A canonically-ordered, flat payload: every spent input and every
-/// created output, across the whole block, as bare commitment hashes --
-/// see the module docs for why there's nothing else here, and
-/// `transaction` for how a hash like this actually gets computed.
+/// created output, across the whole block, as bare commitment hashes,
+/// plus the proof attesting they're properly authorized and balance --
+/// see the module docs for why there's nothing else here, `transaction`
+/// for how a commitment hash actually gets computed, and `prover` for
+/// what `proof` is (today, a stub -- see that module's docs). The proof
+/// is treated as part of the body, not a separate sibling on `Block`:
+/// `body_hash` commits to it right alongside `inputs`/`outputs`, one
+/// hash covering everything below the header.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockBody {
     pub inputs: Vec<[u8; 32]>,
     pub outputs: Vec<[u8; 32]>,
+    pub proof: Proof,
 }
 
 impl BlockBody {
@@ -177,6 +187,7 @@ impl BlockBody {
         BlockBody {
             inputs: Vec::new(),
             outputs: Vec::new(),
+            proof: Proof,
         }
     }
 
@@ -202,6 +213,24 @@ impl BlockBody {
         true
     }
 
+    /// Build a fresh body out of `transactions`, folding each in via
+    /// `add_transaction` in order. The one place this assembly loop
+    /// lives -- callers (block assembly for mining, `chain::Chain::
+    /// build_block`) just hand over the list, rather than each
+    /// reimplementing "loop, add, bail on the first one that doesn't
+    /// verify." Returns the index of the first transaction that failed
+    /// `add_transaction`, if any, with nothing from it (or anything
+    /// after it) folded in.
+    pub fn from_transactions(transactions: &[Transaction]) -> std::result::Result<Self, usize> {
+        let mut body = BlockBody::new();
+        for (i, tx) in transactions.iter().enumerate() {
+            if !body.add_transaction(tx) {
+                return Err(i);
+            }
+        }
+        Ok(body)
+    }
+
     /// Insert `commitment`, keeping `inputs` sorted ascending -- this is
     /// what lets two blocks assembled from the same transactions in a
     /// different order still produce the same `body_hash`.
@@ -216,17 +245,27 @@ impl BlockBody {
     }
 
     /// Hash of the complete body: every input commitment in sorted
-    /// order, then every output commitment, also sorted. What the
-    /// header's `body_hash` commits to.
+    /// order, then every output commitment, also sorted, then the
+    /// proof's own commitment -- one hash covering everything below the
+    /// header, proof included (see the struct docs). What the header's
+    /// `body_hash` commits to.
     pub fn body_hash(&self) -> [u8; 32] {
-        let mut bytes = Vec::with_capacity((self.inputs.len() + self.outputs.len()) * 32);
+        let mut bytes = Vec::with_capacity((self.inputs.len() + self.outputs.len()) * 32 + 32);
         for commitment in &self.inputs {
             bytes.extend_from_slice(commitment);
         }
         for commitment in &self.outputs {
             bytes.extend_from_slice(commitment);
         }
+        bytes.extend_from_slice(&self.proof.commitment_hash());
         hash_bytes_32(&bytes)
+    }
+
+    /// Whether `proof` actually attests to this body's `inputs`/
+    /// `outputs` -- see `prover`'s docs for why this is a stub (always
+    /// `true`) for now.
+    pub fn proof_is_valid(&self) -> bool {
+        self.proof.verify(&self.inputs, &self.outputs)
     }
 
     /// Serialize: a 4-byte big-endian input count, that many 32-byte
@@ -234,6 +273,13 @@ impl BlockBody {
     /// 32-byte commitments. Always produces canonically-ordered bytes,
     /// since `inputs`/`outputs` are only ever populated in that order in
     /// the first place (`push_input`/`push_output`).
+    ///
+    /// **`proof` is not yet part of this wire format.** The stub type
+    /// (see `prover`'s docs) has exactly one possible value, so there's
+    /// nothing to lose by omitting it -- `from_bytes` just fills in that
+    /// one value. This is a deliberate, temporary gap: once `Proof` has
+    /// a real byte representation, encoding/decoding it becomes part of
+    /// this format too.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.inputs.len() as u32).to_be_bytes());
@@ -282,7 +328,11 @@ impl BlockBody {
             return Err(Error::Truncated); // trailing garbage
         }
 
-        Ok(BlockBody { inputs, outputs })
+        Ok(BlockBody {
+            inputs,
+            outputs,
+            proof: Proof,
+        })
     }
 
     /// Whether both `inputs` and `outputs` are strictly increasing --
@@ -315,6 +365,47 @@ impl BlockBody {
     }
 }
 
+/// What `chain::Chain::build_block` actually produces: every chain-
+/// state-dependent field resolved (`prev_hash`, `pmmr_root`,
+/// `bitmap_root`, and the flat `inputs`/`outputs` lists), but no proof
+/// yet, and so no `Block` yet either -- `BlockBody`/`Block` both require
+/// a real `proof` (see `BlockBody`'s docs), and this type deliberately
+/// doesn't carry one. `finish` is the only way to turn this into an
+/// actual `Block`, and it needs a `Proof` to do it (from
+/// `prover::prove_block`) -- which is what keeps `pow::mine_block` from
+/// being callable on anything until proving has actually happened.
+#[derive(Debug)]
+pub struct UnprovenBlock {
+    pub prev_hash: [u8; 32],
+    pub pmmr_root: [u8; 32],
+    pub bitmap_root: [u8; 32],
+    pub inputs: Vec<[u8; 32]>,
+    pub outputs: Vec<[u8; 32]>,
+}
+
+impl UnprovenBlock {
+    /// Attach `proof` to assemble the real, still-unmined `Block`:
+    /// `body_hash` is computed only now, since it commits to the proof
+    /// alongside `inputs`/`outputs` (see `BlockBody::body_hash`).
+    /// `nonce` is left at `[0; 32]` -- `pow::mine_block` is the only
+    /// thing that sets it, and only once this has already happened.
+    pub fn finish(self, proof: Proof) -> Block {
+        let body = BlockBody {
+            inputs: self.inputs,
+            outputs: self.outputs,
+            proof,
+        };
+        let header = BlockHeader {
+            prev_hash: self.prev_hash,
+            pmmr_root: self.pmmr_root,
+            bitmap_root: self.bitmap_root,
+            body_hash: body.body_hash(),
+            nonce: [0u8; 32],
+        };
+        Block { header, body }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Block {
     pub header: BlockHeader,
@@ -324,15 +415,17 @@ pub struct Block {
 impl Block {
     /// Whether this block is sound *on its own*: proof of work checks
     /// out, the body is canonically ordered (sorted, no duplicates) and
-    /// doesn't spend any output it also creates, and the header's
-    /// `body_hash` actually matches the body. This is deliberately
-    /// everything `Block` can check without touching any chain state --
-    /// see the module docs. Resolving spends against real chain state,
-    /// checking balance, catching reuse across different blocks, and
-    /// applying updates all live in `chain::validate_block` instead --
-    /// but duplicate-commitment and same-block-spend detection don't
-    /// need any of that, since they're properties of the body's own two
-    /// lists, nothing else.
+    /// doesn't spend any output it also creates, the header's
+    /// `body_hash` actually matches the body (proof included -- see
+    /// `BlockBody`'s docs), and the proof itself checks out against the
+    /// body's commitments. This is deliberately everything `Block` can
+    /// check without touching any chain state -- see the module docs.
+    /// Resolving spends against real chain state, catching reuse across
+    /// different blocks, and applying updates all live in
+    /// `chain::Chain::apply_block` instead -- but duplicate-commitment,
+    /// same-block-spend, and proof validity don't need any of that,
+    /// since they're properties of the body (and the proof within it)
+    /// alone.
     ///
     /// These checks matter here, specifically, rather than at decode
     /// time: `BlockBody::from_bytes` only checks that bytes are
@@ -354,6 +447,9 @@ impl Block {
             return false;
         }
         if self.body.body_hash() != self.header.body_hash {
+            return false;
+        }
+        if !self.body.proof_is_valid() {
             return false;
         }
         true
@@ -380,6 +476,32 @@ impl Block {
     }
 }
 
+/// Mine `header` in place: search for a nonce satisfying `FIXED_MAX_HASH`,
+/// up to `max_attempts`, setting `header.nonce` and returning `true` on
+/// success. Leaves `header` untouched and returns `false` if none of the
+/// first `max_attempts` nonces satisfy it. Lives here, rather than in
+/// `pow` itself, since `pow` is deliberately kept free of any dependency
+/// on `block` (see that module's docs) -- this is just a thin,
+/// `BlockHeader`-aware wrapper around `pow::mine`.
+pub fn mine_header(header: &mut BlockHeader, max_attempts: u64) -> bool {
+    let preimage = header.pow_preimage();
+    match pow::mine(&preimage, &FIXED_MAX_HASH, max_attempts) {
+        Some((nonce, _)) => {
+            header.nonce = nonce;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Mine `block.header` in place -- see `mine_header`. There's no `Block`
+/// value to call this on until `prover::prove_block` has already run
+/// (see `UnprovenBlock::finish`): that's what keeps mining from starting
+/// before proving does.
+pub fn mine_block(block: &mut Block, max_attempts: u64) -> bool {
+    mine_header(&mut block.header, max_attempts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,9 +523,7 @@ mod tests {
     /// attempt budget -- 1-in-256 odds per attempt, so this finishes in a
     /// handful of tries almost always.
     fn mined_header(mut header: BlockHeader) -> BlockHeader {
-        let preimage = header.pow_preimage();
-        let (nonce, _) = pow::mine(&preimage, &FIXED_MAX_HASH, 100_000).expect("should find a nonce quickly");
-        header.nonce = nonce;
+        assert!(mine_header(&mut header, 100_000), "should find a nonce quickly");
         header
     }
 
@@ -618,6 +738,7 @@ mod tests {
         let body = BlockBody {
             inputs: vec![large, small], // deliberately out of order
             outputs: vec![],
+            ..Default::default()
         };
         let decoded = BlockBody::from_bytes(&body.to_bytes()).unwrap();
         assert_eq!(decoded, body);
@@ -629,8 +750,8 @@ mod tests {
         let b = commitment_of(&keypair(2).1, 20);
         let (small, large) = if a < b { (a, b) } else { (b, a) };
 
-        assert!(BlockBody { inputs: vec![small, large], outputs: vec![] }.is_canonically_ordered());
-        assert!(!BlockBody { inputs: vec![large, small], outputs: vec![] }.is_canonically_ordered());
+        assert!(BlockBody { inputs: vec![small, large], outputs: vec![], ..Default::default() }.is_canonically_ordered());
+        assert!(!BlockBody { inputs: vec![large, small], outputs: vec![], ..Default::default() }.is_canonically_ordered());
     }
 
     #[test]
@@ -639,8 +760,8 @@ mod tests {
         let b = commitment_of(&keypair(2).1, 20);
         let (small, large) = if a < b { (a, b) } else { (b, a) };
 
-        assert!(BlockBody { inputs: vec![], outputs: vec![small, large] }.is_canonically_ordered());
-        assert!(!BlockBody { inputs: vec![], outputs: vec![large, small] }.is_canonically_ordered());
+        assert!(BlockBody { inputs: vec![], outputs: vec![small, large], ..Default::default() }.is_canonically_ordered());
+        assert!(!BlockBody { inputs: vec![], outputs: vec![large, small], ..Default::default() }.is_canonically_ordered());
     }
 
     /// Duplicate adjacent commitments (the same value twice, in order)
@@ -650,13 +771,13 @@ mod tests {
     #[test]
     fn is_canonically_ordered_rejects_duplicate_inputs() {
         let a = commitment_of(&keypair(1).1, 10);
-        assert!(!BlockBody { inputs: vec![a, a], outputs: vec![] }.is_canonically_ordered());
+        assert!(!BlockBody { inputs: vec![a, a], outputs: vec![], ..Default::default() }.is_canonically_ordered());
     }
 
     #[test]
     fn is_canonically_ordered_rejects_duplicate_outputs() {
         let a = commitment_of(&keypair(1).1, 10);
-        assert!(!BlockBody { inputs: vec![], outputs: vec![a, a] }.is_canonically_ordered());
+        assert!(!BlockBody { inputs: vec![], outputs: vec![a, a], ..Default::default() }.is_canonically_ordered());
     }
 
     #[test]
@@ -664,8 +785,8 @@ mod tests {
         let a = commitment_of(&keypair(1).1, 10);
         let b = commitment_of(&keypair(2).1, 20);
 
-        assert!(!BlockBody { inputs: vec![a], outputs: vec![b] }.spends_its_own_output());
-        assert!(BlockBody { inputs: vec![a], outputs: vec![a] }.spends_its_own_output());
+        assert!(!BlockBody { inputs: vec![a], outputs: vec![b], ..Default::default() }.spends_its_own_output());
+        assert!(BlockBody { inputs: vec![a], outputs: vec![a], ..Default::default() }.spends_its_own_output());
     }
 
     /// A block that tries to spend an output it also creates is rejected
@@ -677,6 +798,7 @@ mod tests {
         let body = BlockBody {
             inputs: vec![a],
             outputs: vec![a],
+            ..Default::default()
         };
         assert!(body.is_canonically_ordered()); // not the thing being tested here
         assert!(body.spends_its_own_output());
@@ -707,6 +829,7 @@ mod tests {
         let body = BlockBody {
             inputs: vec![large, small], // deliberately out of order
             outputs: vec![],
+            ..Default::default()
         };
         assert!(!body.is_canonically_ordered());
 
