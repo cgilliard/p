@@ -49,7 +49,7 @@
 //! Whatever target a `Chain` opens with (`DifficultyConfig::
 //! initial_target`, see `Chain::open`) is only ever the *starting*
 //! one, not a fixed one -- `Chain` adjusts it over time to keep blocks
-//! landing roughly `DifficultyConfig::target_block_time_secs` apart,
+//! landing roughly `DifficultyConfig::target_block_time_ms` apart,
 //! which is exactly why `Block::validate`/`pow::mine_block` take the
 //! target as an explicit parameter rather than assuming a constant
 //! (see `block`'s docs). `Chain` tracks two more small pieces of side
@@ -76,7 +76,7 @@
 #![allow(dead_code)]
 
 use crate::bitmap::Bitmap;
-use crate::block::{Block, BlockBody, BlockHeader, UnprovenBlock, now_unix};
+use crate::block::{Block, BlockBody, BlockHeader, UnprovenBlock, now_millis};
 use crate::pmmr::Pmmr;
 use crate::pow;
 use crate::storage::Storage;
@@ -90,15 +90,15 @@ use heed::types::Bytes;
 pub const GENESIS_PARENT_HASH: [u8; 32] = [0u8; 32];
 
 /// How far ahead of this node's own clock a block's `timestamp` is
-/// allowed to claim to be -- same order of magnitude as Bitcoin's
-/// 2-hour rule. This can never be part of any proof, recursive or
-/// otherwise: it's a statement about the relationship between a
-/// timestamp and whenever *this particular check* happens to run, not
-/// a fact fixed at proving time (see `docs/BLOCK_TODO.md` #3). Every
-/// verifier -- full node or light client -- has to check this locally,
-/// against its own clock, no matter how much of the rest of chain
-/// validity eventually gets folded into a recursive proof.
-const MAX_FUTURE_DRIFT_SECS: u64 = 2 * 60 * 60;
+/// allowed to claim to be, in milliseconds -- same order of magnitude
+/// as Bitcoin's 2-hour rule. This can never be part of any proof,
+/// recursive or otherwise: it's a statement about the relationship
+/// between a timestamp and whenever *this particular check* happens to
+/// run, not a fact fixed at proving time (see `docs/BLOCK_TODO.md` #3).
+/// Every verifier -- full node or light client -- has to check this
+/// locally, against its own clock, no matter how much of the rest of
+/// chain validity eventually gets folded into a recursive proof.
+const MAX_FUTURE_DRIFT_MS: u64 = 2 * 60 * 60 * 1000;
 
 /// The tip's full header, the one thing `Chain` persists in its own
 /// `chain_meta` database beyond what `pmmr`/`bitmap`/`utxo` already
@@ -126,8 +126,13 @@ pub struct DifficultyConfig {
     /// Blocks between difficulty adjustments.
     pub interval: u64,
     /// The real time a window of `interval` blocks is supposed to
-    /// take, in seconds, if mining is keeping pace with the target.
-    pub target_block_time_secs: u64,
+    /// take, in **milliseconds**, if mining is keeping pace with the
+    /// target. Milliseconds rather than seconds specifically so a test
+    /// can set this small (tens of milliseconds) and use genuinely
+    /// real elapsed time -- actually sleeping between mined blocks --
+    /// without the test suite paying for it in wall-clock seconds; see
+    /// `for_tests`.
+    pub target_block_time_ms: u64,
     /// How far the actual/expected elapsed-time ratio is allowed to
     /// swing before being clamped, each retarget -- `4` means at most
     /// 4x harder or 4x easier per window. Bitcoin's own value.
@@ -137,14 +142,16 @@ pub struct DifficultyConfig {
 impl DifficultyConfig {
     /// Fast, cheap-to-mine defaults for tests: `block::INITIAL_MAX_HASH`
     /// (the easy target everything else in this crate's test suite is
-    /// already built around) and a short window, so a test can
-    /// actually complete a full retarget window without mining
-    /// hundreds of blocks to get there.
+    /// already built around), a short window, and a millisecond-scale
+    /// target block time -- a full retarget window is nominally just
+    /// `10 * 9 = 90` milliseconds, fast enough that a test exercising
+    /// genuinely real elapsed time (not hand-set `timestamp`s) stays
+    /// fast too.
     pub fn for_tests() -> Self {
         DifficultyConfig {
             initial_target: crate::block::INITIAL_MAX_HASH,
             interval: 10,
-            target_block_time_secs: 10,
+            target_block_time_ms: 10,
             max_adjustment_factor: 4,
         }
     }
@@ -183,7 +190,7 @@ pub enum Error {
     /// on why `height` is trustworthy data in the first place.
     WrongHeight,
     /// `header.timestamp` claims to be further ahead of this node's own
-    /// clock than `MAX_FUTURE_DRIFT_SECS` allows.
+    /// clock than `MAX_FUTURE_DRIFT_MS` allows.
     TimestampTooFarInFuture,
     /// An input commitment doesn't resolve to a currently unspent output.
     UnresolvedInput([u8; 32]),
@@ -375,7 +382,7 @@ impl Chain {
         if (height + 1).is_multiple_of(interval) {
             let window_start = self.window_start_timestamp(wtxn)?;
             let elapsed = applied_header.timestamp.saturating_sub(window_start);
-            let expected = self.difficulty.target_block_time_secs * (interval - 1);
+            let expected = self.difficulty.target_block_time_ms * (interval - 1);
             let factor = self.difficulty.max_adjustment_factor;
             let clamped_elapsed = elapsed.clamp(expected / factor, expected * factor);
 
@@ -440,7 +447,7 @@ impl Chain {
     /// claims. Difficulty retargeting's side state is updated last,
     /// right before committing -- see the module docs.
     pub fn apply_block(&mut self, block: &Block) -> Result<()> {
-        if block.header.timestamp > now_unix() + MAX_FUTURE_DRIFT_SECS {
+        if block.header.timestamp > now_millis() + MAX_FUTURE_DRIFT_MS {
             return Err(Error::TimestampTooFarInFuture);
         }
 
@@ -630,11 +637,11 @@ mod tests {
     }
 
     /// Mine and apply `DifficultyConfig::for_tests().interval` blocks,
-    /// each `seconds_apart` after the last, starting from an arbitrary
+    /// each `ms_apart` after the last, starting from an arbitrary
     /// (but fixed, and comfortably in the past) timestamp -- enough to
     /// complete exactly one retarget window, so the test can check what
     /// `current_target` became afterward.
-    fn apply_one_window(chain: &mut Chain, seconds_apart: u64) {
+    fn apply_one_window(chain: &mut Chain, ms_apart: u64) {
         let mut timestamp = 1_000_000u64;
         for i in 0..DifficultyConfig::for_tests().interval {
             let (_sk, pk) = keypair((i + 1) as u8);
@@ -645,19 +652,19 @@ mod tests {
             block.header.timestamp = timestamp;
             assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
             chain.apply_block(&block).unwrap();
-            timestamp += seconds_apart;
+            timestamp += ms_apart;
         }
     }
 
     /// With `DifficultyConfig::for_tests()` (`interval: 10`,
-    /// `target_block_time_secs: 10`, `max_adjustment_factor: 4`), one
+    /// `target_block_time_ms: 10`, `max_adjustment_factor: 4`), one
     /// window spans 9 gaps and is expected to take `10 * 9 = 90`
-    /// seconds, clamped to `[90/4, 90*4] = [22, 360]` before scaling.
+    /// milliseconds, clamped to `[90/4, 90*4] = [22, 360]` before scaling.
     #[test]
     fn retargets_harder_after_a_window_that_ran_faster_than_target() {
         let (_dir, storage, mut chain) = open();
-        // Nine gaps of 1 second each (elapsed = 9) is unmistakably
-        // faster than the 90-second expectation, and clamped up to the
+        // Nine gaps of 1 ms each (elapsed = 9) is unmistakably
+        // faster than the 90ms expectation, and clamped up to the
         // floor of 22 before scaling -- not scaled by the raw 9/90.
         apply_one_window(&mut chain, 1);
 
@@ -668,7 +675,7 @@ mod tests {
     #[test]
     fn retargets_easier_after_a_window_that_ran_slower_than_target() {
         let (_dir, storage, mut chain) = open();
-        // Nine gaps of 100 seconds each (elapsed = 900) is unmistakably
+        // Nine gaps of 100ms each (elapsed = 900) is unmistakably
         // slower, and clamped down to the ceiling of 360 before
         // scaling -- not scaled by the raw 900/90 (which would be 10x,
         // past the 4x limit).
@@ -680,8 +687,8 @@ mod tests {
 
     /// A window whose elapsed time falls *within* the clamp -- so the
     /// scaling is driven by the real ratio, not just pegged to one of
-    /// the clamp's bounds. Nine gaps of 5 seconds (elapsed = 45) is
-    /// exactly half of the 90-second expectation.
+    /// the clamp's bounds. Nine gaps of 5ms (elapsed = 45) is
+    /// exactly half of the 90ms expectation.
     #[test]
     fn retargets_proportionally_when_within_the_clamp() {
         let (_dir, storage, mut chain) = open();
@@ -689,6 +696,54 @@ mod tests {
 
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 45, 90));
+    }
+
+    /// Unlike `apply_one_window`, which fakes `timestamp` by hand, this
+    /// never touches it at all -- `UnprovenBlock::finish` stamps every
+    /// block with the real clock (`block::now_millis`), so this
+    /// exercises retargeting against genuinely real elapsed time, not
+    /// a simulated stand-in for it. Only practical to do quickly
+    /// because `DifficultyConfig::for_tests()`'s window is
+    /// milliseconds, not seconds (see that method's docs): ten trivial
+    /// blocks, mined back to back with no injected delay, run in this
+    /// test in well under a second of wall-clock test time.
+    ///
+    /// The assertion deliberately doesn't predict a *direction*. The
+    /// first version of this test assumed ten trivial blocks would
+    /// obviously finish faster than the 90ms window and asserted the
+    /// target would harden -- and promptly failed, because
+    /// `apply_block` commits one real LMDB write transaction per
+    /// block, and `fsync`-on-commit durability makes that genuinely
+    /// slow and unpredictable in a sandboxed environment (slower, in
+    /// fact, than the 90ms budget here). That's a real example of
+    /// exactly why wall-clock-timing assertions are riskier than the
+    /// rest of this test suite: the *fact* that real elapsed time
+    /// drives retargeting is what's actually safe to assert, not which
+    /// way a given machine's disk happens to push it.
+    #[test]
+    fn retargeting_reacts_to_genuinely_real_elapsed_time() {
+        let (_dir, storage, mut chain) = open();
+
+        let rtxn = storage.read_txn().unwrap();
+        let initial_target = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+
+        for i in 0..DifficultyConfig::for_tests().interval {
+            let (_sk, pk) = keypair((i + 1) as u8);
+            let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+            let target = unproven.target;
+            let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+            let mut block = unproven.finish(proof); // timestamp: the real clock, untouched
+            assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
+            chain.apply_block(&block).unwrap();
+        }
+
+        let rtxn = storage.read_txn().unwrap();
+        let new_target = chain.current_target(&rtxn).unwrap();
+        assert_ne!(
+            new_target, initial_target,
+            "expected a real, ~90ms window to retarget away from the initial target in *some* direction"
+        );
     }
 
     #[test]
@@ -843,9 +898,9 @@ mod tests {
         let target = unproven.target;
         let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
         let mut block = unproven.finish(proof);
-        // Comfortably past MAX_FUTURE_DRIFT_SECS -- re-mined since
+        // Comfortably past MAX_FUTURE_DRIFT_MS -- re-mined since
         // changing `timestamp` changes the PoW preimage.
-        block.header.timestamp = now_unix() + MAX_FUTURE_DRIFT_SECS + 3600;
+        block.header.timestamp = now_millis() + MAX_FUTURE_DRIFT_MS + 3600;
         assert!(mine_block(&mut block, &target, 100_000));
 
         let err = chain.apply_block(&block).unwrap_err();
@@ -862,7 +917,7 @@ mod tests {
         let mut block = unproven.finish(proof);
         // Just inside the tolerance -- must not be rejected on that
         // basis alone.
-        block.header.timestamp = now_unix() + MAX_FUTURE_DRIFT_SECS - 1;
+        block.header.timestamp = now_millis() + MAX_FUTURE_DRIFT_MS - 1;
         assert!(mine_block(&mut block, &target, 100_000));
 
         chain.apply_block(&block).unwrap();

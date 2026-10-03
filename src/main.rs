@@ -15,7 +15,7 @@ mod transcript;
 mod utxo;
 mod wots;
 
-use block::{Block, mine_block, now_unix};
+use block::{Block, mine_block, now_millis};
 use chain::Chain;
 use output::Output;
 use storage::Storage;
@@ -50,11 +50,12 @@ const INITIAL_LEADING_ZERO_BITS: u32 = 21;
 /// Retargeting knobs for this driver's actual run -- independent of
 /// `chain::DifficultyConfig::for_tests`'s own numbers (see that
 /// method's docs for why they're deliberately never the same values).
-/// Currently set equal to the test suite's own window/target-time
-/// numbers; free to diverge from them since nothing but this constant
-/// list ties the two together.
+/// `target_block_time_ms` here is `10_000` (10 real seconds), not the
+/// test suite's `10` (milliseconds) -- same window size, genuinely
+/// different real-world pace, which is exactly the point of the two
+/// being independent numbers.
 const RETARGET_INTERVAL: u64 = 10;
-const TARGET_BLOCK_TIME_SECS: u64 = 10;
+const TARGET_BLOCK_TIME_MS: u64 = 10_000;
 const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 
 fn data_dir() -> std::path::PathBuf {
@@ -66,22 +67,24 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Convert a Unix timestamp (seconds) into a human-readable
-/// "YYYY-MM-DD HH:MM:SS UTC" string. A small, self-contained civil-
+/// Convert a Unix timestamp, in **milliseconds**, into a human-readable
+/// "YYYY-MM-DD HH:MM:SS.mmm UTC" string. A small, self-contained civil-
 /// calendar conversion -- no time zone database needed since this is
 /// always UTC, and no new dependency needed for just this. The
 /// year/month/day half is Howard Hinnant's `civil_from_days`
 /// algorithm (http://howardhinnant.github.io/date_algorithms.html),
 /// chosen because it's a well-known, easy-to-verify closed form rather
 /// than a loop over "days in this month" by hand.
-fn format_timestamp(unix_secs: u64) -> String {
+fn format_timestamp(unix_millis: u64) -> String {
+    let unix_secs = unix_millis / 1000;
+    let millis = unix_millis % 1000;
     let days = (unix_secs / 86400) as i64;
     let secs_of_day = unix_secs % 86400;
     let (year, month, day) = civil_from_days(days);
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
     let second = secs_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{millis:03} UTC")
 }
 
 /// Days since the Unix epoch (1970-01-01) -> (year, month, day) in the
@@ -140,7 +143,7 @@ fn main() {
     let difficulty = chain::DifficultyConfig {
         initial_target: pow::max_hash_with_leading_zero_bits(INITIAL_LEADING_ZERO_BITS),
         interval: RETARGET_INTERVAL,
-        target_block_time_secs: TARGET_BLOCK_TIME_SECS,
+        target_block_time_ms: TARGET_BLOCK_TIME_MS,
         max_adjustment_factor: MAX_ADJUSTMENT_FACTOR,
     };
     let mut chain = Chain::open(&storage, difficulty).expect("failed to open chain");
@@ -190,7 +193,7 @@ fn main() {
             // Exhausted this preimage's nonce space at this difficulty --
             // a fresh timestamp changes the preimage, opening up an
             // entirely new space to search.
-            block.header.timestamp = now_unix();
+            block.header.timestamp = now_millis();
         }
 
         chain.apply_block(&block).expect("apply_block failed for a block this process just mined");
@@ -205,24 +208,31 @@ mod tests {
 
     #[test]
     fn epoch_is_new_years_day_1970() {
-        assert_eq!(format_timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_timestamp(0), "1970-01-01 00:00:00.000 UTC");
     }
 
     #[test]
     fn one_day_later_rolls_the_date_over() {
-        assert_eq!(format_timestamp(86_400), "1970-01-02 00:00:00 UTC");
+        assert_eq!(format_timestamp(86_400_000), "1970-01-02 00:00:00.000 UTC");
     }
 
     #[test]
     fn time_of_day_decomposes_into_hours_minutes_seconds() {
         // 1h, 1m, 1s past midnight -- same day as the epoch.
-        assert_eq!(format_timestamp(3661), "1970-01-01 01:01:01 UTC");
+        assert_eq!(format_timestamp(3_661_000), "1970-01-01 01:01:01.000 UTC");
+    }
+
+    #[test]
+    fn milliseconds_decompose_too() {
+        assert_eq!(format_timestamp(1_234), "1970-01-01 00:00:01.234 UTC");
     }
 
     #[test]
     fn a_widely_cited_reference_timestamp_matches() {
-        // 1_700_000_000 is a commonly-referenced round value, widely
-        // cited (independently of this code) as this exact moment.
-        assert_eq!(format_timestamp(1_700_000_000), "2023-11-14 22:13:20 UTC");
+        // 1_700_000_000 (seconds) is a commonly-referenced round value,
+        // widely cited (independently of this code) as this exact
+        // moment -- scaled up to milliseconds, `format_timestamp`'s
+        // actual unit now.
+        assert_eq!(format_timestamp(1_700_000_000_000), "2023-11-14 22:13:20.000 UTC");
     }
 }

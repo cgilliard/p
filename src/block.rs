@@ -113,12 +113,17 @@ pub struct BlockHeader {
     /// How many blocks precede this one (the first real block is height
     /// `0`). See `HEADER_LEN`'s docs for why this is a header field.
     pub height: u64,
-    /// Unix time (seconds) this header was assembled, as claimed by
-    /// whoever built it -- not yet validated against anything (no
-    /// monotonicity or future-time bound check exists yet; see
-    /// `docs/BLOCK_TODO.md`). Committed to by PoW just like every other
-    /// field, so it can't be altered after mining without invalidating
-    /// the nonce.
+    /// Unix time, in **milliseconds**, this header was assembled, as
+    /// claimed by whoever built it -- not yet validated against
+    /// anything (no monotonicity or future-time bound check exists
+    /// yet; see `docs/BLOCK_TODO.md`). Committed to by PoW just like
+    /// every other field, so it can't be altered after mining without
+    /// invalidating the nonce. Milliseconds, not seconds, so a short
+    /// retarget window (`chain::DifficultyConfig`) can target sub-
+    /// second block times for fast tests without losing precision --
+    /// `u64` milliseconds since the epoch doesn't overflow for about
+    /// 584 million years, so there's no practical ceiling to worry
+    /// about from the extra precision.
     pub timestamp: u64,
     pub nonce: pow::Nonce,
 }
@@ -452,22 +457,22 @@ impl UnprovenBlock {
             bitmap_root: self.bitmap_root,
             body_hash: body.body_hash(),
             height: self.height,
-            timestamp: now_unix(),
+            timestamp: now_millis(),
             nonce: [0u8; 32],
         };
         Block { header, body }
     }
 }
 
-/// The current Unix time, in seconds -- what `UnprovenBlock::finish`
-/// stamps a new header with, and what `chain::Chain::apply_block` reads
-/// again to bound how far into the future a header's claimed
-/// `timestamp` is allowed to be.
-pub(crate) fn now_unix() -> u64 {
+/// The current Unix time, in **milliseconds** -- what
+/// `UnprovenBlock::finish` stamps a new header with, and what
+/// `chain::Chain::apply_block` reads again to bound how far into the
+/// future a header's claimed `timestamp` is allowed to be.
+pub(crate) fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is before 1970")
-        .as_secs()
+        .as_millis() as u64
 }
 
 #[derive(Clone, Debug)]

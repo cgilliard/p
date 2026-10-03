@@ -76,8 +76,10 @@ somewhere in the build pipeline once there's a real circuit to feed.
 `Chain::apply_block` only accepts a block whose `prev_hash` matches the
 *current* tip (see `chain.rs`'s `WrongParent` check) — there's no notion
 of a competing block, an orphan waiting on a missing parent, or
-switching to a heavier chain. Fine for a single-miner prototype; a real
-multi-miner network needs this. Needs:
+switching to a heavier chain. Not implemented *yet* because there's no
+networking layer to actually receive a competing block from -- not
+because the goal is staying single-miner. This is the real blockchain's
+consensus layer; it's next, not skipped. Needs:
 
 - Storing blocks that don't extend the current tip instead of just
   rejecting them.
@@ -85,6 +87,15 @@ multi-miner network needs this. Needs:
   cumulative work) to compare candidates.
 - Reorg: unwinding `pmmr`/`bitmap`/`utxo` back to a common ancestor and
   reapplying the new best chain.
+- `powLimit` (a network-wide ceiling on how easy the PoW target is ever
+  allowed to become, independent of plain integer saturation): real
+  purpose, not legacy cruft -- bounds how far retargeting can degrade
+  security after a pathological stretch (a long gap with no miner, or
+  adversarial timestamps) once there's an actual network of
+  independent, potentially absent or adversarial miners to defend
+  against. Needs sizing against real behavior once there's a network
+  to observe, so it belongs here, sequenced after this item, not
+  bundled into retargeting (`chain::DifficultyConfig`) in isolation.
 
 ## 3. No block height or timestamp
 
