@@ -1,13 +1,18 @@
-//! A Prunable Merkle Mountain Range (PMMR) storing `Output`s -- just
-//! outputs, unlike designs (e.g. Grin's) that keep a separate PMMR per kind
-//! of committed data (outputs, range proofs, kernels, ...).
+//! A Prunable Merkle Mountain Range (PMMR) of raw 32-byte leaf hashes --
+//! fully generic, with no notion of what a leaf actually represents. It
+//! used to store `Output`s directly (hashing them itself); now the caller
+//! supplies the leaf hash already computed, same as `merkle.rs`. That's
+//! not just tidiness: the hash a leaf actually commits to is now a
+//! privacy-preserving commitment (`H(H(pubkey) || amount)`, computed in
+//! `block.rs`), and this module has no business knowing that, any more
+//! than it needs to know what a pubkey or an amount is.
 //!
 //! An MMR is an append-only structure built from a forest of perfect binary
 //! trees ("peaks") whose heights mirror the binary representation of the
 //! number of leaves. Appending a leaf may trigger a cascade of merges
 //! (exactly like incrementing a binary counter and propagating carries);
 //! the *root* is a single hash committing to the current set of peaks, and
-//! from it a compact proof can show that one specific `Output` is included
+//! from it a compact proof can show that one specific leaf is included
 //! without needing the rest of the set.
 //!
 //! This follows the same append/root structure Grin's PMMR uses, but is not
@@ -60,7 +65,6 @@
 // piecemeal -- this module exists to be exercised by its tests for now.
 #![allow(dead_code)]
 
-use crate::output::Output;
 use crate::poseidon2::hash_bytes_32;
 use crate::storage::Storage;
 use heed::Database;
@@ -279,7 +283,7 @@ impl Proof {
     }
 }
 
-/// A PMMR of `Output`s, backed by an LMDB environment (see
+/// A PMMR of raw leaf hashes, backed by an LMDB environment (see
 /// `crate::storage::Storage`). Every node (leaf and internal) is stored by
 /// position; a leaf's path up to its peak, for proof generation, is
 /// computed arithmetically (see `family`/`is_left_sibling` above) rather
@@ -330,21 +334,16 @@ impl Pmmr {
         self.size
     }
 
-    /// Append an output, returning the position its leaf was stored at.
-    /// The leaf hash is `Poseidon2(output.to_bytes())` -- an `Output` is a
-    /// structured (pubkey hash, amount) pair, not already a single 32-byte
-    /// commitment, so it's hashed down to the fixed node-hash width this
-    /// PMMR uses everywhere else. Durable once this returns: the write
-    /// transaction backing it is committed before `push` returns.
-    pub fn push(&mut self, output: &Output) -> Result<u64> {
+    /// Append a leaf hash, returning the position it was stored at. The
+    /// caller is responsible for having already hashed whatever the leaf
+    /// is supposed to commit to -- this module has no idea, and doesn't
+    /// need to. Durable once this returns: the write transaction backing
+    /// it is committed before `push` returns.
+    pub fn push(&mut self, leaf_hash: Hash) -> Result<u64> {
         let mut wtxn = self.storage.write_txn()?;
 
         let leaf_pos = self.size;
-        self.nodes.put(
-            &mut wtxn,
-            &encode_pos(leaf_pos),
-            &hash_bytes_32(&output.to_bytes()),
-        )?;
+        self.nodes.put(&mut wtxn, &encode_pos(leaf_pos), &leaf_hash)?;
         self.size += 1;
         self.leaf_count += 1;
 
@@ -452,12 +451,13 @@ impl Pmmr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wots::keygen;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn output(byte: u8) -> Output {
-        let (_, pk) = keygen(&[byte; 32]);
-        Output::new(&pk, 100)
+    /// An arbitrary but distinct 32-byte leaf hash for test purposes --
+    /// this module doesn't care what a leaf represents, so there's no
+    /// need to route through `Output`/`wots` here at all anymore.
+    fn leaf(byte: u8) -> Hash {
+        hash_bytes_32(&[byte; 1])
     }
 
     /// Builds the same merge structure `Pmmr::push` does, but as a
@@ -594,10 +594,10 @@ mod tests {
         let dir_b = TempDir::new();
         let storage_a = Storage::open(&dir_a.0).unwrap();
         let mut a = Pmmr::open(&storage_a).unwrap();
-        a.push(&output(1)).unwrap();
+        a.push(leaf(1)).unwrap();
         let storage_b = Storage::open(&dir_b.0).unwrap();
         let mut b = Pmmr::open(&storage_b).unwrap();
-        b.push(&output(2)).unwrap();
+        b.push(leaf(2)).unwrap();
         assert_ne!(a.root().unwrap(), b.root().unwrap());
     }
 
@@ -607,10 +607,10 @@ mod tests {
         let dir_b = TempDir::new();
         let storage_a = Storage::open(&dir_a.0).unwrap();
         let mut a = Pmmr::open(&storage_a).unwrap();
-        a.push(&output(1)).unwrap();
+        a.push(leaf(1)).unwrap();
         let storage_b = Storage::open(&dir_b.0).unwrap();
         let mut b = Pmmr::open(&storage_b).unwrap();
-        b.push(&output(1)).unwrap();
+        b.push(leaf(1)).unwrap();
         assert_eq!(a.root().unwrap(), b.root().unwrap());
     }
 
@@ -627,7 +627,7 @@ mod tests {
         let expected_sizes = [1, 3, 4, 7];
         let expected_peak_counts = [1, 1, 2, 1];
         for (i, byte) in (1u8..=4).enumerate() {
-            mmr.push(&output(byte)).unwrap();
+            mmr.push(leaf(byte)).unwrap();
             assert_eq!(mmr.size(), expected_sizes[i]);
             assert_eq!(mmr.peaks.len(), expected_peak_counts[i]);
         }
@@ -641,7 +641,7 @@ mod tests {
         let mut mmr = Pmmr::open(&storage).unwrap();
         let mut leaf_positions = Vec::new();
         for byte in 1u8..=9 {
-            leaf_positions.push(mmr.push(&output(byte)).unwrap());
+            leaf_positions.push(mmr.push(leaf(byte)).unwrap());
         }
         let root = mmr.root().unwrap();
 
@@ -660,14 +660,14 @@ mod tests {
         let dir_b = TempDir::new();
         let storage_a = Storage::open(&dir_a.0).unwrap();
         let mut mmr = Pmmr::open(&storage_a).unwrap();
-        let pos = mmr.push(&output(1)).unwrap();
-        mmr.push(&output(2)).unwrap();
-        mmr.push(&output(3)).unwrap();
+        let pos = mmr.push(leaf(1)).unwrap();
+        mmr.push(leaf(2)).unwrap();
+        mmr.push(leaf(3)).unwrap();
         let proof = mmr.prove(pos).unwrap().unwrap();
 
         let storage_b = Storage::open(&dir_b.0).unwrap();
         let mut other = Pmmr::open(&storage_b).unwrap();
-        other.push(&output(9)).unwrap();
+        other.push(leaf(9)).unwrap();
         assert!(!proof.verify(other.root().unwrap()));
     }
 
@@ -676,9 +676,9 @@ mod tests {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
         let mut mmr = Pmmr::open(&storage).unwrap();
-        let pos = mmr.push(&output(1)).unwrap();
-        mmr.push(&output(2)).unwrap();
-        mmr.push(&output(3)).unwrap();
+        let pos = mmr.push(leaf(1)).unwrap();
+        mmr.push(leaf(2)).unwrap();
+        mmr.push(leaf(3)).unwrap();
         let root = mmr.root().unwrap();
 
         let mut proof = mmr.prove(pos).unwrap().unwrap();
@@ -691,10 +691,10 @@ mod tests {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
         let mut mmr = Pmmr::open(&storage).unwrap();
-        let pos = mmr.push(&output(1)).unwrap();
-        mmr.push(&output(2)).unwrap();
-        mmr.push(&output(3)).unwrap();
-        mmr.push(&output(4)).unwrap();
+        let pos = mmr.push(leaf(1)).unwrap();
+        mmr.push(leaf(2)).unwrap();
+        mmr.push(leaf(3)).unwrap();
+        mmr.push(leaf(4)).unwrap();
         let root = mmr.root().unwrap();
 
         let mut proof = mmr.prove(pos).unwrap().unwrap();
@@ -711,8 +711,8 @@ mod tests {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
         let mut mmr = Pmmr::open(&storage).unwrap();
-        mmr.push(&output(1)).unwrap();
-        mmr.push(&output(2)).unwrap(); // positions 0,1 are leaves; position 2 is their parent
+        mmr.push(leaf(1)).unwrap();
+        mmr.push(leaf(2)).unwrap(); // positions 0,1 are leaves; position 2 is their parent
         assert!(mmr.prove(2).unwrap().is_none());
     }
 
@@ -722,9 +722,9 @@ mod tests {
         let (root_before, leaf_pos) = {
             let storage = Storage::open(&dir.0).unwrap();
             let mut mmr = Pmmr::open(&storage).unwrap();
-            mmr.push(&output(1)).unwrap();
-            mmr.push(&output(2)).unwrap();
-            let pos = mmr.push(&output(3)).unwrap();
+            mmr.push(leaf(1)).unwrap();
+            mmr.push(leaf(2)).unwrap();
+            let pos = mmr.push(leaf(3)).unwrap();
             (mmr.root().unwrap(), pos)
         };
         // `mmr` and `storage` (and the `Env` it held) are fully dropped
@@ -741,7 +741,7 @@ mod tests {
 
         // Appending after reopening must continue from the right position,
         // not collide with or overwrite anything already stored.
-        let new_pos = reopened.push(&output(4)).unwrap();
+        let new_pos = reopened.push(leaf(4)).unwrap();
         assert_eq!(new_pos, 4);
         assert_ne!(reopened.root().unwrap(), root_before);
     }
