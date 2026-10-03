@@ -285,16 +285,33 @@ impl BlockBody {
         Ok(BlockBody { inputs, outputs })
     }
 
-    /// Whether both `inputs` and `outputs` are in canonical sorted order
-    /// (non-decreasing -- duplicates are fine, see the module docs on why
-    /// a position can legitimately be claimed more than once within a
-    /// body). `add_transaction` always maintains this by construction,
-    /// and so does `to_bytes`/`from_bytes` round-tripping *correctly*
-    /// -- but nothing stops a `BlockBody` from being built some other
-    /// way (`inputs`/`outputs` are public fields), so `Block::validate`
+    /// Whether both `inputs` and `outputs` are strictly increasing --
+    /// sorted, with **no duplicates**. Under the commitment scheme (see
+    /// the module docs), an exact repeat can only mean the same spend, or
+    /// the same output, claimed twice: there's no longer a legitimate
+    /// reason two honest, independent transactions would ever produce
+    /// the identical 32-byte commitment, so this is rejected outright
+    /// rather than deferred to chain-level resolution. `add_transaction`
+    /// maintains this by construction, and so does `to_bytes`/
+    /// `from_bytes` round-tripping a value that was already like this --
+    /// but nothing stops a `BlockBody` from being built some other way
+    /// (`inputs`/`outputs` are public fields), so `Block::validate`
     /// checks this explicitly rather than trusting it.
     pub fn is_canonically_ordered(&self) -> bool {
-        self.inputs.is_sorted() && self.outputs.is_sorted()
+        self.inputs.is_sorted_by(|a, b| a < b) && self.outputs.is_sorted_by(|a, b| a < b)
+    }
+
+    /// Whether any commitment appears in both `inputs` and `outputs` --
+    /// i.e. whether this block tries to spend an output it also creates,
+    /// within the same block. Disallowed: an output only becomes
+    /// spendable starting with the *next* block, which is what lets
+    /// chain-level validation apply a block's spends and its new outputs
+    /// as two independent passes against already-committed state,
+    /// rather than needing to reason about speculative, not-yet-applied
+    /// state partway through processing one block.
+    pub fn spends_its_own_output(&self) -> bool {
+        let outputs: std::collections::HashSet<&[u8; 32]> = self.outputs.iter().collect();
+        self.inputs.iter().any(|commitment| outputs.contains(commitment))
     }
 }
 
@@ -306,14 +323,19 @@ pub struct Block {
 
 impl Block {
     /// Whether this block is sound *on its own*: proof of work checks
-    /// out, the body is canonically ordered, and the header's `body_hash`
-    /// actually matches the body. This is deliberately everything `Block`
-    /// can check without touching any chain state -- see the module
-    /// docs. Resolving spends, checking balance, catching double-spends,
-    /// and applying updates all live in `chain::validate_block` instead.
+    /// out, the body is canonically ordered (sorted, no duplicates) and
+    /// doesn't spend any output it also creates, and the header's
+    /// `body_hash` actually matches the body. This is deliberately
+    /// everything `Block` can check without touching any chain state --
+    /// see the module docs. Resolving spends against real chain state,
+    /// checking balance, catching reuse across different blocks, and
+    /// applying updates all live in `chain::validate_block` instead --
+    /// but duplicate-commitment and same-block-spend detection don't
+    /// need any of that, since they're properties of the body's own two
+    /// lists, nothing else.
     ///
-    /// The ordering check matters here, specifically, rather than at
-    /// decode time: `BlockBody::from_bytes` only checks that bytes are
+    /// These checks matter here, specifically, rather than at decode
+    /// time: `BlockBody::from_bytes` only checks that bytes are
     /// well-formed, not that they're canonical, and `inputs`/`outputs`
     /// are public fields a `BlockBody` could in principle be built
     /// through some other way entirely. Checking it here means
@@ -326,6 +348,9 @@ impl Block {
             return false;
         }
         if !self.body.is_canonically_ordered() {
+            return false;
+        }
+        if self.body.spends_its_own_output() {
             return false;
         }
         if self.body.body_hash() != self.header.body_hash {
@@ -619,13 +644,53 @@ mod tests {
     }
 
     /// Duplicate adjacent commitments (the same value twice, in order)
-    /// are not an ordering violation -- `BlockBody` allows duplicates
-    /// (double-spend detection is `chain::validate_block`'s job, not an
-    /// ordering concern); only an actual inversion counts as disordered.
+    /// are rejected -- an exact repeat can only mean the same spend, or
+    /// the same output, claimed twice, which is never legitimate under
+    /// the commitment scheme (see `is_canonically_ordered`'s docs).
     #[test]
-    fn is_canonically_ordered_allows_duplicates() {
+    fn is_canonically_ordered_rejects_duplicate_inputs() {
         let a = commitment_of(&keypair(1).1, 10);
-        assert!(BlockBody { inputs: vec![a, a], outputs: vec![] }.is_canonically_ordered());
+        assert!(!BlockBody { inputs: vec![a, a], outputs: vec![] }.is_canonically_ordered());
+    }
+
+    #[test]
+    fn is_canonically_ordered_rejects_duplicate_outputs() {
+        let a = commitment_of(&keypair(1).1, 10);
+        assert!(!BlockBody { inputs: vec![], outputs: vec![a, a] }.is_canonically_ordered());
+    }
+
+    #[test]
+    fn spends_its_own_output_detects_overlap() {
+        let a = commitment_of(&keypair(1).1, 10);
+        let b = commitment_of(&keypair(2).1, 20);
+
+        assert!(!BlockBody { inputs: vec![a], outputs: vec![b] }.spends_its_own_output());
+        assert!(BlockBody { inputs: vec![a], outputs: vec![a] }.spends_its_own_output());
+    }
+
+    /// A block that tries to spend an output it also creates is rejected
+    /// by `validate`, even though it's canonically ordered and the
+    /// header's `body_hash` honestly matches.
+    #[test]
+    fn validate_rejects_a_block_that_spends_its_own_output() {
+        let a = commitment_of(&keypair(1).1, 10);
+        let body = BlockBody {
+            inputs: vec![a],
+            outputs: vec![a],
+        };
+        assert!(body.is_canonically_ordered()); // not the thing being tested here
+        assert!(body.spends_its_own_output());
+
+        let header = mined_header(BlockHeader {
+            prev_hash: [0u8; 32],
+            pmmr_root: [0u8; 32],
+            bitmap_root: [0u8; 32],
+            body_hash: body.body_hash(),
+            nonce: [0u8; 32],
+        });
+        let block = Block { header, body };
+
+        assert!(!block.validate());
     }
 
     /// The end-to-end version of the point above: a block whose body is
