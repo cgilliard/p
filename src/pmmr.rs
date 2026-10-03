@@ -68,10 +68,22 @@
 //! tree shapes, against a from-scratch reference that builds the same
 //! links explicitly and independently.
 //!
-//! **Out of scope for now** (noted as explicit follow-up work, not
-//! oversights): pruning/compaction of spent outputs, and rewinding to an
-//! earlier size on a chain reorg. This module only covers append, root, and
-//! inclusion proofs -- the core structure everything else builds on.
+//! # Rewinding
+//!
+//! `truncate` restores the exact `leaf_count`/`peaks` (and therefore
+//! `root`) an earlier, smaller version of this same PMMR had -- the
+//! one new primitive chain-level reorg support needs from this
+//! module. It's cheap and needs no historical snapshots: the MMR
+//! shape for a given leaf count is a deterministic function of that
+//! count alone, so the new peaks are just recomputed from scratch
+//! (`peaks_for_leaf_count`), and nothing under the new size is ever
+//! actually deleted (see `truncate`'s own docs for why that's fine).
+//!
+//! **Still out of scope** (noted as explicit follow-up work, not an
+//! oversight): pruning/compaction of spent outputs -- `truncate`
+//! rewinds the *shape*, but reclaiming the storage of leaves that will
+//! never be rewound back to is a separate concern this module doesn't
+//! address yet.
 
 // `main.rs` doesn't call into this module yet (it just prints "Hello
 // world!"), so allow dead code here rather than suppressing warnings
@@ -92,6 +104,10 @@ pub enum Error {
     /// The on-disk metadata was missing or malformed -- e.g. opening a
     /// directory that isn't actually a PMMR this code created.
     Corrupt(&'static str),
+    /// `truncate` was asked for a `new_leaf_count` larger than the
+    /// current one -- growing the PMMR is `push`'s job, not
+    /// `truncate`'s.
+    WouldGrow,
 }
 
 impl From<crate::storage::Error> for Error {
@@ -112,6 +128,7 @@ impl std::fmt::Display for Error {
             Error::Storage(e) => write!(f, "storage error: {e}"),
             Error::Heed(e) => write!(f, "LMDB error: {e}"),
             Error::Corrupt(msg) => write!(f, "corrupt PMMR metadata: {msg}"),
+            Error::WouldGrow => write!(f, "truncate's new_leaf_count exceeds the current leaf_count"),
         }
     }
 }
@@ -154,6 +171,47 @@ fn bag_peaks(peaks: &[(u64, Hash)]) -> Hash {
 /// the structure has merged `n - popcount(n)` internal nodes into being.
 fn size_for_leaf_count(leaf_count: u64) -> u64 {
     2 * leaf_count - leaf_count.count_ones() as u64
+}
+
+/// The `(height, position)` of every peak a PMMR with exactly
+/// `leaf_count` leaves has -- computed fresh, independent of
+/// `push`/`truncate`, by replaying the same merge *bookkeeping* `push`
+/// does (sizes, heights, positions) without touching storage or
+/// computing a single real hash. The MMR shape for a given leaf count
+/// is a deterministic function of that count alone (standard MMR
+/// property: it mirrors the count's binary representation), so this
+/// never needs to know what was actually pushed, only how many times.
+///
+/// What `truncate` uses to figure out the new `peaks` it needs to
+/// write -- deliberately *not* shared code with `push`'s own loop
+/// (which interleaves this same bookkeeping with real hash reads/
+/// writes), so a bug in one is unlikely to be mirrored in the other.
+/// The round-trip tests below (push to N, remember the root; push
+/// more; truncate back to N; the root must match exactly) are what
+/// actually cross-checks the two against each other.
+fn peaks_for_leaf_count(leaf_count: u64) -> Vec<(u32, u64)> {
+    let mut size: u64 = 0;
+    let mut peaks: Vec<(u32, u64)> = Vec::new();
+
+    for _ in 0..leaf_count {
+        let leaf_pos = size;
+        size += 1;
+        peaks.push((0, leaf_pos));
+        while peaks.len() >= 2 {
+            let (h_top, _) = peaks[peaks.len() - 1];
+            let (h_second, _) = peaks[peaks.len() - 2];
+            if h_top != h_second {
+                break;
+            }
+            peaks.pop();
+            peaks.pop();
+            let parent_pos = size;
+            size += 1;
+            peaks.push((h_second + 1, parent_pos));
+        }
+    }
+
+    peaks
 }
 
 fn encode_pos(pos: u64) -> [u8; 8] {
@@ -391,6 +449,41 @@ impl Pmmr {
         Ok(leaf_pos)
     }
 
+    /// Roll back to exactly the state a PMMR with only `new_leaf_count`
+    /// leaves pushed would have -- same `leaf_count`, same `peaks`,
+    /// and therefore the same `root` and the same proofs for every
+    /// leaf still within range. Fails with `Error::WouldGrow` if
+    /// `new_leaf_count` is larger than the current `leaf_count`;
+    /// growing is `push`'s job.
+    ///
+    /// Doesn't touch `nodes` at all: every leaf and internal node
+    /// beyond the new size simply becomes unreferenced (nothing will
+    /// ever look it up again, since `leaf_count`/`peaks` are the only
+    /// things that say what's "current"), not deleted. That's
+    /// deliberate, not an oversight -- pruning/compaction is still out
+    /// of scope (see the module docs), and there's nothing to reclaim
+    /// here that LMDB would actually shrink anyway. A later `push`
+    /// picks up again from `new_leaf_count` and will overwrite those
+    /// unreferenced positions as it goes, which is exactly what should
+    /// happen once this PMMR's chain has truly moved on.
+    ///
+    /// This is the one new primitive chain-level reorg support needs
+    /// from this module: unwinding back to a common ancestor means
+    /// restoring that ancestor's own leaf count exactly, and nothing
+    /// about *which* leaves existed back then needs to be recorded
+    /// separately -- it's fully determined by the count alone.
+    pub fn truncate(&mut self, wtxn: &mut heed::RwTxn, new_leaf_count: u64) -> Result<()> {
+        let current = self.leaf_count(wtxn)?;
+        if new_leaf_count > current {
+            return Err(Error::WouldGrow);
+        }
+
+        let peaks = peaks_for_leaf_count(new_leaf_count);
+        self.meta.put(wtxn, b"leaf_count".as_slice(), &encode_pos(new_leaf_count))?;
+        self.meta.put(wtxn, b"peaks".as_slice(), &encode_peaks(&peaks))?;
+        Ok(())
+    }
+
     /// The current root: all peaks bagged together. The root of an empty
     /// PMMR is defined as the hash of an empty byte string.
     pub fn root(&self, txn: &heed::RoTxn) -> Result<Hash> {
@@ -478,6 +571,15 @@ mod tests {
         let pos = mmr.push(&mut wtxn, leaf_hash).unwrap();
         wtxn.commit().unwrap();
         pos
+    }
+
+    fn truncate_committed(storage: &Storage, mmr: &mut Pmmr, new_leaf_count: u64) -> Result<()> {
+        let mut wtxn = storage.write_txn().unwrap();
+        let result = mmr.truncate(&mut wtxn, new_leaf_count);
+        if result.is_ok() {
+            wtxn.commit().unwrap();
+        }
+        result
     }
 
     fn root(storage: &Storage, mmr: &Pmmr) -> Hash {
@@ -791,5 +893,184 @@ mod tests {
         let new_pos = push_committed(&storage, &mut reopened, leaf(4));
         assert_eq!(new_pos, 4);
         assert_ne!(root(&storage, &reopened), root_before);
+    }
+
+    #[test]
+    fn truncate_rejects_growing_past_the_current_leaf_count() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
+        push_committed(&storage, &mut mmr, leaf(1));
+        push_committed(&storage, &mut mmr, leaf(2));
+
+        let err = truncate_committed(&storage, &mut mmr, 3).unwrap_err();
+        assert!(matches!(err, Error::WouldGrow));
+        // Nothing should have changed.
+        assert_eq!(leaf_count(&storage, &mmr), 2);
+    }
+
+    #[test]
+    fn truncate_to_the_current_leaf_count_is_a_no_op() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
+        for byte in 1u8..=6 {
+            push_committed(&storage, &mut mmr, leaf(byte));
+        }
+        let before = root(&storage, &mmr);
+
+        truncate_committed(&storage, &mut mmr, 6).unwrap();
+        assert_eq!(root(&storage, &mmr), before);
+        assert_eq!(leaf_count(&storage, &mmr), 6);
+    }
+
+    #[test]
+    fn truncate_to_zero_restores_the_empty_root() {
+        let dir_a = TempDir::new();
+        let dir_b = TempDir::new();
+        let storage_a = Storage::open(&dir_a.0).unwrap();
+        let mut mmr = Pmmr::open(&storage_a).unwrap();
+        let empty_root = root(&storage_a, &mmr); // before any pushes at all
+        for byte in 1u8..=10 {
+            push_committed(&storage_a, &mut mmr, leaf(byte));
+        }
+
+        truncate_committed(&storage_a, &mut mmr, 0).unwrap();
+        assert_eq!(leaf_count(&storage_a, &mmr), 0);
+        assert_eq!(root(&storage_a, &mmr), empty_root);
+
+        // Cross-checked against an entirely separate, never-touched PMMR.
+        let storage_b = Storage::open(&dir_b.0).unwrap();
+        let b = Pmmr::open(&storage_b).unwrap();
+        assert_eq!(root(&storage_a, &mmr), root(&storage_b, &b));
+    }
+
+    /// The key correctness property for reorg support: truncating back
+    /// to `n` leaves must restore *exactly* the root (and `leaf_count`)
+    /// a PMMR that only ever had `n` leaves pushed would have -- not
+    /// just some different-but-plausible root. Checked against
+    /// snapshots actually recorded while pushing (41 of them, for 0
+    /// through 40 leaves), not a separately-derived expectation --
+    /// this is the real thing `peaks_for_leaf_count` has to agree with
+    /// `push` on, for every shape from totally empty up through several
+    /// rounds of carrying merges.
+    #[test]
+    fn truncate_recovers_every_earlier_root_exactly() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
+
+        let mut roots_by_count = vec![root(&storage, &mmr)]; // index 0: empty
+        for byte in 1u8..=40 {
+            push_committed(&storage, &mut mmr, leaf(byte));
+            roots_by_count.push(root(&storage, &mmr));
+        }
+
+        // Descending, since `truncate` can only ever move to a smaller
+        // leaf count than whatever it's currently at.
+        for n in (0..=40u64).rev() {
+            truncate_committed(&storage, &mut mmr, n).unwrap();
+            assert_eq!(leaf_count(&storage, &mmr), n, "leaf_count mismatch after truncating to {n}");
+            assert_eq!(
+                root(&storage, &mmr),
+                roots_by_count[n as usize],
+                "root mismatch after truncating to {n}"
+            );
+        }
+    }
+
+    /// The property that actually matters for a reorg: after rewinding
+    /// and pushing a *different* continuation, the result must be
+    /// indistinguishable from a PMMR whose history never included the
+    /// discarded leaves at all -- not just "some" self-consistent
+    /// state.
+    #[test]
+    fn pushing_a_different_continuation_after_truncate_matches_never_having_diverged() {
+        let dir_a = TempDir::new();
+        let storage_a = Storage::open(&dir_a.0).unwrap();
+        let mut a = Pmmr::open(&storage_a).unwrap();
+        for byte in 1u8..=5 {
+            push_committed(&storage_a, &mut a, leaf(byte));
+        }
+        // `a` goes on to leaves 6 and 7, then gets rewound -- as if a
+        // competing chain, built on top of the same first 5 leaves,
+        // turned out to be the one that should have won instead.
+        push_committed(&storage_a, &mut a, leaf(6));
+        push_committed(&storage_a, &mut a, leaf(7));
+        truncate_committed(&storage_a, &mut a, 5).unwrap();
+        push_committed(&storage_a, &mut a, leaf(99));
+        push_committed(&storage_a, &mut a, leaf(100));
+
+        let dir_b = TempDir::new();
+        let storage_b = Storage::open(&dir_b.0).unwrap();
+        let mut b = Pmmr::open(&storage_b).unwrap();
+        for byte in [1u8, 2, 3, 4, 5, 99, 100] {
+            push_committed(&storage_b, &mut b, leaf(byte));
+        }
+
+        assert_eq!(leaf_count(&storage_a, &a), leaf_count(&storage_b, &b));
+        assert_eq!(root(&storage_a, &a), root(&storage_b, &b));
+    }
+
+    #[test]
+    fn truncate_sees_pushes_still_pending_in_the_same_transaction() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
+
+        let mut wtxn = storage.write_txn().unwrap();
+        mmr.push(&mut wtxn, leaf(1)).unwrap();
+        mmr.push(&mut wtxn, leaf(2)).unwrap();
+        mmr.push(&mut wtxn, leaf(3)).unwrap();
+        // Truncating back to 1, all within the same, still-uncommitted
+        // transaction -- confirms `truncate` reads `leaf_count` through
+        // `wtxn` itself, not some separately-committed value, same
+        // composability `push` already relies on.
+        mmr.truncate(&mut wtxn, 1).unwrap();
+        assert_eq!(mmr.leaf_count(&wtxn).unwrap(), 1);
+        wtxn.commit().unwrap();
+
+        assert_eq!(leaf_count(&storage, &mmr), 1);
+    }
+
+    #[test]
+    fn truncated_state_persists_after_reopening() {
+        let dir = TempDir::new();
+        let root_after_truncate = {
+            let storage = Storage::open(&dir.0).unwrap();
+            let mut mmr = Pmmr::open(&storage).unwrap();
+            for byte in 1u8..=5 {
+                push_committed(&storage, &mut mmr, leaf(byte));
+            }
+            truncate_committed(&storage, &mut mmr, 2).unwrap();
+            root(&storage, &mmr)
+        };
+
+        let storage = Storage::open(&dir.0).unwrap();
+        let reopened = Pmmr::open(&storage).unwrap();
+        assert_eq!(leaf_count(&storage, &reopened), 2);
+        assert_eq!(root(&storage, &reopened), root_after_truncate);
+    }
+
+    #[test]
+    fn proof_for_a_position_beyond_the_truncated_size_is_unavailable() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut mmr = Pmmr::open(&storage).unwrap();
+        let positions: Vec<u64> = (1u8..=5).map(|b| push_committed(&storage, &mut mmr, leaf(b))).collect();
+
+        truncate_committed(&storage, &mut mmr, 3).unwrap();
+
+        // The first three leaves are still provable against the new root.
+        let new_root = root(&storage, &mmr);
+        for &pos in &positions[..3] {
+            let proof = prove(&storage, &mmr, pos).expect("still within range");
+            assert!(proof.verify(new_root));
+        }
+        // Positions beyond the truncated size are gone, even though the
+        // underlying node data technically still sits in `nodes`.
+        for &pos in &positions[3..] {
+            assert!(prove(&storage, &mmr, pos).is_none());
+        }
     }
 }
