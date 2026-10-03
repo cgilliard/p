@@ -14,6 +14,20 @@ rule, and building it against an unspecified rule means redoing it.
 **Status:** not started. This is the real proof's core job, not a
 separate task alongside it.
 
+**Note on scope:** the proof's job isn't just hiding amounts/pubkeys --
+the goal is a *recursive* proof, so a light client (or new node) can
+verify one constant-size proof and trust the entire chain back to
+genesis, without downloading or replaying any of it. That means any
+per-block rule that only gives a *whole-chain* guarantee once composed
+recursively belongs here too, not just the rules that need hidden data.
+Timestamp monotonicity (see #3) is exactly that shape -- it's fully
+public data, so it's not here for privacy reasons, but a plaintext
+`chain.rs` check of it only helps a full node replaying every block
+directly; folding "my timestamp >= the previous (already-verified)
+timestamp" into each recursive step is what lets a light client get the
+same guarantee for free. (The future-bound timestamp check, by
+contrast, can *never* be part of any proof -- see #3.)
+
 Nothing anywhere checks that total output value is bounded by block
 reward. Concretely, *today*, a block can contain any number of
 zero-input "reward" transactions, minting any amount to any pubkey, and
@@ -42,6 +56,9 @@ What the circuit needs pinned down:
 - A rule for how many reward-claiming transactions a block may contain
   (exactly one?).
 - The one balance equation above.
+- Timestamp monotonicity: `header.timestamp >= previous_header.timestamp`,
+  checked at each recursive step against the previous (already-verified)
+  timestamp -- see the scope note above and #3.
 
 What's still ordinary (non-proof) plumbing, once the circuit exists:
 the miner needs to compute `sum(their plaintext inputs) -
@@ -71,29 +88,48 @@ multi-miner network needs this. Needs:
 
 ## 3. No block height or timestamp
 
-**Status:** done, with one piece deliberately deferred.
+**Status:** done. Timestamp enforcement split across two homes, for a
+reason worth remembering: one piece can recursively compose into the
+proof, the other structurally never can.
 
-- **Height** is deliberately *not* a header field -- it's just "how
-  many blocks came before this one," fully recoverable without
-  spending any of the header's own space on it. `Chain` tracks it as a
-  side field instead: `Chain::height(&self, txn) -> Result<Option<u64>>`
-  (`None` for an empty chain, `Some(0)` after the first block, and so
-  on), backed by a `next_height` counter in `chain_meta` that advances
-  by one in the same write transaction every successful `apply_block`
-  commits (see `chain.rs`).
-- **Timestamp** *is* a header field now: `BlockHeader::timestamp: u64`
+- **Height *is* a header field after all** (`BlockHeader::height: u64`,
+  covered by PoW) -- the original reasoning for leaving it out ("fully
+  recoverable by walking `prev_hash`") only holds for a full node that
+  already has the whole chain. A light client verifying a single block
+  or recursive proof, without downloading the rest, has nothing to
+  walk -- it needs height to be self-contained, verifiable data on the
+  block itself, same as everything else PoW covers. `Chain` still
+  independently tracks and checks it (`Error::WrongHeight` if a new
+  block's claimed height isn't exactly one more than the current tip's)
+  so a full node catches a bad claim immediately, same spirit as
+  re-deriving `pmmr_root`/`bitmap_root` rather than trusting them.
+  `chain_meta` stores the tip's one full header now (`tip_header`,
+  under `TIP_HEADER_KEY`) rather than separate `tip_hash` +
+  `next_height` scalars -- `tip_hash()`/`height()` both just derive
+  from it, so there's no longer two independently-updated pieces of
+  tip metadata that could drift out of sync with each other.
+- **Timestamp** *is* a header field too: `BlockHeader::timestamp: u64`
   (Unix seconds), stamped with the current time in
   `UnprovenBlock::finish` and included in `pow_preimage` (so it can't
   be altered post-mining without redoing the proof of work, same as
-  every other committed field). `HEADER_LEN` grew from 160 to 168
-  bytes accordingly.
-- **Deferred:** no validation of `timestamp` exists yet -- no
-  monotonicity check against the previous block, no bound on how far
-  into the future it can claim to be. Not yet needed with one miner;
-  common once multiple miners exist. Revisit alongside #2 (fork
-  handling), since a sensible bound (e.g. median-time-past) usually
-  wants a short run of recent headers to compare against, which only
-  matters once there's more than one chain to compare.
+  every other committed field). `HEADER_LEN` grew from 160 (original)
+  to 176 bytes across both additions (160 → 168 for `timestamp`, then
+  168 → 176 for `height`).
+- **Future-bound check: implemented**, in plaintext, in
+  `Chain::apply_block`: rejects (`Error::TimestampTooFarInFuture`) a
+  header whose `timestamp` is more than `MAX_FUTURE_DRIFT_SECS` (2
+  hours, Bitcoin's order of magnitude) ahead of this node's own clock
+  (`block::now_unix`). This rule can **never** move into any proof,
+  recursive or not -- it's a statement about the relationship between a
+  timestamp and whenever *this particular check* runs, not a fact fixed
+  at proving time. Every verifier checks this locally, against its own
+  clock, no matter how much of the rest of chain validity eventually
+  gets folded into a recursive proof.
+- **Monotonicity check: deferred to the proof**, folded into #1 instead
+  of implemented here in plaintext. Unlike the future-bound check, this
+  one *is* a fixed, recursively-composable fact (each header's
+  timestamp relative to the one before it), so it belongs in the same
+  place the balance equation does -- see #1's scope note.
 
 This also settles #1's dependency on a schedule-based reward (height
 is now available to key a reward-halving schedule off of, whenever #1

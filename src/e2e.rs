@@ -10,7 +10,7 @@
 #[cfg(test)]
 mod tests {
     use crate::block::mine_block;
-    use crate::chain::{Chain, Error};
+    use crate::chain::{self, Chain, Error};
     use crate::output::Output;
     use crate::prover;
     use crate::storage::Storage;
@@ -67,10 +67,11 @@ mod tests {
     /// all through `Chain`'s public API.
     fn mine_and_apply(chain: &mut Chain, transactions: &[Transaction]) -> Result<(), Error> {
         let unproven = chain.build_block(transactions)?;
+        let target = unproven.target;
         let proof =
             prover::prove_block(&unproven.inputs, &unproven.outputs, transactions).expect("stub prover always succeeds");
         let mut block = unproven.finish(proof);
-        assert!(mine_block(&mut block, 100_000), "should find a nonce quickly");
+        assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
         chain.apply_block(&block)
     }
 
@@ -84,7 +85,7 @@ mod tests {
     fn miner_mines_two_blocks_and_pays_another_user() {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let mut chain = Chain::open(&storage).unwrap();
+        let mut chain = Chain::open(&storage, chain::DifficultyConfig::for_tests()).unwrap();
 
         // The miner's two reward addresses -- a fresh one each time,
         // since a WOTS pubkey can only ever sign once (see

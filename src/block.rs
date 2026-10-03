@@ -75,25 +75,34 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The fixed proof-of-work target: first byte zero, the rest maxed out, so
-/// a candidate hash meets it iff its own first byte is exactly zero --
-/// true for a uniformly random hash with probability 1/256. No difficulty
-/// retargeting yet (that needs block height/timestamps first), so this is
-/// one constant every block is mined against.
-pub const FIXED_MAX_HASH: [u8; 32] = {
+/// The proof-of-work target used for the very first retarget window,
+/// before `chain::Chain` has adjusted anything: first byte zero, the
+/// rest maxed out, so a candidate hash meets it iff its own first byte
+/// is exactly zero -- true for a uniformly random hash with probability
+/// 1/256. Not a fixed, chain-wide constant any more -- see `chain`'s
+/// docs on difficulty retargeting -- so `pow_valid`/`validate`/
+/// `mine_header`/`mine_block` all take the actual target to check
+/// against as an explicit parameter, rather than assuming this one.
+pub const INITIAL_MAX_HASH: [u8; 32] = {
     let mut b = [0xffu8; 32];
     b[0] = 0x00;
     b
 };
 
 /// `prev_hash`, `pmmr_root`, `bitmap_root`, `body_hash` (32 bytes each),
-/// then `timestamp` (8 bytes) and `nonce` (32 bytes) -- `BlockHeader`'s
-/// fixed encoded width. Deliberately **no height field**: height is
-/// just "how many blocks came before this one," entirely recoverable by
-/// walking `prev_hash` (or, cheaply, from `chain::Chain`'s own count of
-/// applied blocks -- see that module's docs) without spending any of
-/// the header's own space on a number every node can already derive.
-pub const HEADER_LEN: usize = 32 * 4 + 8 + 32;
+/// then `height` (8 bytes), `timestamp` (8 bytes), and `nonce` (32
+/// bytes) -- `BlockHeader`'s fixed encoded width.
+///
+/// `height` **is** a header field, deliberately -- a full node
+/// replaying every block from genesis could always reconstruct it by
+/// counting, but a light client verifying a single block (or a single
+/// recursive proof) without downloading the rest of the chain has
+/// nothing to count. Putting it here, covered by PoW like every other
+/// field, is what lets anyone learn a block's height directly from the
+/// block itself, without trusting an unverifiable claim or replaying
+/// anything. See `chain::Chain`'s docs for how a full node still
+/// double-checks a claimed height against what it already knows.
+pub const HEADER_LEN: usize = 32 * 4 + 8 + 8 + 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
@@ -101,6 +110,9 @@ pub struct BlockHeader {
     pub pmmr_root: [u8; 32],
     pub bitmap_root: [u8; 32],
     pub body_hash: [u8; 32],
+    /// How many blocks precede this one (the first real block is height
+    /// `0`). See `HEADER_LEN`'s docs for why this is a header field.
+    pub height: u64,
     /// Unix time (seconds) this header was assembled, as claimed by
     /// whoever built it -- not yet validated against anything (no
     /// monotonicity or future-time bound check exists yet; see
@@ -112,16 +124,18 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Serialize to exactly `HEADER_LEN` bytes: the six fields,
-    /// concatenated in field-declaration order (`timestamp` big-endian).
+    /// Serialize to exactly `HEADER_LEN` bytes: the seven fields,
+    /// concatenated in field-declaration order (`height`/`timestamp`
+    /// big-endian).
     pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
         out[0..32].copy_from_slice(&self.prev_hash);
         out[32..64].copy_from_slice(&self.pmmr_root);
         out[64..96].copy_from_slice(&self.bitmap_root);
         out[96..128].copy_from_slice(&self.body_hash);
-        out[128..136].copy_from_slice(&self.timestamp.to_be_bytes());
-        out[136..168].copy_from_slice(&self.nonce);
+        out[128..136].copy_from_slice(&self.height.to_be_bytes());
+        out[136..144].copy_from_slice(&self.timestamp.to_be_bytes());
+        out[144..176].copy_from_slice(&self.nonce);
         out
     }
 
@@ -141,24 +155,27 @@ impl BlockHeader {
             pmmr_root: bytes[32..64].try_into().unwrap(),
             bitmap_root: bytes[64..96].try_into().unwrap(),
             body_hash: bytes[96..128].try_into().unwrap(),
-            timestamp: u64::from_be_bytes(bytes[128..136].try_into().unwrap()),
-            nonce: bytes[136..168].try_into().unwrap(),
+            height: u64::from_be_bytes(bytes[128..136].try_into().unwrap()),
+            timestamp: u64::from_be_bytes(bytes[136..144].try_into().unwrap()),
+            nonce: bytes[144..176].try_into().unwrap(),
         })
     }
 
     /// Everything the header commits to except the nonce -- what
     /// `pow::verify`/`pow::mine` actually hash, re-hashed with a new
-    /// nonce on every mining attempt. Includes `timestamp` (so it can't
-    /// be altered post-mining without redoing the proof of work, same
-    /// reasoning Bitcoin hashes its timestamp too). Doesn't need to
-    /// separately mention the proof: `body_hash` already commits to it
-    /// (see `BlockBody`'s docs), so PoW covers it transitively.
+    /// nonce on every mining attempt. Includes `height` and `timestamp`
+    /// (so neither can be altered post-mining without redoing the proof
+    /// of work, same reasoning Bitcoin hashes its timestamp too).
+    /// Doesn't need to separately mention the proof: `body_hash` already
+    /// commits to it (see `BlockBody`'s docs), so PoW covers it
+    /// transitively.
     pub(crate) fn pow_preimage(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(32 * 4 + 8);
+        let mut bytes = Vec::with_capacity(32 * 4 + 8 + 8);
         bytes.extend_from_slice(&self.prev_hash);
         bytes.extend_from_slice(&self.pmmr_root);
         bytes.extend_from_slice(&self.bitmap_root);
         bytes.extend_from_slice(&self.body_hash);
+        bytes.extend_from_slice(&self.height.to_be_bytes());
         bytes.extend_from_slice(&self.timestamp.to_be_bytes());
         bytes
     }
@@ -169,8 +186,13 @@ impl BlockHeader {
         pow::pow_hash(&self.pow_preimage(), self.nonce)
     }
 
-    pub fn pow_valid(&self) -> bool {
-        pow::verify(&self.pow_preimage(), self.nonce, &FIXED_MAX_HASH)
+    /// Whether `nonce` actually satisfies `target` for this header's
+    /// preimage. `target` is supplied by the caller rather than a fixed
+    /// constant: the right target for a given height depends on chain
+    /// history (see `chain`'s docs on difficulty retargeting), which
+    /// this type has no access to on its own.
+    pub fn pow_valid(&self, target: &[u8; 32]) -> bool {
+        pow::verify(&self.pow_preimage(), self.nonce, target)
     }
 }
 
@@ -383,7 +405,7 @@ impl BlockBody {
 }
 
 /// What `chain::Chain::build_block` actually produces: every chain-
-/// state-dependent field resolved (`prev_hash`, `pmmr_root`,
+/// state-dependent field resolved (`prev_hash`, `height`, `pmmr_root`,
 /// `bitmap_root`, and the flat `inputs`/`outputs` lists), but no proof
 /// yet, and so no `Block` yet either -- `BlockBody`/`Block` both require
 /// a real `proof` (see `BlockBody`'s docs), and this type deliberately
@@ -391,9 +413,17 @@ impl BlockBody {
 /// actual `Block`, and it needs a `Proof` to do it (from
 /// `prover::prove_block`) -- which is what keeps `pow::mine_block` from
 /// being callable on anything until proving has actually happened.
+///
+/// `target` isn't part of the eventual header -- it's not something a
+/// block commits to, just the PoW difficulty `chain::Chain` currently
+/// expects (see that module's docs on retargeting). It's carried here
+/// purely so whoever's about to mine has it on hand without a separate
+/// lookup; grab it before calling `finish` (which consumes `self`).
 #[derive(Debug)]
 pub struct UnprovenBlock {
     pub prev_hash: [u8; 32],
+    pub height: u64,
+    pub target: [u8; 32],
     pub pmmr_root: [u8; 32],
     pub bitmap_root: [u8; 32],
     pub inputs: Vec<[u8; 32]>,
@@ -421,6 +451,7 @@ impl UnprovenBlock {
             pmmr_root: self.pmmr_root,
             bitmap_root: self.bitmap_root,
             body_hash: body.body_hash(),
+            height: self.height,
             timestamp: now_unix(),
             nonce: [0u8; 32],
         };
@@ -429,8 +460,10 @@ impl UnprovenBlock {
 }
 
 /// The current Unix time, in seconds -- what `UnprovenBlock::finish`
-/// stamps a new header with.
-fn now_unix() -> u64 {
+/// stamps a new header with, and what `chain::Chain::apply_block` reads
+/// again to bound how far into the future a header's claimed
+/// `timestamp` is allowed to be.
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock is before 1970")
@@ -444,31 +477,37 @@ pub struct Block {
 }
 
 impl Block {
-    /// Whether this block is sound *on its own*: proof of work checks
-    /// out, the body is canonically ordered (sorted, no duplicates) and
-    /// doesn't spend any output it also creates, the header's
+    /// Whether this block is sound *on its own*, given the proof-of-work
+    /// `target` it's supposed to meet: proof of work checks out against
+    /// `target`, the body is canonically ordered (sorted, no duplicates)
+    /// and doesn't spend any output it also creates, the header's
     /// `body_hash` actually matches the body (proof included -- see
     /// `BlockBody`'s docs), and the proof itself checks out against the
-    /// body's commitments. This is deliberately everything `Block` can
-    /// check without touching any chain state -- see the module docs.
-    /// Resolving spends against real chain state, catching reuse across
-    /// different blocks, and applying updates all live in
-    /// `chain::Chain::apply_block` instead -- but duplicate-commitment,
-    /// same-block-spend, and proof validity don't need any of that,
-    /// since they're properties of the body (and the proof within it)
-    /// alone.
+    /// body's commitments.
+    ///
+    /// `target` is the one piece of this that isn't fully intrinsic to
+    /// the block: the *right* target for a given height depends on
+    /// chain history (see `chain`'s docs on difficulty retargeting), so
+    /// the caller -- `chain::Chain::apply_block`, which has that
+    /// history -- has to supply it. Everything else here is checked
+    /// without touching any chain state at all. Resolving spends against
+    /// real chain state, catching reuse across different blocks, and
+    /// applying updates all live in `chain::Chain::apply_block` too --
+    /// but duplicate-commitment, same-block-spend, and proof validity
+    /// don't need any of that, since they're properties of the body (and
+    /// the proof within it) alone.
     ///
     /// These checks matter here, specifically, rather than at decode
     /// time: `BlockBody::from_bytes` only checks that bytes are
     /// well-formed, not that they're canonical, and `inputs`/`outputs`
     /// are public fields a `BlockBody` could in principle be built
     /// through some other way entirely. Checking it here means
-    /// `validate` is a complete, self-contained answer to "is this
-    /// block acceptable" regardless of how the value in hand was
+    /// `validate` is a complete answer to "is this block acceptable
+    /// against this target" regardless of how the value in hand was
     /// constructed, rather than a check that's only honest if you also
     /// know it arrived via `from_bytes`.
-    pub fn validate(&self) -> bool {
-        if !self.header.pow_valid() {
+    pub fn validate(&self, target: &[u8; 32]) -> bool {
+        if !self.header.pow_valid(target) {
             return false;
         }
         if !self.body.is_canonically_ordered() {
@@ -507,16 +546,20 @@ impl Block {
     }
 }
 
-/// Mine `header` in place: search for a nonce satisfying `FIXED_MAX_HASH`,
-/// up to `max_attempts`, setting `header.nonce` and returning `true` on
+/// Mine `header` in place: search for a nonce satisfying `target`, up to
+/// `max_attempts`, setting `header.nonce` and returning `true` on
 /// success. Leaves `header` untouched and returns `false` if none of the
 /// first `max_attempts` nonces satisfy it. Lives here, rather than in
 /// `pow` itself, since `pow` is deliberately kept free of any dependency
 /// on `block` (see that module's docs) -- this is just a thin,
-/// `BlockHeader`-aware wrapper around `pow::mine`.
-pub fn mine_header(header: &mut BlockHeader, max_attempts: u64) -> bool {
+/// `BlockHeader`-aware wrapper around `pow::mine`. `target` should be
+/// whatever `chain::Chain` currently reports as the active target (see
+/// that module's docs on difficulty retargeting) -- mining against
+/// anything else just wastes work, since `apply_block` checks against
+/// its own idea of the right target, not whatever was mined against.
+pub fn mine_header(header: &mut BlockHeader, target: &[u8; 32], max_attempts: u64) -> bool {
     let preimage = header.pow_preimage();
-    match pow::mine(&preimage, &FIXED_MAX_HASH, max_attempts) {
+    match pow::mine(&preimage, target, max_attempts) {
         Some((nonce, _)) => {
             header.nonce = nonce;
             true
@@ -529,8 +572,8 @@ pub fn mine_header(header: &mut BlockHeader, max_attempts: u64) -> bool {
 /// value to call this on until `prover::prove_block` has already run
 /// (see `UnprovenBlock::finish`): that's what keeps mining from starting
 /// before proving does.
-pub fn mine_block(block: &mut Block, max_attempts: u64) -> bool {
-    mine_header(&mut block.header, max_attempts)
+pub fn mine_block(block: &mut Block, target: &[u8; 32], max_attempts: u64) -> bool {
+    mine_header(&mut block.header, target, max_attempts)
 }
 
 #[cfg(test)]
@@ -550,22 +593,22 @@ mod tests {
     }
 
     /// Mine a real nonce for `header` (with `nonce` still unset) against
-    /// `FIXED_MAX_HASH`, panicking if none is found within a generous
+    /// `INITIAL_MAX_HASH`, panicking if none is found within a generous
     /// attempt budget -- 1-in-256 odds per attempt, so this finishes in a
     /// handful of tries almost always.
     fn mined_header(mut header: BlockHeader) -> BlockHeader {
-        assert!(mine_header(&mut header, 100_000), "should find a nonce quickly");
+        assert!(mine_header(&mut header, &INITIAL_MAX_HASH, 100_000), "should find a nonce quickly");
         header
     }
 
-    /// A nonce guaranteed *not* to satisfy `FIXED_MAX_HASH` for the given
-    /// header preimage -- used to test PoW rejection without any chance
-    /// of test flakiness from accidentally picking a valid one.
+    /// A nonce guaranteed *not* to satisfy `INITIAL_MAX_HASH` for the
+    /// given header preimage -- used to test PoW rejection without any
+    /// chance of test flakiness from accidentally picking a valid one.
     fn a_failing_nonce(preimage: &[u8]) -> pow::Nonce {
         for counter in 0u64..64 {
             let mut nonce = [0u8; 32];
             nonce[..8].copy_from_slice(&counter.to_le_bytes());
-            if !pow::meets_target(&pow::pow_hash(preimage, nonce), &FIXED_MAX_HASH) {
+            if !pow::meets_target(&pow::pow_hash(preimage, nonce), &INITIAL_MAX_HASH) {
                 return nonce;
             }
         }
@@ -579,6 +622,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: BlockBody::new().body_hash(),
+            height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
         });
@@ -587,7 +631,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(block.validate());
+        assert!(block.validate(&INITIAL_MAX_HASH));
     }
 
     /// PoW is checked first -- an arbitrary (wrong) `body_hash` is fine
@@ -599,6 +643,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [4u8; 32],
+            height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
         };
@@ -611,7 +656,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(!block.validate());
+        assert!(!block.validate(&INITIAL_MAX_HASH));
     }
 
     /// A header whose `body_hash` doesn't match the actual body is
@@ -625,6 +670,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [0xABu8; 32], // does not match BlockBody::new()'s hash
+            height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
         });
@@ -633,7 +679,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(!block.validate());
+        assert!(!block.validate(&INITIAL_MAX_HASH));
     }
 
     /// A transaction that doesn't verify (unsigned) is rejected by
@@ -679,6 +725,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [4u8; 32],
+            height: 0,
             timestamp: 1_700_000_000,
             nonce: [0u8; 32],
         });
@@ -695,16 +742,18 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [4u8; 32],
+            height: 0,
             timestamp: 1_700_000_000,
             nonce: [0u8; 32],
         });
-        assert!(header.pow_valid());
+        assert!(header.pow_valid(&INITIAL_MAX_HASH));
 
         let tampered = BlockHeader {
+            height: 0,
             timestamp: header.timestamp + 1,
             ..header
         };
-        assert!(!tampered.pow_valid());
+        assert!(!tampered.pow_valid(&INITIAL_MAX_HASH));
     }
 
     #[test]
@@ -714,6 +763,7 @@ mod tests {
             pmmr_root: [2u8; 32],
             bitmap_root: [3u8; 32],
             body_hash: [4u8; 32],
+            height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
         });
@@ -772,6 +822,7 @@ mod tests {
             pmmr_root: [8u8; 32],
             bitmap_root: [7u8; 32],
             body_hash: body.body_hash(),
+            height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
         });
@@ -780,7 +831,7 @@ mod tests {
         let decoded = Block::from_bytes(&block.to_bytes()).unwrap();
         assert_eq!(decoded.header, block.header);
         assert_eq!(decoded.body, block.body);
-        assert!(decoded.validate());
+        assert!(decoded.validate(&INITIAL_MAX_HASH));
     }
 
     /// `BlockBody::from_bytes` only checks byte-level well-formedness --
@@ -867,12 +918,13 @@ mod tests {
             pmmr_root: [0u8; 32],
             bitmap_root: [0u8; 32],
             body_hash: body.body_hash(),
+            height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
         });
         let block = Block { header, body };
 
-        assert!(!block.validate());
+        assert!(!block.validate(&INITIAL_MAX_HASH));
     }
 
     /// The end-to-end version of the point above: a block whose body is
@@ -898,12 +950,13 @@ mod tests {
             pmmr_root: [0u8; 32],
             bitmap_root: [0u8; 32],
             body_hash: body.body_hash(), // matches honestly, PoW is fine
+            height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
         });
         let block = Block { header, body };
 
-        assert!(!block.validate());
+        assert!(!block.validate(&INITIAL_MAX_HASH));
     }
 
     #[test]
