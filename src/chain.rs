@@ -271,6 +271,13 @@ pub enum Error {
     /// The block is, or descends from, one already recorded in
     /// `INVALID_BLOCKS_DB`.
     KnownInvalidBlock,
+    /// An orphan's proof of work doesn't even meet the active chain's
+    /// current target relaxed by `max_adjustment_factor` -- see
+    /// `Chain::orphan_target`. Not a verdict on the block (its real
+    /// target is unknowable without its parent), just a refusal to
+    /// spend pool space on it; it can always be sent again once its
+    /// parent is known.
+    OrphanPowTooWeak,
 }
 
 impl Error {
@@ -344,6 +351,7 @@ impl std::fmt::Display for Error {
             Error::InvalidSideBranchLineage => write!(f, "side-branch block's prev_hash/height doesn't match its claimed parent"),
             Error::ReorgTooDeep => write!(f, "competing chain's common ancestor is beyond max_reorg_depth"),
             Error::KnownInvalidBlock => write!(f, "block is, or descends from, a block already known to be invalid"),
+            Error::OrphanPowTooWeak => write!(f, "orphan's proof of work is too weak to be worth pooling"),
         }
     }
 }
@@ -774,6 +782,22 @@ impl Chain {
         Ok(())
     }
 
+    /// The least proof of work an orphan must show to be pooled: the
+    /// active chain's current target, made easier by
+    /// `max_adjustment_factor`. An orphan's real target can't be known
+    /// without its parent, so this is a heuristic, not consensus -- it
+    /// only has to make junk orphans expensive (each costs a real
+    /// fraction of a block's work, rather than nothing) without turning
+    /// away legitimate ones. Relaxing by exactly one retarget's maximum
+    /// swing admits an orphan from just past a window boundary on a
+    /// chain that eased up as far as one retarget allows. Rejecting a
+    /// legitimate orphan is cheap anyway: it just gets accepted
+    /// normally once its parent arrives and it's sent again.
+    fn orphan_target(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
+        let current = self.current_target(txn)?;
+        Ok(pow::scale(current, self.difficulty.max_adjustment_factor, 1))
+    }
+
     /// The current tip's header hash, or `GENESIS_PARENT_HASH` if no
     /// block has ever been applied.
     pub fn tip_hash(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
@@ -1139,7 +1163,9 @@ impl Chain {
     ///   a heavier-looking branch aborts the whole reorg, leaving the
     ///   active chain exactly as it was.
     /// - Its parent isn't known at all: held in the orphan pool (at
-    ///   most `max_orphans` of them, oldest evicted first).
+    ///   most `max_orphans` of them, oldest evicted first), provided
+    ///   its proof of work meets `orphan_target` -- `Error::
+    ///   OrphanPowTooWeak` otherwise.
     ///
     /// Before any of that, a block already stored or already waiting
     /// as an orphan is reported as `AlreadyKnown` and otherwise
@@ -1195,9 +1221,16 @@ impl Chain {
 
         let parent_known =
             block.header.prev_hash == GENESIS_PARENT_HASH || self.blocks.get(&rtxn, &block.header.prev_hash)?.is_some();
+        let orphan_target = self.orphan_target(&rtxn)?;
         drop(rtxn);
 
         if !parent_known {
+            // Only the proof of work, and only against a relaxed
+            // target: everything else (and the real target) is checked
+            // once the parent is known and this is accepted for real.
+            if !block.header.pow_valid(&orphan_target) {
+                return Err(Error::OrphanPowTooWeak);
+            }
             if self.orphans.len() >= self.max_orphans {
                 self.orphans.remove(0);
             }
@@ -2554,5 +2587,53 @@ mod tests {
         let stored = chain.retarget_state_after(&rtxn, tip).unwrap();
         assert_eq!(stored.target, chain.current_target(&rtxn).unwrap());
         assert_eq!(stored.window_start_timestamp, chain.window_start_timestamp(&rtxn).unwrap());
+    }
+
+    /// Overwrite `block`'s nonce with successive values until `accept`
+    /// says yes -- for crafting a header whose proof of work lands in a
+    /// specific band of targets.
+    fn renonce_until(block: &mut Block, accept: impl Fn(&BlockHeader) -> bool) {
+        for n in 0u64..1_000_000 {
+            block.header.nonce = [0u8; 32];
+            block.header.nonce[24..].copy_from_slice(&n.to_be_bytes());
+            if accept(&block.header) {
+                return;
+            }
+        }
+        panic!("no nonce found in range");
+    }
+
+    #[test]
+    fn an_orphan_with_too_little_work_is_refused_and_not_pooled() {
+        let (_dir, storage, mut chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        let orphan_target = chain.orphan_target(&rtxn).unwrap();
+        drop(rtxn);
+
+        let mut orphan = build_chain(2, 1).into_iter().nth(1).unwrap();
+        renonce_until(&mut orphan, |header| !header.pow_valid(&orphan_target));
+
+        assert!(matches!(chain.accept_block(orphan), Err(Error::OrphanPowTooWeak)));
+        assert!(chain.orphans.is_empty());
+    }
+
+    /// An orphan that misses the current target but meets the relaxed
+    /// one is still pooled -- the tolerance for a legitimately easier
+    /// chain just past a retarget.
+    #[test]
+    fn an_orphan_meeting_only_the_relaxed_target_is_still_pooled() {
+        let (_dir, storage, mut chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        let current_target = chain.current_target(&rtxn).unwrap();
+        let orphan_target = chain.orphan_target(&rtxn).unwrap();
+        drop(rtxn);
+        assert!(orphan_target > current_target);
+
+        let mut orphan = build_chain(2, 1).into_iter().nth(1).unwrap();
+        renonce_until(&mut orphan, |header| {
+            header.pow_valid(&orphan_target) && !header.pow_valid(&current_target)
+        });
+
+        assert_eq!(chain.accept_block(orphan).unwrap(), AcceptOutcome::Orphaned);
     }
 }

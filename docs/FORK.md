@@ -1,7 +1,7 @@
 # Fork handling: status
 
 Progress on item #2 of `BLOCK_TODO.md` ("No fork handling"): side
-branches, fork-choice by cumulative work, reorgs, and orphans. All 231
+branches, fork-choice by cumulative work, reorgs, and orphans. All 233
 tests pass.
 
 ## Done
@@ -64,7 +64,13 @@ tests pass.
   `Chain::open` takes `max_reorg_depth`
   (`main.rs`: 1000; tests: 5).
 - In-memory orphan pool, capped at `MAX_ORPHANS` (100), oldest evicted
-  first. `accept_block` retries waiting orphans itself, transitively,
+  first. An orphan is only pooled if its proof of work meets the
+  current target made easier by `max_adjustment_factor`
+  (`Chain::orphan_target`; `Error::OrphanPowTooWeak` otherwise), so
+  flooding the pool costs real work -- a quarter-block each today --
+  while a legitimate orphan from just past an easing retarget still
+  gets in. This is a heuristic, not consensus: a wrongly refused orphan
+  is simply accepted once its parent is known. `accept_block` retries waiting orphans itself, transitively,
   whenever a block connects; orphans' own outcomes aren't reported
   (failures are dropped), but their effect shows in `tip_hash`.
 - Invalid-block tracking: a new `invalid_blocks` table. A reorg replay
@@ -94,5 +100,13 @@ tests pass.
    as invalid** (it was never stored, so nothing can extend it; a
    resend just fails again the same way). Only reorg-replay failures
    are recorded. Intentional.
-2. **Orphan pool has no expiry**, only the size cap.
-3. **`powLimit`** (`BLOCK_TODO.md` #2) -- not started.
+2. **Orphan pool has no expiry**, only the size cap -- low priority
+   now that pooling costs real work.
+3. **Far-behind sync refuses orphans**: if the chain eased by more than
+   one retarget's swing beyond this node's tip, orphans from there fail
+   `orphan_target` and must be re-fetched once their parents arrive.
+   Fine for now; real sync should be headers-first, where orphans are
+   rare.
+4. **`powLimit`** (`BLOCK_TODO.md` #2) -- not started; no longer needed
+   for orphan DoS, only for its original purpose (bounding how far
+   retargeting can ease difficulty).
