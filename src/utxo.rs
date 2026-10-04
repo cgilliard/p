@@ -267,4 +267,48 @@ mod tests {
         assert_eq!(get(&storage, &index, hash_of(1)), None);
         assert_eq!(get(&storage, &index, hash_of(2)), Some(20));
     }
+
+    /// The property reorg undo relies on for reversing a *spend*:
+    /// removing an entry and then re-inserting the exact same
+    /// `(commitment, position)` pair must match a store that never
+    /// removed it at all -- with an unrelated entry left alone the
+    /// whole time, to confirm the undo doesn't disturb anything else.
+    #[test]
+    fn removing_then_reinserting_matches_never_having_removed_it() {
+        let (storage_a, _dir_a) = temp_storage();
+        let mut a = UtxoIndex::open(&storage_a).unwrap();
+        insert_committed(&storage_a, &mut a, hash_of(1), 10);
+        insert_committed(&storage_a, &mut a, hash_of(2), 20);
+        remove_committed(&storage_a, &mut a, hash_of(1)); // simulate a spend
+        insert_committed(&storage_a, &mut a, hash_of(1), 10); // undo it
+
+        let (storage_b, _dir_b) = temp_storage();
+        let mut b = UtxoIndex::open(&storage_b).unwrap();
+        insert_committed(&storage_b, &mut b, hash_of(1), 10);
+        insert_committed(&storage_b, &mut b, hash_of(2), 20);
+        // hash_of(1) is never removed at all in `b`.
+
+        assert_eq!(get(&storage_a, &a, hash_of(1)), get(&storage_b, &b, hash_of(1)));
+        assert_eq!(get(&storage_a, &a, hash_of(2)), get(&storage_b, &b, hash_of(2)));
+    }
+
+    /// The other direction: reversing an output's *creation*. Inserting
+    /// then removing the same entry must match a store that never
+    /// inserted it at all.
+    #[test]
+    fn inserting_then_removing_matches_never_having_inserted_it() {
+        let (storage_a, _dir_a) = temp_storage();
+        let mut a = UtxoIndex::open(&storage_a).unwrap();
+        insert_committed(&storage_a, &mut a, hash_of(2), 20);
+        insert_committed(&storage_a, &mut a, hash_of(1), 10); // simulate a new output
+        remove_committed(&storage_a, &mut a, hash_of(1)); // undo its creation
+
+        let (storage_b, _dir_b) = temp_storage();
+        let mut b = UtxoIndex::open(&storage_b).unwrap();
+        insert_committed(&storage_b, &mut b, hash_of(2), 20);
+        // hash_of(1) is never inserted at all in `b`.
+
+        assert_eq!(get(&storage_a, &a, hash_of(1)), get(&storage_b, &b, hash_of(1)));
+        assert_eq!(get(&storage_a, &a, hash_of(2)), get(&storage_b, &b, hash_of(2)));
+    }
 }

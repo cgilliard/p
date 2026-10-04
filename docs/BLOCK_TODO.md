@@ -71,7 +71,11 @@ somewhere in the build pipeline once there's a real circuit to feed.
 
 ## 2. No fork handling
 
-**Status:** not started.
+**Status:** mostly done -- side branches, fork-choice by cumulative
+work, bounded reorgs, orphans, and invalid-block tracking are in
+`chain.rs` (`Chain::accept_block`). See `FORK.md` for what's done and
+what's still open. `powLimit` (below) is not started. The original
+description follows.
 
 `Chain::apply_block` only accepts a block whose `prev_hash` matches the
 *current* tip (see `chain.rs`'s `WrongParent` check) — there's no notion

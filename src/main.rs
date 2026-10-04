@@ -58,6 +58,12 @@ const RETARGET_INTERVAL: u64 = 10;
 const TARGET_BLOCK_TIME_MS: u64 = 10_000;
 const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 
+/// How many blocks a reorg is ever allowed to unwind in this driver's
+/// actual run -- independent of the test suite's own (much smaller)
+/// number, same reasoning as the retargeting knobs above. 1000 is a
+/// starting point, not a calibration.
+const MAX_REORG_DEPTH: u64 = 1000;
+
 fn data_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").expect("HOME environment variable must be set");
     std::path::PathBuf::from(home).join(".tabernacle").join("mdb.dat")
@@ -146,7 +152,7 @@ fn main() {
         target_block_time_ms: TARGET_BLOCK_TIME_MS,
         max_adjustment_factor: MAX_ADJUSTMENT_FACTOR,
     };
-    let mut chain = Chain::open(&storage, difficulty).expect("failed to open chain");
+    let mut chain = Chain::open(&storage, difficulty, MAX_REORG_DEPTH).expect("failed to open chain");
 
     {
         let rtxn = storage.read_txn().expect("failed to open read transaction");

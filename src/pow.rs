@@ -155,6 +155,163 @@ pub fn max_hash_with_leading_zero_bits(zero_bits: u32) -> [u8; 32] {
     out
 }
 
+// # Chain work
+//
+// `chain::Chain`'s fork-choice needs to compare competing chains by
+// total accumulated work, not height -- height alone stopped being a
+// valid proxy once difficulty could actually change block to block.
+// This is Bitcoin's own definition (`GetBlockProof` in its source),
+// computed exactly, as a fixed-width 256-bit integer throughout, the
+// same way Bitcoin's `arith_uint256` does: summing work across many
+// blocks is technically unbounded, but true overflow would require
+// accumulating work on a scale many, many orders of magnitude beyond
+// anything physically realistic, so -- deliberately, matching Bitcoin
+// -- this wraps instead of growing arbitrarily wide. Nothing here
+// needs revisiting as this crate's difficulty grows; the fixed width
+// is the design, not a shortcut.
+
+/// Bitwise NOT of a 256-bit value.
+fn not256(x: [u8; 32]) -> [u8; 32] {
+    x.map(|b| !b)
+}
+
+/// Add 1 to a 256-bit big-endian value, wrapping to all-zero on
+/// overflow -- see the "Chain work" docs above on why wrapping is the
+/// deliberate choice here, not a bug.
+fn increment256(x: [u8; 32]) -> [u8; 32] {
+    let mut out = x;
+    for byte in out.iter_mut().rev() {
+        if *byte == 0xff {
+            *byte = 0;
+        } else {
+            *byte += 1;
+            return out;
+        }
+    }
+    out // overflowed all the way around to zero
+}
+
+/// Add two 256-bit big-endian values, wrapping on overflow -- see the
+/// "Chain work" docs above.
+pub fn add256(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut carry: u16 = 0;
+    for i in (0..32).rev() {
+        let sum = a[i] as u16 + b[i] as u16 + carry;
+        out[i] = (sum & 0xff) as u8;
+        carry = sum >> 8;
+    }
+    out
+}
+
+/// Subtract `b` from `a`, treating both as 256-bit big-endian
+/// integers. Only ever called by `divmod256` with `a >= b`; wraps
+/// (silently, like the rest of this fixed-width arithmetic) rather
+/// than panicking if that's ever violated.
+fn sub256(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut borrow: i16 = 0;
+    for i in (0..32).rev() {
+        let diff = a[i] as i16 - b[i] as i16 - borrow;
+        if diff < 0 {
+            out[i] = (diff + 256) as u8;
+            borrow = 1;
+        } else {
+            out[i] = diff as u8;
+            borrow = 0;
+        }
+    }
+    out
+}
+
+/// Shift a 256-bit big-endian value left by one bit, setting the new
+/// low bit to `carry_in` (0 or 1) -- the "bring in the next dividend
+/// bit" step `divmod256` needs. Whatever bit overflows out the top is
+/// simply dropped: in long division, the running remainder is always
+/// smaller than the divisor going in, so that bit is never actually
+/// significant.
+fn shift_left_1_with_carry_in(x: [u8; 32], carry_in: u8) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut carry = carry_in;
+    for i in (0..32).rev() {
+        let overflow_bit = (x[i] & 0x80) >> 7;
+        out[i] = (x[i] << 1) | carry;
+        carry = overflow_bit;
+    }
+    out
+}
+
+/// Divide `dividend` by `divisor`, treating both as 256-bit big-endian
+/// integers, returning `(quotient, remainder)`. Plain schoolbook
+/// binary long division -- one bit at a time, 256 iterations, built
+/// from nothing but the shift/compare/subtract primitives above
+/// (`[u8; 32]`'s derived `Ord` already does big-endian integer
+/// comparison correctly, same observation `meets_target` relies on).
+///
+/// `divisor` must be nonzero; returns `([0xff; 32], dividend)` instead
+/// of panicking if it isn't, since there's no meaningful quotient --
+/// the one caller, `work_for_target`, already special-cases its own
+/// zero-divisor-adjacent inputs before ever reaching here.
+fn divmod256(dividend: [u8; 32], divisor: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+    if divisor == [0u8; 32] {
+        return ([0xffu8; 32], dividend);
+    }
+
+    let mut quotient = [0u8; 32];
+    let mut remainder = [0u8; 32];
+
+    for byte_index in 0..32 {
+        for bit_index in (0..8).rev() {
+            let incoming_bit = (dividend[byte_index] >> bit_index) & 1;
+            remainder = shift_left_1_with_carry_in(remainder, incoming_bit);
+            if remainder >= divisor {
+                remainder = sub256(remainder, divisor);
+                quotient[byte_index] |= 1 << bit_index;
+            }
+        }
+    }
+
+    (quotient, remainder)
+}
+
+/// The work one block mined against `target` represents -- Bitcoin's
+/// own definition, `2^256 / (target + 1)`, computed without ever
+/// needing a 257-bit intermediate value via the identity Bitcoin
+/// itself uses: since `2^256 == !target + target + 1` (true for any
+/// 256-bit `target`, by definition of bitwise NOT), dividing through
+/// by `target + 1` gives `2^256/(target+1) == !target/(target+1) + 1`
+/// *exactly* (the `+1` term is itself an exact multiple of the
+/// divisor, so flooring the sum is the same as flooring the first
+/// term and then adding the exact `1`). Smaller `target` (harder)
+/// means more work; this is the per-block value `chain::Chain` sums
+/// (via `add256`) to compare competing chains' total work.
+///
+/// Two boundary inputs get special-cased rather than falling through
+/// the general formula, both because the natural result doesn't fit
+/// in 256 bits otherwise:
+/// - `target == 0` (a target no hash could ever satisfy) returns zero
+///   work, matching Bitcoin's own special case for this input --
+///   moot in practice either way, since no real block could ever be
+///   mined against it.
+/// - `target == [0xff; 32]` (the easiest possible target) would make
+///   `target + 1` equal to exactly `2^256`, one past what 256 bits
+///   can represent; the exact answer here is just `1`, so this
+///   short-circuits rather than let that wrap incorrectly.
+pub fn work_for_target(target: [u8; 32]) -> [u8; 32] {
+    if target == [0u8; 32] {
+        return [0u8; 32];
+    }
+    if target == [0xffu8; 32] {
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        return one;
+    }
+
+    let divisor = increment256(target); // target != MAX, so this can't wrap
+    let (quotient, _remainder) = divmod256(not256(target), divisor);
+    increment256(quotient) // quotient is well below MAX for any target in [1, MAX-1], so this can't wrap either
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +511,87 @@ mod tests {
     #[test]
     fn counts_above_256_clamp_rather_than_panic() {
         assert_eq!(max_hash_with_leading_zero_bits(1000), [0x00u8; 32]);
+    }
+
+    /// A 256-bit big-endian value holding the small number `n` in its
+    /// low 8 bytes, zero everywhere else -- makes the chain-work tests
+    /// below readable as ordinary arithmetic instead of 32-byte arrays.
+    fn u256(n: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[24..32].copy_from_slice(&n.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn add256_adds_small_values() {
+        assert_eq!(add256(u256(2), u256(3)), u256(5));
+    }
+
+    #[test]
+    fn add256_carries_across_a_byte_boundary() {
+        assert_eq!(add256(u256(0xff), u256(1)), u256(0x100));
+    }
+
+    #[test]
+    fn add256_wraps_on_overflow() {
+        assert_eq!(add256([0xffu8; 32], u256(1)), [0u8; 32]);
+    }
+
+    #[test]
+    fn divmod256_matches_ordinary_small_division() {
+        assert_eq!(divmod256(u256(10), u256(3)), (u256(3), u256(1)));
+    }
+
+    #[test]
+    fn divmod256_with_zero_remainder() {
+        assert_eq!(divmod256(u256(12), u256(4)), (u256(3), u256(0)));
+    }
+
+    #[test]
+    fn divmod256_by_a_divisor_larger_than_the_dividend() {
+        assert_eq!(divmod256(u256(3), u256(10)), (u256(0), u256(3)));
+    }
+
+    #[test]
+    fn work_for_target_of_zero_is_zero() {
+        assert_eq!(work_for_target([0u8; 32]), [0u8; 32]);
+    }
+
+    #[test]
+    fn work_for_target_of_the_easiest_target_is_one() {
+        assert_eq!(work_for_target([0xffu8; 32]), u256(1));
+    }
+
+    /// Hand-traced independently of the identity `work_for_target`
+    /// actually uses: `target` here is `2^255 - 1` (first byte `0x7f`,
+    /// rest `0xff`), so `target + 1 == 2^255` exactly, and
+    /// `2^256 / 2^255 == 2` exactly -- a clean value with no rounding
+    /// to obscure a sign of a wrong implementation.
+    #[test]
+    fn work_for_target_matches_a_hand_traced_half_target() {
+        let mut target = [0xffu8; 32];
+        target[0] = 0x7f;
+        assert_eq!(work_for_target(target), u256(2));
+    }
+
+    /// Ties back to this crate's own `INITIAL_MAX_HASH` (first byte
+    /// zero, rest `0xff`): a uniformly random hash satisfies it with
+    /// probability `1/256`, so finding one takes 256 attempts on
+    /// average -- exactly the work value this must come out to.
+    #[test]
+    fn work_for_target_of_initial_max_hash_is_256() {
+        assert_eq!(work_for_target(max_hash_with_leading_zero_bits(8)), u256(256));
+    }
+
+    #[test]
+    fn work_for_target_of_sixteen_leading_zero_bits_is_65536() {
+        assert_eq!(work_for_target(max_hash_with_leading_zero_bits(16)), u256(65_536));
+    }
+
+    #[test]
+    fn harder_targets_have_strictly_more_work() {
+        let easier = work_for_target(max_hash_with_leading_zero_bits(10));
+        let harder = work_for_target(max_hash_with_leading_zero_bits(20));
+        assert!(harder > easier);
     }
 }

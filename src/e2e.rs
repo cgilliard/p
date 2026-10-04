@@ -85,7 +85,7 @@ mod tests {
     fn miner_mines_two_blocks_and_pays_another_user() {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let mut chain = Chain::open(&storage, chain::DifficultyConfig::for_tests()).unwrap();
+        let mut chain = Chain::open(&storage, chain::DifficultyConfig::for_tests(), 5).unwrap();
 
         // The miner's two reward addresses -- a fresh one each time,
         // since a WOTS pubkey can only ever sign once (see

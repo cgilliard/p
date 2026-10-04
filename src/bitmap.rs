@@ -397,6 +397,57 @@ mod tests {
         drop(dir_b);
     }
 
+    /// `clearing_a_bit_restores_the_empty_root` only checks the easy
+    /// case (undoing the *only* bit ever set). The property reorg
+    /// undo actually relies on is more general: with *other* bits
+    /// already live, unsetting one specific bit -- regardless of
+    /// whether it shares a page with one of those others -- must
+    /// produce exactly the root a bitmap that never touched that bit
+    /// (with the others still present) would have. Not just "a
+    /// different" root; the *same* one a from-scratch bitmap reaches.
+    #[test]
+    fn unsetting_one_bit_matches_never_having_set_it_while_others_remain() {
+        let (dir_a, storage_a, mut a) = open();
+        set_committed(&storage_a, &mut a, 10, true);
+        set_committed(&storage_a, &mut a, 10_000_000, true); // a different page
+        set_committed(&storage_a, &mut a, 42, true); // same page as position 10
+        set_committed(&storage_a, &mut a, 42, false); // undo, as a reorg would
+
+        assert!(get(&storage_a, &a, 10));
+        assert!(get(&storage_a, &a, 10_000_000));
+        assert!(!get(&storage_a, &a, 42));
+
+        let (dir_b, storage_b, mut b) = open();
+        set_committed(&storage_b, &mut b, 10, true);
+        set_committed(&storage_b, &mut b, 10_000_000, true);
+        // Position 42 is never touched at all in `b`.
+
+        assert_eq!(root(&storage_a, &a), root(&storage_b, &b));
+        drop(dir_a);
+        drop(dir_b);
+    }
+
+    /// The undo doesn't have to happen in strict reverse-chronological
+    /// order relative to other bits being set elsewhere -- a reorg
+    /// might need to undo an earlier block's spend after a later
+    /// block's spend has already landed. Order between *independent*
+    /// positions shouldn't matter, same spirit as
+    /// `order_of_setting_bits_does_not_affect_the_final_root`.
+    #[test]
+    fn undoing_an_earlier_bit_after_a_later_one_was_set_still_matches() {
+        let (dir_a, storage_a, mut a) = open();
+        set_committed(&storage_a, &mut a, 1, true);
+        set_committed(&storage_a, &mut a, 2, true);
+        set_committed(&storage_a, &mut a, 1, false); // undo the earlier one
+
+        let (dir_b, storage_b, mut b) = open();
+        set_committed(&storage_b, &mut b, 2, true);
+
+        assert_eq!(root(&storage_a, &a), root(&storage_b, &b));
+        drop(dir_a);
+        drop(dir_b);
+    }
+
     #[test]
     fn touching_a_position_near_u64_max_works() {
         let (_dir, storage, mut bitmap) = open();
