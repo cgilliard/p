@@ -10,13 +10,13 @@
 //! |------|--------------|-------------------------------------------------------------|
 //! | 1    | `GET_HOSTS`  | nonce u64 ‖ max u16 ‖ zero padding                          |
 //! | 2    | `HOSTS`      | nonce u64 ‖ cookie u64 ‖ count u16 ‖ count × addr (6)       |
-//! | 3    | `INV`        | hash (32) ‖ height u64 ‖ size u32                           |
+//! | 3    | `INV`        | hash (32) ‖ height u64 ‖ size u32 ‖ tip_height u64           |
 //! | 4    | `GET_INV`    | kind u8 (0 = by height, 1 = by hash) ‖ 32-byte field          |
 //! | 5    | `GET_CHUNKS` | cookie u64 ‖ hash (32) ‖ first u32 ‖ count u16               |
 //! | 6    | `CHUNK`      | hash (32) ‖ index u32 ‖ data (`CHUNK_LEN`, or less if last)  |
 //!
 //! `GET_INV`'s field is the hash, or for a height, 24 zero bytes then
-//! the height -- one fixed size either way, so its `INV` reply (50
+//! the height -- one fixed size either way, so its `INV` reply (58
 //! bytes) never exceeds `AMPLIFICATION_FACTOR` times the request (39).
 //!
 //! Every packet is at most `MAX_PACKET` bytes, so none ever needs IP
@@ -29,7 +29,7 @@ use crate::peers::{self, ADDR_LEN};
 use std::net::SocketAddrV4;
 
 pub const MAGIC: [u8; 4] = *b"TBRN";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// Largest packet this protocol ever sends or accepts -- comfortably
 /// under the 1280-byte IPv6 minimum MTU (and every realistic IPv4 path
@@ -55,7 +55,7 @@ const TYPE_CHUNK: u8 = 6;
 pub const HEADER_LEN: usize = MAGIC.len() + 2;
 const GET_HOSTS_MIN: usize = HEADER_LEN + 8 + 2;
 const HOSTS_MIN: usize = HEADER_LEN + 8 + 8 + 2;
-const INV_LEN: usize = HEADER_LEN + 32 + 8 + 4;
+const INV_LEN: usize = HEADER_LEN + 32 + 8 + 4 + 8;
 const GET_INV_LEN: usize = HEADER_LEN + 1 + 32;
 const GET_CHUNKS_LEN: usize = HEADER_LEN + 8 + 32 + 4 + 2;
 const CHUNK_HEADER_LEN: usize = HEADER_LEN + 32 + 4;
@@ -83,9 +83,17 @@ pub enum Message {
     /// quote back in any `GetChunks` it sends us -- proof it really
     /// receives packets at its source address.
     Hosts { nonce: u64, cookie: u64, hosts: Vec<SocketAddrV4> },
-    /// "I have this block, `size` bytes encoded." Sent unprompted when a
-    /// node gets a new tip, and as the answer to `GetInv`.
-    Inv { hash: [u8; 32], height: u64, size: u32 },
+    /// "I have this block, `size` bytes encoded -- and my tip is at
+    /// `tip_height`." Sent unprompted when a node gets a new tip (the
+    /// block *is* the tip then), and as the answer to `GetInv`. Carrying
+    /// the tip height means any `INV` tells the receiver exactly how far
+    /// ahead the sender is.
+    Inv {
+        hash: [u8; 32],
+        height: u64,
+        size: u32,
+        tip_height: u64,
+    },
     /// "Tell me about this block, if you have it."
     GetInv(InvQuery),
     /// "Send me chunks `first .. first + count` of this block."
@@ -164,11 +172,17 @@ impl Message {
                     out.extend_from_slice(&peers::encode_addr(*host));
                 }
             }
-            Message::Inv { hash, height, size } => {
+            Message::Inv {
+                hash,
+                height,
+                size,
+                tip_height,
+            } => {
                 out.push(TYPE_INV);
                 out.extend_from_slice(hash);
                 out.extend_from_slice(&height.to_be_bytes());
                 out.extend_from_slice(&size.to_be_bytes());
+                out.extend_from_slice(&tip_height.to_be_bytes());
             }
             Message::GetInv(query) => {
                 out.push(TYPE_GET_INV);
@@ -242,6 +256,7 @@ impl Message {
                 hash: read_hash(body),
                 height: read_u64(&body[32..]),
                 size: read_u32(&body[40..]),
+                tip_height: read_u64(&body[44..]),
             }),
             TYPE_GET_INV if bytes.len() == GET_INV_LEN => match body[0] {
                 0 if body[1..25].iter().all(|&b| b == 0) => Some(Message::GetInv(InvQuery::ByHeight(read_u64(&body[25..])))),
@@ -276,7 +291,12 @@ impl Message {
                 let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
                 format!("HOSTS(nonce={nonce:016x}, [{}])", hosts.join(", "))
             }
-            Message::Inv { hash, height, size } => format!("INV({} @ {height}, {size} bytes)", short(hash)),
+            Message::Inv {
+                hash,
+                height,
+                size,
+                tip_height,
+            } => format!("INV({} @ {height}, {size} bytes, tip {tip_height})", short(hash)),
             Message::GetInv(InvQuery::ByHeight(height)) => format!("GET_INV(height {height})"),
             Message::GetInv(InvQuery::ByHash(hash)) => format!("GET_INV({})", short(hash)),
             Message::GetChunks { hash, first, count, .. } => {
@@ -308,6 +328,7 @@ mod tests {
                 hash: [7; 32],
                 height: 1_000,
                 size: 2_000_000,
+                tip_height: 1_200,
             },
             Message::GetInv(InvQuery::ByHeight(12)),
             Message::GetInv(InvQuery::ByHash([9; 32])),

@@ -24,9 +24,16 @@
 //! instead, then the next, and so on. If a block we pull turns out to be
 //! an orphan (the peer is on a fork we don't have), the caller asks for
 //! its parent by hash (`request_block`), walking back until the branch
-//! connects. When idle, every `sync_interval_ms` we ask some peer for
-//! tip + 1 anyway, which is how a freshly started node finds out it's
-//! behind at all.
+//! connects.
+//!
+//! Knowing who's ahead takes knowing every peer's height. Mostly that
+//! comes for free: every `INV` a peer announces says its height. A peer
+//! we haven't heard a height from -- a new one, or one silent for
+//! `peer_height_refresh_ms` -- is asked once with `GET_INV` for our tip +
+//! 1, which every node always answers: with that block if it has one,
+//! or else with an `INV` for its own tip (telling us it isn't ahead).
+//! So a node in step with its peers sends no sync traffic at all beyond
+//! the announcements themselves.
 //!
 //! # Abuse resistance
 //!
@@ -68,9 +75,9 @@ pub struct Config {
     pub max_retries: u32,
     /// How many blocks may be downloading at once.
     pub max_downloads: usize,
-    /// How often an idle node asks a peer for its block at our tip + 1,
-    /// in milliseconds.
-    pub sync_interval_ms: u64,
+    /// How long a peer's last known height stays fresh, in milliseconds
+    /// -- after that, it's asked again (see the module docs).
+    pub peer_height_refresh_ms: u64,
 }
 
 impl Config {
@@ -123,15 +130,33 @@ struct Download {
     retries: u32,
 }
 
+/// What this node knows of one peer's chain.
+struct PeerHeight {
+    /// The highest height it has told us about, if it ever has.
+    height: Option<u64>,
+    /// When we last heard its height, or last asked for it -- whichever
+    /// is later; `None` if neither has happened yet. It's asked (again)
+    /// once `peer_height_refresh_ms` has passed since.
+    as_of_ms: Option<u64>,
+}
+
+/// How long a just-downloaded block is remembered, so it isn't fetched
+/// again while it waits to be applied (`has_block` can't see it until
+/// then), in milliseconds.
+const RECENTLY_DELIVERED_MS: u64 = 30_000;
+
 pub struct Transfer {
     config: Config,
     downloads: HashMap<[u8; 32], Download>,
-    /// The highest block height each peer has announced -- who to sync
-    /// from.
-    peer_heights: HashMap<SocketAddrV4, u64>,
-    last_sync_ms: Option<u64>,
-    /// Rotates the idle sync probe across peers.
-    sync_cursor: usize,
+    /// What we know of each peer's height -- who to sync from.
+    peer_heights: HashMap<SocketAddrV4, PeerHeight>,
+    /// The last `GET_INV` sent to catch up from a peer known to be ahead:
+    /// which height was asked for, and when. Not repeated for the same
+    /// height until `chunk_timeout_ms` has passed without an answer.
+    last_catch_up: Option<(u64, u64)>,
+    /// Blocks downloaded and handed off, by when -- see
+    /// `RECENTLY_DELIVERED_MS`.
+    recently_delivered: HashMap<[u8; 32], u64>,
 }
 
 impl Transfer {
@@ -140,8 +165,8 @@ impl Transfer {
             config,
             downloads: HashMap::new(),
             peer_heights: HashMap::new(),
-            last_sync_ms: None,
-            sync_cursor: 0,
+            last_catch_up: None,
+            recently_delivered: HashMap::new(),
         }
     }
 
@@ -164,7 +189,13 @@ impl Transfer {
         except: Option<SocketAddrV4>,
         discovery: &Discovery,
     ) -> Result<Vec<Outgoing>> {
-        let message = Message::Inv { hash, height, size }.encode();
+        let message = Message::Inv {
+            hash,
+            height,
+            size,
+            tip_height: height,
+        }
+        .encode();
         let peers = discovery.table().active(usize::MAX, except.unwrap_or(SocketAddrV4::new(0.into(), 0)))?;
         Ok(peers
             .into_iter()
@@ -184,13 +215,6 @@ impl Transfer {
         }]
     }
 
-    /// Ask for a sync probe on the next `tick`, rather than waiting out
-    /// `sync_interval_ms` -- e.g. right after the tip advanced, to keep
-    /// catching up without pausing between blocks.
-    pub fn sync_soon(&mut self) {
-        self.last_sync_ms = None;
-    }
-
     /// Handle one decoded message from `from`. Messages that aren't about
     /// block transfer are ignored.
     pub fn handle(
@@ -203,7 +227,12 @@ impl Transfer {
     ) -> Result<Step> {
         let mut step = Step::default();
         match message {
-            &Message::Inv { hash, height, size } => self.on_inv(from, hash, height, size, discovery, reader, now_ms, &mut step)?,
+            &Message::Inv {
+                hash,
+                height,
+                size,
+                tip_height,
+            } => self.on_inv(from, hash, height, size, tip_height, discovery, reader, now_ms, &mut step)?,
             Message::GetInv(query) => step.packets.extend(self.on_get_inv(from, *query, reader)?),
             &Message::GetChunks {
                 cookie,
@@ -226,15 +255,25 @@ impl Transfer {
         hash: [u8; 32],
         height: u64,
         size: u32,
+        tip_height: u64,
         discovery: &Discovery,
         reader: &BlockReader,
         now_ms: u64,
         step: &mut Step,
     ) -> Result<()> {
-        let known_height = self.peer_heights.entry(from).or_insert(height);
-        *known_height = (*known_height).max(height);
+        let known = self.peer_heights.entry(from).or_insert(PeerHeight {
+            height: None,
+            as_of_ms: None,
+        });
+        // The sender's tip, as of now -- not a running maximum: after a
+        // reorg onto a heavier but shorter chain, it can go down.
+        known.height = Some(tip_height.max(height));
+        known.as_of_ms = Some(now_ms);
 
-        if self.downloads.contains_key(&hash) || reader.has_block(hash)? {
+        if self.downloads.contains_key(&hash)
+            || self.recently_delivered.contains_key(&hash)
+            || reader.has_block(hash)?
+        {
             return Ok(());
         }
         let size = size as usize;
@@ -249,7 +288,7 @@ impl Transfer {
                 to: from,
                 bytes: Message::GetInv(InvQuery::ByHeight(next)).encode(),
             });
-            self.last_sync_ms = Some(now_ms);
+            self.last_catch_up = Some((next, now_ms));
             return Ok(());
         }
 
@@ -298,9 +337,14 @@ impl Transfer {
 
     fn on_get_inv(&self, from: SocketAddrV4, query: InvQuery, reader: &BlockReader) -> Result<Vec<Outgoing>> {
         let hash = match query {
+            // Beyond our tip, answer with the tip itself: that tells the
+            // asker our height, which is what it needs to know either way.
             InvQuery::ByHeight(height) => match reader.active_hash_at(height)? {
                 Some(hash) => hash,
-                None => return Ok(Vec::new()),
+                None => match reader.tip()? {
+                    Some((tip_height, tip_hash)) if tip_height < height => tip_hash,
+                    _ => return Ok(Vec::new()),
+                },
             },
             InvQuery::ByHash(hash) => hash,
         };
@@ -316,6 +360,7 @@ impl Transfer {
                 hash,
                 height: header.height,
                 size: size as u32,
+                tip_height: reader.tip()?.map_or(0, |(h, _)| h),
             }
             .encode(),
         }])
@@ -376,7 +421,10 @@ impl Transfer {
         if download.remaining == 0 {
             let download = self.downloads.remove(&hash).unwrap();
             match Block::from_bytes(&download.data) {
-                Ok(block) if block.header.hash() == hash => step.delivered.push((block, download.peer)),
+                Ok(block) if block.header.hash() == hash => {
+                    self.recently_delivered.insert(hash, now_ms);
+                    step.delivered.push((block, download.peer));
+                }
                 _ => {} // corrupt or not what was announced: dropped
             }
             return;
@@ -434,41 +482,57 @@ impl Transfer {
             self.downloads.insert(hash, download);
         }
 
-        let due = self
-            .last_sync_ms
-            .is_none_or(|last| now_ms >= last + self.config.sync_interval_ms);
-        if self.downloads.is_empty() && due {
-            self.last_sync_ms = Some(now_ms);
-            if let Some(peer) = self.sync_peer(discovery, reader)? {
-                step.packets.push(Outgoing {
-                    to: peer,
-                    bytes: Message::GetInv(InvQuery::ByHeight(Self::next_height(reader)?)).encode(),
-                });
-            }
+        self.recently_delivered
+            .retain(|_, &mut at| now_ms < at + RECENTLY_DELIVERED_MS);
+
+        if self.downloads.is_empty() {
+            step.packets.extend(self.sync(discovery, reader, now_ms)?);
         }
         Ok(step)
     }
 
-    /// Who to ask for our tip + 1: the peer known to be furthest ahead of
-    /// us, if any is; otherwise the next verified peer in rotation (one
-    /// may be ahead without having said so yet).
-    fn sync_peer(&mut self, discovery: &Discovery, reader: &BlockReader) -> Result<Option<SocketAddrV4>> {
+    /// If some peer is known to be ahead, ask the furthest-ahead one for
+    /// our tip + 1 (at most once per `chunk_timeout_ms` for the same
+    /// height). Otherwise, ask every verified peer whose height we don't
+    /// know, or haven't heard in `peer_height_refresh_ms`.
+    fn sync(&mut self, discovery: &Discovery, reader: &BlockReader, now_ms: u64) -> Result<Vec<Outgoing>> {
         let next = Self::next_height(reader)?;
+        let query = Message::GetInv(InvQuery::ByHeight(next)).encode();
+
         let ahead = self
             .peer_heights
             .iter()
-            .filter(|&(_, &height)| height >= next)
-            .max_by_key(|&(_, &height)| height)
-            .map(|(peer, _)| *peer);
-        if ahead.is_some() {
-            return Ok(ahead);
+            .filter_map(|(peer, known)| Some((*peer, known.height?)))
+            .filter(|&(_, height)| height >= next)
+            .max_by_key(|&(_, height)| height)
+            .map(|(peer, _)| peer);
+        if let Some(peer) = ahead {
+            let asked_recently = self
+                .last_catch_up
+                .is_some_and(|(height, at)| height == next && now_ms < at + self.config.chunk_timeout_ms);
+            if asked_recently {
+                return Ok(Vec::new());
+            }
+            self.last_catch_up = Some((next, now_ms));
+            return Ok(vec![Outgoing { to: peer, bytes: query }]);
         }
-        let peers = discovery.table().active(usize::MAX, SocketAddrV4::new(0.into(), 0))?;
-        if peers.is_empty() {
-            return Ok(None);
+
+        let refresh = self.config.peer_height_refresh_ms;
+        let mut out = Vec::new();
+        for peer in discovery.table().active(usize::MAX, SocketAddrV4::new(0.into(), 0))? {
+            let known = self.peer_heights.entry(peer).or_insert(PeerHeight {
+                height: None,
+                as_of_ms: None,
+            });
+            if known.as_of_ms.is_none_or(|at| now_ms >= at + refresh) {
+                known.as_of_ms = Some(now_ms);
+                out.push(Outgoing {
+                    to: peer,
+                    bytes: query.clone(),
+                });
+            }
         }
-        self.sync_cursor = (self.sync_cursor + 1) % peers.len();
-        Ok(Some(peers[self.sync_cursor]))
+        Ok(out)
     }
 }
 
@@ -521,7 +585,7 @@ mod tests {
             chunk_timeout_ms: 100,
             max_retries: 2,
             max_downloads: 4,
-            sync_interval_ms: 1_000,
+            peer_height_refresh_ms: 1_000,
         }
     }
 
@@ -812,6 +876,7 @@ mod tests {
             hash: block.header.hash(),
             height: 0,
             size,
+            tip_height: 0,
         });
 
         for query in [InvQuery::ByHeight(0), InvQuery::ByHash(block.header.hash())] {
@@ -821,13 +886,18 @@ mod tests {
                 .unwrap();
             assert_eq!(Message::decode(&step.packets[0].bytes), expected);
         }
-        for query in [InvQuery::ByHeight(1), InvQuery::ByHash([9; 32])] {
-            let step = a
-                .transfer
-                .handle(b.addr, &Message::GetInv(query), &a.discovery, &a.reader, 0)
-                .unwrap();
-            assert!(step.packets.is_empty());
-        }
+        // Beyond the tip: answered with the tip, so the asker learns our height.
+        let step = a
+            .transfer
+            .handle(b.addr, &Message::GetInv(InvQuery::ByHeight(7)), &a.discovery, &a.reader, 0)
+            .unwrap();
+        assert_eq!(Message::decode(&step.packets[0].bytes), expected);
+        // An unknown hash gets no answer.
+        let step = a
+            .transfer
+            .handle(b.addr, &Message::GetInv(InvQuery::ByHash([9; 32])), &a.discovery, &a.reader, 0)
+            .unwrap();
+        assert!(step.packets.is_empty());
     }
 
     #[test]
@@ -842,16 +912,88 @@ mod tests {
             hash: block.header.hash(),
             height: 0,
             size: 300,
+            tip_height: 0,
         };
         let huge = Message::Inv {
             hash: [5; 32],
             height: 1,
             size: (config().max_block_bytes + 1) as u32,
+            tip_height: 1,
         };
         for message in [known, huge] {
             let step = b.transfer.handle(a.addr, &message, &b.discovery, &b.reader, 0).unwrap();
             assert!(step.packets.is_empty(), "{message:?}");
         }
+        assert_eq!(b.transfer.downloading(), 0);
+    }
+
+    /// Two nodes on the same tip: once each knows the other's height,
+    /// neither sends anything until that knowledge goes stale.
+    #[test]
+    fn nodes_in_step_send_no_sync_traffic() {
+        let (mut a, mut b) = (side(1), side(2));
+        introduce(&mut a, &mut b);
+        let block = mine_block_with_outputs(&mut a.chain, 1, 1);
+        a.chain.apply_block(&block).unwrap();
+        b.chain.apply_block(&block).unwrap();
+
+        // b asks a's height once; a answers with its tip, which b has.
+        let probe = b.transfer.tick(&b.discovery, &b.reader, 0).unwrap();
+        assert_eq!(probe.packets.len(), 1);
+        let answer = deliver(&b, &mut a, probe.packets, 0, &|_| false);
+        let step = deliver(&a, &mut b, answer.packets, 0, &|_| false);
+        assert!(step.packets.is_empty());
+
+        for now in [100, 500, 999] {
+            assert!(b.transfer.tick(&b.discovery, &b.reader, now).unwrap().packets.is_empty(), "at {now}");
+        }
+        // Stale after the refresh interval: asked once more.
+        assert_eq!(b.transfer.tick(&b.discovery, &b.reader, 1_000).unwrap().packets.len(), 1);
+    }
+
+    /// A peer known to be ahead is asked for our next block right away,
+    /// then not again for that height until `chunk_timeout_ms` passes.
+    #[test]
+    fn a_peer_known_to_be_ahead_is_asked_without_waiting_but_not_flooded() {
+        let (mut a, mut b) = (side(1), side(2));
+        introduce(&mut a, &mut b);
+        // a claims height 5; b has nothing.
+        let inv = Message::Inv {
+            hash: [5; 32],
+            height: 5,
+            size: 300,
+            tip_height: 5,
+        };
+        let step = b.transfer.handle(a.addr, &inv, &b.discovery, &b.reader, 0).unwrap();
+        assert_eq!(step.packets.len(), 1);
+
+        assert!(b.transfer.tick(&b.discovery, &b.reader, 50).unwrap().packets.is_empty());
+        let again = b.transfer.tick(&b.discovery, &b.reader, 100).unwrap();
+        assert_eq!(again.packets.len(), 1);
+        assert_eq!(again.packets[0].to, a.addr);
+        assert_eq!(
+            Message::decode(&again.packets[0].bytes),
+            Some(Message::GetInv(InvQuery::ByHeight(0)))
+        );
+    }
+
+    /// A block downloaded but not applied yet (the chain's owner hasn't
+    /// got to it) isn't downloaded a second time when offered again.
+    #[test]
+    fn a_just_delivered_block_is_not_downloaded_again() {
+        let (mut a, mut b) = (side(1), side(2));
+        introduce(&mut a, &mut b);
+        let block = mine_block_with_outputs(&mut a.chain, 1, 1);
+        a.chain.apply_block(&block).unwrap();
+        let size = block.to_bytes().len() as u32;
+        let hash = block.header.hash();
+
+        let announce = a.transfer.announce(hash, 0, size, None, &a.discovery).unwrap();
+        let (_, got_b) = exchange(&mut a, &mut b, announce.clone(), 0, &|_| false);
+        assert_eq!(got_b.delivered.len(), 1);
+
+        let step = deliver(&a, &mut b, announce, 10, &|_| false);
+        assert!(step.packets.is_empty());
         assert_eq!(b.transfer.downloading(), 0);
     }
 }

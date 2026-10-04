@@ -58,7 +58,7 @@ const INITIAL_LEADING_ZERO_BITS: u32 = 23;
 /// different real-world pace, which is exactly the point of the two
 /// being independent numbers.
 const RETARGET_INTERVAL: u64 = 10;
-const TARGET_BLOCK_TIME_MS: u64 = 10_000;
+const TARGET_BLOCK_TIME_MS: u64 = 60_000;
 const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 
 /// How many blocks a reorg is ever allowed to unwind in this driver's
@@ -84,7 +84,7 @@ const CHUNK_WINDOW: u16 = 32;
 const CHUNK_TIMEOUT_MS: u64 = 1_000;
 const MAX_CHUNK_RETRIES: u32 = 5;
 const MAX_DOWNLOADS: usize = 4;
-const SYNC_INTERVAL_MS: u64 = 10_000;
+const PEER_HEIGHT_REFRESH_MS: u64 = 60_000;
 
 /// How often the network thread runs both protocols' ticks.
 const NETWORK_TICK_MS: u64 = 100;
@@ -198,7 +198,7 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> (Rec
         chunk_timeout_ms: CHUNK_TIMEOUT_MS,
         max_retries: MAX_CHUNK_RETRIES,
         max_downloads: MAX_DOWNLOADS,
-        sync_interval_ms: SYNC_INTERVAL_MS,
+        peer_height_refresh_ms: PEER_HEIGHT_REFRESH_MS,
     });
     let reader = BlockReader::open(storage).expect("failed to open block reader");
     let mut node = net::Node::new(discovery, transfer, reader, socket, NETWORK_TICK_MS);

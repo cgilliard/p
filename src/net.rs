@@ -154,9 +154,6 @@ impl<T: Transport> Node<T> {
                 size,
                 except,
             } => {
-                // The tip moved: if we're catching up, ask for the next
-                // block right away instead of waiting out the interval.
-                self.transfer.sync_soon();
                 self.transfer.announce(hash, height, size, except, &self.discovery)?
             }
             Command::RequestBlock { hash, from } => self.transfer.request_block(hash, from),
@@ -313,7 +310,7 @@ mod tests {
             chunk_timeout_ms: 200,
             max_retries: 5,
             max_downloads: 4,
-            sync_interval_ms: 100,
+            peer_height_refresh_ms: 60_000,
         });
         let reader = BlockReader::open(&storage).unwrap();
         let node = Node::new(discovery, transfer, reader, socket, 10);
