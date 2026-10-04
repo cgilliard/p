@@ -1,10 +1,12 @@
 mod bitmap;
 mod block;
 mod chain;
+mod discovery;
 mod e2e;
 mod fri;
 mod merkle;
 mod output;
+mod peers;
 mod pmmr;
 mod poseidon2;
 mod pow;
@@ -17,7 +19,9 @@ mod wots;
 
 use block::{Block, mine_block, now_millis};
 use chain::Chain;
+use discovery::Discovery;
 use output::Output;
+use peers::PeerTable;
 use storage::Storage;
 use transaction::Transaction;
 
@@ -64,9 +68,117 @@ const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 /// starting point, not a calibration.
 const MAX_REORG_DEPTH: u64 = 1000;
 
-fn data_dir() -> std::path::PathBuf {
+/// UDP port discovery listens on when `--port` isn't given.
+const DEFAULT_PORT: u16 = 7701;
+
+/// Peer discovery knobs for this driver's actual run (see `discovery`
+/// and `peers` for what each one does). Starting points, not
+/// calibrations.
+const SHARE_LIMIT: u16 = 100;
+const MAX_KNOWN_HOSTS: usize = 1000;
+const MAX_HOST_FAILURES: u8 = 3;
+const PROBE_INTERVAL_MS: u64 = 60_000;
+const RESPONSE_TIMEOUT_MS: u64 = 5_000;
+const DISCOVERY_TICK_MS: u64 = 250;
+/// How long one `recv_from` waits before `Node::poll` returns to tick --
+/// well under `DISCOVERY_TICK_MS`, so ticks aren't delayed by it.
+const SOCKET_READ_TIMEOUT_MS: u64 = 50;
+
+fn default_data_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").expect("HOME environment variable must be set");
-    std::path::PathBuf::from(home).join(".tabernacle").join("mdb.dat")
+    std::path::PathBuf::from(home).join(".tabernacle").join("lmdb")
+}
+
+/// Command-line options. Hand-parsed -- there are only three, and this
+/// crate takes on no dependencies it doesn't need.
+struct Args {
+    data_dir: std::path::PathBuf,
+    port: u16,
+    seeds: Vec<std::net::SocketAddrV4>,
+}
+
+const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]...";
+
+fn parse_args() -> Args {
+    let mut args = Args {
+        data_dir: default_data_dir(),
+        port: DEFAULT_PORT,
+        seeds: Vec::new(),
+    };
+    let mut iter = std::env::args().skip(1);
+    while let Some(flag) = iter.next() {
+        let mut value = || {
+            iter.next().unwrap_or_else(|| {
+                eprintln!("{flag} needs a value\n{USAGE}");
+                std::process::exit(2);
+            })
+        };
+        match flag.as_str() {
+            "--data-dir" => args.data_dir = value().into(),
+            "--port" => {
+                let v = value();
+                args.port = v.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid port: {v}\n{USAGE}");
+                    std::process::exit(2);
+                });
+            }
+            "--seed" => {
+                let v = value();
+                args.seeds.push(v.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid seed (expected IPV4:PORT): {v}\n{USAGE}");
+                    std::process::exit(2);
+                }));
+            }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown argument: {other}\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
+    args
+}
+
+/// 32 fresh random bytes for `Discovery`'s nonce key, from the OS.
+fn random_key() -> [u8; 32] {
+    use std::io::Read;
+    let mut key = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut key))
+        .expect("failed to read /dev/urandom");
+    key
+}
+
+/// Run peer discovery on its own thread for the life of the process.
+fn spawn_discovery(storage: &Storage, port: u16, seeds: Vec<std::net::SocketAddrV4>) {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
+        eprintln!("failed to bind UDP port {port}: {e}");
+        std::process::exit(1);
+    });
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_millis(SOCKET_READ_TIMEOUT_MS)))
+        .expect("failed to set socket read timeout");
+    let table = PeerTable::open(storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
+    let config = discovery::Config {
+        seeds,
+        share_limit: SHARE_LIMIT,
+        probe_interval_ms: PROBE_INTERVAL_MS,
+        response_timeout_ms: RESPONSE_TIMEOUT_MS,
+    };
+    let mut node = discovery::Node::new(Discovery::new(config, table, random_key()), socket, DISCOVERY_TICK_MS);
+    // Debugging aid for now: log every datagram sent and received,
+    // labeled with this node's port so several local nodes' logs are
+    // easy to tell apart.
+    node.log = Some(format!(":{port}"));
+    std::thread::spawn(move || {
+        static NEVER_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Err(e) = node.run(now_millis, &NEVER_STOP) {
+            eprintln!("peer discovery stopped: {e:?}");
+        }
+    });
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -134,7 +246,8 @@ fn print_block(block: &Block) {
 }
 
 fn main() {
-    let path = data_dir();
+    let args = parse_args();
+    let path = args.data_dir.clone();
     // `Storage::open` would transparently create-or-load either way
     // (LMDB behaves the same regardless), but checking first lets us
     // say which one actually happened.
@@ -164,6 +277,15 @@ fn main() {
             None => println!("Starting from genesis."),
         }
     }
+
+    if args.seeds.is_empty() {
+        println!("Discovery listening on UDP port {} (no seeds given).", args.port);
+    } else {
+        let seeds: Vec<String> = args.seeds.iter().map(|s| s.to_string()).collect();
+        println!("Discovery listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
+    }
+    spawn_discovery(&storage, args.port, args.seeds);
+    let peer_table = PeerTable::open(&storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
 
     println!("Mining -- press Ctrl+C to stop.\n");
 
@@ -205,6 +327,9 @@ fn main() {
         chain.apply_block(&block).expect("apply_block failed for a block this process just mined");
 
         print_block(&block);
+        let hosts = peer_table.all().expect("failed to read peer table");
+        let verified = hosts.iter().filter(|(_, record)| record.is_verified()).count();
+        println!("  peers:       {} known, {verified} verified", hosts.len());
     }
 }
 

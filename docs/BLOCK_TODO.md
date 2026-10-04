@@ -71,11 +71,13 @@ somewhere in the build pipeline once there's a real circuit to feed.
 
 ## 2. No fork handling
 
-**Status:** mostly done -- side branches, fork-choice by cumulative
-work, bounded reorgs, orphans, and invalid-block tracking are in
-`chain.rs` (`Chain::accept_block`). See `FORK.md` for what's done and
-what's still open. `powLimit` (below) is not started. The original
-description follows.
+**Status:** done -- side branches, fork-choice by cumulative work,
+bounded reorgs with pruning, orphans (PoW-gated, capped), and
+invalid-block tracking are in `chain.rs` (`Chain::accept_block`). See
+`FORK.md` for details and the few deliberately deferred loose ends.
+`powLimit` (below) is the one listed need not done: it's a retargeting
+concern, not a fork-handling one, and is still waiting on a real
+network to size it against. The original description follows.
 
 `Chain::apply_block` only accepts a block whose `prev_hash` matches the
 *current* tip (see `chain.rs`'s `WrongParent` check) — there's no notion
