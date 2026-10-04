@@ -1,9 +1,8 @@
 # Fork handling: status
 
 Progress on item #2 of `BLOCK_TODO.md` ("No fork handling"): side
-branches, fork-choice by cumulative work, reorgs, and orphans. As of
-this writing the work is uncommitted on top of `eda0bd6 add pmmr
-truncate`; it builds cleanly and all 224 tests pass.
+branches, fork-choice by cumulative work, reorgs, and orphans. All 231
+tests pass.
 
 ## Done
 
@@ -20,8 +19,10 @@ truncate`; it builds cleanly and all 224 tests pass.
 ### Undo data and unwinding (`chain.rs`)
 
 - New LMDB databases, all keyed by header hash: `blocks` (full block
-  bytes), `block_undo` (`UndoData`), `block_work` (cumulative work).
-  `storage::MAX_DBS` raised from 8 to 16.
+  bytes), `block_undo` (`UndoData`), `block_work` (cumulative work),
+  `block_retarget` (`RetargetState` after the block), `invalid_blocks`;
+  plus `block_heights` (height ‖ hash, for pruning). `storage::MAX_DBS`
+  raised from 8 to 16 (12 used).
 - `apply_block` split into `apply_block_in_txn`, so several blocks (plus
   unwinds) can share one atomic transaction.
 - `UndoData` snapshots, at apply time, the previous tip header, previous
@@ -41,16 +42,31 @@ truncate`; it builds cleanly and all 224 tests pass.
 - `accept_block(block) -> AcceptOutcome`, one of `Applied`,
   `StoredAsSideBranch`, `Reorged { unwound, applied }`, `Orphaned`.
 - Side-branch blocks are validated and stored (`store_side_branch_block`)
-  in their own transaction, without touching live state.
+  in their own transaction, without touching live state. Each is checked
+  against *its own branch's* target: the retarget rule is a pure function
+  (`RetargetState::after`), and every stored block records the state
+  after it, so a fork straddling a retarget-window boundary is handled
+  exactly.
 - Reorg only on *strictly* more cumulative work. Unwind + replay run in a
   single write transaction; any replay failure aborts it, leaving the
   active chain untouched. This is safe because `Pmmr`, `Bitmap`, and
   `UtxoIndex` hold no in-memory state -- everything lives in LMDB.
-- `find_fork_point` searches back at most `max_reorg_depth` blocks;
-  beyond that, `Error::ReorgTooDeep`. `Chain::open` now takes
-  `max_reorg_depth` (`main.rs`: 1000; tests: 5).
-- In-memory orphan pool keyed by missing parent hash;
-  `try_connect_orphans(hash)` retries waiting orphans transitively.
+- One height cutoff, `reorg_floor` (tip height − `max_reorg_depth`),
+  drives three things: blocks at or below it are refused on arrival
+  (`Error::ReorgTooDeep`, not stored or pooled); `find_fork_point`
+  walks the candidate side back to it (bounded by height, not step
+  count, so a branch longer than `max_reorg_depth` can still win if the
+  *unwind* is within the limit); and everything strictly below it is
+  pruned (`Chain::prune`) after each apply or reorg -- active chain and
+  side branches alike. Every node is a pruned node, by decision: nothing
+  serves old blocks to peers yet, and the recursive proof is meant to
+  make history unnecessary; an archival mode can come later if needed.
+  `Chain::open` takes `max_reorg_depth`
+  (`main.rs`: 1000; tests: 5).
+- In-memory orphan pool, capped at `MAX_ORPHANS` (100), oldest evicted
+  first. `accept_block` retries waiting orphans itself, transitively,
+  whenever a block connects; orphans' own outcomes aren't reported
+  (failures are dropped), but their effect shows in `tip_hash`.
 - Invalid-block tracking: a new `invalid_blocks` table. A reorg replay
   that fails on a block-level fault (`Error::is_block_fault`: bad
   validate, lineage, unresolved/duplicate input or output, root
@@ -66,23 +82,17 @@ truncate`; it builds cleanly and all 224 tests pass.
   replayed (active chain unchanged, follow-up block refused without a
   retry); mid-chain fork whose winning branch spends a shared output
   differently (final roots match a node that only saw the winning
-  branch); duplicate applied / side-branch / orphan blocks.
+  branch); duplicate applied / side-branch / orphan blocks; side-branch
+  block valid only under its own branch's post-retarget target; neck-and-
+  neck branch replaying `max_reorg_depth + 1` blocks; floor rejection;
+  pruning (and a full-depth unwind still working afterwards); orphan
+  eviction and automatic connection.
 
 ## Gaps / loose ends
 
-1. **Side-branch blocks are validated against the active chain's
-   target**, not a branch-specific recomputed one. Documented as a
-   deliberate simplification; imprecise for forks straddling a
-   retarget-window boundary.
-2. **Orphan pool is unbounded** -- no size cap or expiry (memory DoS).
-3. **`accept_block` doesn't call `try_connect_orphans` itself**; the
-   caller must remember to.
-4. **`max_reorg_depth` also bounds the candidate branch's length** past
-   the fork point, so a long new branch is refused even if the unwind
-   itself would be shallow.
-5. **No pruning** of `blocks` / `block_undo` / `block_work` beyond
-   `max_reorg_depth`.
-6. **A block that fails to apply directly onto the tip isn't recorded
+1. **A block that fails to apply directly onto the tip isn't recorded
    as invalid** (it was never stored, so nothing can extend it; a
    resend just fails again the same way). Only reorg-replay failures
-   are recorded.
+   are recorded. Intentional.
+2. **Orphan pool has no expiry**, only the size cap.
+3. **`powLimit`** (`BLOCK_TODO.md` #2) -- not started.

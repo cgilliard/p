@@ -28,8 +28,9 @@ pub const DEFAULT_MAP_SIZE: usize = 1 << 30;
 /// LMDB requires declaring this upfront. Currently used: `nodes` and `meta`
 /// (by `Pmmr`), `bitmap_pages` and `bitmap_nodes` (by `Bitmap`),
 /// `utxo_index` (by `UtxoIndex`), and `chain_meta`, `blocks`,
-/// `block_undo`, `block_work`, and `invalid_blocks` (by `Chain`) -- 10 of
-/// 16, leaving some headroom before this needs revisiting again.
+/// `block_undo`, `block_work`, `invalid_blocks`, `block_retarget`, and
+/// `block_heights` (by `Chain`) -- 12 of 16, leaving some headroom before
+/// this needs revisiting again.
 const MAX_DBS: u32 = 16;
 
 #[derive(Debug)]

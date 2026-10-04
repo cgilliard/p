@@ -200,6 +200,26 @@ const BLOCK_WORK_DB: &str = "block_work";
 /// across restarts, so the verdict on them has to as well.
 const INVALID_BLOCKS_DB: &str = "invalid_blocks";
 
+/// Database name: the `RetargetState` in effect right *after* each
+/// stored block, keyed by the same header hash as `BLOCKS_DB`. Tracked
+/// for every accepted block, active or side branch, for the same reason
+/// as `BLOCK_WORK_DB`: a side-branch block has to be checked against
+/// the target *its own branch's* history implies, which can differ from
+/// the active chain's once the two straddle a retarget-window boundary.
+const BLOCK_RETARGET_DB: &str = "block_retarget";
+
+/// Database name: an index of every stored block by height -- key is
+/// `height` (big-endian) followed by the header hash, value unused --
+/// so pruning can find everything below a height without scanning
+/// `BLOCKS_DB`. See `Chain::prune`.
+const BLOCK_HEIGHTS_DB: &str = "block_heights";
+
+/// How many blocks the orphan pool holds before evicting the oldest --
+/// a bound on how much memory a peer can make this node spend on
+/// blocks it can't place yet. Same number Bitcoin Core uses for its
+/// orphan *transaction* pool; not calibrated against anything here.
+const MAX_ORPHANS: usize = 100;
+
 #[derive(Debug)]
 pub enum Error {
     Storage(crate::storage::Error),
@@ -239,16 +259,14 @@ pub enum Error {
     /// that was passed in.
     InvalidTransaction(usize),
     /// A side-branch block's own header is unsound -- `Block::validate`
-    /// against the active chain's current target failed (see
-    /// `accept_block`'s docs on why that target, specifically, is the
-    /// one checked against).
+    /// against the target its own branch's history implies failed.
     InvalidSideBranchBlock,
     /// A side-branch block's claimed `prev_hash`/`height` doesn't
     /// match the block it claims to extend.
     InvalidSideBranchLineage,
-    /// A competing chain has more work than the active one, but
-    /// finding their common ancestor would need to unwind further
-    /// than `max_reorg_depth` allows -- see `Chain::open`'s docs.
+    /// A competing chain (or a block that could only ever belong to
+    /// one) would fork off the active chain further back than
+    /// `max_reorg_depth` allows -- see `Chain::open`'s docs.
     ReorgTooDeep,
     /// The block is, or descends from, one already recorded in
     /// `INVALID_BLOCKS_DB`.
@@ -339,8 +357,77 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// from before it was removed -- see that method's docs.
 type ResolveResult = ([u8; 32], [u8; 32], Vec<([u8; 32], u64)>);
 
+/// `BLOCK_HEIGHTS_DB`'s key for a block: big-endian height first, so
+/// keys sort by height, then the hash to keep same-height blocks apart.
+fn height_key(height: u64, hash: [u8; 32]) -> [u8; 40] {
+    let mut out = [0u8; 40];
+    out[..8].copy_from_slice(&height.to_be_bytes());
+    out[8..].copy_from_slice(&hash);
+    out
+}
+
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Difficulty retargeting's state as of right after some block: the
+/// target the *next* block must meet, and the timestamp the retarget
+/// window in progress started at. What `chain_meta`'s
+/// `CURRENT_TARGET_KEY`/`WINDOW_START_TIMESTAMP_KEY` hold for the
+/// active tip, and what `BLOCK_RETARGET_DB` holds for every stored block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetargetState {
+    target: [u8; 32],
+    window_start_timestamp: u64,
+}
+
+impl RetargetState {
+    fn to_bytes(self) -> [u8; 40] {
+        let mut out = [0u8; 40];
+        out[..32].copy_from_slice(&self.target);
+        out[32..].copy_from_slice(&self.window_start_timestamp.to_be_bytes());
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 40 {
+            return Err(Error::Corrupt("stored retarget state was not 40 bytes"));
+        }
+        Ok(RetargetState {
+            target: bytes[..32].try_into().unwrap(),
+            window_start_timestamp: u64::from_be_bytes(bytes[32..].try_into().unwrap()),
+        })
+    }
+
+    /// The state right after `header` lands on top of `self` -- the
+    /// retargeting rule itself, as a pure function of nothing but the
+    /// previous state and the new header, so it can be run for any
+    /// branch, not just the active one. Two things can happen, and at
+    /// most one ever does for a given block (see the module docs): if
+    /// `header` opens a new window, its timestamp becomes the new
+    /// `window_start_timestamp`; if it closes one, the window's actual
+    /// elapsed time, clamped to within `max_adjustment_factor` of what
+    /// was expected, becomes the ratio `target` is scaled by (Bitcoin's
+    /// own rule -- see the module docs).
+    fn after(self, config: &DifficultyConfig, header: &BlockHeader) -> Self {
+        let height = header.height;
+        let interval = config.interval;
+        let mut next = self;
+
+        if height.is_multiple_of(interval) {
+            next.window_start_timestamp = header.timestamp;
+        }
+
+        if (height + 1).is_multiple_of(interval) {
+            let elapsed = header.timestamp.saturating_sub(next.window_start_timestamp);
+            let expected = config.target_block_time_ms * (interval - 1);
+            let factor = config.max_adjustment_factor;
+            let clamped_elapsed = elapsed.clamp(expected / factor, expected * factor);
+            next.target = pow::scale(next.target, clamped_elapsed, expected);
+        }
+
+        next
+    }
 }
 
 /// Everything `Chain::unwind_tip` needs to reverse exactly what
@@ -465,6 +552,15 @@ pub enum AcceptOutcome {
     AlreadyKnown,
 }
 
+/// Whether `outcome` means the block is now stored -- on the active
+/// chain or a side branch -- so anything waiting on it can connect too.
+fn is_connected(outcome: &AcceptOutcome) -> bool {
+    matches!(
+        outcome,
+        AcceptOutcome::Applied | AcceptOutcome::StoredAsSideBranch | AcceptOutcome::Reorged { .. }
+    )
+}
+
 /// A full node's chain state: the real `Pmmr`, `Bitmap`, and `UtxoIndex`,
 /// plus the metadata none of those three know about on their own -- which
 /// header is the current tip, and at what height.
@@ -478,19 +574,25 @@ pub struct Chain {
     block_undo: Database<Bytes, Bytes>,
     block_work: Database<Bytes, Bytes>,
     invalid_blocks: Database<Bytes, Bytes>,
+    block_retarget: Database<Bytes, Bytes>,
+    block_heights: Database<Bytes, Bytes>,
     difficulty: DifficultyConfig,
     /// How many blocks a reorg is ever allowed to unwind -- see
-    /// `Chain::open`'s docs. Bounds how far back `blocks`/`block_undo`
-    /// genuinely need to be retained (nothing prunes them yet, but
-    /// this is the depth any future pruning pass would need to keep).
+    /// `Chain::open`'s docs. Also how far back stored blocks are kept
+    /// at all; see `prune`.
     max_reorg_depth: u64,
-    /// Blocks whose parent isn't known at all yet, keyed by that
-    /// missing parent's hash -- purely in-memory, not persisted. This
-    /// is inherently about a transient "still waiting on the network"
-    /// state; if this process restarts, there's nothing to resume,
-    /// the orphan would just arrive again (or get re-requested) the
-    /// same way it did the first time.
-    orphans: std::collections::HashMap<[u8; 32], Vec<Block>>,
+    /// Blocks whose parent isn't known at all yet, each with its own
+    /// header hash, oldest first -- purely in-memory, not persisted.
+    /// This is inherently about a transient "still waiting on the
+    /// network" state; if this process restarts, there's nothing to
+    /// resume, the orphan would just arrive again (or get re-requested)
+    /// the same way it did the first time. A plain `Vec` rather than a
+    /// map keyed by parent: it never holds more than `max_orphans`
+    /// entries, so a linear scan is cheap, and arrival order is exactly
+    /// what eviction needs.
+    orphans: Vec<([u8; 32], Block)>,
+    /// `MAX_ORPHANS`, as a field only so tests can shrink it.
+    max_orphans: usize,
 }
 
 impl Chain {
@@ -516,6 +618,8 @@ impl Chain {
         let block_undo = storage.database(BLOCK_UNDO_DB)?;
         let block_work = storage.database(BLOCK_WORK_DB)?;
         let invalid_blocks = storage.database(INVALID_BLOCKS_DB)?;
+        let block_retarget = storage.database(BLOCK_RETARGET_DB)?;
+        let block_heights = storage.database(BLOCK_HEIGHTS_DB)?;
         Ok(Chain {
             storage: storage.clone(),
             pmmr,
@@ -526,9 +630,12 @@ impl Chain {
             block_undo,
             block_work,
             invalid_blocks,
+            block_retarget,
+            block_heights,
             difficulty,
             max_reorg_depth,
-            orphans: std::collections::HashMap::new(),
+            orphans: Vec::new(),
+            max_orphans: MAX_ORPHANS,
         })
     }
 
@@ -586,6 +693,87 @@ impl Chain {
         bytes.try_into().map_err(|_| Error::Corrupt("stored chain work was not 32 bytes"))
     }
 
+    /// The `RetargetState` right after `hash` -- the initial state for
+    /// `GENESIS_PARENT_HASH`, otherwise whatever was recorded for that
+    /// block when it was accepted (`BLOCK_RETARGET_DB`).
+    fn retarget_state_after(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<RetargetState> {
+        if hash == GENESIS_PARENT_HASH {
+            return Ok(RetargetState {
+                target: self.difficulty.initial_target,
+                window_start_timestamp: 0,
+            });
+        }
+        let bytes = self
+            .block_retarget
+            .get(txn, &hash)?
+            .ok_or(Error::Corrupt("no stored retarget state for this block"))?;
+        RetargetState::from_bytes(bytes)
+    }
+
+    /// Record `block` in every per-block store -- the block itself, its
+    /// cumulative work, the retargeting state after it, and the height
+    /// index -- active chain or side branch alike.
+    fn store_block_records(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        block: &Block,
+        work: [u8; 32],
+        retarget: RetargetState,
+    ) -> Result<()> {
+        let hash = block.header.hash();
+        self.blocks.put(wtxn, &hash, &block.to_bytes())?;
+        self.block_work.put(wtxn, &hash, &work)?;
+        self.block_retarget.put(wtxn, &hash, &retarget.to_bytes())?;
+        self.block_heights.put(wtxn, &height_key(block.header.height, hash), &[])?;
+        Ok(())
+    }
+
+    /// The height at or below which no block can matter any more: a
+    /// block at this height or lower could only ever be part of a
+    /// branch forking off the active chain further back than
+    /// `max_reorg_depth` allows. `None` while the active chain is still
+    /// shallower than that (every height, back to genesis, is fair game).
+    /// The single number `accept_block`'s early rejection,
+    /// `find_fork_point`'s search bound, and `prune`'s cutoff all share.
+    fn reorg_floor(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
+        Ok(self
+            .height(txn)?
+            .and_then(|tip_height| tip_height.checked_sub(self.max_reorg_depth)))
+    }
+
+    /// Delete every stored record (block, undo data, work, retarget
+    /// state, invalid marker, height index entry) for blocks strictly
+    /// below `reorg_floor` -- active chain and side branches alike.
+    /// Nothing below that height can ever be unwound to, replayed, or
+    /// extended by an acceptable block again, so there's no reason to
+    /// keep it. The floor block itself is kept: a side branch forking
+    /// right at it still needs its work and retarget state.
+    fn prune(&self, wtxn: &mut heed::RwTxn) -> Result<()> {
+        let Some(floor) = self.reorg_floor(wtxn)? else {
+            return Ok(());
+        };
+        let end = floor.to_be_bytes();
+        let mut doomed = Vec::new();
+        // A `(Bound, Bound)` pair rather than `..&end[..]`: `Bytes`' key
+        // type is the unsized `[u8]`, which only the tuple form of
+        // `RangeBounds` accepts.
+        let below_floor = (std::ops::Bound::Unbounded, std::ops::Bound::Excluded(&end[..]));
+        for entry in self.block_heights.range(wtxn, &below_floor)? {
+            let (key, _) = entry?;
+            doomed.push(key.to_vec());
+        }
+        for key in doomed {
+            let hash: [u8; 32] = key[8..].try_into().map_err(|_| Error::Corrupt("height index key was not 40 bytes"))?;
+            self.blocks.delete(wtxn, &hash)?;
+            self.block_undo.delete(wtxn, &hash)?;
+            self.block_work.delete(wtxn, &hash)?;
+            self.block_retarget.delete(wtxn, &hash)?;
+            self.invalid_blocks.delete(wtxn, &hash)?;
+            self.block_heights.delete(wtxn, &key)?;
+        }
+        Ok(())
+    }
+
     /// The current tip's header hash, or `GENESIS_PARENT_HASH` if no
     /// block has ever been applied.
     pub fn tip_hash(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
@@ -630,38 +818,21 @@ impl Chain {
         }
     }
 
-    /// Update retargeting's side state for the window `applied_header`
-    /// just landed in, through `wtxn` -- called once a block has
-    /// already passed every other check in `apply_block`, right before
-    /// it's committed. Two things can happen, and at most one ever does
-    /// for a given block (see the module docs): if `applied_header`
-    /// opens a new window, its timestamp becomes the new
-    /// `window_start_timestamp`; if it closes one, the window's actual
-    /// elapsed time, clamped to within `max_adjustment_factor` of what
-    /// was expected, becomes the ratio `current_target` is scaled by
-    /// (Bitcoin's own rule -- see the module docs).
-    fn retarget_if_due(&mut self, wtxn: &mut heed::RwTxn, applied_header: &BlockHeader) -> Result<()> {
-        let height = applied_header.height;
-        let interval = self.difficulty.interval;
-
-        if height.is_multiple_of(interval) {
-            self.meta
-                .put(wtxn, WINDOW_START_TIMESTAMP_KEY, &applied_header.timestamp.to_be_bytes())?;
-        }
-
-        if (height + 1).is_multiple_of(interval) {
-            let window_start = self.window_start_timestamp(wtxn)?;
-            let elapsed = applied_header.timestamp.saturating_sub(window_start);
-            let expected = self.difficulty.target_block_time_ms * (interval - 1);
-            let factor = self.difficulty.max_adjustment_factor;
-            let clamped_elapsed = elapsed.clamp(expected / factor, expected * factor);
-
-            let old_target = self.current_target(wtxn)?;
-            let new_target = pow::scale(old_target, clamped_elapsed, expected);
-            self.meta.put(wtxn, CURRENT_TARGET_KEY, &new_target)?;
-        }
-
-        Ok(())
+    /// Advance the active chain's retargeting state past
+    /// `applied_header` (see `RetargetState::after` for the rule
+    /// itself), through `wtxn` -- called once a block has already
+    /// passed every other check in `apply_block`, right before it's
+    /// committed. Returns the new state, for `BLOCK_RETARGET_DB`.
+    fn retarget_if_due(&mut self, wtxn: &mut heed::RwTxn, applied_header: &BlockHeader) -> Result<RetargetState> {
+        let prev = RetargetState {
+            target: self.current_target(wtxn)?,
+            window_start_timestamp: self.window_start_timestamp(wtxn)?,
+        };
+        let next = prev.after(&self.difficulty, applied_header);
+        self.meta.put(wtxn, CURRENT_TARGET_KEY, &next.target)?;
+        self.meta
+            .put(wtxn, WINDOW_START_TIMESTAMP_KEY, &next.window_start_timestamp.to_be_bytes())?;
+        Ok(next)
     }
 
     /// Resolve and apply `body`'s inputs and outputs against real chain
@@ -726,6 +897,7 @@ impl Chain {
         let storage = self.storage.clone();
         let mut wtxn = storage.write_txn()?;
         self.apply_block_in_txn(&mut wtxn, block)?;
+        self.prune(&mut wtxn)?;
         wtxn.commit()?;
         Ok(())
     }
@@ -770,20 +942,18 @@ impl Chain {
             return Err(Error::BitmapRootMismatch);
         }
 
-        self.retarget_if_due(wtxn, &block.header)?;
+        let retarget = self.retarget_if_due(wtxn, &block.header)?;
         self.meta.put(wtxn, TIP_HEADER_KEY, &block.header.to_bytes())?;
 
-        let hash = block.header.hash();
-        self.blocks.put(wtxn, &hash, &block.to_bytes())?;
         let undo = UndoData {
             prev_tip_header,
             prev_current_target,
             prev_window_start_timestamp,
             spent_inputs,
         };
-        self.block_undo.put(wtxn, &hash, &undo.to_bytes())?;
+        self.block_undo.put(wtxn, &block.header.hash(), &undo.to_bytes())?;
         let this_work = pow::add256(parent_work, pow::work_for_target(target));
-        self.block_work.put(wtxn, &hash, &this_work)?;
+        self.store_block_records(wtxn, block, this_work, retarget)?;
 
         Ok(())
     }
@@ -855,13 +1025,20 @@ impl Chain {
     }
 
     /// Find where `candidate_tip_hash`'s chain and the active chain
-    /// diverge, searching back at most `self.max_reorg_depth` blocks
-    /// on each side. `None` if no common ancestor turns up within
-    /// that bound -- the caller should treat that as `Error::
-    /// ReorgTooDeep`, not keep searching (see `Chain::open`'s docs on
-    /// why this crate refuses rather than attempting a deeper reorg).
+    /// diverge, searching the active side back at most
+    /// `self.max_reorg_depth` blocks, and the candidate side back until
+    /// it either meets the active side or drops to `reorg_floor` (below
+    /// which it can't possibly meet it any more). The candidate side is
+    /// bounded by height, not by a step count: a branch can be longer
+    /// than `max_reorg_depth` past the fork point without the *unwind*
+    /// being any deeper -- two miners neck and neck for a while, say.
+    /// `None` if no common ancestor turns up within those bounds -- the
+    /// caller should treat that as `Error::ReorgTooDeep`, not keep
+    /// searching (see `Chain::open`'s docs on why this crate refuses
+    /// rather than attempting a deeper reorg).
     fn find_fork_point(&self, txn: &heed::RoTxn, candidate_tip_hash: [u8; 32]) -> Result<Option<ForkPoint>> {
         let max_depth = self.max_reorg_depth;
+        let floor = self.reorg_floor(txn)?;
 
         // Hash -> how many `unwind_tip` calls reach it from the active tip.
         let mut active_depth: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
@@ -881,19 +1058,20 @@ impl Chain {
         // until landing on a hash the active side already knows about.
         let mut replay = Vec::new();
         let mut hash = candidate_tip_hash;
-        let mut steps = 0u64;
         loop {
             if let Some(&unwind_count) = active_depth.get(&hash) {
                 replay.reverse();
                 return Ok(Some(ForkPoint { unwind_count, replay }));
             }
-            if hash == GENESIS_PARENT_HASH || steps >= max_depth {
+            if hash == GENESIS_PARENT_HASH {
                 return Ok(None);
             }
             let block = self.get_stored_block(txn, hash)?;
+            if floor.is_some_and(|floor| block.header.height <= floor) {
+                return Ok(None);
+            }
             hash = block.header.prev_hash;
             replay.push(block);
-            steps += 1;
         }
     }
 
@@ -912,20 +1090,14 @@ impl Chain {
     ///
     /// What *is* checked here: the block's own `Block::validate`
     /// (proof of work, canonical ordering, body_hash, proof), against
-    /// the *active* chain's current target -- not a recomputed target
-    /// for this specific branch's own history. That's a deliberate
-    /// simplification, not an oversight: computing a branch-specific
-    /// target would mean replaying retargeting from arbitrary stored
-    /// headers, independent of `Chain`'s own live meta state, which
-    /// is real additional work deferred for now. This is correct for
-    /// the common case (a shallow fork, recent enough that difficulty
-    /// hasn't actually moved between the branches) and imprecise for
-    /// a fork straddling a retarget-window boundary deep within
-    /// `max_reorg_depth`'s range. Also checked: that `prev_hash`/
-    /// `height` actually match the parent block it claims to extend.
+    /// the target its own branch's history implies -- the parent's
+    /// recorded `RetargetState`, not the active chain's, since the two
+    /// differ once a fork straddles a retarget-window boundary. Also
+    /// checked: that `prev_hash`/`height` actually match the parent
+    /// block it claims to extend.
     fn store_side_branch_block(&mut self, wtxn: &mut heed::RwTxn, block: &Block) -> Result<()> {
-        let target = self.current_target(wtxn)?;
-        if !block.validate(&target) {
+        let parent_retarget = self.retarget_state_after(wtxn, block.header.prev_hash)?;
+        if !block.validate(&parent_retarget.target) {
             return Err(Error::InvalidSideBranchBlock);
         }
 
@@ -940,11 +1112,9 @@ impl Chain {
             return Err(Error::InvalidSideBranchLineage);
         }
 
-        let hash = block.header.hash();
-        self.blocks.put(wtxn, &hash, &block.to_bytes())?;
-        let this_work = pow::add256(parent_work, pow::work_for_target(target));
-        self.block_work.put(wtxn, &hash, &this_work)?;
-        Ok(())
+        let this_work = pow::add256(parent_work, pow::work_for_target(parent_retarget.target));
+        let retarget = parent_retarget.after(&self.difficulty, &block.header);
+        self.store_block_records(wtxn, block, this_work, retarget)
     }
 
     /// Accept `block`, whatever it turns out to be relative to the
@@ -968,18 +1138,38 @@ impl Chain {
     ///   replayed block actually validates -- so a bad block deep in
     ///   a heavier-looking branch aborts the whole reorg, leaving the
     ///   active chain exactly as it was.
-    /// - Its parent isn't known at all: held in the orphan pool. See
-    ///   `try_connect_orphans`.
+    /// - Its parent isn't known at all: held in the orphan pool (at
+    ///   most `max_orphans` of them, oldest evicted first).
     ///
     /// Before any of that, a block already stored or already waiting
     /// as an orphan is reported as `AlreadyKnown` and otherwise
-    /// ignored, and one that is, or extends, a block recorded in
-    /// `INVALID_BLOCKS_DB` is refused with `Error::KnownInvalidBlock`.
-    /// A reorg that fails on a block-level fault (`Error::
-    /// is_block_fault`) records the failing block and everything after
-    /// it in that branch there, so the same branch never triggers
-    /// another attempt.
+    /// ignored; one that is, or extends, a block recorded in
+    /// `INVALID_BLOCKS_DB` is refused with `Error::KnownInvalidBlock`;
+    /// and one at or below `reorg_floor` is refused with `Error::
+    /// ReorgTooDeep` -- nothing that low can ever win, so it isn't
+    /// worth storing or pooling. A reorg that fails on a block-level
+    /// fault (`Error::is_block_fault`) records the failing block and
+    /// everything after it in that branch as invalid, so the same
+    /// branch never triggers another attempt.
+    ///
+    /// Whenever `block` ends up connected (applied, stored, or reorged
+    /// onto), any orphans that were waiting on it are retried right
+    /// away, transitively -- see `connect_orphans`. The returned
+    /// outcome is `block`'s own; theirs aren't reported (an orphan that
+    /// fails is just dropped), but anything they did to the active
+    /// chain is visible through `tip_hash` like any other change.
     pub fn accept_block(&mut self, block: Block) -> Result<AcceptOutcome> {
+        let hash = block.header.hash();
+        let outcome = self.accept_one(block)?;
+        if is_connected(&outcome) {
+            self.connect_orphans(hash);
+        }
+        Ok(outcome)
+    }
+
+    /// `accept_block` for exactly one block, without touching the
+    /// orphan pool beyond (possibly) adding `block` to it.
+    fn accept_one(&mut self, block: Block) -> Result<AcceptOutcome> {
         let storage = self.storage.clone();
         let hash = block.header.hash();
 
@@ -989,12 +1179,11 @@ impl Chain {
             self.mark_invalid(std::slice::from_ref(&block))?;
             return Err(Error::KnownInvalidBlock);
         }
-        let already_orphaned = self
-            .orphans
-            .get(&block.header.prev_hash)
-            .is_some_and(|waiting| waiting.iter().any(|orphan| orphan.header.hash() == hash));
-        if already_orphaned || self.blocks.get(&rtxn, &hash)?.is_some() {
+        if self.orphans.iter().any(|(orphan_hash, _)| *orphan_hash == hash) || self.blocks.get(&rtxn, &hash)?.is_some() {
             return Ok(AcceptOutcome::AlreadyKnown);
+        }
+        if self.reorg_floor(&rtxn)?.is_some_and(|floor| block.header.height <= floor) {
+            return Err(Error::ReorgTooDeep);
         }
 
         let tip_hash = self.tip_hash(&rtxn)?;
@@ -1009,7 +1198,10 @@ impl Chain {
         drop(rtxn);
 
         if !parent_known {
-            self.orphans.entry(block.header.prev_hash).or_default().push(block);
+            if self.orphans.len() >= self.max_orphans {
+                self.orphans.remove(0);
+            }
+            self.orphans.push((hash, block));
             return Ok(AcceptOutcome::Orphaned);
         }
 
@@ -1057,6 +1249,7 @@ impl Chain {
                 return Err(e);
             }
         }
+        self.prune(&mut wtxn)?;
         wtxn.commit()?;
 
         Ok(AcceptOutcome::Reorged {
@@ -1066,31 +1259,24 @@ impl Chain {
     }
 
     /// Retry every orphan waiting on `newly_known_hash`, now that it's
-    /// actually known -- and, transitively, anything that in turn
-    /// starts waiting on one of *those* once they're accepted. Not
-    /// called automatically by `accept_block` itself (keeping that
-    /// method focused on classifying one block); a caller -- a future
-    /// networking receive loop, or a test -- calls this explicitly
-    /// right after a block it just accepted might have unblocked
-    /// something.
-    pub fn try_connect_orphans(&mut self, newly_known_hash: [u8; 32]) -> Vec<Result<AcceptOutcome>> {
+    /// actually known -- and, transitively, anything that in turn was
+    /// waiting on one of *those* once they're connected. Returns each
+    /// retried orphan's outcome, in the order they were retried; only
+    /// tests look at them (`accept_block` discards them).
+    fn connect_orphans(&mut self, newly_known_hash: [u8; 32]) -> Vec<Result<AcceptOutcome>> {
         let mut outcomes = Vec::new();
         let mut queue = vec![newly_known_hash];
-        while let Some(hash) = queue.pop() {
-            let Some(waiting) = self.orphans.remove(&hash) else {
-                continue;
-            };
-            for orphan in waiting {
-                let orphan_hash = orphan.header.hash();
-                let outcome = self.accept_block(orphan);
-                let newly_connected = matches!(
-                    outcome,
-                    Ok(AcceptOutcome::Applied) | Ok(AcceptOutcome::StoredAsSideBranch) | Ok(AcceptOutcome::Reorged { .. })
-                );
-                outcomes.push(outcome);
-                if newly_connected {
+        while let Some(parent_hash) = queue.pop() {
+            let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.orphans)
+                .into_iter()
+                .partition(|(_, orphan)| orphan.header.prev_hash == parent_hash);
+            self.orphans = rest;
+            for (orphan_hash, orphan) in waiting {
+                let outcome = self.accept_one(orphan);
+                if outcome.as_ref().is_ok_and(is_connected) {
                     queue.push(orphan_hash);
                 }
+                outcomes.push(outcome);
             }
         }
         outcomes
@@ -1893,27 +2079,106 @@ mod tests {
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
     }
 
-    /// The common ancestor (genesis) is further back than
-    /// `TEST_MAX_REORG_DEPTH` allows either side to search -- the
-    /// active chain is deeper than that on its own, so even a
-    /// strictly heavier competing chain must be refused rather than
+    /// A competing branch that was stored back when it was still
+    /// within reach, but whose fork point the active chain has since
+    /// moved more than `TEST_MAX_REORG_DEPTH` past: even once that
+    /// branch becomes strictly heavier, it must be refused rather than
     /// attempted.
     #[test]
     fn accept_block_rejects_a_reorg_deeper_than_max_reorg_depth() {
-        let (_dir, _storage, mut chain) = open();
+        let (_dir, storage, mut chain) = open();
+        let competing = build_chain(TEST_MAX_REORG_DEPTH + 3, 100);
+
+        let mut active_tip = None;
+        for i in 0..(TEST_MAX_REORG_DEPTH + 2) {
+            let (_sk, pk) = keypair((i + 1) as u8);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            active_tip = Some(block.header.hash());
+            // The competing branch's first two blocks arrive early,
+            // while genesis is still within reach.
+            if i < 2 {
+                let outcome = chain.accept_block(competing[i as usize].clone()).unwrap();
+                assert_eq!(outcome, AcceptOutcome::StoredAsSideBranch);
+            }
+        }
+
+        let mut last_outcome = None;
+        for block in competing.into_iter().skip(2) {
+            last_outcome = Some(chain.accept_block(block));
+        }
+        assert!(matches!(last_outcome, Some(Err(Error::ReorgTooDeep))));
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), active_tip.unwrap());
+    }
+
+    /// A block that could only ever fork off the active chain further
+    /// back than `TEST_MAX_REORG_DEPTH` is refused on arrival -- not
+    /// stored, and not pooled as an orphan either.
+    #[test]
+    fn accept_block_refuses_a_block_at_or_below_the_reorg_floor() {
+        let (_dir, storage, mut chain) = open();
         for i in 0..(TEST_MAX_REORG_DEPTH + 2) {
             let (_sk, pk) = keypair((i + 1) as u8);
             let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
             chain.apply_block(&block).unwrap();
         }
 
-        let competing = build_chain(TEST_MAX_REORG_DEPTH + 3, 100);
-
-        let mut last_outcome = None;
-        for block in competing {
-            last_outcome = Some(chain.accept_block(block));
+        // Active tip is at height 6, so the floor is 1: heights 0 and 1
+        // are out of reach.
+        let competing = build_chain(2, 100);
+        for block in competing.iter().cloned() {
+            assert!(matches!(chain.accept_block(block), Err(Error::ReorgTooDeep)));
         }
-        assert!(matches!(last_outcome, Some(Err(Error::ReorgTooDeep))));
+
+        let rtxn = storage.read_txn().unwrap();
+        assert!(chain.blocks.get(&rtxn, &competing[0].header.hash()).unwrap().is_none());
+        assert!(chain.orphans.is_empty());
+    }
+
+    /// Two miners neck and neck: the competing branch keeps pace with
+    /// the active chain for `TEST_MAX_REORG_DEPTH` blocks, then pulls
+    /// ahead by one. The unwind is exactly `TEST_MAX_REORG_DEPTH`
+    /// (allowed) even though the branch being replayed is one longer --
+    /// the replay side mustn't be held to the unwind limit.
+    #[test]
+    fn accept_block_reorgs_onto_a_branch_longer_than_max_reorg_depth() {
+        let (_dir, storage, mut chain) = open();
+        let (_builder_dir, _builder_storage, mut builder) = open();
+
+        let (_sk, pk) = keypair(1);
+        let shared = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&shared).unwrap();
+        builder.apply_block(&shared).unwrap();
+
+        let mut competing = Vec::new();
+        for i in 0..=TEST_MAX_REORG_DEPTH {
+            let (_sk, pk) = keypair(100 + i as u8);
+            let block = built_proved_and_mined(&mut builder, &[reward_transaction(&pk, 50)]);
+            builder.apply_block(&block).unwrap();
+            competing.push(block);
+        }
+
+        for i in 0..TEST_MAX_REORG_DEPTH {
+            let (_sk, pk) = keypair(2 + i as u8);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            let outcome = chain.accept_block(competing[i as usize].clone()).unwrap();
+            assert_eq!(outcome, AcceptOutcome::StoredAsSideBranch);
+        }
+
+        let last = competing.last().unwrap().clone();
+        assert_eq!(
+            chain.accept_block(last.clone()).unwrap(),
+            AcceptOutcome::Reorged {
+                unwound: TEST_MAX_REORG_DEPTH,
+                applied: TEST_MAX_REORG_DEPTH + 1
+            }
+        );
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), last.header.hash());
     }
 
     #[test]
@@ -1926,22 +2191,62 @@ mod tests {
     }
 
     #[test]
-    fn try_connect_orphans_applies_a_previously_orphaned_block_once_its_parent_arrives() {
+    fn accepting_a_missing_parent_connects_the_orphans_waiting_on_it() {
         let (_dir, storage, mut chain) = open();
-        let other = build_chain(2, 1);
-        let mut other = other.into_iter();
+        let mut other = build_chain(3, 1).into_iter();
+        let parent = other.next().unwrap();
+        let child = other.next().unwrap();
+        let grandchild = other.next().unwrap();
+
+        // Out of order: the grandchild first, then the child.
+        assert_eq!(chain.accept_block(grandchild.clone()).unwrap(), AcceptOutcome::Orphaned);
+        assert_eq!(chain.accept_block(child).unwrap(), AcceptOutcome::Orphaned);
+        assert_eq!(chain.accept_block(parent).unwrap(), AcceptOutcome::Applied);
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), grandchild.header.hash());
+        assert!(chain.orphans.is_empty());
+    }
+
+    #[test]
+    fn connect_orphans_reports_each_retried_orphans_outcome() {
+        let (_dir, _storage, mut chain) = open();
+        let mut other = build_chain(2, 1).into_iter();
         let parent = other.next().unwrap();
         let child = other.next().unwrap();
 
-        assert_eq!(chain.accept_block(child.clone()).unwrap(), AcceptOutcome::Orphaned);
-        assert_eq!(chain.accept_block(parent.clone()).unwrap(), AcceptOutcome::Applied);
+        assert_eq!(chain.accept_block(child).unwrap(), AcceptOutcome::Orphaned);
+        // Bypass `accept_block`'s automatic retry, to see it directly.
+        assert_eq!(chain.accept_one(parent.clone()).unwrap(), AcceptOutcome::Applied);
 
-        let outcomes = chain.try_connect_orphans(parent.header.hash());
+        let outcomes = chain.connect_orphans(parent.header.hash());
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0], Ok(AcceptOutcome::Applied)));
+    }
 
+    /// Past `max_orphans`, the *oldest* orphan is the one evicted.
+    #[test]
+    fn the_orphan_pool_evicts_its_oldest_entry_when_full() {
+        let (_dir, storage, mut chain) = open();
+        chain.max_orphans = 2;
+        let blocks = build_chain(4, 1);
+
+        for block in &blocks[1..] {
+            assert_eq!(chain.accept_block(block.clone()).unwrap(), AcceptOutcome::Orphaned);
+        }
+        // blocks[1] -- the oldest -- was evicted to make room for blocks[3].
+        assert_eq!(chain.orphans.len(), 2);
+
+        assert_eq!(chain.accept_block(blocks[0].clone()).unwrap(), AcceptOutcome::Applied);
         let rtxn = storage.read_txn().unwrap();
-        assert_eq!(chain.tip_hash(&rtxn).unwrap(), child.header.hash());
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), blocks[0].header.hash());
+        drop(rtxn);
+
+        // Once blocks[1] arrives again, the rest connect behind it.
+        assert_eq!(chain.accept_block(blocks[1].clone()).unwrap(), AcceptOutcome::Applied);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), blocks[3].header.hash());
+        assert!(chain.orphans.is_empty());
     }
 
     #[test]
@@ -1979,8 +2284,8 @@ mod tests {
         assert_eq!(chain.accept_block(child.clone()).unwrap(), AcceptOutcome::Orphaned);
         assert_eq!(chain.accept_block(child).unwrap(), AcceptOutcome::AlreadyKnown);
 
-        chain.accept_block(parent.clone()).unwrap();
-        assert_eq!(chain.try_connect_orphans(parent.header.hash()).len(), 1);
+        chain.accept_block(parent).unwrap();
+        assert!(chain.orphans.is_empty());
     }
 
     /// The winning branch shares a real prefix with the active chain
@@ -2105,5 +2410,149 @@ mod tests {
 
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), active2.header.hash());
+    }
+
+    /// The real `build_block` -> prove -> finish -> mine pipeline, like
+    /// `built_proved_and_mined`, but with a hand-set `timestamp` -- for
+    /// tests that need to steer retargeting.
+    fn built_proved_and_mined_at(chain: &mut Chain, transactions: &[Transaction], timestamp: u64) -> Block {
+        let unproven = chain.build_block(transactions).unwrap();
+        let target = unproven.target;
+        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, transactions).unwrap();
+        let mut block = unproven.finish(proof);
+        block.header.timestamp = timestamp;
+        assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
+        block
+    }
+
+    /// A fork straddling a retarget-window boundary: the two branches
+    /// close the window at different speeds, so after it they're on
+    /// different targets. The competing branch's first post-window
+    /// block meets *its own* (easier) target but deliberately not the
+    /// active chain's -- it has to be accepted against the former.
+    #[test]
+    fn a_side_branch_block_is_checked_against_its_own_branchs_target() {
+        let (_dir, storage, mut chain) = open();
+        let (_builder_dir, builder_storage, mut builder) = open();
+        let interval = DifficultyConfig::for_tests().interval;
+        let start = 1_000_000u64;
+
+        // Heights 0..=5, shared.
+        for i in 0..6u64 {
+            let (_sk, pk) = keypair(1 + i as u8);
+            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], start + 10 * i);
+            chain.apply_block(&block).unwrap();
+            builder.apply_block(&block).unwrap();
+        }
+
+        // Heights 6..=9 on each side: active fast (harder after the
+        // window), competing slow (easier).
+        for i in 6..interval {
+            let (_sk, pk) = keypair(1 + i as u8);
+            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], start + 50 + (i - 5));
+            chain.apply_block(&block).unwrap();
+        }
+        let mut competing = Vec::new();
+        for i in 6..interval {
+            let (_sk, pk) = keypair(100 + i as u8);
+            let block = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk, 50)], start + 50 + 100 * (i - 5));
+            builder.apply_block(&block).unwrap();
+            competing.push(block);
+        }
+
+        let rtxn = storage.read_txn().unwrap();
+        let active_target = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+        let builder_rtxn = builder_storage.read_txn().unwrap();
+        let competing_target = builder.current_target(&builder_rtxn).unwrap();
+        drop(builder_rtxn);
+        assert!(competing_target > active_target, "competing branch should have retargeted easier");
+
+        // Height 10 on the competing side, re-mined until it meets only
+        // the easier target.
+        let (_sk, pk) = keypair(200);
+        let mut timestamp = start + 1_000;
+        let post_window = loop {
+            let block = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk, 50)], timestamp);
+            if !block.header.pow_valid(&active_target) {
+                break block;
+            }
+            timestamp += 1;
+        };
+        builder.apply_block(&post_window).unwrap();
+        competing.push(post_window.clone());
+
+        for block in &competing[..competing.len() - 1] {
+            assert_eq!(chain.accept_block(block.clone()).unwrap(), AcceptOutcome::StoredAsSideBranch);
+        }
+        assert_eq!(
+            chain.accept_block(post_window.clone()).unwrap(),
+            AcceptOutcome::Reorged { unwound: 4, applied: 5 }
+        );
+
+        let rtxn = storage.read_txn().unwrap();
+        let builder_rtxn = builder_storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), post_window.header.hash());
+        assert_eq!(chain.current_target(&rtxn).unwrap(), builder.current_target(&builder_rtxn).unwrap());
+        assert_eq!(chain.pmmr.root(&rtxn).unwrap(), builder.pmmr.root(&builder_rtxn).unwrap());
+    }
+
+    /// Everything below `reorg_floor` -- active chain and side branch
+    /// alike -- is pruned; everything at or above it is kept, and is
+    /// exactly enough to unwind the full `TEST_MAX_REORG_DEPTH`.
+    #[test]
+    fn blocks_below_the_reorg_floor_are_pruned() {
+        let (_dir, storage, mut chain) = open();
+        let mut active = Vec::new();
+        let (_sk, pk) = keypair(1);
+        let first = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&first).unwrap();
+        active.push(first);
+
+        let side = build_chain(1, 99).into_iter().next().unwrap();
+        assert_eq!(chain.accept_block(side.clone()).unwrap(), AcceptOutcome::StoredAsSideBranch);
+
+        for i in 1..8u8 {
+            let (_sk, pk) = keypair(1 + i);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            active.push(block);
+        }
+
+        // Tip at height 7, floor at 2: heights 0 and 1 are gone.
+        let rtxn = storage.read_txn().unwrap();
+        for block in active[..2].iter().chain(std::iter::once(&side)) {
+            let hash = block.header.hash();
+            assert!(chain.blocks.get(&rtxn, &hash).unwrap().is_none());
+            assert!(chain.block_undo.get(&rtxn, &hash).unwrap().is_none());
+            assert!(chain.block_work.get(&rtxn, &hash).unwrap().is_none());
+            assert!(chain.block_retarget.get(&rtxn, &hash).unwrap().is_none());
+            let key = height_key(block.header.height, hash);
+            assert!(chain.block_heights.get(&rtxn, &key).unwrap().is_none());
+        }
+        for block in &active[2..] {
+            assert!(chain.blocks.get(&rtxn, &block.header.hash()).unwrap().is_some());
+        }
+        drop(rtxn);
+
+        for _ in 0..TEST_MAX_REORG_DEPTH {
+            unwind_committed(&storage, &mut chain);
+        }
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), active[2].header.hash());
+    }
+
+    /// The retargeting rule, as a pure function, must agree with what
+    /// the active chain actually stores block by block.
+    #[test]
+    fn stored_retarget_state_matches_the_active_chains_own() {
+        let (_dir, storage, mut chain) = open();
+        apply_one_window(&mut chain, 1);
+
+        let rtxn = storage.read_txn().unwrap();
+        let tip = chain.tip_hash(&rtxn).unwrap();
+        let stored = chain.retarget_state_after(&rtxn, tip).unwrap();
+        assert_eq!(stored.target, chain.current_target(&rtxn).unwrap());
+        assert_eq!(stored.window_start_timestamp, chain.window_start_timestamp(&rtxn).unwrap());
     }
 }
