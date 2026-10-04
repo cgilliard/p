@@ -57,10 +57,12 @@ tests pass.
   walks the candidate side back to it (bounded by height, not step
   count, so a branch longer than `max_reorg_depth` can still win if the
   *unwind* is within the limit); and everything strictly below it is
-  pruned (`Chain::prune`) after each apply or reorg -- active chain and
-  side branches alike. Every node is a pruned node, by decision: nothing
-  serves old blocks to peers yet, and the recursive proof is meant to
-  make history unnecessary; an archival mode can come later if needed.
+  pruned (`Chain::prune`) after each apply or reorg: side-branch blocks
+  entirely, active-chain blocks down to the block itself (undo data,
+  work, and retarget state go). Active-chain blocks are kept forever so
+  any node can serve a full sync to a new one -- until state-snapshot
+  sync backed by the recursive proof exists. An `active_heights` index
+  (height → hash) tracks the active chain for that.
   `Chain::open` takes `max_reorg_depth`
   (`main.rs`: 1000; tests: 5).
 - In-memory orphan pool, capped at `MAX_ORPHANS` (100), oldest evicted

@@ -13,26 +13,10 @@
 //! # Bare-metal shape
 //!
 //! Everything here is datagrams in, datagrams out. `Discovery` itself
-//! does no I/O at all and never reads a clock: the caller hands it each
-//! received packet and the current time, and gets back the packets to
-//! send. The only I/O-touching part is `Node`, which drives a
-//! `Discovery` over anything implementing `Transport` (send/receive one
-//! datagram) -- `std::net::UdpSocket` implements it here; a bare-metal
-//! UDP stack can implement it the same way without touching the
-//! protocol. Every packet is at most `MAX_PACKET` bytes, so no IP
-//! fragmentation is ever needed (minimal stacks often can't reassemble).
-//!
-//! # Wire format
-//!
-//! Every packet: `MAGIC` (4) ‖ `VERSION` (1) ‖ type (1) ‖ body.
-//!
-//! - `GET_HOSTS` (type 1): `nonce` (u64) ‖ `max` (u16) ‖ zero padding.
-//! - `HOSTS` (type 2): `nonce` (u64) ‖ `count` (u16) ‖ `count` × 6-byte
-//!   addresses (`peers::encode_addr`).
-//!
-//! Integers are big-endian. A packet that doesn't parse exactly is
-//! silently dropped -- there's no error reply, which an attacker could
-//! only use as a reflector.
+//! does no network I/O and never reads a clock: the caller hands it each
+//! received message and the current time, and gets back the packets to
+//! send. `net::Node` drives it over a datagram socket. The wire format
+//! lives in `wire`.
 //!
 //! # Abuse resistance
 //!
@@ -46,6 +30,15 @@
 //!   more than `AMPLIFICATION_FACTOR` times the size of the request that
 //!   prompted it (QUIC's rule); `GET_HOSTS` is padded by its sender to
 //!   make room for as many hosts as it asks for.
+//! - **Cookies:** requests whose replies are much bigger than they are
+//!   (`GET_CHUNKS`, in `transfer`) can't follow that rule, so they must
+//!   instead prove the requester really receives packets at its source
+//!   address. Every `HOSTS` reply carries a `cookie` for the requester:
+//!   a keyed hash of its address, under a secret only this node knows.
+//!   Quoting it back proves the requester saw our reply -- an attacker
+//!   forging a victim's address never does. Checking one is stateless
+//!   (`check_cookie` just recomputes it), the same idea as DNS cookies
+//!   or a QUIC retry token.
 //! - **Unverified addresses are never repeated:** only hosts this node
 //!   has itself heard back from are shared (`PeerTable::active`).
 //!
@@ -62,107 +55,10 @@
 
 #![allow(dead_code)]
 
-use crate::peers::{self, ADDR_LEN, PeerTable};
+use crate::peers::{self, PeerTable};
+use crate::wire::{self, MAX_HOSTS_PER_PACKET, Message};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, SocketAddrV4};
-
-pub const MAGIC: [u8; 4] = *b"TBRN";
-pub const VERSION: u8 = 1;
-
-/// Largest packet this protocol ever sends or accepts -- comfortably
-/// under the 1280-byte IPv6 minimum MTU (and every realistic IPv4 path
-/// MTU), so nothing is ever fragmented.
-pub const MAX_PACKET: usize = 1200;
-
-/// A reply is never more than this many times the size of its request.
-pub const AMPLIFICATION_FACTOR: usize = 3;
-
-const TYPE_GET_HOSTS: u8 = 1;
-const TYPE_HOSTS: u8 = 2;
-
-const HEADER_LEN: usize = MAGIC.len() + 2;
-/// `nonce` + `max`/`count` -- the same shape for both message bodies.
-const BODY_PREFIX_LEN: usize = 8 + 2;
-const MIN_PACKET: usize = HEADER_LEN + BODY_PREFIX_LEN;
-
-/// The most addresses a single `HOSTS` packet can carry within
-/// `MAX_PACKET`.
-pub const MAX_HOSTS_PER_PACKET: usize = (MAX_PACKET - MIN_PACKET) / ADDR_LEN;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Message {
-    GetHosts { nonce: u64, max: u16 },
-    Hosts { nonce: u64, hosts: Vec<SocketAddrV4> },
-}
-
-/// Size of a `HOSTS` packet carrying `count` addresses.
-fn hosts_packet_len(count: usize) -> usize {
-    MIN_PACKET + count * ADDR_LEN
-}
-
-/// How many addresses a reply to a `request_len`-byte request may carry
-/// without breaking the amplification bound.
-fn amplification_limit(request_len: usize) -> usize {
-    (request_len * AMPLIFICATION_FACTOR).saturating_sub(MIN_PACKET) / ADDR_LEN
-}
-
-impl Message {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(MAX_PACKET);
-        out.extend_from_slice(&MAGIC);
-        out.push(VERSION);
-        match self {
-            Message::GetHosts { nonce, max } => {
-                out.push(TYPE_GET_HOSTS);
-                out.extend_from_slice(&nonce.to_be_bytes());
-                out.extend_from_slice(&max.to_be_bytes());
-                // Pad so the answer we're asking for fits under the
-                // amplification bound: request_len * FACTOR >= reply_len.
-                let max = (*max as usize).min(MAX_HOSTS_PER_PACKET);
-                let needed = hosts_packet_len(max).div_ceil(AMPLIFICATION_FACTOR);
-                if out.len() < needed {
-                    out.resize(needed, 0);
-                }
-            }
-            Message::Hosts { nonce, hosts } => {
-                out.push(TYPE_HOSTS);
-                out.extend_from_slice(&nonce.to_be_bytes());
-                let hosts = &hosts[..hosts.len().min(MAX_HOSTS_PER_PACKET)];
-                out.extend_from_slice(&(hosts.len() as u16).to_be_bytes());
-                for host in hosts {
-                    out.extend_from_slice(&peers::encode_addr(*host));
-                }
-            }
-        }
-        out
-    }
-
-    /// Parse a packet, or `None` if it isn't exactly a valid one.
-    pub fn decode(bytes: &[u8]) -> Option<Message> {
-        if bytes.len() < MIN_PACKET || bytes.len() > MAX_PACKET {
-            return None;
-        }
-        if bytes[..4] != MAGIC || bytes[4] != VERSION {
-            return None;
-        }
-        let nonce = u64::from_be_bytes(bytes[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap());
-        let n = u16::from_be_bytes(bytes[HEADER_LEN + 8..MIN_PACKET].try_into().unwrap());
-        let rest = &bytes[MIN_PACKET..];
-        match bytes[5] {
-            // Padding is allowed (and required, for large `max`), but
-            // must be zeros -- no room to smuggle anything else in.
-            TYPE_GET_HOSTS if rest.iter().all(|&b| b == 0) => Some(Message::GetHosts { nonce, max: n }),
-            TYPE_HOSTS if rest.len() == n as usize * ADDR_LEN => {
-                let hosts = rest
-                    .chunks_exact(ADDR_LEN)
-                    .map(|chunk| peers::decode_addr(chunk.try_into().unwrap()))
-                    .collect();
-                Some(Message::Hosts { nonce, hosts })
-            }
-            _ => None,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -198,6 +94,12 @@ pub struct Discovery {
     table: PeerTable,
     nonce_key: [u8; 32],
     nonce_counter: u64,
+    /// The secret behind the cookies this node issues -- derived from
+    /// `nonce_key`, under a different domain, so the two never coincide.
+    cookie_key: [u8; 32],
+    /// The cookie each peer issued *us*, from its latest `HOSTS` reply --
+    /// what we quote back when asking it for chunks.
+    peer_cookies: HashMap<SocketAddrV4, u64>,
     /// Requests awaiting a reply, by the host they were sent to -- at
     /// most one outstanding per host.
     pending: HashMap<SocketAddrV4, Pending>,
@@ -219,6 +121,8 @@ impl Discovery {
             table,
             nonce_key,
             nonce_counter: 0,
+            cookie_key: crate::poseidon2::hash_bytes_32(&[&nonce_key[..], b"discovery cookie key"].concat()),
+            peer_cookies: HashMap::new(),
             pending: HashMap::new(),
             last_probe_ms: HashMap::new(),
             self_addrs: HashSet::new(),
@@ -247,7 +151,27 @@ impl Discovery {
         self.self_addrs.insert(addr);
         self.pending.remove(&addr);
         self.last_probe_ms.remove(&addr);
+        self.peer_cookies.remove(&addr);
         self.table.remove(addr)
+    }
+
+    /// The cookie this node issues to `addr` -- see the module docs.
+    fn issue_cookie(&self, addr: SocketAddrV4) -> u64 {
+        let mut input = [0u8; 32 + peers::ADDR_LEN];
+        input[..32].copy_from_slice(&self.cookie_key);
+        input[32..].copy_from_slice(&peers::encode_addr(addr));
+        let digest = crate::poseidon2::hash_bytes_32(&input);
+        u64::from_be_bytes(digest[..8].try_into().unwrap())
+    }
+
+    /// Whether `cookie` is the one this node issued to `from`.
+    pub fn check_cookie(&self, from: SocketAddrV4, cookie: u64) -> bool {
+        self.issue_cookie(from) == cookie
+    }
+
+    /// The cookie `peer` issued us, if it has ever answered us.
+    pub fn cookie_from(&self, peer: SocketAddrV4) -> Option<u64> {
+        self.peer_cookies.get(&peer).copied()
     }
 
     fn share_limit(&self) -> usize {
@@ -308,6 +232,7 @@ impl Discovery {
             self.pending.remove(&addr);
             if self.table.record_failure(addr)? {
                 self.last_probe_ms.remove(&addr);
+                self.peer_cookies.remove(&addr);
             }
         }
 
@@ -323,13 +248,28 @@ impl Discovery {
     }
 
     /// Handle one received datagram from `from`. Anything that isn't a
-    /// well-formed, expected message is ignored.
+    /// well-formed discovery message is ignored.
     pub fn handle(&mut self, from: SocketAddr, bytes: &[u8], now_ms: u64) -> peers::Result<Vec<Outgoing>> {
         let SocketAddr::V4(from) = from else {
             return Ok(Vec::new());
         };
         match Message::decode(bytes) {
-            Some(Message::GetHosts { nonce, max }) => {
+            Some(message) => self.handle_message(from, &message, bytes.len(), now_ms),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// `handle`, for an already-decoded message that arrived as a
+    /// `packet_len`-byte datagram. Non-discovery messages are ignored.
+    pub fn handle_message(
+        &mut self,
+        from: SocketAddrV4,
+        message: &Message,
+        packet_len: usize,
+        now_ms: u64,
+    ) -> peers::Result<Vec<Outgoing>> {
+        match *message {
+            Message::GetHosts { nonce, max } => {
                 // One of our own requests, arriving back at us: whatever
                 // address we sent it to is this node.
                 let sent_to_self = self
@@ -347,170 +287,33 @@ impl Discovery {
                 self.add_candidate(from)?;
                 let limit = (max as usize)
                     .min(self.share_limit())
-                    .min(amplification_limit(bytes.len()));
+                    .min(wire::hosts_amplification_limit(packet_len));
                 let hosts = self.table.active(limit, from)?;
-                let reply = Message::Hosts { nonce, hosts };
+                let reply = Message::Hosts {
+                    nonce,
+                    cookie: self.issue_cookie(from),
+                    hosts,
+                };
                 Ok(vec![Outgoing {
                     to: from,
                     bytes: reply.encode(),
                 }])
             }
-            Some(Message::Hosts { nonce, hosts }) => {
+            Message::Hosts { nonce, cookie, ref hosts } => {
                 match self.pending.get(&from) {
                     Some(p) if p.nonce == nonce => {}
                     _ => return Ok(Vec::new()),
                 }
                 self.pending.remove(&from);
+                self.peer_cookies.insert(from, cookie);
                 self.table.record_success(from, now_ms)?;
-                for host in hosts.into_iter().take(self.share_limit()) {
+                for &host in hosts.iter().take(self.share_limit()) {
                     self.add_candidate(host)?;
                 }
                 Ok(Vec::new())
             }
-            None => Ok(Vec::new()),
+            _ => Ok(Vec::new()),
         }
-    }
-}
-
-/// One datagram socket, as `Node` needs it -- the seam between the
-/// protocol and whatever UDP stack is underneath.
-pub trait Transport {
-    type Error: std::fmt::Debug;
-
-    fn send_to(&mut self, bytes: &[u8], to: SocketAddrV4) -> Result<(), Self::Error>;
-
-    /// Receive one datagram into `buf`, returning its length and
-    /// sender, or `None` if nothing arrived within the transport's own
-    /// wait (a timeout, or nothing ready on a non-blocking socket).
-    fn recv_from(&mut self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddr)>, Self::Error>;
-}
-
-/// `std`'s UDP socket. Set a read timeout (or non-blocking mode) on it
-/// first, or `recv_from` blocks until a packet arrives and `Node::poll`
-/// never gets to run `tick`.
-impl Transport for std::net::UdpSocket {
-    type Error = std::io::Error;
-
-    fn send_to(&mut self, bytes: &[u8], to: SocketAddrV4) -> std::io::Result<()> {
-        std::net::UdpSocket::send_to(self, bytes, to).map(|_| ())
-    }
-
-    fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<Option<(usize, SocketAddr)>> {
-        match std::net::UdpSocket::recv_from(self, buf) {
-            Ok((len, from)) => Ok(Some((len, from))),
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum NodeError<E> {
-    Peers(peers::Error),
-    Transport(E),
-}
-
-impl<E> From<peers::Error> for NodeError<E> {
-    fn from(e: peers::Error) -> Self {
-        NodeError::Peers(e)
-    }
-}
-
-/// A one-line, human-readable summary of a datagram, for `Node`'s log.
-fn describe(bytes: &[u8]) -> String {
-    match Message::decode(bytes) {
-        Some(Message::GetHosts { nonce, max }) => format!("GET_HOSTS(nonce={nonce:016x}, max={max})"),
-        Some(Message::Hosts { nonce, hosts }) => {
-            let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
-            format!("HOSTS(nonce={nonce:016x}, [{}])", hosts.join(", "))
-        }
-        None => format!("unparseable packet ({} bytes)", bytes.len()),
-    }
-}
-
-/// A `Discovery` wired to a `Transport`.
-pub struct Node<T: Transport> {
-    pub discovery: Discovery,
-    /// When set, print every datagram sent and received to stderr,
-    /// prefixed with this label (the node's own port, say) -- a
-    /// debugging aid, off by default.
-    pub log: Option<String>,
-    transport: T,
-    tick_interval_ms: u64,
-    next_tick_ms: Option<u64>,
-    buf: Vec<u8>,
-}
-
-impl<T: Transport> Node<T> {
-    /// `tick_interval_ms` is how often `Discovery::tick` runs -- it
-    /// bounds how late a timeout or a due probe can be noticed, so keep
-    /// it well under `response_timeout_ms`.
-    pub fn new(discovery: Discovery, transport: T, tick_interval_ms: u64) -> Self {
-        Node {
-            discovery,
-            log: None,
-            transport,
-            tick_interval_ms,
-            next_tick_ms: None,
-            buf: vec![0u8; MAX_PACKET + 1],
-        }
-    }
-
-    fn send_all(&mut self, out: Vec<Outgoing>) {
-        // A failed send is just a lost datagram, which this protocol
-        // already tolerates (the request times out and is retried).
-        for packet in out {
-            let result = self.transport.send_to(&packet.bytes, packet.to);
-            if let Some(label) = &self.log {
-                match &result {
-                    Ok(()) => eprintln!("[{label}] sent {} to {}", describe(&packet.bytes), packet.to),
-                    Err(e) => eprintln!("[{label}] FAILED to send {} to {}: {e:?}", describe(&packet.bytes), packet.to),
-                }
-            }
-        }
-    }
-
-    /// One step: on the first call, `Discovery::start`; afterwards,
-    /// handle at most one received datagram, then `tick` if it's due.
-    /// `now_ms` is read once per call by the caller.
-    pub fn poll(&mut self, now_ms: u64) -> Result<(), NodeError<T::Error>> {
-        let Some(next_tick) = self.next_tick_ms else {
-            let out = self.discovery.start(now_ms)?;
-            self.send_all(out);
-            self.next_tick_ms = Some(now_ms + self.tick_interval_ms);
-            return Ok(());
-        };
-
-        // One spare byte past MAX_PACKET, so an oversized datagram
-        // shows up as too long (and is rejected) instead of being
-        // silently truncated into something that parses.
-        if let Some((len, from)) = self.transport.recv_from(&mut self.buf).map_err(NodeError::Transport)? {
-            let packet = self.buf[..len].to_vec();
-            if let Some(label) = &self.log {
-                eprintln!("[{label}] recv {} from {from}", describe(&packet));
-            }
-            let out = self.discovery.handle(from, &packet, now_ms)?;
-            self.send_all(out);
-        }
-
-        if now_ms >= next_tick {
-            let out = self.discovery.tick(now_ms)?;
-            self.send_all(out);
-            self.next_tick_ms = Some(now_ms + self.tick_interval_ms);
-        }
-        Ok(())
-    }
-
-    /// `poll` forever, reading the time from `clock`, until `stop` is set.
-    pub fn run(
-        &mut self,
-        clock: impl Fn() -> u64,
-        stop: &std::sync::atomic::AtomicBool,
-    ) -> Result<(), NodeError<T::Error>> {
-        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-            self.poll(clock())?;
-        }
-        Ok(())
     }
 }
 
@@ -569,68 +372,7 @@ mod tests {
     }
 
     fn hosts_reply(nonce: u64, hosts: Vec<SocketAddrV4>) -> Vec<u8> {
-        Message::Hosts { nonce, hosts }.encode()
-    }
-
-    #[test]
-    fn messages_roundtrip() {
-        let get = Message::GetHosts { nonce: 42, max: 17 };
-        assert_eq!(Message::decode(&get.encode()), Some(get));
-        let hosts = Message::Hosts {
-            nonce: 43,
-            hosts: vec![addr(1, 1), addr(2, 2)],
-        };
-        assert_eq!(Message::decode(&hosts.encode()), Some(hosts));
-    }
-
-    #[test]
-    fn malformed_packets_are_rejected() {
-        let good = Message::Hosts {
-            nonce: 1,
-            hosts: vec![addr(1, 1)],
-        }
-        .encode();
-
-        let mut bad_magic = good.clone();
-        bad_magic[0] ^= 1;
-        let mut bad_version = good.clone();
-        bad_version[4] = VERSION + 1;
-        let mut bad_type = good.clone();
-        bad_type[5] = 99;
-        let truncated = &good[..good.len() - 1];
-        let mut trailing = good.clone();
-        trailing.push(0);
-        let mut nonzero_padding = Message::GetHosts { nonce: 1, max: 50 }.encode();
-        *nonzero_padding.last_mut().unwrap() = 1;
-
-        for packet in [&bad_magic[..], &bad_version, &bad_type, truncated, &trailing, &nonzero_padding, &good[..3]] {
-            assert_eq!(Message::decode(packet), None);
-        }
-        assert_eq!(Message::decode(&vec![0u8; MAX_PACKET + 1]), None);
-    }
-
-    #[test]
-    fn every_packet_fits_the_size_limit() {
-        let biggest = Message::Hosts {
-            nonce: 0,
-            hosts: vec![addr(1, 1); MAX_HOSTS_PER_PACKET + 50],
-        }
-        .encode();
-        assert!(biggest.len() <= MAX_PACKET);
-        let biggest_request = Message::GetHosts { nonce: 0, max: u16::MAX }.encode();
-        assert!(biggest_request.len() <= MAX_PACKET);
-    }
-
-    /// A request is padded enough that a full answer to it stays within
-    /// the amplification bound.
-    #[test]
-    fn a_request_is_padded_to_cover_the_reply_it_asks_for() {
-        for max in [0u16, 1, 10, 100, MAX_HOSTS_PER_PACKET as u16] {
-            let request = Message::GetHosts { nonce: 0, max }.encode();
-            let reply_len = hosts_packet_len(max as usize);
-            assert!(request.len() * AMPLIFICATION_FACTOR >= reply_len, "max = {max}");
-            assert!(amplification_limit(request.len()) >= max as usize);
-        }
+        Message::Hosts { nonce, cookie: 0, hosts }.encode()
     }
 
     #[test]
@@ -744,6 +486,7 @@ mod tests {
             Message::decode(&out[0].bytes),
             Some(Message::Hosts {
                 nonce: 5,
+                cookie: d.issue_cookie(requester),
                 hosts: vec![addr(2, 9000), addr(1, 9000)]
             })
         );
@@ -781,10 +524,10 @@ mod tests {
         }
 
         let mut request = Message::GetHosts { nonce: 1, max: 10 }.encode();
-        request.truncate(MIN_PACKET);
+        request.truncate(wire::HEADER_LEN + 8 + 2);
         let out = d.handle(SocketAddr::V4(addr(99, 9000)), &request, 0).unwrap();
 
-        assert!(out[0].bytes.len() <= request.len() * AMPLIFICATION_FACTOR);
+        assert!(out[0].bytes.len() <= request.len() * wire::AMPLIFICATION_FACTOR);
         assert_eq!(
             Message::decode(&out[0].bytes).map(|m| matches!(m, Message::Hosts { .. })),
             Some(true)
@@ -808,61 +551,6 @@ mod tests {
         let a = d.next_nonce();
         let b = d.next_nonce();
         assert_ne!(a, b);
-    }
-
-    /// Three real nodes on loopback UDP: B only knows A, A only knows C.
-    /// B should end up having verified C itself, purely through A.
-    #[test]
-    fn hosts_propagate_between_real_udp_nodes() {
-        use std::net::UdpSocket;
-        use std::time::Duration;
-
-        fn bind() -> (UdpSocket, SocketAddrV4) {
-            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
-            let SocketAddr::V4(local) = socket.local_addr().unwrap() else {
-                unreachable!()
-            };
-            (socket, local)
-        }
-
-        fn node(seeds: Vec<SocketAddrV4>, socket: UdpSocket, key: u8) -> (TempDir, Node<UdpSocket>) {
-            let dir = TempDir::new();
-            let storage = Storage::open(&dir.0).unwrap();
-            let table = PeerTable::open(&storage, 100, 3).unwrap();
-            let cfg = Config {
-                seeds,
-                share_limit: 10,
-                probe_interval_ms: 50,
-                response_timeout_ms: 500,
-            };
-            (dir, Node::new(Discovery::new(cfg, table, [key; 32]), socket, 10))
-        }
-
-        let (socket_a, addr_a) = bind();
-        let (socket_b, _addr_b) = bind();
-        let (socket_c, addr_c) = bind();
-        let (_dir_a, mut a) = node(vec![addr_c], socket_a, 1);
-        let (_dir_b, mut b) = node(vec![addr_a], socket_b, 2);
-        let (_dir_c, mut c) = node(vec![], socket_c, 3);
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let now = crate::block::now_millis();
-            a.poll(now).unwrap();
-            b.poll(now).unwrap();
-            c.poll(now).unwrap();
-            let verified_c = b
-                .discovery
-                .table()
-                .get(addr_c)
-                .unwrap()
-                .is_some_and(|record| record.is_verified());
-            if verified_c {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "B never verified C");
-        }
     }
 
     /// The classic way this happens: a node handed its own address as a
@@ -910,5 +598,46 @@ mod tests {
         assert_eq!(d.table().get(alias).unwrap(), None);
         assert!(d.self_addrs().contains(&alias));
         assert!(d.self_addrs().contains(&real));
+    }
+
+    /// A peer's `HOSTS` reply carries the cookie it issued us, and we
+    /// keep it for quoting back later.
+    #[test]
+    fn a_reply_records_the_cookie_the_peer_issued_us() {
+        let seed = addr(1, 9000);
+        let (_dir, mut d) = discovery(config(vec![seed]));
+        let out = d.start(0).unwrap();
+        let nonce = nonce_sent_to(&out, seed);
+        assert_eq!(d.cookie_from(seed), None);
+
+        let reply = Message::Hosts {
+            nonce,
+            cookie: 0xabcd,
+            hosts: vec![],
+        };
+        d.handle(SocketAddr::V4(seed), &reply.encode(), 1).unwrap();
+        assert_eq!(d.cookie_from(seed), Some(0xabcd));
+    }
+
+    /// The cookie we issue a requester checks out for that address, and
+    /// only that address -- and two nodes' cookies differ.
+    #[test]
+    fn cookies_we_issue_check_out_only_for_their_own_address() {
+        let (_dir, mut d) = discovery(config(vec![]));
+        let requester = addr(9, 9000);
+        let request = Message::GetHosts { nonce: 1, max: 10 }.encode();
+        let out = d.handle(SocketAddr::V4(requester), &request, 0).unwrap();
+        let Some(Message::Hosts { cookie, .. }) = Message::decode(&out[0].bytes) else {
+            panic!("expected HOSTS");
+        };
+
+        assert!(d.check_cookie(requester, cookie));
+        assert!(!d.check_cookie(addr(9, 9001), cookie));
+        assert!(!d.check_cookie(requester, cookie ^ 1));
+
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let other = Discovery::new(config(vec![]), PeerTable::open(&storage, 100, 3).unwrap(), [8u8; 32]);
+        assert!(!other.check_cookie(requester, cookie));
     }
 }

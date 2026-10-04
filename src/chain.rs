@@ -214,6 +214,14 @@ const BLOCK_RETARGET_DB: &str = "block_retarget";
 /// `BLOCKS_DB`. See `Chain::prune`.
 const BLOCK_HEIGHTS_DB: &str = "block_heights";
 
+/// Database name: the active chain by height -- key is `height`
+/// (big-endian), value the active block's header hash. Maintained as
+/// blocks are applied and unwound, so it always describes exactly the
+/// active chain. What lets a peer ask for "your block at height N"
+/// (sync), and what `prune` uses to tell active-chain blocks (kept
+/// forever) from side-branch ones (dropped once out of reach).
+const ACTIVE_HEIGHTS_DB: &str = "active_heights";
+
 /// How many blocks the orphan pool holds before evicting the oldest --
 /// a bound on how much memory a peer can make this node spend on
 /// blocks it can't place yet. Same number Bitcoin Core uses for its
@@ -560,6 +568,80 @@ pub enum AcceptOutcome {
     AlreadyKnown,
 }
 
+/// Read-only access to stored blocks and the active chain, separate from
+/// `Chain` -- so another thread (the network's) can serve blocks to peers
+/// and see where the tip is, while `Chain` itself stays owned by whoever
+/// applies blocks. Cheap to clone. Sees exactly what's committed.
+#[derive(Clone)]
+pub struct BlockReader {
+    storage: Storage,
+    meta: Database<Bytes, Bytes>,
+    blocks: Database<Bytes, Bytes>,
+    active_heights: Database<Bytes, Bytes>,
+}
+
+impl BlockReader {
+    pub fn open(storage: &Storage) -> Result<Self> {
+        Ok(BlockReader {
+            storage: storage.clone(),
+            meta: storage.database("chain_meta")?,
+            blocks: storage.database(BLOCKS_DB)?,
+            active_heights: storage.database(ACTIVE_HEIGHTS_DB)?,
+        })
+    }
+
+    /// A stored block's encoding (`Block::to_bytes`), active chain or
+    /// side branch.
+    pub fn block_bytes(&self, hash: [u8; 32]) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.storage.read_txn()?;
+        Ok(self.blocks.get(&rtxn, &hash)?.map(|bytes| bytes.to_vec()))
+    }
+
+    /// `len` bytes of a stored block's encoding starting at `start`
+    /// (fewer if it ends first), plus the encoding's total size -- one
+    /// chunk's worth, without copying out the whole (up to megabytes)
+    /// block. `None` if the block isn't stored or `start` is past its end.
+    pub fn block_range(&self, hash: [u8; 32], start: usize, len: usize) -> Result<Option<(usize, Vec<u8>)>> {
+        let rtxn = self.storage.read_txn()?;
+        let Some(bytes) = self.blocks.get(&rtxn, &hash)? else {
+            return Ok(None);
+        };
+        if start >= bytes.len() {
+            return Ok(None);
+        }
+        let end = start.saturating_add(len).min(bytes.len());
+        Ok(Some((bytes.len(), bytes[start..end].to_vec())))
+    }
+
+    pub fn has_block(&self, hash: [u8; 32]) -> Result<bool> {
+        let rtxn = self.storage.read_txn()?;
+        Ok(self.blocks.get(&rtxn, &hash)?.is_some())
+    }
+
+    /// The active chain's block hash at `height`, if it's that tall.
+    pub fn active_hash_at(&self, height: u64) -> Result<Option<[u8; 32]>> {
+        let rtxn = self.storage.read_txn()?;
+        match self.active_heights.get(&rtxn, &height.to_be_bytes())? {
+            Some(bytes) => Ok(Some(
+                bytes.try_into().map_err(|_| Error::Corrupt("active height entry was not 32 bytes"))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The active tip's `(height, hash)`, or `None` for an empty chain.
+    pub fn tip(&self) -> Result<Option<(u64, [u8; 32])>> {
+        let rtxn = self.storage.read_txn()?;
+        match self.meta.get(&rtxn, TIP_HEADER_KEY)? {
+            Some(bytes) => {
+                let header = BlockHeader::from_bytes(bytes).map_err(|_| Error::Corrupt("tip header was corrupt"))?;
+                Ok(Some((header.height, header.hash())))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 /// Whether `outcome` means the block is now stored -- on the active
 /// chain or a side branch -- so anything waiting on it can connect too.
 fn is_connected(outcome: &AcceptOutcome) -> bool {
@@ -584,6 +666,7 @@ pub struct Chain {
     invalid_blocks: Database<Bytes, Bytes>,
     block_retarget: Database<Bytes, Bytes>,
     block_heights: Database<Bytes, Bytes>,
+    active_heights: Database<Bytes, Bytes>,
     difficulty: DifficultyConfig,
     /// How many blocks a reorg is ever allowed to unwind -- see
     /// `Chain::open`'s docs. Also how far back stored blocks are kept
@@ -628,6 +711,7 @@ impl Chain {
         let invalid_blocks = storage.database(INVALID_BLOCKS_DB)?;
         let block_retarget = storage.database(BLOCK_RETARGET_DB)?;
         let block_heights = storage.database(BLOCK_HEIGHTS_DB)?;
+        let active_heights = storage.database(ACTIVE_HEIGHTS_DB)?;
         Ok(Chain {
             storage: storage.clone(),
             pmmr,
@@ -640,6 +724,7 @@ impl Chain {
             invalid_blocks,
             block_retarget,
             block_heights,
+            active_heights,
             difficulty,
             max_reorg_depth,
             orphans: Vec::new(),
@@ -749,13 +834,16 @@ impl Chain {
             .and_then(|tip_height| tip_height.checked_sub(self.max_reorg_depth)))
     }
 
-    /// Delete every stored record (block, undo data, work, retarget
-    /// state, invalid marker, height index entry) for blocks strictly
-    /// below `reorg_floor` -- active chain and side branches alike.
-    /// Nothing below that height can ever be unwound to, replayed, or
-    /// extended by an acceptable block again, so there's no reason to
-    /// keep it. The floor block itself is kept: a side branch forking
-    /// right at it still needs its work and retarget state.
+    /// For every block strictly below `reorg_floor`, drop what only a
+    /// reorg could ever need -- undo data, work, retarget state, invalid
+    /// marker, height index entry -- and, for side-branch blocks, the
+    /// block itself. Nothing below that height can ever be unwound to,
+    /// replayed, or extended by an acceptable block again. Active-chain
+    /// blocks themselves are kept forever: they're what a new node
+    /// syncing from genesis has to download from someone, and until
+    /// state-snapshot sync exists, that someone is every node. The floor
+    /// block keeps everything: a side branch forking right at it still
+    /// needs its work and retarget state.
     fn prune(&self, wtxn: &mut heed::RwTxn) -> Result<()> {
         let Some(floor) = self.reorg_floor(wtxn)? else {
             return Ok(());
@@ -772,7 +860,10 @@ impl Chain {
         }
         for key in doomed {
             let hash: [u8; 32] = key[8..].try_into().map_err(|_| Error::Corrupt("height index key was not 40 bytes"))?;
-            self.blocks.delete(wtxn, &hash)?;
+            let active = self.active_heights.get(wtxn, &key[..8])? == Some(&hash[..]);
+            if !active {
+                self.blocks.delete(wtxn, &hash)?;
+            }
             self.block_undo.delete(wtxn, &hash)?;
             self.block_work.delete(wtxn, &hash)?;
             self.block_retarget.delete(wtxn, &hash)?;
@@ -978,6 +1069,8 @@ impl Chain {
         self.block_undo.put(wtxn, &block.header.hash(), &undo.to_bytes())?;
         let this_work = pow::add256(parent_work, pow::work_for_target(target));
         self.store_block_records(wtxn, block, this_work, retarget)?;
+        self.active_heights
+            .put(wtxn, &block.header.height.to_be_bytes(), &block.header.hash())?;
 
         Ok(())
     }
@@ -1031,6 +1124,8 @@ impl Chain {
             .leaf_count(wtxn)?
             .saturating_sub(block.body.outputs.len() as u64);
         self.pmmr.truncate(wtxn, new_leaf_count)?;
+
+        self.active_heights.delete(wtxn, &block.header.height.to_be_bytes())?;
 
         // Restore the tip and retargeting state exactly as snapshotted.
         match &undo.prev_tip_header {
@@ -2530,9 +2625,10 @@ mod tests {
         assert_eq!(chain.pmmr.root(&rtxn).unwrap(), builder.pmmr.root(&builder_rtxn).unwrap());
     }
 
-    /// Everything below `reorg_floor` -- active chain and side branch
-    /// alike -- is pruned; everything at or above it is kept, and is
-    /// exactly enough to unwind the full `TEST_MAX_REORG_DEPTH`.
+    /// Below `reorg_floor`, side-branch blocks are dropped entirely and
+    /// active-chain blocks keep only the block itself (for serving
+    /// sync); at or above it, everything is kept, and is exactly enough
+    /// to unwind the full `TEST_MAX_REORG_DEPTH`.
     #[test]
     fn blocks_below_the_reorg_floor_are_pruned() {
         let (_dir, storage, mut chain) = open();
@@ -2552,18 +2648,19 @@ mod tests {
             active.push(block);
         }
 
-        // Tip at height 7, floor at 2: heights 0 and 1 are gone.
+        // Tip at height 7, floor at 2: heights 0 and 1 are out of reach.
         let rtxn = storage.read_txn().unwrap();
+        assert!(chain.blocks.get(&rtxn, &side.header.hash()).unwrap().is_none());
         for block in active[..2].iter().chain(std::iter::once(&side)) {
             let hash = block.header.hash();
-            assert!(chain.blocks.get(&rtxn, &hash).unwrap().is_none());
             assert!(chain.block_undo.get(&rtxn, &hash).unwrap().is_none());
             assert!(chain.block_work.get(&rtxn, &hash).unwrap().is_none());
             assert!(chain.block_retarget.get(&rtxn, &hash).unwrap().is_none());
             let key = height_key(block.header.height, hash);
             assert!(chain.block_heights.get(&rtxn, &key).unwrap().is_none());
         }
-        for block in &active[2..] {
+        // Every active-chain block is still there to be served.
+        for block in &active {
             assert!(chain.blocks.get(&rtxn, &block.header.hash()).unwrap().is_some());
         }
         drop(rtxn);
@@ -2573,6 +2670,37 @@ mod tests {
         }
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), active[2].header.hash());
+    }
+
+    /// `BlockReader` sees the active chain by height, follows unwinds,
+    /// and can fetch any stored block -- including a side branch's.
+    #[test]
+    fn block_reader_tracks_the_active_chain() {
+        let (_dir, storage, mut chain) = open();
+        let reader = BlockReader::open(&storage).unwrap();
+        assert_eq!(reader.tip().unwrap(), None);
+
+        let mut active = Vec::new();
+        for i in 0..3u8 {
+            let (_sk, pk) = keypair(1 + i);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            active.push(block);
+        }
+        let side = build_chain(1, 99).into_iter().next().unwrap();
+        chain.accept_block(side.clone()).unwrap();
+
+        assert_eq!(reader.tip().unwrap(), Some((2, active[2].header.hash())));
+        for (height, block) in active.iter().enumerate() {
+            assert_eq!(reader.active_hash_at(height as u64).unwrap(), Some(block.header.hash()));
+            assert_eq!(reader.block_bytes(block.header.hash()).unwrap(), Some(block.to_bytes()));
+        }
+        assert!(reader.has_block(side.header.hash()).unwrap());
+        assert_eq!(reader.active_hash_at(3).unwrap(), None);
+
+        unwind_committed(&storage, &mut chain);
+        assert_eq!(reader.tip().unwrap(), Some((1, active[1].header.hash())));
+        assert_eq!(reader.active_hash_at(2).unwrap(), None);
     }
 
     /// The retargeting rule, as a pure function, must agree with what
