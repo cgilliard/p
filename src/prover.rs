@@ -232,6 +232,9 @@ fn verify_direct(mut r: Bytes, inputs: &[[u8; 32]], outputs: &[[u8; 32]]) -> boo
     stark::verify(&air, &proof, &PARAMS)
 }
 
+/// One chunk's input and output commitments.
+type ChunkLists = (Vec<[u8; 32]>, Vec<[u8; 32]>);
+
 /// Split the body's lists into chunks by the given chunk indices,
 /// keeping body order (so each chunk's lists stay sorted). `None` if an
 /// index is out of range or a chunk overflows `CHUNK_SHAPE`.
@@ -241,7 +244,7 @@ fn chunk_lists(
     output_chunks: &[u16],
     inputs: &[[u8; 32]],
     outputs: &[[u8; 32]],
-) -> Option<Vec<(Vec<[u8; 32]>, Vec<[u8; 32]>)>> {
+) -> Option<Vec<ChunkLists>> {
     let mut chunks = vec![(Vec::new(), Vec::new()); count];
     for (&c, commitment) in input_chunks.iter().zip(inputs) {
         chunks.get_mut(c as usize)?.0.push(*commitment);
@@ -315,12 +318,18 @@ pub fn prove_block(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions: &[Tr
 /// inputs or outputs for one chunk). Consensus accepts either kind for any
 /// block; this is only a cost choice.
 pub fn prove_block_auto(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions: &[Transaction], seed: [u8; 32]) -> Option<Proof> {
-    if inputs.len() > CHUNK_SHAPE.inputs
+    if prefers_tree(inputs.len())
         && let Some(proof) = prove_block_tree(inputs, outputs, transactions, seed)
     {
         return Some(proof);
     }
     prove_block(inputs, outputs, transactions, seed)
+}
+
+/// The reference rule: a tree for blocks with more inputs than one chunk
+/// holds.
+fn prefers_tree(inputs: usize) -> bool {
+    inputs > CHUNK_SHAPE.inputs
 }
 
 /// Group transactions, in order, into chunks that fit `CHUNK_SHAPE`;
@@ -432,6 +441,7 @@ mod tests {
     use super::*;
     use crate::block::BlockBody;
     use crate::output::Output;
+    use crate::stark::Air;
     use crate::wots;
 
     fn reward_block() -> (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<Transaction>) {
@@ -532,6 +542,12 @@ mod tests {
     }
 
     #[test]
+    fn the_reference_rule_uses_a_tree_beyond_one_chunk_of_inputs() {
+        assert!(!prefers_tree(0) && !prefers_tree(10));
+        assert!(prefers_tree(11) && prefers_tree(10_000));
+    }
+
+    #[test]
     fn transactions_partition_into_chunks_in_order() {
         let (_, _, txs) = spends(12);
         let chunks = partition(&txs).unwrap();
@@ -555,11 +571,17 @@ mod tests {
         let start = std::time::Instant::now();
         let proof = prove_block_tree(&inputs, &outputs, &txs, [3; 32]);
         println!("proved in {:.2?}", start.elapsed());
-        let keys = TREE_KEYS.lock().unwrap();
-        let keys = keys.as_ref().unwrap();
-        let wrap = cap_to_hex(&keys.wrap.preprocessed.cap);
-        let aggregate = cap_to_hex(&keys.aggregate.as_ref().unwrap().preprocessed.cap);
-        assert_eq!(keys.wrap.preprocessed.log_lde, TREE_LOG_LDE);
+        // (The lock is released at the end of this block: proving again
+        // below takes it.)
+        let (wrap, aggregate) = {
+            let keys = TREE_KEYS.lock().unwrap();
+            let keys = keys.as_ref().unwrap();
+            assert_eq!(keys.wrap.preprocessed.log_lde, TREE_LOG_LDE);
+            (
+                cap_to_hex(&keys.wrap.preprocessed.cap),
+                cap_to_hex(&keys.aggregate.as_ref().unwrap().preprocessed.cap),
+            )
+        };
         if wrap != WRAP_CAP || aggregate != AGGREGATE_CAP {
             println!("const WRAP_CAP: &str = \"{wrap}\";");
             println!("const AGGREGATE_CAP: &str = \"{aggregate}\";");
@@ -579,9 +601,7 @@ mod tests {
         bytes[1] ^= 1; // A
         bytes[9] ^= 1; // B, keeping A - B
         assert!(!Proof::from_bytes(bytes).verify(&inputs, &outputs));
-        // The reference rule picks the tree for this block, direct for a
-        // small one.
-        assert!(prove_block_auto(&inputs, &outputs, &txs, [4; 32]).unwrap().is_tree());
+        // The reference rule makes a small block's proof direct.
         let (i, o, t) = spends(2);
         let small = prove_block_auto(&i, &o, &t, [5; 32]).unwrap();
         assert!(!small.is_tree() && small.verify(&i, &o));
