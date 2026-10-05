@@ -10,6 +10,8 @@ mod e2e;
 mod ext;
 mod field;
 mod fri;
+#[macro_use]
+mod log;
 mod merkle;
 mod net;
 mod ntt;
@@ -160,9 +162,15 @@ struct Args {
     port: u16,
     seeds: Vec<SocketAddrV4>,
     mine: bool,
+    /// Where to log (default: `tabernacle.log` in the data directory).
+    log_file: Option<std::path::PathBuf>,
+    log_level: log::Level,
+    /// Also log to standard output.
+    log_stdout: bool,
 }
 
-const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]";
+const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
+         [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]";
 
 fn parse_args() -> Args {
     let mut args = Args {
@@ -170,6 +178,9 @@ fn parse_args() -> Args {
         port: DEFAULT_PORT,
         seeds: Vec::new(),
         mine: true,
+        log_file: None,
+        log_level: log::Level::Info,
+        log_stdout: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -196,6 +207,15 @@ fn parse_args() -> Args {
                 }));
             }
             "--no-mine" => args.mine = false,
+            "--log-file" => args.log_file = Some(value().into()),
+            "--log-level" => {
+                let v = value();
+                args.log_level = log::Level::parse(&v).unwrap_or_else(|| {
+                    eprintln!("invalid log level: {v}\n{USAGE}");
+                    std::process::exit(2);
+                });
+            }
+            "--log-stdout" => args.log_stdout = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -225,8 +245,7 @@ fn random_key() -> [u8; 32] {
 /// `Command`s on.
 fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> (Receiver<(Block, SocketAddrV4)>, Sender<Command>) {
     let socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
-        eprintln!("failed to bind UDP port {port}: {e}");
-        std::process::exit(1);
+        die(&format!("failed to bind UDP port {port}: {e}"));
     });
     socket
         .set_read_timeout(Some(std::time::Duration::from_millis(SOCKET_READ_TIMEOUT_MS)))
@@ -265,7 +284,7 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> (Rec
             let _ = blocks_tx.send((block, from));
         };
         if let Err(e) = node.run(now_millis, &NEVER_STOP, deliver, &commands_rx) {
-            eprintln!("network stopped: {e:?}");
+            error!("network stopped: {e:?}");
         }
     });
     (blocks_rx, commands_tx)
@@ -315,20 +334,20 @@ fn process_one(chain: &mut Chain, reader: &BlockReader, commands: &Sender<Comman
     let tip_before = reader.tip().expect("failed to read tip");
     match chain.accept_block(block.clone()) {
         Ok(AcceptOutcome::Applied) => {
-            println!("received block #{height} from {from}");
+            info!("received block #{height} from {from}");
             print_block(&block);
         }
         Ok(AcceptOutcome::Reorged { unwound, applied }) => {
-            println!("received block #{height} from {from}: reorg, unwound {unwound}, applied {applied}");
+            info!("received block #{height} from {from}: reorg, unwound {unwound}, applied {applied}");
             print_block(&block);
         }
         Ok(AcceptOutcome::Orphaned) => {
-            println!("received block #{height} from {from}: orphan, asking for its parent");
+            info!("received block #{height} from {from}: orphan, asking for its parent");
             let _ = commands.send(Command::RequestBlock { hash: prev_hash, from });
         }
-        Ok(AcceptOutcome::StoredAsSideBranch) => println!("received block #{height} from {from}: side branch"),
+        Ok(AcceptOutcome::StoredAsSideBranch) => info!("received block #{height} from {from}: side branch"),
         Ok(AcceptOutcome::AlreadyKnown) => {}
-        Err(e) => println!("rejected block #{height} from {from}: {e}"),
+        Err(e) => info!("rejected block #{height} from {from}: {e}"),
     }
     let tip_moved = reader.tip().expect("failed to read tip") != tip_before;
     if tip_moved {
@@ -413,12 +432,12 @@ fn print_mining_stats(hashes: u64, elapsed: std::time::Duration, target: &[u8; 3
     let secs = elapsed.as_secs_f64().max(1e-9);
     let rate = hashes as f64 / secs;
     let expected_hashes = u256_to_f64(pow::work_for_target(*target));
-    println!(
+    info!(
         "  hash rate:   {} ({hashes} hashes in {})",
         format_hash_rate(rate),
         format_duration(secs)
     );
-    println!(
+    info!(
         "  expected:    {} per block at this rate (target {})",
         format_duration(expected_hashes / rate),
         format_duration(TARGET_BLOCK_TIME_MS as f64 / 1000.0)
@@ -426,27 +445,55 @@ fn print_mining_stats(hashes: u64, elapsed: std::time::Duration, target: &[u8; 3
 }
 
 fn print_block(block: &Block) {
-    println!("------------------------------------------------------------");
-    println!("block #{}", block.header.height);
-    println!("  hash:        {}", hex(&block.header.hash()));
-    println!("  prev_hash:   {}", hex(&block.header.prev_hash));
-    println!(
+    info!("------------------------------------------------------------");
+    info!("block #{}", block.header.height);
+    info!("  hash:        {}", hex(&block.header.hash()));
+    info!("  prev_hash:   {}", hex(&block.header.prev_hash));
+    info!(
         "  timestamp:   {} ({})",
         block.header.timestamp,
         format_timestamp(block.header.timestamp)
     );
-    println!("  nonce:       {}", hex(&block.header.nonce));
-    println!("  pmmr_root:   {}", hex(&block.header.pmmr_root));
-    println!("  bitmap_root: {}", hex(&block.header.bitmap_root));
-    println!("  body_hash:   {}", hex(&block.header.body_hash));
-    println!("  inputs:      {}", block.body.inputs.len());
+    info!("  nonce:       {}", hex(&block.header.nonce));
+    info!("  pmmr_root:   {}", hex(&block.header.pmmr_root));
+    info!("  bitmap_root: {}", hex(&block.header.bitmap_root));
+    info!("  body_hash:   {}", hex(&block.header.body_hash));
+    info!("  inputs:      {}", block.body.inputs.len());
     for commitment in &block.body.inputs {
-        println!("    - {}", hex(commitment));
+        info!("    - {}", hex(commitment));
     }
-    println!("  outputs:     {}", block.body.outputs.len());
+    info!("  outputs:     {}", block.body.outputs.len());
     for commitment in &block.body.outputs {
-        println!("    + {}", hex(commitment));
+        info!("    + {}", hex(commitment));
     }
+}
+
+/// Set up the log (see `log`): a file (rotated) and, with `--log-stdout`,
+/// the terminal too -- which otherwise is told where the log is.
+fn start_logging(args: &Args) {
+    let file = args.log_file.clone().unwrap_or_else(|| args.data_dir.join("tabernacle.log"));
+    let config = log::Config {
+        file: Some(file.clone()),
+        stdout: args.log_stdout,
+        colors: false,
+        level: args.log_level,
+        header: Some(format!("tabernacle node log (port {})", args.port)),
+        ..log::Config::default()
+    };
+    if let Err(e) = log::init(config) {
+        eprintln!("failed to open log file {}: {e}", file.display());
+        std::process::exit(1);
+    }
+    if !args.log_stdout {
+        println!("Logging to {} (level {}).", file.display(), args.log_level);
+    }
+}
+
+/// Log a fatal error, say so on the terminal too, and exit.
+fn die(message: &str) -> ! {
+    fatal!("{message}");
+    eprintln!("{message}");
+    std::process::exit(1);
 }
 
 fn main() {
@@ -456,22 +503,24 @@ fn main() {
     // (LMDB behaves the same regardless), but checking first lets us
     // say which one actually happened.
     let is_new = !path.exists();
+    start_logging(&args);
     if is_new {
-        println!("No existing chain found at {} -- creating a new one.", path.display());
+        info!("No existing chain found at {} -- creating a new one.", path.display());
     } else {
-        println!("Found an existing chain at {} -- loading it.", path.display());
+        info!("Found an existing chain at {} -- loading it.", path.display());
     }
 
     let storage = Storage::open(&path).expect("failed to open storage");
     let genesis = genesis_block();
     assert_eq!(hex(&genesis.header.hash()), GENESIS_HASH, "genesis constants are inconsistent");
-    println!("Genesis block: {GENESIS_HASH}");
+    info!("Genesis block: {GENESIS_HASH}");
     let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
-        eprintln!("failed to open chain at {}: {e}", path.display());
-        if matches!(e, chain::Error::WrongGenesis) {
-            eprintln!("(its data is from a chain with a different genesis block -- delete it, or use another --data-dir)");
-        }
-        std::process::exit(1);
+        let hint = if matches!(e, chain::Error::WrongGenesis) {
+            " (its data is from a chain with a different genesis block -- delete it, or use another --data-dir)"
+        } else {
+            ""
+        };
+        die(&format!("failed to open chain at {}: {e}{hint}", path.display()));
     });
 
     {
@@ -479,29 +528,29 @@ fn main() {
         match chain.height(&rtxn).expect("failed to read chain height") {
             Some(height) => {
                 let tip = chain.tip_hash(&rtxn).expect("failed to read tip hash");
-                println!("Resuming at height {height}, tip {}.", hex(&tip));
+                info!("Resuming at height {height}, tip {}.", hex(&tip));
             }
-            None => println!("Starting from genesis."),
+            None => info!("Starting from genesis."),
         }
     }
 
     if args.seeds.is_empty() {
-        println!("Listening on UDP port {} (no seeds given).", args.port);
+        info!("Listening on UDP port {} (no seeds given).", args.port);
     } else {
         let seeds: Vec<String> = args.seeds.iter().map(|s| s.to_string()).collect();
-        println!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
+        info!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
     }
     let (received, commands) = spawn_network(&storage, args.port, args.seeds);
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
     let peer_table = PeerTable::open(&storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
 
     if !args.mine {
-        println!("Following the network without mining -- press Ctrl+C to stop.\n");
+        info!("Following the network without mining -- press Ctrl+C to stop.");
         loop {
             // Block until something arrives, then handle it (and anything
             // else already waiting).
             let Ok((block, from)) = received.recv() else {
-                eprintln!("network thread exited");
+                error!("network thread exited");
                 return;
             };
             process_one(&mut chain, &reader, &commands, block, from);
@@ -509,7 +558,7 @@ fn main() {
         }
     }
 
-    println!("Mining -- press Ctrl+C to stop.\n");
+    info!("Mining -- press Ctrl+C to stop.");
 
     // Mixed into every reward key, so this node's keys differ from every
     // other node's (and from its own in any earlier run) even at the
@@ -579,10 +628,10 @@ fn main() {
                 print_mining_stats(hashes, elapsed, &target);
                 let hosts = peer_table.all().expect("failed to read peer table");
                 let verified = hosts.iter().filter(|(_, record)| record.is_verified()).count();
-                println!("  peers:       {} known, {verified} verified", hosts.len());
+                info!("  peers:       {} known, {verified} verified", hosts.len());
                 announce_tip(&reader, &commands, None);
             }
-            other => println!("mined block #{} was not applied: {other:?}", block.header.height),
+            other => info!("mined block #{} was not applied: {other:?}", block.header.height),
         }
     }
 }

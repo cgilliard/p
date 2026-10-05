@@ -138,8 +138,8 @@ impl<T: Transport> Node<T> {
                 }
                 let what = message.map_or("unparseable packet".to_string(), |m| m.describe());
                 match &result {
-                    Ok(()) => eprintln!("[{label}] sent {what} to {}", packet.to),
-                    Err(e) => eprintln!("[{label}] FAILED to send {what} to {}: {e:?}", packet.to),
+                    Ok(()) => debug!("[{label}] sent {what} to {}", packet.to),
+                    Err(e) => warn!("[{label}] FAILED to send {what} to {}: {e:?}", packet.to),
                 }
             }
         }
@@ -184,7 +184,7 @@ impl<T: Transport> Node<T> {
                 && !matches!(message, Some(Message::Chunk { .. }))
             {
                 let what = message.as_ref().map_or(format!("unparseable packet ({len} bytes)"), |m| m.describe());
-                eprintln!("[{label}] recv {what} from {from}");
+                debug!("[{label}] recv {what} from {from}");
             }
             if let Some(message) = message {
                 let out = match message {
@@ -214,7 +214,7 @@ impl<T: Transport> Node<T> {
 
         if let Some(label) = &self.log {
             for (block, from) in &delivered {
-                eprintln!("[{label}] downloaded block #{} from {from}", block.header.height);
+                info!("[{label}] downloaded block #{} from {from}", block.header.height);
             }
         }
         Ok(delivered)
