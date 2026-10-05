@@ -542,7 +542,8 @@ fn main() {
         let unproven = chain.build_block(&transactions).expect("build_block failed");
         let target = unproven.target;
         let min_timestamp = unproven.min_timestamp;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &transactions, random_key())
+        // Direct for small blocks, a tree beyond (`prove_block_auto`).
+        let proof = prover::prove_block_auto(&unproven.inputs, &unproven.outputs, &transactions, random_key())
             .expect("a block of this node's own valid, balanced transactions always proves");
         let mut block = unproven.finish(proof);
 

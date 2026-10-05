@@ -82,9 +82,11 @@ pub fn recursive_statement(header: &[BabyBear], tuples: &[(BabyBear, Vec<BabyBea
 /// A verified proof's statement, as cells the caller can hash or
 /// constrain: everything the verifier circuit took on trust.
 pub struct Statement {
-    /// The AIR's whole `statement()`, octet by octet (header and tuple
-    /// headers are constants; tuple values are witness).
+    /// The AIR's whole `statement()`, octet by octet (its header and the
+    /// tuple count are constants; everything about the tuples is witness).
     pub octets: Vec<OVar>,
+    /// Each bus tuple's header octet `[multiplicity, length]` (witness).
+    pub tuple_headers: Vec<OVar>,
     /// Each bus tuple's value octets (witness).
     pub tuples: Vec<Vec<OVar>>,
     /// The preprocessed columns' cap (witness), if the AIR has any.
@@ -389,10 +391,13 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
     let mut statement: Vec<OVar> = octets(&air.statement_header()).into_iter().map(|o| b.const_octet(o)).collect();
     statement.push(b.const_octet(octet_of(BabyBear::new(tuples.len() as u32))));
     let mut tuple_cells = Vec::with_capacity(tuples.len());
+    let mut tuple_headers = Vec::with_capacity(tuples.len());
     for (m, tuple) in &tuples {
         let mut header = octet_of(*m);
         header[1] = BabyBear::new(tuple.len() as u32);
-        statement.push(b.const_octet(header));
+        let header = b.witness_octet(header);
+        statement.push(header);
+        tuple_headers.push(header);
         let cells: Vec<OVar> = octets(tuple).into_iter().map(|o| b.witness_octet(o)).collect();
         statement.extend_from_slice(&cells);
         tuple_cells.push(cells);
@@ -491,7 +496,7 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
         let column = bus.aux_offset + bus.slots;
         let (gamma, beta) = (challenges[bus.challenge_offset], challenges[bus.challenge_offset + 1]);
         let mut public_sum = b.zero();
-        for ((m, tuple), cells) in tuples.iter().zip(&tuple_cells) {
+        for (((_, tuple), cells), &header) in tuples.iter().zip(&tuple_cells).zip(&tuple_headers) {
             let mut acc = b.zero();
             for j in (0..tuple.len()).rev() {
                 let (half, lane) = element(b, cells, j);
@@ -499,8 +504,9 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
             }
             let fingerprint = b.sub(gamma, acc);
             let inv = b.inverse(fingerprint);
-            let zr = BabyBear::ZERO;
-            public_sum = b.arith(zr, Some(inv), Some(public_sum), *m, BabyBear::ONE, None, zr, [zr; 4]);
+            let (header_lo, _) = b.halves(header);
+            let m = b.lane(header_lo, 0);
+            public_sum = b.mul_add(m, inv, public_sum);
         }
         let first = row_inv(b, 0);
         boundary_terms.push(b.mul(aux_z[column], first));
@@ -719,6 +725,7 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
     }
     Some(Statement {
         octets: statement,
+        tuple_headers,
         tuples: tuple_cells,
         preprocessed_cap,
     })
@@ -761,12 +768,13 @@ mod tests {
         log_blowup: 2,
         num_queries: 4,
         grinding_bits: 3,
+        hiding: true,
     };
 
     #[test]
     fn the_verifier_circuit_accepts_a_real_block_proof() {
         let (circuit, _) = block_verifier(&SMALL);
-        let air = circuit.air(&Params { log_blowup: 1, num_queries: 2, grinding_bits: 0 });
+        let air = circuit.air(&Params { log_blowup: 1, num_queries: 2, grinding_bits: 0, hiding: true });
         stark::check(&air, &circuit.witness, &challenges()).unwrap();
     }
 
@@ -820,7 +828,7 @@ mod tests {
         let (circuit, _) = block_verifier(&inner);
         println!("built in {:.2?}", start.elapsed());
         for outer in [
-            Params { log_blowup: 1, num_queries: 84, grinding_bits: 16 },
+            Params { log_blowup: 1, num_queries: 84, grinding_bits: 16, hiding: true },
             crate::prover::PARAMS,
         ] {
             let start = std::time::Instant::now();

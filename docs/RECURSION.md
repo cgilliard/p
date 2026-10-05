@@ -1,6 +1,6 @@
 # Recursion: design proposal
 
-Status: **agreed; in progress.** Steps 1–4 of "Suggested order" are done.
+Status: **in consensus.** Steps 1–5 of "Suggested order" are done, and blocks may carry a tree proof (see "Consensus" at the end).
 
 ## Why
 
@@ -223,12 +223,101 @@ the published proof stays the same size.
    wrap circuit verifying it (2^17 rows) proven at consensus parameters is
    120 KB / 8 ms / 130 s (+27 s one-time key). Aggregating two wraps at
    light tree parameters: ~18 s per wrap or aggregation, 3.4 ms root
-   verification. A secure aggregation layer needs 2^18-row circuits at
-   blowup 16, beyond this machine's 22 GB with today's memory layout
-   (Merkle trees keep every leaf; LDEs are kept whole).
-5. Chunking with global challenges and the shares checks.
+   verification.
+
+   **Memory reduction (done):** the prover never holds a whole
+   low-degree extension. It works in `2^log_blowup` slices of the LDE
+   (a point and its negation share a slice); Merkle trees keep only
+   hashes and openings recompute their leaf from the polynomials; the
+   composition is evaluated only on its own degree-bound domain (one
+   slice) and interpolated; DEEP combines coefficients first. Proofs are
+   unchanged. One-spend block proof: 38 s → 24 s, peak 490 MB. A fully
+   secure tree -- every layer at the consensus parameters, 2^18-row
+   circuits -- now runs on the 22 GB laptop: peak 7.5 GB; wrap ~200 s,
+   aggregation ~250 s, one-time keys ~50 s each; root proof 127 KB,
+   verified in 8.6 ms.
+5. ~~Chunking~~ — **done**, with *whole-transaction chunks proven
+   independently* rather than the global-challenge design in section 2
+   above (decided 2026-10-04: it allows proving chunks as transactions
+   arrive, and keeps per-chunk fees private).
+   - The block circuit proves `sum(inputs) + a == sum(outputs) + b` for
+     public amounts `(a, b)` sent on its bus (`TAG_NET`), instead of a
+     reward built into its constraints. A whole block is `(reward, 0)`.
+   - Chunks have a fixed `ChunkShape` (trace size, input/output slots;
+     unused slots are multiplicity-0 public tuples), so one wrap circuit
+     verifies every chunk. Tuple multiplicities are part of the hashed
+     statement.
+   - Tree proofs have three public inputs `[vk, data, amounts]`. Wraps
+     range-check the chunk's `a`, `b` limbs and hash its statement with
+     them blanked; aggregations sum amounts with carries (no wrap-around,
+     no 64-bit overflow).
+   - The tree over `k` chunks pairs neighbours level by level, carrying a
+     lone node up (`tree_data`, `aggregate_all`). `VerifyingKey::
+     verify_block(chunk statements, (A, B), reward, proof)` checks the
+     root: data from the chunks' statements, `A − B == reward`.
+   - Tested end to end (`chunked_block`, light parameters): reward chunk +
+     fee-paying spend + fee-free spend, ((W1, W2), W3); wrong totals and
+     reordered chunks refused.
+
+   For consensus, a block body would then carry its chunk boundaries and
+   the totals `(A, B)` (A − B = reward reveals only the block's total
+   fees), plus the root proof.
 6. Revisit the chunk layout (dense/narrow) with real aggregation costs in
    hand.
+
+## Prover optimizations (done, 2026-10-05)
+
+Profiling a secure 2^18-row wrap proof showed Merkle commitments (leaf
+hashing) and low-degree extensions (NTTs) dominating. Changes, none of
+which alter proofs except the last (a parameter):
+
+- **Poseidon2** runs in Montgomery form with lazily reduced linear
+  layers (`reduce_wide`: shift-and-add folding, vectorizable), and
+  `permute_lanes` runs 8 permutations in lockstep, compiled for AVX2
+  when the CPU has it (runtime-detected; portable fallback). Merkle
+  leaves and nodes hash in such batches. 2.06 µs → ~0.75 µs per
+  width-24 permutation (throughput, one core).
+- **NTT**: `coset_evaluate_many` transforms 8 columns at once in
+  Montgomery form (AVX2 as above), running early stages one cache-sized
+  block at a time, and keeps results in that batched row layout so a
+  Merkle leaf gathers its row in a few contiguous reads. Slices are
+  evaluated several at once when there are fewer column batches than
+  threads.
+- **`Params::hiding`**: zero-knowledge blinding is now optional. It
+  doubles every column's degree, so proofs without it extend over half
+  the domain. Block and chunk proofs keep it (their witnesses are
+  secret); tree layers can drop it -- their witnesses are child proofs,
+  ultimately zero-knowledge chunk proofs. What a non-hiding tree proof
+  could in principle leak is information about per-chunk amounts (fees),
+  not transactions; a final hiding wrap over the root would restore full
+  zero knowledge for one more wrap's cost.
+
+Measured (Ryzen 5 7530U, 6 cores / 12 threads):
+
+| | before | after |
+|---|---|---|
+| one-spend block proof | 23.1 s | 13.4 s |
+| secure wrap, 2^18 rows, hiding | 192 s | 121 s |
+| secure wrap, 2^18 rows, not hiding | — | 58–61 s |
+| secure aggregation, 2^18 rows, not hiding | 251 s (hiding) | 62 s |
+| tree key (one-time) | ~50 s | ~13 s |
+| two-chunk secure tree, end to end | 810 s | 239 s |
+| peak memory, secure tree | 7.5 GB | 4.9 GB |
+
+Root: 120.5 KB, 7.5 ms to verify. An aggregation circuit over two
+2^17-row children needs 231k rows, so tree circuits stay at 2^18.
+
+Considered and set aside, with reasons:
+
+- *Two Poseidon2 rounds per row*: halves rows but doubles width; Merkle
+  hashing scales with rows × width, and wider rows make every opening
+  more expensive to verify in-circuit. No net win.
+- *4-ary aggregation*: halves tree depth, but each node verifies twice
+  as many children (twice the work), so latency per block is about the
+  same unless nodes are themselves split across machines.
+- *Cheaper tree parameters* (lower blowup, more queries): more queries
+  make the verifier circuit bigger than 2^18; blowup 16 / 20 queries is
+  the sweet spot for tree layers.
 
 ## Open questions
 
@@ -243,3 +332,35 @@ the published proof stays the same size.
   clients — the "whole chain in one proof" recursion. Out of scope here,
   but the aggregation circuit's design (verifying aggregation proofs)
   is the same mechanism.
+
+## Consensus (done, 2026-10-05)
+
+A block's proof (`prover::Proof`) starts with its kind, and consensus
+accepts either kind for any block -- they prove the same statement about
+the body's commitment lists:
+
+- **Direct** (`0`): `u32` trace block count, then the `block_air` proof
+  at `PARAMS`, as before.
+- **Tree** (`1`): the root's totals `A`, `B` (`u64` each; must satisfy
+  `A − B = REWARD`), the chunk count (`u16`), each input's then each
+  output's chunk index (`u16`, in body order), then the root proof. The
+  body's commitment lists stay globally sorted; a chunk's lists are its
+  commitments in body order (so sorted, as its statement requires). A
+  verifier rebuilds each chunk's statement from them and checks the root
+  against the tree's verifying key (`VerifyingKey::verify_block`).
+
+Consensus constants (`prover`): `CHUNK_SHAPE` (4096 blocks = 2^17 rows,
+10 inputs, 256 outputs), `CHUNK_PARAMS` (= `PARAMS`, hiding), `TREE`
+(2^18 rows; blowup 16, 20 queries, 20-bit grinding, *not* hiding), and
+the wrap and aggregation circuits' preprocessed caps (`WRAP_CAP`,
+`AGGREGATE_CAP`), derived from the circuits by the `tree_keys` test --
+which must be re-run, and the constants updated, after any change to the
+circuits, the hash, or the STARK.
+
+The reference miner (`prove_block_auto`) proves directly up to
+`CHUNK_SHAPE.inputs` (10) inputs and as a tree beyond: transactions are
+grouped in order into chunks; each chunk's net `(a, b)` comes from its
+plaintext amounts; proving keys are derived from the first tree block it
+proves and kept; and it checks the result against the consensus key
+before publishing, falling back to a direct proof if anything fails
+(including a transaction too big for one chunk).

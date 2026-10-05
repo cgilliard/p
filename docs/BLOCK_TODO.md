@@ -21,10 +21,14 @@ a reward-only block, ~119 KB with one spend, ~8.5 ms to verify.
 
 **Scale target: 5,000-10,000 transactions per block.** One trace can't
 hold that (BabyBear's 2^27 domain caps it at a few hundred inputs), so
-the next step is recursion -- chunk proofs aggregated into one published
-proof. Design: `docs/RECURSION.md`. Also open: recursive composition
-across the whole chain (for light clients), and timestamp monotonicity
-inside that recursion.
+blocks may also carry a **tree proof**: chunks of whole transactions
+(`prover::CHUNK_SHAPE`: up to 10 inputs, 256 outputs) proven
+independently, aggregated into one root proof. Consensus accepts either
+kind of proof for any block (`prover::Proof`); the reference miner uses a
+direct proof up to 10 inputs and a tree beyond (`prove_block_auto`).
+Design and measurements: `docs/RECURSION.md`. Still open: recursive
+composition across the whole chain (for light clients), and timestamp
+monotonicity inside that recursion.
 
 **Note on scope:** the proof's job isn't just hiding amounts/pubkeys --
 the goal is a *recursive* proof, so a light client (or new node) can

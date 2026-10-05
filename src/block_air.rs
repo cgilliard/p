@@ -1,9 +1,12 @@
-//! The block statement as a STARK circuit: for a block's public input and
-//! output commitment lists, "there are transactions such that every input
-//! is authorized by its owner's WOTS signature over its transaction, every
-//! commitment is correctly formed, and `sum(inputs) + reward ==
-//! sum(outputs)` exactly" -- with every public key, amount, and signature
-//! kept private.
+//! The block statement as a STARK circuit: for public input and output
+//! commitment lists and public amounts `a`, `b`, "there are transactions
+//! such that every input is authorized by its owner's WOTS signature over
+//! its transaction, every commitment is correctly formed, and
+//! `sum(inputs) + a == sum(outputs) + b` exactly" -- with every public
+//! key, amount, and signature kept private. A whole block is `a = reward`,
+//! `b = 0`; a *chunk* of a block's transactions (see `aggregate`) has
+//! whatever net its transactions leave, with the chunks' `a - b` summing
+//! to the reward.
 //!
 //! # Layout
 //!
@@ -43,8 +46,10 @@
 //!   the input count and then every commitment received from the bus; the
 //!   last sends the message once per input of the transaction.
 //! - `PAD`: unused filler (the first block is always one).
-//! - `BAL`: the last block, checking the running total plus the reward
-//!   comes out to exactly zero, carry by carry.
+//! - `BAL`: the last block, checking the running total plus `a` minus `b`
+//!   comes out to exactly zero, carry by carry. `a` and `b` (as 16-bit
+//!   limbs) are sent to the public side of the bus, so they're part of the
+//!   statement without being built into the constraints.
 //!
 //! Where data must cross distant blocks it goes over one LogUp `bus`;
 //! where it flows between neighbouring blocks it's wired directly. Each
@@ -179,6 +184,8 @@ const TAG_MSG: u32 = 3;
 const TAG_ITEM: u32 = 4;
 const TAG_PIN: u32 = 5;
 const TAG_POUT: u32 = 6;
+/// The public amounts `a`, `b`: `[TAG_NET, 0, 0, a limbs, b limbs]`.
+pub const TAG_NET: u32 = 7;
 const TUPLE_LEN: usize = 11;
 const BUS: Bus = Bus {
     slots: 9,
@@ -208,25 +215,59 @@ fn bb(v: u32) -> BabyBear {
     BabyBear::new(v)
 }
 
-/// The public statement: commitments the block spends and creates, the
-/// reward, and how many blocks the trace has.
+/// The public statement: commitments spent and created, the amounts
+/// `a` (added) and `b` (taken), and how many blocks the trace has.
 pub struct BlockAir {
     chip: Poseidon2Chip<24>,
     num_blocks: usize,
     inputs: Vec<[BabyBear; 8]>,
     outputs: Vec<[BabyBear; 8]>,
-    reward: u64,
+    net: (u64, u64),
+    /// Public commitment slots, `(inputs, outputs)`: the lists padded to
+    /// these lengths with unused entries (multiplicity 0), so every chunk
+    /// of a given shape has the same statement layout. `None`: no padding.
+    capacity: Option<(usize, usize)>,
     num_constraints: usize,
 }
 
+/// A fixed chunk shape: trace size and public commitment slots. Chunks of
+/// one shape are all verified by one wrap circuit (`aggregate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkShape {
+    pub num_blocks: usize,
+    pub inputs: usize,
+    pub outputs: usize,
+}
+
 impl BlockAir {
+    /// A whole block's statement: `a = reward`, `b = 0`.
     pub fn new(num_blocks: usize, inputs: Vec<[BabyBear; 8]>, outputs: Vec<[BabyBear; 8]>, reward: u64) -> Self {
+        Self::with_net(num_blocks, inputs, outputs, (reward, 0))
+    }
+
+    /// `sum(inputs) + a == sum(outputs) + b`, `net = (a, b)`.
+    pub fn with_net(num_blocks: usize, inputs: Vec<[BabyBear; 8]>, outputs: Vec<[BabyBear; 8]>, net: (u64, u64)) -> Self {
+        Self::chunk(num_blocks, inputs, outputs, net, None)
+    }
+
+    /// A chunk's statement, its commitment lists padded to `capacity`.
+    pub fn chunk(
+        num_blocks: usize,
+        inputs: Vec<[BabyBear; 8]>,
+        outputs: Vec<[BabyBear; 8]>,
+        net: (u64, u64),
+        capacity: Option<(usize, usize)>,
+    ) -> Self {
+        if let Some((i, o)) = capacity {
+            assert!(inputs.len() <= i && outputs.len() <= o, "more commitments than slots");
+        }
         let mut air = BlockAir {
             chip: Poseidon2Chip::<24>::new(),
             num_blocks,
             inputs,
             outputs,
-            reward,
+            net,
+            capacity,
             num_constraints: 0,
         };
         let zeros = vec![BabyBear::ZERO; WIDTH];
@@ -246,8 +287,8 @@ impl BlockAir {
         &self.outputs
     }
 
-    fn reward_limbs(&self) -> [BabyBear; AMOUNT_LIMBS] {
-        amount_limbs(self.reward)
+    pub fn net(&self) -> (u64, u64) {
+        self.net
     }
 
     /// Every transition constraint, in a fixed order.
@@ -441,12 +482,12 @@ impl BlockAir {
             out.push((commit + kb) * carry * (carry - one) * (carry + one));
         }
 
-        // The final balance: the running total plus the reward, carried
-        // limb by limb, must come out to exactly zero.
-        let r = self.reward_limbs().map(F::from_base);
+        // The final balance: the running total plus `a` minus `b` (row 0's
+        // LIMB and LACC, both otherwise unused here), carried limb by
+        // limb, must come out to exactly zero.
         for j in 0..AMOUNT_LIMBS {
             let carry_in = if j == 0 { F::ZERO } else { c[carry_column(j - 1)] };
-            out.push(kb * (c[ACC + j] + r[j] + carry_in - base * c[carry_column(j)]));
+            out.push(kb * p0 * (c[ACC + j] + c[LIMB + j] - c[LACC + j] + carry_in - base * c[carry_column(j)]));
         }
         out.push(kb * (c[ACC_TOP] + c[carry_column(3)]));
 
@@ -512,12 +553,16 @@ impl BlockAir {
                 (kout, tuple(TAG_ITEM, c[TX], F::ZERO, &carry8)),
             ]),
         });
-        // Slot 2: a message, once per input; or digit lane 0.
+        // Slot 2: a message, once per input; or digit lane 0; or the
+        // public amounts.
+        let kb = c[K_BAL];
+        let net: Vec<F> = range(LIMB, AMOUNT_LIMBS).into_iter().chain(range(LACC, AMOUNT_LIMBS)).collect();
         slots.push(Interaction {
-            multiplicity: km * pout * c[LAST] * c[NIN] + kd * lt10,
+            multiplicity: km * pout * c[LAST] * c[NIN] + kd * lt10 + kb * p0,
             values: mix(&[
                 (km, tuple(TAG_MSG, c[TX], F::ZERO, &carry8)),
                 (kd, tuple(TAG_CH, c[UID], p[PR_DROW], &[digit(0)])),
+                (kb, tuple(TAG_NET, F::ZERO, F::ZERO, &net)),
             ]),
         });
         // Slots 3-8: digit lanes 1-6.
@@ -538,10 +583,20 @@ impl BlockAir {
             t.extend_from_slice(commitment);
             (BabyBear::ONE, t)
         };
-        self.inputs
-            .iter()
-            .map(|c| entry(TAG_PIN, c))
+        let mut amounts = vec![bb(TAG_NET), BabyBear::ZERO, BabyBear::ZERO];
+        amounts.extend(amount_limbs(self.net.0));
+        amounts.extend(amount_limbs(self.net.1));
+        let (in_slots, out_slots) = self.capacity.unwrap_or((self.inputs.len(), self.outputs.len()));
+        let unused = |tag: u32| {
+            let mut t = vec![bb(tag)];
+            t.resize(TUPLE_LEN, BabyBear::ZERO);
+            (BabyBear::ZERO, t)
+        };
+        std::iter::once((BabyBear::ONE, amounts))
+            .chain(self.inputs.iter().map(|c| entry(TAG_PIN, c)))
+            .chain((self.inputs.len()..in_slots).map(|_| unused(TAG_PIN)))
             .chain(self.outputs.iter().map(|c| entry(TAG_POUT, c)))
+            .chain((self.outputs.len()..out_slots).map(|_| unused(TAG_POUT)))
             .collect()
     }
 }
@@ -698,7 +753,13 @@ fn iv(domain: u32, len: u32) -> [BabyBear; 24] {
 /// and output commitment lists a `BlockBody` built from the same
 /// transactions would publish.
 pub fn build(transactions: &[Transaction], reward: u64) -> Result<Witness, WitnessError> {
-    build_inner(transactions, reward, true)
+    build_inner(transactions, (reward, 0), true)
+}
+
+/// Lay out a chunk of a block's transactions, proving
+/// `sum(inputs) + a == sum(outputs) + b` for `net = (a, b)`.
+pub fn build_chunk(transactions: &[Transaction], net: (u64, u64), shape: ChunkShape) -> Result<Witness, WitnessError> {
+    build_shaped(transactions, net, Some(shape), true)
 }
 
 /// `build`, optionally skipping the native signature check -- so tests can
@@ -707,7 +768,16 @@ pub fn build(transactions: &[Transaction], reward: u64) -> Result<Witness, Witne
 // Indexing several parallel arrays (digits, signature values, tops) by
 // chain is clearer than zipping them.
 #[allow(clippy::needless_range_loop)]
-fn build_inner(transactions: &[Transaction], reward: u64, check_signatures: bool) -> Result<Witness, WitnessError> {
+fn build_inner(transactions: &[Transaction], net: (u64, u64), check_signatures: bool) -> Result<Witness, WitnessError> {
+    build_shaped(transactions, net, None, check_signatures)
+}
+
+fn build_shaped(
+    transactions: &[Transaction],
+    net: (u64, u64),
+    shape: Option<ChunkShape>,
+    check_signatures: bool,
+) -> Result<Witness, WitnessError> {
     let perm = crate::poseidon2::perm24();
     let mut specs = vec![Spec::new(K_PAD, [BabyBear::ZERO; 24])];
     let mut public_inputs = Vec::new();
@@ -865,11 +935,17 @@ fn build_inner(transactions: &[Transaction], reward: u64, check_signatures: bool
         debug_assert_eq!(sponge[..8], message[..]);
     }
 
-    // Balance: the running total plus the reward must carry out to
+    // Balance: the running total plus a minus b must carry out to
     // exactly zero.
-    let carries = total.finish(reward).ok_or(WitnessError::Unbalanced)?;
+    let carries = total.finish(net).ok_or(WitnessError::Unbalanced)?;
 
-    let num_blocks = (specs.len() + 1).next_power_of_two().max(2);
+    let mut num_blocks = (specs.len() + 1).next_power_of_two().max(2);
+    if let Some(shape) = shape {
+        if num_blocks > shape.num_blocks {
+            return Err(WitnessError::TooLarge);
+        }
+        num_blocks = shape.num_blocks;
+    }
     if num_blocks * ROWS > 1 << max_log_rows(&crate::prover::PARAMS) {
         return Err(WitnessError::TooLarge);
     }
@@ -878,13 +954,24 @@ fn build_inner(transactions: &[Transaction], reward: u64, check_signatures: bool
     }
     let mut bal = Spec::new(K_BAL, [BabyBear::ZERO; 24]);
     bal.carries = carries;
+    bal.limbs = amount_limbs(net.0);
     specs.push(bal);
 
     // The same order a `BlockBody` publishes them in.
     public_inputs.sort_by_key(|c| digest_to_bytes(*c));
     public_outputs.sort_by_key(|c| digest_to_bytes(*c));
-    let air = BlockAir::new(num_blocks, public_inputs, public_outputs, reward);
-    let trace = fill(&air, &specs);
+    if let Some(shape) = shape
+        && (public_inputs.len() > shape.inputs || public_outputs.len() > shape.outputs)
+    {
+        return Err(WitnessError::TooLarge);
+    }
+    let capacity = shape.map(|s| (s.inputs, s.outputs));
+    let air = BlockAir::chunk(num_blocks, public_inputs, public_outputs, net, capacity);
+    let mut trace = fill(&air, &specs);
+    let bal_row = (num_blocks - 1) * ROWS;
+    for (j, limb) in amount_limbs(net.1).into_iter().enumerate() {
+        trace[LACC + j][bal_row] = limb;
+    }
     Ok(Witness { air, trace })
 }
 
@@ -920,17 +1007,17 @@ impl RunningTotal {
         carries
     }
 
-    /// The final check's carries: adding `reward` must bring the total to
-    /// exactly zero, or `None`.
-    fn finish(&self, reward: u64) -> Option<[i64; AMOUNT_LIMBS]> {
+    /// The final check's carries: adding `a` and taking `b` must bring
+    /// the total to exactly zero, or `None`.
+    fn finish(&self, (a, b): (u64, u64)) -> Option<[i64; AMOUNT_LIMBS]> {
         let mut carries = [0; AMOUNT_LIMBS];
         let mut carry = 0;
-        for (j, limb) in amount_limbs(reward).iter().enumerate() {
-            let value = self.limbs[j] + limb.value() as i64 + carry;
-            if value % (1 << 16) != 0 {
+        for (j, (x, y)) in amount_limbs(a).iter().zip(amount_limbs(b)).enumerate() {
+            let value = self.limbs[j] + x.value() as i64 - y.value() as i64 + carry;
+            if value.rem_euclid(1 << 16) != 0 {
                 return None;
             }
-            carry = value >> 16;
+            carry = value.div_euclid(1 << 16);
             carries[j] = carry;
         }
         (self.top + carry == 0).then_some(carries)
@@ -1088,12 +1175,10 @@ impl crate::recursion::RecursiveAir for BlockAir {
         Some((BUS, self.public_tuples()))
     }
 
-    /// A version tag and the reward (which the balance constraints build
-    /// in), then -- in the tuples -- both public commitment lists.
+    /// A version tag; everything else -- the amounts, then both
+    /// commitment lists -- is in the tuples.
     fn statement_header(&self) -> Vec<BabyBear> {
-        let mut out = vec![bb(1)];
-        out.extend(amount_limbs(self.reward));
-        out
+        vec![bb(1)]
     }
 }
 
@@ -1227,6 +1312,7 @@ mod tests {
             log_blowup: 1,
             num_queries: 8,
             grinding_bits: 4,
+            hiding: true,
         };
         let proof = stark::prove(&witness.air, &witness.trace, &params, [9; 32]).unwrap();
         assert!(stark::verify(&witness.air, &proof, &params));
@@ -1241,9 +1327,9 @@ mod tests {
         let (_, pk) = keypair(1);
         let reward_only = build(&[reward_tx(&pk, REWARD)], REWARD).unwrap();
         let candidates = [
-            ("blowup 4, 42 queries, 16-bit grind", Params { log_blowup: 2, num_queries: 42, grinding_bits: 16 }),
-            ("blowup 8, 27 queries, 20-bit grind", Params { log_blowup: 3, num_queries: 27, grinding_bits: 20 }),
-            ("blowup 16, 20 queries, 20-bit grind", Params { log_blowup: 4, num_queries: 20, grinding_bits: 20 }),
+            ("blowup 4, 42 queries, 16-bit grind", Params { log_blowup: 2, num_queries: 42, grinding_bits: 16, hiding: true }),
+            ("blowup 8, 27 queries, 20-bit grind", Params { log_blowup: 3, num_queries: 27, grinding_bits: 20, hiding: true }),
+            ("blowup 16, 20 queries, 20-bit grind", Params { log_blowup: 4, num_queries: 20, grinding_bits: 20, hiding: true }),
         ];
         let blocks = [("reward-only", reward_only), ("one spend", spend_block())];
         for ((name, witness), (label, params)) in blocks.iter().flat_map(|b| candidates.iter().map(move |c| (b, c))) {
@@ -1275,9 +1361,9 @@ mod tests {
         total.add(1, -1);
         assert_eq!((total.limbs, total.top), ([0; AMOUNT_LIMBS], 0));
         total.add(REWARD, -1);
-        assert!(total.finish(REWARD).is_some());
+        assert!(total.finish((REWARD, 0)).is_some());
         total.add(1, -1);
-        assert!(total.finish(REWARD).is_none());
+        assert!(total.finish((REWARD, 0)).is_none());
     }
 
     /// Amounts far past what a single limb-sum could hold without
@@ -1351,7 +1437,7 @@ mod tests {
         assert!(!spend.verify());
 
         let (_, pk_m) = keypair(4);
-        let witness = build_inner(&[spend, reward_tx(&pk_m, REWARD)], REWARD, false).unwrap();
+        let witness = build_inner(&[spend, reward_tx(&pk_m, REWARD)], (REWARD, 0), false).unwrap();
         // Every per-row rule holds -- the layout is faithful -- but the
         // bus can't balance: the chains' ends aren't the owner's tops.
         assert!(matches!(
@@ -1373,7 +1459,7 @@ mod tests {
         assert!(spend.sign_input(&pk_a, &sk_other));
         assert!(!spend.verify());
 
-        let witness = build_inner(&[spend], REWARD - REWARD, false);
+        let witness = build_inner(&[spend], (0, 0), false);
         // Zero reward here keeps the block balanced on its own terms, so
         // only the signature is wrong.
         let witness = witness.unwrap();

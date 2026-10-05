@@ -316,6 +316,7 @@ mod tests {
         log_blowup: 1,
         num_queries: 16,
         grinding_bits: 4,
+        hiding: true,
     };
 
     fn input<const WIDTH: usize>(seed: u32) -> [BabyBear; WIDTH] {
@@ -457,9 +458,9 @@ mod tests {
         let (columns, outputs) = trace(&chip, &inputs);
         let air = Permutations { chip, inputs, outputs };
         for params in [
-            Params { log_blowup: 1, num_queries: 100, grinding_bits: 4 },
-            Params { log_blowup: 2, num_queries: 50, grinding_bits: 4 },
-            Params { log_blowup: 3, num_queries: 34, grinding_bits: 4 },
+            Params { log_blowup: 1, num_queries: 100, grinding_bits: 4, hiding: true },
+            Params { log_blowup: 2, num_queries: 50, grinding_bits: 4, hiding: true },
+            Params { log_blowup: 3, num_queries: 34, grinding_bits: 4, hiding: true },
         ] {
             let start = std::time::Instant::now();
             let proof = stark::prove(&air, &columns, &params, [1; 32]).unwrap();

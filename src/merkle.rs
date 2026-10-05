@@ -14,7 +14,10 @@
 
 #![allow(dead_code)]
 
-use crate::poseidon2::{BabyBear, DOMAIN_MERKLE_LEAF, DOMAIN_MERKLE_NODE, digest_from_bytes, digest_to_bytes, hash_octets, hash_pair};
+use crate::poseidon2::{
+    BabyBear, DOMAIN_MERKLE_LEAF, DOMAIN_MERKLE_NODE, LANES, digest_from_bytes, digest_to_bytes, hash_octets, hash_octets_lanes,
+    hash_pair, hash_pair_lanes,
+};
 
 pub type Hash = [u8; 32];
 
@@ -38,6 +41,39 @@ pub(crate) fn leaf_hash(leaf: &[u8]) -> Hash {
 /// without building the bytes.
 pub(crate) fn leaf_hash_elements(elements: &[BabyBear]) -> Hash {
     digest_to_bytes(hash_octets(DOMAIN_MERKLE_LEAF, 4 * elements.len(), elements))
+}
+
+/// `leaf_hash_elements` of `count` leaves at once, `leaf(i)` giving leaf
+/// `i`'s elements (all the same length), in parallel and in lockstep
+/// batches.
+pub(crate) fn leaf_hashes_elements(count: usize, leaf: impl Fn(usize) -> Vec<BabyBear> + Sync) -> Vec<Hash> {
+    let groups = crate::parallel::map(count.div_ceil(LANES), |g| {
+        let rows: Vec<Vec<BabyBear>> = (0..LANES).map(|l| leaf((g * LANES + l).min(count - 1))).collect();
+        let len = rows[0].len();
+        if rows.iter().any(|r| r.len() != len) {
+            return rows.iter().map(|r| leaf_hash_elements(r)).collect::<Vec<_>>();
+        }
+        let inputs: [&[BabyBear]; LANES] = std::array::from_fn(|l| &rows[l][..]);
+        hash_octets_lanes(DOMAIN_MERKLE_LEAF, 4 * len, inputs).map(digest_to_bytes).to_vec()
+    });
+    let mut out: Vec<Hash> = groups.into_iter().flatten().collect();
+    out.truncate(count);
+    out
+}
+
+/// One level of internal nodes over `prev`, in lockstep batches.
+fn hash_level(level: u32, prev: &[Hash]) -> Vec<Hash> {
+    let count = prev.len() / 2;
+    let groups = crate::parallel::map(count.div_ceil(LANES), |g| {
+        let pairs = std::array::from_fn(|l| {
+            let i = (g * LANES + l).min(count - 1);
+            (digest_from_bytes(&prev[2 * i]), digest_from_bytes(&prev[2 * i + 1]))
+        });
+        hash_pair_lanes(DOMAIN_MERKLE_NODE + level, pairs).map(digest_to_bytes)
+    });
+    let mut out: Vec<Hash> = groups.into_iter().flatten().collect();
+    out.truncate(count);
+    out
 }
 
 /// `node_hash(level, left, right)`: the two child digests, one
@@ -130,7 +166,22 @@ impl MerkleTree {
             leaves.len()
         );
 
-        let hashes = crate::parallel::map(leaves.len(), |i| leaf_hash(&leaves[i]));
+        let to_elements = |leaf: &[u8]| -> Vec<BabyBear> {
+            leaf.chunks(4)
+                .map(|chunk| {
+                    let mut padded = [0u8; 4];
+                    padded[..chunk.len()].copy_from_slice(chunk);
+                    BabyBear::from_bytes(padded)
+                })
+                .collect()
+        };
+        // Batched when every leaf is whole elements (all here are);
+        // anything else hashes leaf by leaf.
+        let hashes = if leaves.iter().all(|l| l.len() % 4 == 0 && l.len() == leaves[0].len()) {
+            leaf_hashes_elements(leaves.len(), |i| to_elements(&leaves[i]))
+        } else {
+            crate::parallel::map(leaves.len(), |i| leaf_hash(&leaves[i]))
+        };
         let mut tree = Self::from_leaf_hashes(hashes);
         tree.leaves = Some(leaves);
         tree
@@ -150,7 +201,7 @@ impl MerkleTree {
         let mut level_num = 1u32;
         while levels.last().unwrap().len() > 1 {
             let prev = levels.last().unwrap();
-            let next = crate::parallel::map(prev.len() / 2, |i| node_hash(level_num, prev[2 * i], prev[2 * i + 1]));
+            let next = hash_level(level_num, prev);
             levels.push(next);
             level_num += 1;
         }

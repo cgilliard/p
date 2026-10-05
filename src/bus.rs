@@ -255,6 +255,7 @@ mod tests {
         log_blowup: 2,
         num_queries: 20,
         grinding_bits: 4,
+        hiding: true,
     };
 
     /// Private values `values` scattered among unselected filler rows.

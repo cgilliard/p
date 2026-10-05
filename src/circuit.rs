@@ -984,6 +984,7 @@ mod tests {
         log_blowup: 1,
         num_queries: 20,
         grinding_bits: 0,
+        hiding: true,
     };
 
     fn e(v: u32) -> Ext {

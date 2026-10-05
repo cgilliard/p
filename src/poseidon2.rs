@@ -478,12 +478,289 @@ pub struct Poseidon2BabyBear<const WIDTH: usize> {
     pub(crate) ext_final: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS],
     pub(crate) internal_rc: Vec<BabyBear>,
     pub(crate) internal_diag: [BabyBear; WIDTH],
+    /// The same constants in Montgomery form, for `permute`.
+    mont: MontConstants<WIDTH>,
+}
+
+// ---- Montgomery arithmetic, for the permutation's inner loop ---------------
+//
+// `permute` runs on raw `u32`s in Montgomery form (`x·2^32 mod P`), where a
+// product reduces with two multiplications and no division, and sums in the
+// linear layers accumulate in `u64` and reduce once. Inputs and outputs are
+// converted at the boundary, so nothing outside sees the representation.
+
+/// `P^-1 mod 2^32`.
+const MONTY_MU: u32 = {
+    // Newton iteration for the inverse mod 2^32.
+    let mut inv: u32 = 1;
+    let mut i = 0;
+    while i < 5 {
+        inv = inv.wrapping_mul(2u32.wrapping_sub(P.wrapping_mul(inv)));
+        i += 1;
+    }
+    inv
+};
+
+/// `x · 2^-32 mod P`, for `x < P · 2^32`.
+#[inline(always)]
+pub(crate) fn monty_reduce(x: u64) -> u32 {
+    let m = (x as u32).wrapping_mul(MONTY_MU);
+    let u = m as u64 * P as u64;
+    let (diff, borrow) = x.overflowing_sub(u);
+    let hi = (diff >> 32) as u32;
+    if borrow { hi.wrapping_add(P) } else { hi }
+}
+
+#[inline(always)]
+pub(crate) fn monty_mul(a: u32, b: u32) -> u32 {
+    monty_reduce(a as u64 * b as u64)
+}
+
+#[inline(always)]
+pub(crate) fn to_monty(x: BabyBear) -> u32 {
+    (((x.0 as u64) << 32) % P as u64) as u32
+}
+
+#[inline(always)]
+pub(crate) fn from_monty(x: u32) -> BabyBear {
+    BabyBear(monty_reduce(x as u64))
+}
+
+/// `x mod P` for `x < 2^37`, by folding: `2^31 ≡ 2^27 - 1 (mod P)`, so
+/// `hi·2^31 + lo ≡ lo + hi·2^27 - hi`. Shifts and adds only -- unlike `%`
+/// on `u64`, it vectorizes.
+#[inline(always)]
+fn reduce_wide(x: u64) -> u32 {
+    const MASK: u64 = (1 << 31) - 1;
+    let (hi, lo) = (x >> 31, x & MASK);
+    let y = lo + (hi << 27) - hi; // < 2^34
+    let (hi, lo) = (y >> 31, y & MASK);
+    let z = lo + (hi << 27) - hi; // < 2^31 + 2^30 < 2P
+    let z = z as u32;
+    if z >= P { z - P } else { z }
+}
+
+#[inline(always)]
+pub(crate) fn add_mod(a: u32, b: u32) -> u32 {
+    let s = a + b;
+    if s >= P { s - P } else { s }
+}
+
+#[inline(always)]
+pub(crate) fn sub_mod(a: u32, b: u32) -> u32 {
+    let (d, borrow) = a.overflowing_sub(b);
+    if borrow { d.wrapping_add(P) } else { d }
+}
+
+#[inline(always)]
+fn sbox_monty(x: u32) -> u32 {
+    let x2 = monty_mul(x, x);
+    let x3 = monty_mul(x2, x);
+    let x6 = monty_mul(x3, x3);
+    monty_mul(x6, x)
+}
+
+/// How many states `permute_lanes` runs in lockstep.
+pub const LANES: usize = 8;
+
+#[inline(always)]
+fn sbox_lanes(x: &mut [u32; LANES], rc: u32) {
+    for v in x.iter_mut() {
+        *v = sbox_monty(add_mod(*v, rc));
+    }
+}
+
+#[inline(always)]
+fn external_layer_lanes<const WIDTH: usize>(s: &mut [[u32; LANES]; WIDTH]) {
+    let mut wide = [[0u64; LANES]; WIDTH];
+    for j in (0..WIDTH).step_by(4) {
+        for l in 0..LANES {
+            let x = [s[j][l] as u64, s[j + 1][l] as u64, s[j + 2][l] as u64, s[j + 3][l] as u64];
+            let t01 = x[0] + x[1];
+            let t23 = x[2] + x[3];
+            let t0123 = t01 + t23;
+            let t01123 = t0123 + x[1];
+            let t01233 = t0123 + x[3];
+            wide[j + 3][l] = t01233 + 2 * x[0];
+            wide[j + 1][l] = t01123 + 2 * x[2];
+            wide[j][l] = t01123 + t01;
+            wide[j + 2][l] = t01233 + t23;
+        }
+    }
+    let mut sums = [[0u64; LANES]; 4];
+    for j in 0..WIDTH {
+        for l in 0..LANES {
+            sums[j % 4][l] += wide[j][l];
+        }
+    }
+    for j in 0..WIDTH {
+        for l in 0..LANES {
+            s[j][l] = reduce_wide(wide[j][l] + sums[j % 4][l]);
+        }
+    }
+}
+
+struct MontConstants<const WIDTH: usize> {
+    ext_initial: [[u32; WIDTH]; HALF_FULL_ROUNDS],
+    ext_final: [[u32; WIDTH]; HALF_FULL_ROUNDS],
+    internal_rc: Vec<u32>,
+    internal_diag: [u32; WIDTH],
+}
+
+/// The external linear layer on reduced values: each 4-chunk through the
+/// 4x4 matrix (entries summing to 7 per row), plus the per-position sums
+/// across chunks -- at most 49·P before the one reduction per element.
+#[inline(always)]
+fn external_layer_monty<const WIDTH: usize>(s: &mut [u32; WIDTH]) {
+    let mut wide = [0u64; WIDTH];
+    for (chunk, out) in s.chunks(4).zip(wide.chunks_mut(4)) {
+        let x = [chunk[0] as u64, chunk[1] as u64, chunk[2] as u64, chunk[3] as u64];
+        let t01 = x[0] + x[1];
+        let t23 = x[2] + x[3];
+        let t0123 = t01 + t23;
+        let t01123 = t0123 + x[1];
+        let t01233 = t0123 + x[3];
+        out[3] = t01233 + 2 * x[0];
+        out[1] = t01123 + 2 * x[2];
+        out[0] = t01123 + t01;
+        out[2] = t01233 + t23;
+    }
+    let mut sums = [0u64; 4];
+    for chunk in wide.chunks(4) {
+        for k in 0..4 {
+            sums[k] += chunk[k];
+        }
+    }
+    for (i, (slot, w)) in s.iter_mut().zip(wide).enumerate() {
+        *slot = reduce_wide(w + sums[i % 4]);
+    }
+}
+
+impl<const WIDTH: usize> Poseidon2BabyBear<WIDTH> {
+    fn assemble(
+        ext_initial: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS],
+        ext_final: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS],
+        internal_rc: Vec<BabyBear>,
+        internal_diag: [BabyBear; WIDTH],
+    ) -> Self {
+        let mont = MontConstants {
+            ext_initial: ext_initial.map(|r| r.map(to_monty)),
+            ext_final: ext_final.map(|r| r.map(to_monty)),
+            internal_rc: internal_rc.iter().map(|&c| to_monty(c)).collect(),
+            internal_diag: internal_diag.map(to_monty),
+        };
+        Poseidon2BabyBear {
+            ext_initial,
+            ext_final,
+            internal_rc,
+            internal_diag,
+            mont,
+        }
+    }
 }
 
 impl<const WIDTH: usize> Poseidon2BabyBear<WIDTH> {
     /// The full Poseidon2 permutation: an initial external linear layer, then
     /// R_F/2 full rounds, R_P partial rounds, and R_F/2 more full rounds.
     pub fn permute(&self, input: [BabyBear; WIDTH]) -> [BabyBear; WIDTH] {
+        let c = &self.mont;
+        let mut s = input.map(to_monty);
+        external_layer_monty(&mut s);
+        for round in &c.ext_initial {
+            for i in 0..WIDTH {
+                s[i] = sbox_monty(add_mod(s[i], round[i]));
+            }
+            external_layer_monty(&mut s);
+        }
+        for &rc in &c.internal_rc {
+            s[0] = sbox_monty(add_mod(s[0], rc));
+            let sum = reduce_wide(s.iter().map(|&x| x as u64).sum::<u64>());
+            for (x, &d) in s.iter_mut().zip(&c.internal_diag) {
+                *x = add_mod(monty_mul(*x, d), sum);
+            }
+        }
+        for round in &c.ext_final {
+            for i in 0..WIDTH {
+                s[i] = sbox_monty(add_mod(s[i], round[i]));
+            }
+            external_layer_monty(&mut s);
+        }
+        s.map(from_monty)
+    }
+
+    /// `permute` on `LANES` states at once, in lockstep: every step runs
+    /// across all of them, written as plain loops over the lanes so the
+    /// compiler can keep them in vector registers (and the CPU overlaps
+    /// them even where it doesn't). For hashing many independent inputs --
+    /// Merkle leaves and nodes.
+    pub fn permute_lanes(&self, input: &[[BabyBear; WIDTH]; LANES]) -> [[BabyBear; WIDTH]; LANES] {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU supports AVX2, checked just above.
+            return unsafe { self.permute_lanes_avx2(input) };
+        }
+        self.permute_lanes_generic(input)
+    }
+
+    /// `permute_lanes_generic` compiled with AVX2 enabled, so the lane
+    /// loops become vector instructions.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn permute_lanes_avx2(&self, input: &[[BabyBear; WIDTH]; LANES]) -> [[BabyBear; WIDTH]; LANES] {
+        self.permute_lanes_generic(input)
+    }
+
+    #[inline(always)]
+    fn permute_lanes_generic(&self, input: &[[BabyBear; WIDTH]; LANES]) -> [[BabyBear; WIDTH]; LANES] {
+        let c = &self.mont;
+        // s[i][l]: element i of lane l's state.
+        let mut s = [[0u32; LANES]; WIDTH];
+        for (l, state) in input.iter().enumerate() {
+            for i in 0..WIDTH {
+                s[i][l] = to_monty(state[i]);
+            }
+        }
+        external_layer_lanes(&mut s);
+        for round in &c.ext_initial {
+            for i in 0..WIDTH {
+                sbox_lanes(&mut s[i], round[i]);
+            }
+            external_layer_lanes(&mut s);
+        }
+        for &rc in &c.internal_rc {
+            sbox_lanes(&mut s[0], rc);
+            let mut sum = [0u64; LANES];
+            for row in &s {
+                for l in 0..LANES {
+                    sum[l] += row[l] as u64;
+                }
+            }
+            let sum = sum.map(reduce_wide);
+            for (row, &d) in s.iter_mut().zip(&c.internal_diag) {
+                for (x, &t) in row.iter_mut().zip(&sum) {
+                    *x = add_mod(monty_mul(*x, d), t);
+                }
+            }
+        }
+        for round in &c.ext_final {
+            for i in 0..WIDTH {
+                sbox_lanes(&mut s[i], round[i]);
+            }
+            external_layer_lanes(&mut s);
+        }
+        let mut out = [[BabyBear::ZERO; WIDTH]; LANES];
+        for (l, state) in out.iter_mut().enumerate() {
+            for i in 0..WIDTH {
+                state[i] = from_monty(s[i][l]);
+            }
+        }
+        out
+    }
+
+    /// The textbook permutation on `BabyBear` arithmetic -- what `permute`
+    /// must agree with.
+    #[cfg(test)]
+    fn permute_reference(&self, input: [BabyBear; WIDTH]) -> [BabyBear; WIDTH] {
         let mut s = input;
         apply_external_layer(&mut s);
 
@@ -545,34 +822,34 @@ impl<const WIDTH: usize> Poseidon2BabyBear<WIDTH> {
 
 impl Poseidon2BabyBear<16> {
     pub fn new() -> Self {
-        Poseidon2BabyBear {
-            ext_initial: EXTERNAL_RC_INITIAL_16.map(|r| r.map(BabyBear::new)),
-            ext_final: EXTERNAL_RC_FINAL_16.map(|r| r.map(BabyBear::new)),
-            internal_rc: INTERNAL_RC_16.map(BabyBear::new).to_vec(),
-            internal_diag: diagonal_16(),
-        }
+        Self::assemble(
+            EXTERNAL_RC_INITIAL_16.map(|r| r.map(BabyBear::new)),
+            EXTERNAL_RC_FINAL_16.map(|r| r.map(BabyBear::new)),
+            INTERNAL_RC_16.map(BabyBear::new).to_vec(),
+            diagonal_16(),
+        )
     }
 }
 
 impl Poseidon2BabyBear<24> {
     pub fn new() -> Self {
-        Poseidon2BabyBear {
-            ext_initial: EXTERNAL_RC_INITIAL_24.map(|r| r.map(BabyBear::new)),
-            ext_final: EXTERNAL_RC_FINAL_24.map(|r| r.map(BabyBear::new)),
-            internal_rc: INTERNAL_RC_24.map(BabyBear::new).to_vec(),
-            internal_diag: diagonal_24(),
-        }
+        Self::assemble(
+            EXTERNAL_RC_INITIAL_24.map(|r| r.map(BabyBear::new)),
+            EXTERNAL_RC_FINAL_24.map(|r| r.map(BabyBear::new)),
+            INTERNAL_RC_24.map(BabyBear::new).to_vec(),
+            diagonal_24(),
+        )
     }
 }
 
 impl Poseidon2BabyBear<32> {
     pub fn new() -> Self {
-        Poseidon2BabyBear {
-            ext_initial: EXTERNAL_RC_INITIAL_32.map(|r| r.map(BabyBear::new)),
-            ext_final: EXTERNAL_RC_FINAL_32.map(|r| r.map(BabyBear::new)),
-            internal_rc: INTERNAL_RC_32.map(BabyBear::new).to_vec(),
-            internal_diag: diagonal_32(),
-        }
+        Self::assemble(
+            EXTERNAL_RC_INITIAL_32.map(|r| r.map(BabyBear::new)),
+            EXTERNAL_RC_FINAL_32.map(|r| r.map(BabyBear::new)),
+            INTERNAL_RC_32.map(BabyBear::new).to_vec(),
+            diagonal_32(),
+        )
     }
 }
 
@@ -718,6 +995,46 @@ pub fn hash_octets(domain: u32, length: usize, elements: &[BabyBear]) -> [BabyBe
 
 /// Hash two digests into one -- a Merkle node -- in a single permutation
 /// (their 16 elements fill the sponge's rate exactly).
+/// `hash_octets` of `LANES` inputs of one length at once (lockstep
+/// permutations: see `Poseidon2BabyBear::permute_lanes`).
+pub fn hash_octets_lanes(domain: u32, length: usize, inputs: [&[BabyBear]; LANES]) -> [[BabyBear; 8]; LANES] {
+    assert!(length < P as usize, "input too long to encode its length");
+    let len = inputs[0].len();
+    assert!(inputs.iter().all(|x| x.len() == len), "lanes must have equal lengths");
+    let perm24 = perm24();
+    let mut start = [BabyBear::ZERO; 24];
+    start[SPONGE_RATE] = BabyBear::new(domain);
+    start[SPONGE_RATE + 1] = BabyBear::new(length as u32);
+    let mut states = [start; LANES];
+    if len == 0 {
+        states = perm24.permute_lanes(&states);
+    }
+    for offset in (0..len).step_by(SPONGE_RATE) {
+        let block = SPONGE_RATE.min(len - offset);
+        let octets = block.div_ceil(8);
+        for (state, input) in states.iter_mut().zip(inputs) {
+            state[..8 * octets].fill(BabyBear::ZERO);
+            state[..block].copy_from_slice(&input[offset..offset + block]);
+        }
+        states = perm24.permute_lanes(&states);
+    }
+    states.map(|s| s[..8].try_into().unwrap())
+}
+
+/// `hash_pair` of `LANES` pairs at once.
+pub fn hash_pair_lanes(domain: u32, pairs: [([BabyBear; 8], [BabyBear; 8]); LANES]) -> [[BabyBear; 8]; LANES] {
+    let mut start = [BabyBear::ZERO; 24];
+    start[SPONGE_RATE] = BabyBear::new(domain);
+    start[SPONGE_RATE + 1] = BabyBear::new(16);
+    let states = pairs.map(|(l, r)| {
+        let mut s = start;
+        s[..8].copy_from_slice(&l);
+        s[8..16].copy_from_slice(&r);
+        s
+    });
+    perm24().permute_lanes(&states).map(|s| s[..8].try_into().unwrap())
+}
+
 pub fn hash_pair(domain: u32, left: [BabyBear; 8], right: [BabyBear; 8]) -> [BabyBear; 8] {
     let mut elements = [BabyBear::ZERO; 16];
     elements[..8].copy_from_slice(&left);
@@ -943,5 +1260,92 @@ mod tests {
         // subtracting ZERO does, via ZERO.neg().
         assert_eq!(a.sub(BabyBear::ZERO), a);
     }
+
+    /// Not a correctness test: single-thread permutation speed. Run with
+    /// `cargo test --release -- --ignored --nocapture permutation_speed`.
+    #[test]
+    #[ignore]
+    fn permutation_speed() {
+        let perm = perm24();
+        let mut state = [BabyBear::new(1); 24];
+        let n = 200_000;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            state = perm.permute(state);
+        }
+        let per = start.elapsed().as_nanos() as f64 / n as f64;
+        println!("width-24 permutation: {per:.0} ns ({:?})", state[0]);
+        let perm16 = perm16();
+        let mut state = [BabyBear::new(1); 16];
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            state = perm16.permute(state);
+        }
+        let per = start.elapsed().as_nanos() as f64 / n as f64;
+        println!("width-16 permutation: {per:.0} ns ({:?})", state[0]);
+        let mut states = [[BabyBear::new(1); 24]; LANES];
+        let start = std::time::Instant::now();
+        for _ in 0..n / LANES {
+            states = perm.permute_lanes(&states);
+        }
+        let per = start.elapsed().as_nanos() as f64 / n as f64;
+        println!("width-24, {LANES} in lockstep: {per:.0} ns per permutation ({:?})", states[0][0]);
+    }
+
+
+    #[test]
+    fn the_fast_permutation_matches_the_reference() {
+        let mut state24 = [BabyBear::ZERO; 24];
+        let mut state16 = [BabyBear::ZERO; 16];
+        for round in 0..50u32 {
+            for (i, x) in state24.iter_mut().enumerate() {
+                *x = *x + BabyBear::new(round.wrapping_mul(2_654_435_761).wrapping_add(i as u32 * 97));
+            }
+            for (i, x) in state16.iter_mut().enumerate() {
+                *x = *x + BabyBear::new(round.wrapping_mul(40_503).wrapping_add(i as u32));
+            }
+            assert_eq!(perm24().permute(state24), perm24().permute_reference(state24));
+            assert_eq!(perm16().permute(state16), perm16().permute_reference(state16));
+            state24 = perm24().permute(state24);
+            state16 = perm16().permute(state16);
+        }
+        // Lockstep lanes agree with one at a time.
+        let lanes: [[BabyBear; 24]; LANES] =
+            std::array::from_fn(|l| std::array::from_fn(|i| BabyBear::new(((l * 1000 + i * 7919) as u32).wrapping_mul(31337))));
+        let together = perm24().permute_lanes(&lanes);
+        for l in 0..LANES {
+            assert_eq!(together[l], perm24().permute(lanes[l]));
+        }
+        // Extremes: all zero, all P - 1.
+        let top = BabyBear::new(P - 1);
+        assert_eq!(perm24().permute([top; 24]), perm24().permute_reference([top; 24]));
+        assert_eq!(perm24().permute([BabyBear::ZERO; 24]), perm24().permute_reference([BabyBear::ZERO; 24]));
+    }
+
+
+    #[test]
+    fn wide_reduction_matches_modulo() {
+        let p = P as u64;
+        for x in [0, 1, p - 1, p, p + 1, 2 * p, (1 << 37) - 1, 49 * p - 1, 24 * (p - 1), 1 << 31, (1 << 34) + 12345] {
+            assert_eq!(reduce_wide(x) as u64, x % p, "{x}");
+        }
+        let mut x: u64 = 0x1234_5678;
+        for _ in 0..100_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let v = x >> 27; // < 2^37
+            assert_eq!(reduce_wide(v) as u64, v % p);
+        }
+    }
+
+
+    /// The portable path (what CPUs without AVX2, or other
+    /// architectures, run) agrees with whatever `permute_lanes` picked.
+    #[test]
+    fn portable_lanes_match_the_dispatched_ones() {
+        let lanes: [[BabyBear; 24]; LANES] =
+            std::array::from_fn(|l| std::array::from_fn(|i| BabyBear::new(((l * 31 + i) as u32).wrapping_mul(2_654_435_761))));
+        assert_eq!(perm24().permute_lanes_generic(&lanes), perm24().permute_lanes(&lanes));
+    }
+
 }
 

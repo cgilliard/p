@@ -102,7 +102,7 @@ use crate::ext::{Ext, batch_inverse};
 use crate::field::Field;
 use crate::fri::{self, coset_domain, domain_generator};
 use crate::merkle::{Hash, MerkleTree, Opening};
-use crate::ntt::{coset_evaluate, coset_interpolate, evaluate_at, intt};
+use crate::ntt::{Evaluations, coset_evaluate, coset_interpolate, evaluate_at, intt};
 use crate::poseidon2::BabyBear;
 use crate::transcript::Transcript;
 
@@ -183,7 +183,7 @@ impl Preprocessed {
             coeffs
         });
         let slices = Slices::new(log_lde, params.log_blowup);
-        let tree = slices.commit(|r| slices.eval_all(&coeffs, r));
+        let tree = slices.commit_polys(&coeffs);
         Preprocessed {
             num_columns: columns.len(),
             log_lde,
@@ -297,9 +297,21 @@ pub struct Params {
     /// Proof-of-work bits required before the queries are drawn (see
     /// `fri`'s docs) -- each one worth a bit of soundness.
     pub grinding_bits: u32,
+    /// Zero knowledge: blind the trace with random rows (see "Zero
+    /// knowledge" in the module docs). Doubles every column's degree, so
+    /// the low-degree extension, and so proving, costs twice as much --
+    /// worth it only when the witness is secret. Soundness is the same
+    /// either way.
+    pub hiding: bool,
 }
 
 impl Params {
+    /// Trace polynomials have degree below this times the trace length
+    /// (2 with the random rows of `hiding`, else 1).
+    fn trace_degree_factor(&self) -> usize {
+        if self.hiding { 2 } else { 1 }
+    }
+
     pub(crate) fn fri(&self) -> fri::Settings {
         fri::Settings {
             log_blowup: self.log_blowup,
@@ -617,7 +629,7 @@ fn lde_bits(n: usize, constraint_degree: usize, params: &Params) -> Option<usize
     if !n.is_power_of_two() || n < 2 {
         return None;
     }
-    let factor = (2 * constraint_degree.max(1)).next_power_of_two();
+    let factor = (params.trace_degree_factor() * constraint_degree.max(1)).next_power_of_two();
     let log_lde = n.trailing_zeros() as usize + factor.trailing_zeros() as usize + params.log_blowup;
     (log_lde <= fri::MAX_TWO_ADICITY && params.log_blowup >= 1).then_some(log_lde)
 }
@@ -646,7 +658,7 @@ pub(crate) fn layout<A: Air>(air: &A, params: &Params) -> Option<Layout> {
     // Trace polynomials have degree < 2n (the random rows -- see the
     // module docs), so a degree-D constraint has degree < 2D·n, and its
     // quotient by the (degree n - 1) transition divisor stays below that.
-    let factor = (2 * air.constraint_degree().max(1)).next_power_of_two();
+    let factor = (params.trace_degree_factor() * air.constraint_degree().max(1)).next_power_of_two();
     let log_composition_factor = factor.trailing_zeros() as usize;
     let log_lde = log_n + log_composition_factor + params.log_blowup;
     if air.preprocessed().is_some_and(|p| p.log_lde != log_lde) {
@@ -668,6 +680,9 @@ pub fn hides<A: Air>(air: &A, params: &Params) -> bool {
     let Some(layout) = layout(air, params) else {
         return false;
     };
+    if !params.hiding {
+        return false;
+    }
     let fri_degree_bound = 1usize << (layout.log_lde - params.log_blowup);
     let fri_revealed = params.num_queries * fri::revealed_per_query(layout.log_lde, params.log_blowup);
     air.trace_len() > 4 * params.num_queries + 2 && fri_degree_bound > fri_revealed
@@ -981,15 +996,25 @@ fn deep_value(x: Ext, main: &[Ext], aux: &[Ext], composition: Ext, mask: Ext, oo
 /// A trace column's blinded polynomial (coefficients, degree < 2n): the
 /// column's values on the even points of the size-2n domain -- which are
 /// exactly the trace rows -- and fresh random values on the odd ones.
-fn blind_column(column: &[BabyBear], randomness: &mut Randomness) -> Vec<BabyBear> {
-    let mut values: Vec<BabyBear> = column.iter().flat_map(|&v| [v, randomness.next()]).collect();
+/// A column's polynomial: interleaved with random rows when hiding (see
+/// the module docs), else just its interpolation.
+fn blind_column(column: &[BabyBear], randomness: &mut Randomness, hiding: bool) -> Vec<BabyBear> {
+    let mut values: Vec<BabyBear> = if hiding {
+        column.iter().flat_map(|&v| [v, randomness.next()]).collect()
+    } else {
+        column.to_vec()
+    };
     intt(&mut values);
     values
 }
 
 /// `blind_column`, for an auxiliary (extension) column.
-fn blind_ext_column(column: &[Ext], randomness: &mut Randomness) -> Vec<Ext> {
-    let mut values: Vec<Ext> = column.iter().flat_map(|&v| [v, randomness.next_ext()]).collect();
+fn blind_ext_column(column: &[Ext], randomness: &mut Randomness, hiding: bool) -> Vec<Ext> {
+    let mut values: Vec<Ext> = if hiding {
+        column.iter().flat_map(|&v| [v, randomness.next_ext()]).collect()
+    } else {
+        column.to_vec()
+    };
     intt(&mut values);
     values
 }
@@ -1048,40 +1073,77 @@ impl Slices {
         coset_evaluate(coeffs, self.shift(r), self.log_size())
     }
 
-    fn eval_all<F: Field + Send + Sync, C: AsRef<[F]> + Sync>(&self, polys: &[C], r: usize) -> Vec<Vec<F>> {
-        crate::parallel::map_each(polys.len(), |c| self.eval(polys[c].as_ref(), r))
+    /// Every polynomial's values on slice `r` (batched: see
+    /// `ntt::coset_evaluate_many`).
+    fn eval_all<C: AsRef<[BabyBear]> + Sync>(&self, polys: &[C], r: usize) -> Evaluations {
+        crate::ntt::coset_evaluate_rows(polys, self.shift(r), self.log_size(), true)
+    }
+
+    /// Extension polynomials' values on slice `r`, as their components.
+    fn eval_all_ext<C: AsRef<[Ext]> + Sync>(&self, polys: &[C], r: usize) -> Evaluations {
+        crate::ntt::coset_evaluate_rows_ext(polys, self.shift(r), self.log_size(), true)
+    }
+
+    /// Commit base-field polynomials' rows (see `commit`).
+    fn commit_polys<C: AsRef<[BabyBear]> + Sync>(&self, polys: &[C]) -> MerkleTree {
+        let (log_size, batches) = (self.log_size(), crate::ntt::batches(polys.len()));
+        self.commit(batches, |r, parallel| crate::ntt::coset_evaluate_rows(polys, self.shift(r), log_size, parallel))
+    }
+
+    /// Commit extension-field polynomials' rows, each value as its four
+    /// coefficients.
+    fn commit_polys_ext<C: AsRef<[Ext]> + Sync>(&self, polys: &[C]) -> MerkleTree {
+        let (log_size, batches) = (self.log_size(), crate::ntt::batches(4 * polys.len()));
+        self.commit(batches, |r, parallel| crate::ntt::coset_evaluate_rows_ext(polys, self.shift(r), log_size, parallel))
     }
 
     /// Commit rows of base-field columns: leaf `i` is the row at `i` then
     /// at `i + N/2`. `slice_columns(r)` gives every column's values on
     /// slice `r`. Keeps only hashes; openings supply the leaf
     /// (`MerkleTree::open_leaf`).
-    fn commit(&self, slice_columns: impl Fn(usize) -> Vec<Vec<BabyBear>>) -> MerkleTree {
+    ///
+    /// One evaluation's parallelism is its number of column `batches`;
+    /// with fewer than there are threads, several slices are evaluated at
+    /// once (each on one thread) -- no more than needed, to bound memory.
+    fn commit(&self, batches: usize, slice_columns: impl Fn(usize, bool) -> Evaluations + Sync) -> MerkleTree {
         let half = 1usize << (self.log_lde - 1);
         let slice_half = 1usize << (self.log_size() - 1);
         let mut hashes = vec![[0u8; 32]; half];
-        for r in 0..self.count() {
-            let columns = slice_columns(r);
-            let leaf_hashes = crate::parallel::map(slice_half, |k| {
-                let row: Vec<BabyBear> = columns.iter().map(|c| c[k]).chain(columns.iter().map(|c| c[k + slice_half])).collect();
-                crate::merkle::leaf_hash_elements(&row)
-            });
-            for (k, h) in leaf_hashes.into_iter().enumerate() {
-                hashes[self.index(r, k)] = h;
+        let profiling = std::env::var_os("STARK_PROFILE").is_some();
+        let (mut eval_time, mut hash_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let together = (crate::parallel::threads() / batches.max(1)).clamp(1, self.count());
+        for first in (0..self.count()).step_by(together) {
+            let rs: Vec<usize> = (first..(first + together).min(self.count())).collect();
+            let t = std::time::Instant::now();
+            let evaluated: Vec<Evaluations> = if rs.len() == 1 {
+                vec![slice_columns(rs[0], true)]
+            } else {
+                crate::parallel::map_each(rs.len(), |i| slice_columns(rs[i], false))
+            };
+            eval_time += t.elapsed();
+            let t = std::time::Instant::now();
+            for (&r, columns) in rs.iter().zip(&evaluated) {
+                let leaf_hashes = crate::merkle::leaf_hashes_elements(slice_half, |k| {
+                    let mut row = Vec::with_capacity(2 * columns.width);
+                    columns.row_into(k, &mut row);
+                    columns.row_into(k + slice_half, &mut row);
+                    row
+                });
+                for (k, h) in leaf_hashes.into_iter().enumerate() {
+                    hashes[self.index(r, k)] = h;
+                }
             }
+            hash_time += t.elapsed();
         }
-        MerkleTree::from_leaf_hashes(hashes)
+        let t = std::time::Instant::now();
+        let tree = MerkleTree::from_leaf_hashes(hashes);
+        if profiling {
+            eprintln!("    (evaluate {eval_time:.2?}, leaf hashes {hash_time:.2?}, tree {:.2?})", t.elapsed());
+        }
+        tree
     }
 }
 
-/// Extension columns as base-field columns, coefficient by coefficient --
-/// each value's four coefficients adjacent in a row, as in a leaf.
-fn expand(columns: &[Vec<Ext>]) -> Vec<Vec<BabyBear>> {
-    columns
-        .iter()
-        .flat_map(|c| (0..4).map(move |k| c.iter().map(|v| v.0[k]).collect()))
-        .collect()
-}
 
 fn prove_inner<A: Air + Sync>(
     air: &A,
@@ -1121,10 +1183,10 @@ fn prove_inner<A: Air + Sync>(
     //    the size-2n domain (see the module docs), then extended and
     //    committed row by row.
     let coeffs: Vec<Vec<BabyBear>> = crate::parallel::map_each(trace.len(), |c| {
-        blind_column(&trace[c], &mut Randomness::stream(seed, b"trace column", c))
+        blind_column(&trace[c], &mut Randomness::stream(seed, b"trace column", c), params.hiding)
     });
     phase("trace interpolation");
-    let trace_tree = slices.commit(|r| slices.eval_all(&coeffs, r));
+    let trace_tree = slices.commit_polys(&coeffs);
     let trace_cap = trace_tree.cap(fri::CAP_HEIGHT);
     transcript.absorb_digests(TRACE_ROOT_LABEL, &trace_cap);
     phase("trace extension + commitment");
@@ -1150,10 +1212,10 @@ fn prove_inner<A: Air + Sync>(
     drop(full);
     let aux_width = aux.len();
     let aux_coeffs: Vec<Vec<Ext>> = crate::parallel::map_each(aux.len(), |c| {
-        blind_ext_column(&aux[c], &mut Randomness::stream(seed, b"aux column", c))
+        blind_ext_column(&aux[c], &mut Randomness::stream(seed, b"aux column", c), params.hiding)
     });
     drop(aux);
-    let aux_tree = slices.commit(|r| expand(&slices.eval_all(&aux_coeffs, r)));
+    let aux_tree = slices.commit_polys_ext(&aux_coeffs);
     let aux_cap = aux_tree.cap(fri::CAP_HEIGHT);
     transcript.absorb_digests(AUX_ROOT_LABEL, &aux_cap);
     phase("aux extension + commitment");
@@ -1169,7 +1231,7 @@ fn prove_inner<A: Air + Sync>(
     let step = q_size / n; // index distance of one trace row
     let points = coset_domain(COSET_SHIFT, log_q);
     let lde = slices.eval_all(&all_coeffs, 0);
-    let aux_lde = slices.eval_all(&aux_coeffs, 0);
+    let aux_lde = slices.eval_all_ext(&aux_coeffs, 0);
     let g = domain_generator(layout.log_n);
     let last_row_point = g.pow(n as u64 - 1);
     // x^n depends only on i mod `step` (x^n = shift^n · w^(i·n), w^n of order `step`).
@@ -1206,8 +1268,9 @@ fn prove_inner<A: Air + Sync>(
     let composition_values: Vec<Ext> = crate::parallel::map_ranges(q_size, |range| {
         let mut out = vec![BabyBear::ZERO; air.num_transition_constraints()];
         let mut aux_out = vec![Ext::ZERO; air.num_aux_constraints()];
-        let mut current = vec![BabyBear::ZERO; width];
-        let mut next = vec![BabyBear::ZERO; width];
+        let mut current = Vec::with_capacity(width);
+        let mut next = Vec::with_capacity(width);
+        let mut aux_row = Vec::with_capacity(4 * aux_width);
         let mut p = vec![BabyBear::ZERO; periodic_tables.len()];
         let mut boundary_terms = vec![BabyBear::ZERO; boundaries.len()];
         let mut aux_boundary_terms = vec![Ext::ZERO; aux_boundaries.len()];
@@ -1215,10 +1278,10 @@ fn prove_inner<A: Air + Sync>(
             .map(|i| {
                 let x = points[i];
                 let j = (i + step) % q_size;
-                for c in 0..width {
-                    current[c] = lde[c][i];
-                    next[c] = lde[c][j];
-                }
+                current.clear();
+                lde.row_into(i, &mut current);
+                next.clear();
+                lde.row_into(j, &mut next);
                 for (slot, table) in p.iter_mut().zip(&periodic_tables) {
                     *slot = table[i % table.len()];
                 }
@@ -1230,9 +1293,14 @@ fn prove_inner<A: Air + Sync>(
                     boundary_terms[k] = (current[b.column] - b.value) * row_inv[boundary_slot[k]];
                 }
                 if !aux_out.is_empty() || !aux_boundaries.is_empty() {
-                    let aux_current: Vec<Ext> = aux_lde.iter().map(|c| c[i]).collect();
+                    let mut aux_at = |k: usize| -> Vec<Ext> {
+                        aux_row.clear();
+                        aux_lde.row_into(k, &mut aux_row);
+                        aux_row.chunks(4).map(|c| Ext([c[0], c[1], c[2], c[3]])).collect()
+                    };
+                    let aux_current = aux_at(i);
                     if !aux_out.is_empty() {
-                        let aux_next: Vec<Ext> = aux_lde.iter().map(|c| c[j]).collect();
+                        let aux_next = aux_at(j);
                         let (mc, mn, pe) = (lift_all(&current), lift_all(&next), lift_all(&p));
                         let frame = AuxFrame {
                             main_current: &mc,
@@ -1272,7 +1340,7 @@ fn prove_inner<A: Air + Sync>(
     let mut mask_randomness = Randomness::stream(seed, b"mask", 0);
     let mask_coeffs: Vec<Ext> = (0..fri_degree_bound).map(|_| mask_randomness.next_ext()).collect();
     let composition_polys = [&composition_coeffs[..], &mask_coeffs[..]];
-    let composition_tree = slices.commit(|r| expand(&slices.eval_all(&composition_polys, r)));
+    let composition_tree = slices.commit_polys_ext(&composition_polys);
     let composition_cap = composition_tree.cap(fri::CAP_HEIGHT);
     transcript.absorb_digests(COMPOSITION_ROOT_LABEL, &composition_cap);
     phase("mask + composition commitment");
@@ -1338,14 +1406,23 @@ fn prove_inner<A: Air + Sync>(
     };
     let sum_z = combine(&w_z, Some(w_composition));
     let sum_zg = combine(&w_zg, None);
-    let mut deep = vec![Ext::ZERO; 1 << layout.log_lde];
-    for r in 0..slices.count() {
-        let [pz, pzg, mask] = [&sum_z, &sum_zg, &mask_coeffs].map(|c| slices.eval(c, r));
+    // Slices are independent: each in its own thread.
+    let deep_slices: Vec<Vec<Ext>> = crate::parallel::map_each(slices.count(), |r| {
+        let polys = [&sum_z[..], &sum_zg[..], &mask_coeffs[..]];
+        let parts: Vec<Vec<BabyBear>> = polys.iter().flat_map(|p| (0..4).map(move |k| p.iter().map(|e| e.0[k]).collect())).collect();
+        let evals = crate::ntt::coset_evaluate_many_serial(&parts, slices.shift(r), log_q);
+        let ext = |p: usize, k: usize| Ext([evals[4 * p][k], evals[4 * p + 1][k], evals[4 * p + 2][k], evals[4 * p + 3][k]]);
         let xs = coset_domain(slices.shift(r), log_q);
         let inv_z = batch_inverse(&xs.iter().map(|&x| Ext::from_base(x) - z).collect::<Vec<_>>());
         let inv_zg = batch_inverse(&xs.iter().map(|&x| Ext::from_base(x) - zg).collect::<Vec<_>>());
-        for k in 0..q_size {
-            deep[slices.index(r, k)] = (pz[k] - constant_z) * inv_z[k] + (pzg[k] - constant_zg) * inv_zg[k] + w_mask * mask[k];
+        (0..q_size)
+            .map(|k| (ext(0, k) - constant_z) * inv_z[k] + (ext(1, k) - constant_zg) * inv_zg[k] + w_mask * ext(2, k))
+            .collect()
+    });
+    let mut deep = vec![Ext::ZERO; 1 << layout.log_lde];
+    for (r, values) in deep_slices.into_iter().enumerate() {
+        for (k, v) in values.into_iter().enumerate() {
+            deep[slices.index(r, k)] = v;
         }
     }
     drop((sum_z, sum_zg));
@@ -1575,6 +1652,7 @@ mod tests {
         log_blowup: 2,
         num_queries: 20,
         grinding_bits: 4,
+        hiding: true,
     };
 
     const SEED: [u8; 32] = [42; 32];
@@ -1627,6 +1705,22 @@ mod tests {
         let trace = fibonacci_trace(1 << log_n);
         let result = *trace[1].last().unwrap();
         (Fibonacci { log_n, result }, trace)
+    }
+
+    /// Without hiding: same soundness checks, half the extension, and a
+    /// proof made one way isn't accepted the other.
+    #[test]
+    fn non_hiding_proofs_verify_over_half_the_extension() {
+        let open = Params { hiding: false, ..PARAMS };
+        let (air, trace) = honest_fibonacci(6);
+        let proof = prove(&air, &trace, &open, SEED).unwrap();
+        assert!(verify(&air, &proof, &open));
+        assert!(!verify(&air, &proof, &PARAMS));
+        assert!(!hides(&air, &open));
+        assert_eq!(layout(&air, &open).unwrap().log_lde + 1, layout(&air, &PARAMS).unwrap().log_lde);
+        let (_, mut bad) = honest_fibonacci(6);
+        bad[0][3] = bad[0][3] + BabyBear::ONE;
+        assert!(prove(&air, &bad, &open, SEED).is_err());
     }
 
     #[test]
@@ -1791,7 +1885,7 @@ mod tests {
     #[test]
     fn a_blinded_column_still_equals_the_trace_on_its_rows() {
         let column: Vec<BabyBear> = (0..16u32).map(|i| BabyBear::new(i * 7 + 1)).collect();
-        let coeffs = blind_column(&column, &mut Randomness::new(SEED));
+        let coeffs = blind_column(&column, &mut Randomness::new(SEED), true);
         assert_eq!(coeffs.len(), 32);
         let g = domain_generator(4);
         for (row, &value) in column.iter().enumerate() {
@@ -1805,8 +1899,8 @@ mod tests {
     #[test]
     fn a_blinded_column_is_randomized_off_the_trace_rows() {
         let column: Vec<BabyBear> = (0..16u32).map(|i| BabyBear::new(i * 7 + 1)).collect();
-        let a = blind_column(&column, &mut Randomness::new([1; 32]));
-        let b = blind_column(&column, &mut Randomness::new([2; 32]));
+        let a = blind_column(&column, &mut Randomness::new([1; 32]), true);
+        let b = blind_column(&column, &mut Randomness::new([2; 32]), true);
         assert_ne!(a, b);
         assert!(a[16..].iter().any(|&c| c != BabyBear::ZERO));
         let off_trace = COSET_SHIFT; // not a trace row
