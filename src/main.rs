@@ -10,6 +10,7 @@ mod e2e;
 mod ext;
 mod field;
 mod fri;
+mod keychain;
 #[macro_use]
 mod log;
 mod merkle;
@@ -24,6 +25,7 @@ mod poseidon2_air;
 mod pow;
 mod prover;
 mod recursion;
+mod slate;
 mod stark;
 mod storage;
 mod symbolic;

@@ -141,6 +141,9 @@ fn decode_elements(bytes: &[u8], count: usize) -> Option<Vec<BabyBear>> {
 /// than re-deriving the arithmetic.
 pub const PUBLIC_KEY_LEN: usize = (PARAM_LEN + V * CHAIN_LEN) * 4;
 
+/// A signature's encoded length: the randomizer, then a value per chain.
+pub const SIGNATURE_LEN: usize = (RAND_LEN + V * CHAIN_LEN) * 4;
+
 impl PublicKey {
     /// Every field element of the key, in order: `param`, then `tops`
     /// chain by chain.

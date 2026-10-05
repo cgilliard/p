@@ -37,6 +37,33 @@ pub fn amount_limbs(amount: u64) -> [BabyBear; AMOUNT_LIMBS] {
     std::array::from_fn(|i| BabyBear::new(((amount >> (AMOUNT_LIMB_BITS as usize * i)) & 0xffff) as u32))
 }
 
+/// Base units per coin: amounts are integers, shown with 9 decimals (the
+/// block reward is 1 coin).
+pub const UNITS_PER_COIN: u64 = 1_000_000_000;
+
+/// `amount` base units as coins: `2.500000000`.
+pub fn format_amount(amount: u64) -> String {
+    format!("{}.{:09}", amount / UNITS_PER_COIN, amount % UNITS_PER_COIN)
+}
+
+/// Coins (`2.5`, `2.500000000`, `3`) as base units -- exactly, with no
+/// floating point; `None` for anything else, more than 9 decimals, or
+/// more than a `u64` holds.
+pub fn parse_amount(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (whole, frac) = match text.split_once('.') {
+        Some((whole, frac)) if digits(frac) => (whole, frac),
+        Some(_) => return None,
+        None => (text, ""),
+    };
+    if !digits(whole) || frac.len() > 9 {
+        return None;
+    }
+    let units = format!("{frac:0<9}").parse::<u64>().ok()?;
+    whole.parse::<u64>().ok()?.checked_mul(UNITS_PER_COIN)?.checked_add(units)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Output {
     /// Poseidon2 hash of the owning public key.
@@ -95,6 +122,20 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amounts_format_and_parse_exactly() {
+        assert_eq!(format_amount(2_500_000_000), "2.500000000");
+        assert_eq!(format_amount(1), "0.000000001");
+        assert_eq!(format_amount(u64::MAX), "18446744073.709551615");
+        for (text, units) in [("2.5", 2_500_000_000), ("3", 3_000_000_000), ("0.000000001", 1), ("18446744073.709551615", u64::MAX)] {
+            assert_eq!(parse_amount(text), Some(units), "{text}");
+            assert_eq!(parse_amount(&format_amount(units)), Some(units));
+        }
+        for bad in ["", ".", "1.", ".5", "1.0000000001", "-1", "1e9", "18446744073.709551616", "1,5", "abc"] {
+            assert_eq!(parse_amount(bad), None, "{bad}");
+        }
+    }
 
     /// The collision the old byte encoding allowed: one 32-bit half of the
     /// amount past BabyBear's prime wrapped onto a smaller amount.

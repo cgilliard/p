@@ -321,6 +321,93 @@ impl Default for Transaction {
     }
 }
 
+/// The encoding's version byte.
+const ENCODING_VERSION: u8 = 1;
+
+impl Transaction {
+    /// Byte encoding -- what's stored, written into files, and relayed:
+    /// a version byte; the input count (`u16`), each input's public key,
+    /// amount (`u64`) and signature (a presence byte, then the
+    /// signature); the output count (`u16`) and each output. Little-endian
+    /// throughout.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![ENCODING_VERSION];
+        out.extend((self.inputs.len() as u16).to_le_bytes());
+        for input in &self.inputs {
+            out.extend(input.pubkey.to_bytes());
+            out.extend(input.amount.to_le_bytes());
+            match &input.signature {
+                Some(sig) => {
+                    out.push(1);
+                    out.extend(sig.to_bytes());
+                }
+                None => out.push(0),
+            }
+        }
+        out.extend((self.outputs.len() as u16).to_le_bytes());
+        for output in &self.outputs {
+            out.extend(output.to_bytes());
+        }
+        out
+    }
+
+    /// Decode, the inverse of `to_bytes` -- strictly: nothing may be left
+    /// over, and inputs and outputs must already be in canonical order
+    /// (so every transaction has exactly one encoding). Says nothing about
+    /// whether it's validly signed; that's `verify`.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = bytes;
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let (head, tail) = (r.get(..n)?, r.get(n..)?);
+            r = tail;
+            Some(head)
+        };
+        if take(1)?[0] != ENCODING_VERSION {
+            return None;
+        }
+        let mut tx = Transaction::new();
+        let inputs = u16::from_le_bytes(take(2)?.try_into().unwrap());
+        for _ in 0..inputs {
+            let pubkey = PublicKey::from_bytes(take(wots::PUBLIC_KEY_LEN)?)?;
+            let amount = u64::from_le_bytes(take(8)?.try_into().unwrap());
+            let signature = match take(1)?[0] {
+                0 => None,
+                1 => Some(wots::Signature::from_bytes(take(wots::SIGNATURE_LEN)?)?),
+                _ => return None,
+            };
+            tx.inputs.push(Input { pubkey, amount, signature });
+        }
+        let outputs = u16::from_le_bytes(take(2)?.try_into().unwrap());
+        for _ in 0..outputs {
+            tx.outputs.push(Output::from_bytes(take(crate::output::OUTPUT_LEN)?)?);
+        }
+        if !r.is_empty() {
+            return None;
+        }
+        let inputs_sorted = tx.inputs.windows(2).all(|w| w[0].pubkey.to_bytes() < w[1].pubkey.to_bytes());
+        let outputs_sorted = tx.outputs.windows(2).all(|w| w[0].to_bytes() <= w[1].to_bytes());
+        if !inputs_sorted || !outputs_sorted {
+            return None;
+        }
+        tx.finalized = tx.inputs.iter().any(|i| i.signature.is_some());
+        Some(tx)
+    }
+
+    /// This transaction's id: a hash of its encoding.
+    pub fn id(&self) -> [u8; 32] {
+        crate::poseidon2::hash_bytes_32(&self.to_bytes())
+    }
+
+    /// The fee this transaction leaves for the miner: inputs minus
+    /// outputs, or `None` if the outputs exceed the inputs (or a sum
+    /// overflows).
+    pub fn fee(&self) -> Option<u64> {
+        let spent = self.inputs.iter().try_fold(0u64, |a, i| a.checked_add(i.amount))?;
+        let created = self.outputs.iter().try_fold(0u64, |a, o| a.checked_add(o.amount))?;
+        spent.checked_sub(created)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +419,39 @@ mod tests {
     fn new_output(byte: u8, amount: u64) -> Output {
         let (_, pk) = keypair(byte);
         Output::new(&pk, amount)
+    }
+
+    #[test]
+    fn encoding_round_trips_and_is_strict() {
+        let (sk_a, pk_a) = keypair(1);
+        let (_, pk_b) = keypair(2);
+        let mut tx = Transaction::new();
+        tx.add_input(&pk_a, 100).unwrap();
+        tx.add_output(new_output(3, 60)).unwrap();
+        tx.add_output(new_output(4, 30)).unwrap();
+        // Unsigned, then signed.
+        let unsigned = Transaction::from_bytes(&tx.to_bytes()).unwrap();
+        assert!(!unsigned.is_finalized() && unsigned.to_bytes() == tx.to_bytes());
+        assert!(tx.sign_input(&pk_a, &sk_a));
+        let decoded = Transaction::from_bytes(&tx.to_bytes()).unwrap();
+        assert!(decoded.verify() && decoded.is_finalized());
+        assert_eq!(decoded.id(), tx.id());
+        assert_eq!(decoded.fee(), Some(10));
+        // Trailing bytes, truncation, an unknown version.
+        let bytes = tx.to_bytes();
+        assert!(Transaction::from_bytes(&[&bytes[..], &[0]].concat()).is_none());
+        assert!(Transaction::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        let mut versioned = bytes.clone();
+        versioned[0] = 9;
+        assert!(Transaction::from_bytes(&versioned).is_none());
+        // Inputs out of canonical order.
+        let mut two = Transaction::new();
+        two.add_input(&pk_a, 1).unwrap();
+        two.add_input(&pk_b, 2).unwrap();
+        let mut swapped = two.clone();
+        swapped.inputs.swap(0, 1);
+        assert!(Transaction::from_bytes(&two.to_bytes()).is_some());
+        assert!(Transaction::from_bytes(&swapped.to_bytes()).is_none());
     }
 
     #[test]
