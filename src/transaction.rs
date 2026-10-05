@@ -121,15 +121,9 @@
 #![allow(dead_code)]
 
 use crate::output::Output;
-use crate::poseidon2::{BabyBear, hash_bytes};
+use crate::poseidon2::{BabyBear, DOMAIN_SIGNING, digest_from_bytes, hash_elements};
 use crate::wots::{self, PublicKey, SecretKey, Signature};
 
-/// Domain separator for the transaction signing message. Bumped to `-v2`
-/// because what gets signed changed shape (the whole transaction, not one
-/// input's own slice of it) -- a `-v1` message could never collide with
-/// one of these anyway (the byte layout differs), but a distinct version
-/// tag keeps that obvious rather than relying on it.
-const SIGNING_DOMAIN: &[u8] = b"transaction-v2";
 
 /// Returned by `add_input`/`add_output` when the transaction has already
 /// collected a signature.
@@ -233,21 +227,32 @@ impl Transaction {
     }
 
     /// The single message every signer signs: a hash over the complete
-    /// current transaction -- every input's (pubkey, amount) in canonical
-    /// sorted order, then every output, also sorted. Identical for every
-    /// signer at any given moment; changes the instant the input or
-    /// output set changes at all (see the module docs).
+    /// current transaction -- the number of inputs, then every input's
+    /// commitment in canonical (pubkey-sorted) order, then every output's
+    /// commitment, also in canonical order. Identical for every signer at
+    /// any given moment; changes the instant the input or output set
+    /// changes at all (see the module docs). The input count is padded to
+    /// 8 elements so every commitment lands on exactly half of one of the
+    /// sponge's 16-element blocks, which is what lets a block's proof
+    /// absorb each one as a single unit.
+    ///
+    /// Over commitments rather than raw (pubkey, amount) pairs: each
+    /// commitment binds its owner and amount just as firmly (it's a
+    /// collision-resistant hash of them), and hashing eight field elements
+    /// per entry -- instead of a whole public key, byte by byte -- is what
+    /// a block's proof can afford to recompute. The input count keeps the
+    /// boundary between inputs and outputs unambiguous.
     pub fn signing_message(&self) -> [BabyBear; 8] {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(SIGNING_DOMAIN);
+        let mut elements = vec![BabyBear::ZERO; 8];
+        elements[0] = BabyBear::new(self.inputs.len() as u32);
         for input in &self.inputs {
-            bytes.extend_from_slice(&input.pubkey.to_bytes());
-            bytes.extend_from_slice(&input.amount.to_le_bytes());
+            let commitment = Output::new(&input.pubkey, input.amount).commitment();
+            elements.extend(digest_from_bytes(&commitment));
         }
         for output in &self.outputs {
-            bytes.extend_from_slice(&output.to_bytes());
+            elements.extend(digest_from_bytes(&output.commitment()));
         }
-        hash_bytes(&bytes)
+        hash_elements(DOMAIN_SIGNING, &elements)
     }
 
     /// Sign the input owned by `pubkey` with `secret_key`, over the

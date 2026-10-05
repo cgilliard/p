@@ -580,7 +580,7 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            max_block_bytes: 2 * 1024 * 1024,
+            max_block_bytes: crate::block::MAX_BLOCK_BYTES,
             window: 2,
             chunk_timeout_ms: 100,
             max_retries: 2,
@@ -592,7 +592,8 @@ mod tests {
     fn side(port: u16) -> Side {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5, None).unwrap();
+        chain.skip_proof_checks();
         let reader = BlockReader::open(&storage).unwrap();
         let table = PeerTable::open(&storage, 100, 3).unwrap();
         let cfg = discovery::Config {
@@ -645,7 +646,7 @@ mod tests {
             .collect();
         let unproven = chain.build_block(&transactions).unwrap();
         let target = unproven.target;
-        let proof = crate::prover::prove_block(&unproven.inputs, &unproven.outputs, &transactions).unwrap();
+        let proof = crate::prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert!(block::mine_block(&mut block, &target, 100_000));
         block

@@ -10,11 +10,16 @@
 //! `inputs`/`outputs` are bare opaque commitments (see `block`'s docs),
 //! there's nothing left in plaintext to check a sum over -- that's
 //! permanently the future ZK proof's job, not a placeholder standing in
-//! for it. The same is true of timestamp *monotonicity* (each block's
-//! `timestamp` not preceding the one before it): it's a per-block rule
-//! that only gives a whole-chain guarantee once composed recursively,
-//! same shape as the balance equation -- see `docs/BLOCK_TODO.md` #3,
-//! and `prover`'s docs once that lands there.
+//! for it.
+//!
+//! Timestamps must **strictly increase**: every block's `timestamp` is
+//! later than its parent's (`Error::TimestampNotAfterParent`). Checked
+//! here, in plaintext, by every full node -- it's cheap, and it's what
+//! stops a miner backdating the first block of a retarget window to
+//! fake a slow window and drag difficulty down (the "timewarp" attack).
+//! A light client relying on the recursive proof instead will need the
+//! proof to attest the same rule; that's the proof's job on top of this,
+//! not instead of it.
 //!
 //! What this module *does* check is everything structural: does this
 //! block chain onto the current tip, does its `timestamp` claim to be
@@ -286,6 +291,14 @@ pub enum Error {
     /// spend pool space on it; it can always be sent again once its
     /// parent is known.
     OrphanPowTooWeak,
+    /// `header.timestamp` isn't strictly later than its parent's.
+    TimestampNotAfterParent,
+    /// A block claiming to be the first one (`prev_hash` is
+    /// `GENESIS_PARENT_HASH`) that isn't this chain's genesis block -- or,
+    /// at `Chain::open`, stored data whose first block isn't.
+    WrongGenesis,
+    /// `build_block` was handed more than fits in `block::MAX_BLOCK_BYTES`.
+    BlockTooLarge,
 }
 
 impl Error {
@@ -303,6 +316,8 @@ impl Error {
                 | Error::DuplicateOutput(_)
                 | Error::PmmrRootMismatch
                 | Error::BitmapRootMismatch
+                | Error::TimestampNotAfterParent
+                | Error::WrongGenesis
         )
     }
 }
@@ -360,6 +375,9 @@ impl std::fmt::Display for Error {
             Error::ReorgTooDeep => write!(f, "competing chain's common ancestor is beyond max_reorg_depth"),
             Error::KnownInvalidBlock => write!(f, "block is, or descends from, a block already known to be invalid"),
             Error::OrphanPowTooWeak => write!(f, "orphan's proof of work is too weak to be worth pooling"),
+            Error::TimestampNotAfterParent => write!(f, "header timestamp is not later than its parent's"),
+            Error::WrongGenesis => write!(f, "block is not this chain's genesis block"),
+            Error::BlockTooLarge => write!(f, "transactions don't fit in the maximum block size"),
         }
     }
 }
@@ -667,6 +685,12 @@ pub struct Chain {
     block_retarget: Database<Bytes, Bytes>,
     block_heights: Database<Bytes, Bytes>,
     active_heights: Database<Bytes, Bytes>,
+    /// The one block allowed to have no parent, if this chain has a
+    /// fixed one -- see `Chain::open`.
+    genesis_hash: Option<[u8; 32]>,
+    /// Whether blocks' proofs are verified -- always, except in tests that
+    /// opt out (`skip_proof_checks`) because they're about something else.
+    check_proofs: bool,
     difficulty: DifficultyConfig,
     /// How many blocks a reorg is ever allowed to unwind -- see
     /// `Chain::open`'s docs. Also how far back stored blocks are kept
@@ -700,7 +724,21 @@ impl Chain {
     /// test (small, so the "too deep" path is actually exercisable
     /// without mining hundreds of blocks) and for an actual run
     /// (1000, say) are never the same number.
-    pub fn open(storage: &Storage, difficulty: DifficultyConfig, max_reorg_depth: u64) -> Result<Self> {
+    ///
+    /// `genesis`, if given, is this chain's fixed first block: applied
+    /// right away if the chain is empty, and from then on the only block
+    /// ever accepted at height 0 (`Error::WrongGenesis` for any other) --
+    /// so every node on a network starts from the same block, and can't
+    /// be fed a wholly different chain. Stored data whose first block
+    /// isn't `genesis` (left over from a different network, say) fails
+    /// to open with `Error::WrongGenesis`. `None` means no fixed first
+    /// block -- for tests, which build their own chains from scratch.
+    pub fn open(
+        storage: &Storage,
+        difficulty: DifficultyConfig,
+        max_reorg_depth: u64,
+        genesis: Option<&Block>,
+    ) -> Result<Self> {
         let pmmr = Pmmr::open(storage)?;
         let bitmap = Bitmap::open(storage)?;
         let utxo = UtxoIndex::open(storage)?;
@@ -712,7 +750,7 @@ impl Chain {
         let block_retarget = storage.database(BLOCK_RETARGET_DB)?;
         let block_heights = storage.database(BLOCK_HEIGHTS_DB)?;
         let active_heights = storage.database(ACTIVE_HEIGHTS_DB)?;
-        Ok(Chain {
+        let mut chain = Chain {
             storage: storage.clone(),
             pmmr,
             bitmap,
@@ -725,11 +763,56 @@ impl Chain {
             block_retarget,
             block_heights,
             active_heights,
+            genesis_hash: genesis.map(|g| g.header.hash()),
+            check_proofs: true,
             difficulty,
             max_reorg_depth,
             orphans: Vec::new(),
             max_orphans: MAX_ORPHANS,
-        })
+        };
+
+        if let Some(genesis) = genesis {
+            let rtxn = storage.read_txn()?;
+            let first = chain.active_heights.get(&rtxn, &0u64.to_be_bytes())?.map(|h| h.to_vec());
+            drop(rtxn);
+            match first {
+                None => chain.apply_block(genesis)?,
+                Some(hash) if hash[..] == genesis.header.hash()[..] => {}
+                Some(_) => return Err(Error::WrongGenesis),
+            }
+        }
+        Ok(chain)
+    }
+
+    /// Stop verifying blocks' proofs -- for tests about forks, retargeting,
+    /// or sync, whose blocks carry placeholder proofs, since real ones take
+    /// seconds each to make. Doesn't exist outside tests.
+    #[cfg(test)]
+    pub fn skip_proof_checks(&mut self) {
+        self.check_proofs = false;
+    }
+
+    /// `Block::validate`: every structural rule, then the proof -- unless
+    /// proofs are being skipped, or this is the chain's fixed genesis,
+    /// which is trusted by consensus (it's hardcoded) and couldn't prove
+    /// anything anyway: its empty body claims no reward.
+    fn block_is_valid(&self, block: &Block, target: &[u8; 32]) -> bool {
+        if !block.validate_structure(target) {
+            return false;
+        }
+        let is_genesis = self.genesis_hash == Some(block.header.hash());
+        !self.check_proofs || is_genesis || block.body.proof_is_valid()
+    }
+
+    /// `Error::WrongGenesis` if `header` claims to be a first block but
+    /// isn't this chain's fixed genesis (when it has one).
+    fn check_genesis(&self, header: &BlockHeader) -> Result<()> {
+        match self.genesis_hash {
+            Some(genesis) if header.prev_hash == GENESIS_PARENT_HASH && header.hash() != genesis => {
+                Err(Error::WrongGenesis)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The tip's full header, or `None` if no block has ever been
@@ -1029,7 +1112,7 @@ impl Chain {
         }
 
         let target = self.current_target(wtxn)?;
-        if !block.validate(&target) {
+        if !self.block_is_valid(block, &target) {
             return Err(Error::InvalidBlock);
         }
 
@@ -1039,6 +1122,12 @@ impl Chain {
         }
         if block.header.height != expected_height {
             return Err(Error::WrongHeight);
+        }
+        self.check_genesis(&block.header)?;
+        if let Some(parent) = self.tip_header(wtxn)?
+            && block.header.timestamp <= parent.timestamp
+        {
+            return Err(Error::TimestampNotAfterParent);
         }
 
         // Snapshot everything `unwind_tip` will need to restore, before
@@ -1216,14 +1305,18 @@ impl Chain {
     /// block it claims to extend.
     fn store_side_branch_block(&mut self, wtxn: &mut heed::RwTxn, block: &Block) -> Result<()> {
         let parent_retarget = self.retarget_state_after(wtxn, block.header.prev_hash)?;
-        if !block.validate(&parent_retarget.target) {
+        if !self.block_is_valid(block, &parent_retarget.target) {
             return Err(Error::InvalidSideBranchBlock);
         }
 
+        self.check_genesis(&block.header)?;
         let (expected_height, parent_work) = if block.header.prev_hash == GENESIS_PARENT_HASH {
             (0, [0u8; 32])
         } else {
             let parent = self.get_stored_block(wtxn, block.header.prev_hash)?;
+            if block.header.timestamp <= parent.header.timestamp {
+                return Err(Error::TimestampNotAfterParent);
+            }
             let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
             (parent.header.height + 1, parent_work)
         };
@@ -1427,10 +1520,16 @@ impl Chain {
     /// doesn't need to re-resolve anything per attempt.
     pub fn build_block(&mut self, transactions: &[Transaction]) -> Result<UnprovenBlock> {
         let body = BlockBody::from_transactions(transactions).map_err(Error::InvalidTransaction)?;
+        // Without the proof, which doesn't exist yet -- `Block::validate`
+        // checks the finished block, proof included.
+        if crate::block::HEADER_LEN + body.encoded_len() > crate::block::MAX_BLOCK_BYTES {
+            return Err(Error::BlockTooLarge);
+        }
 
         let storage = self.storage.clone();
         let mut wtxn = storage.write_txn()?;
         let (prev_hash, height) = self.next_prev_hash_and_height(&wtxn)?;
+        let min_timestamp = self.tip_header(&wtxn)?.map_or(0, |parent| parent.timestamp + 1);
         let target = self.current_target(&wtxn)?;
         let (pmmr_root, bitmap_root, _spent_inputs) = self.resolve_and_apply(&mut wtxn, &body)?;
         // Deliberately never committed -- see the module docs. `wtxn`
@@ -1440,6 +1539,7 @@ impl Chain {
             prev_hash,
             height,
             target,
+            min_timestamp,
             pmmr_root,
             bitmap_root,
             inputs: body.inputs,
@@ -1484,7 +1584,8 @@ mod tests {
     fn open() -> (TempDir, Storage, Chain) {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let chain = Chain::open(&storage, DifficultyConfig::for_tests(), TEST_MAX_REORG_DEPTH).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), TEST_MAX_REORG_DEPTH, None).unwrap();
+        chain.skip_proof_checks();
         (dir, storage, chain)
     }
 
@@ -1493,7 +1594,7 @@ mod tests {
     }
 
     fn commitment_of(pubkey: &PublicKey, amount: u64) -> [u8; 32] {
-        crate::poseidon2::hash_bytes_32(&Output::new(pubkey, amount).to_bytes())
+        Output::new(pubkey, amount).commitment()
     }
 
     /// A one-output, zero-input transaction -- the shape a miner's
@@ -1529,7 +1630,7 @@ mod tests {
     fn built_proved_and_mined(chain: &mut Chain, transactions: &[Transaction]) -> Block {
         let unproven = chain.build_block(transactions).unwrap();
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, transactions).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
         block
@@ -1762,7 +1863,7 @@ mod tests {
             let (_sk, pk) = keypair((i + 1) as u8);
             let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
             let target = unproven.target;
-            let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+            let proof = prover::Proof::placeholder();
             let mut block = unproven.finish(proof);
             block.header.timestamp = timestamp;
             assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
@@ -1847,7 +1948,7 @@ mod tests {
             let (_sk, pk) = keypair((i + 1) as u8);
             let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
             let target = unproven.target;
-            let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+            let proof = prover::Proof::placeholder();
             let mut block = unproven.finish(proof); // timestamp: the real clock, untouched
             assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
             chain.apply_block(&block).unwrap();
@@ -1892,7 +1993,7 @@ mod tests {
         let tx = reward_transaction(&pk, 50);
 
         let unproven = chain.build_block(&[tx]).unwrap();
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+        let proof = prover::Proof::placeholder();
         let block = unproven.finish(proof);
 
         assert_eq!(block.header.body_hash, block.body.body_hash());
@@ -1920,7 +2021,7 @@ mod tests {
         let tx = reward_transaction(&pk, 50);
 
         let block = built_proved_and_mined(&mut chain, &[tx]);
-        assert!(block.validate(&INITIAL_MAX_HASH));
+        assert!(block.validate_structure(&INITIAL_MAX_HASH));
 
         chain.apply_block(&block).unwrap();
 
@@ -1963,7 +2064,7 @@ mod tests {
         let (_dir, _storage, mut chain) = open();
         let (_sk, pk) = keypair(1);
         let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+        let proof = prover::Proof::placeholder();
         // Leave the nonce unmined -- pow_valid() will be false, so
         // validate() fails before chain state is even consulted.
         let block = unproven.finish(proof);
@@ -1979,7 +2080,7 @@ mod tests {
         let mut unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
         unproven.prev_hash = [0xffu8; 32];
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert!(mine_block(&mut block, &target, 100_000));
 
@@ -1997,7 +2098,7 @@ mod tests {
         let mut unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
         unproven.height = 1; // the real first block must be height 0
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert!(mine_block(&mut block, &target, 100_000));
 
@@ -2011,7 +2112,7 @@ mod tests {
         let (_sk, pk) = keypair(1);
         let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         // Comfortably past MAX_FUTURE_DRIFT_MS -- re-mined since
         // changing `timestamp` changes the PoW preimage.
@@ -2028,7 +2129,7 @@ mod tests {
         let (_sk, pk) = keypair(1);
         let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         // Just inside the tolerance -- must not be rejected on that
         // basis alone.
@@ -2133,7 +2234,7 @@ mod tests {
         // exactly the partial-progress scenario atomicity has to cover.
         unproven.pmmr_root = [0xabu8; 32];
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &[]).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert!(mine_block(&mut block, &target, 100_000));
 
@@ -2502,7 +2603,7 @@ mod tests {
         let mut unproven = builder.build_block(&bad_txs).unwrap();
         unproven.pmmr_root = [0xabu8; 32];
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &bad_txs).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut bad = unproven.finish(proof);
         assert!(mine_block(&mut bad, &target, 100_000));
 
@@ -2514,7 +2615,7 @@ mod tests {
         let mut unproven = builder.build_block(&after_txs).unwrap();
         unproven.prev_hash = bad.header.hash();
         unproven.height = bad.header.height + 1;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &after_txs).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut after = unproven.finish(proof);
         assert!(mine_block(&mut after, &target, 100_000));
 
@@ -2546,7 +2647,7 @@ mod tests {
     fn built_proved_and_mined_at(chain: &mut Chain, transactions: &[Transaction], timestamp: u64) -> Block {
         let unproven = chain.build_block(transactions).unwrap();
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, transactions).unwrap();
+        let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         block.header.timestamp = timestamp;
         assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
@@ -2763,5 +2864,121 @@ mod tests {
         });
 
         assert_eq!(chain.accept_block(orphan).unwrap(), AcceptOutcome::Orphaned);
+    }
+
+    /// Each block's timestamp must be strictly later than its parent's:
+    /// equal or earlier is rejected, one millisecond later is fine.
+    #[test]
+    fn a_timestamp_must_be_strictly_later_than_the_parents() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let first = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], 1_000_000);
+        chain.apply_block(&first).unwrap();
+
+        let (_sk2, pk2) = keypair(2);
+        for timestamp in [1_000_000, 999_999] {
+            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk2, 50)], timestamp);
+            assert!(matches!(chain.apply_block(&block), Err(Error::TimestampNotAfterParent)), "at {timestamp}");
+        }
+        let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk2, 50)], 1_000_001);
+        chain.apply_block(&block).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), block.header.hash());
+    }
+
+    /// The same rule holds for a block arriving on a side branch.
+    #[test]
+    fn a_side_branch_block_must_also_be_later_than_its_parent() {
+        let (_dir, _storage, mut chain) = open();
+        let (_builder_dir, _builder_storage, mut builder) = open();
+        let (_sk, pk) = keypair(1);
+        let shared = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], 1_000_000);
+        chain.apply_block(&shared).unwrap();
+        builder.apply_block(&shared).unwrap();
+        let (_sk2, pk2) = keypair(2);
+        let active = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk2, 50)], 1_000_010);
+        chain.apply_block(&active).unwrap();
+
+        // A competing child of `shared`, stamped before it. `builder`
+        // never applies it, only builds it.
+        let (_sk3, pk3) = keypair(3);
+        let backdated = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk3, 50)], 999_000);
+        assert!(matches!(chain.accept_block(backdated), Err(Error::TimestampNotAfterParent)));
+    }
+
+    /// `build_block` tells the miner the earliest timestamp it may use,
+    /// and `finish` never stamps anything earlier -- even when the parent
+    /// claims a time ahead of this node's clock.
+    #[test]
+    fn build_block_carries_the_minimum_timestamp_forward() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let ahead = now_millis() + 60_000; // within MAX_FUTURE_DRIFT_MS
+        let first = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], ahead);
+        chain.apply_block(&first).unwrap();
+
+        let (_sk2, pk2) = keypair(2);
+        let transactions = [reward_transaction(&pk2, 50)];
+        let unproven = chain.build_block(&transactions).unwrap();
+        assert_eq!(unproven.min_timestamp, ahead + 1);
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        assert_eq!(block.header.timestamp, ahead + 1);
+        assert!(mine_block(&mut block, &target, 100_000));
+        chain.apply_block(&block).unwrap();
+    }
+
+    /// With a fixed genesis, no other block is ever accepted at height 0
+    /// -- not even as a side branch.
+    #[test]
+    fn a_chain_with_a_fixed_genesis_refuses_any_other_first_block() {
+        let (_builder_dir, _builder_storage, mut builder) = open();
+        let (_sk, pk) = keypair(1);
+        let genesis = built_proved_and_mined(&mut builder, &[reward_transaction(&pk, 50)]);
+        let (_other_dir, _other_storage, mut other_builder) = open();
+        let (_sk2, pk2) = keypair(2);
+        let impostor = built_proved_and_mined(&mut other_builder, &[reward_transaction(&pk2, 50)]);
+
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), TEST_MAX_REORG_DEPTH, Some(&genesis)).unwrap();
+        chain.skip_proof_checks();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), genesis.header.hash());
+        drop(rtxn);
+
+        assert!(matches!(chain.accept_block(impostor), Err(Error::WrongGenesis)));
+        assert_eq!(chain.accept_block(genesis).unwrap(), AcceptOutcome::AlreadyKnown);
+    }
+
+    /// With proof checks on (as outside tests they always are), a block
+    /// carrying a real proof of its transactions is accepted, and the same
+    /// block with a placeholder proof in its place is refused.
+    #[test]
+    fn a_chain_checking_proofs_accepts_only_a_really_proven_block() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), TEST_MAX_REORG_DEPTH, None).unwrap();
+        let (_sk, pk) = keypair(1);
+        let transactions = [reward_transaction(&pk, prover::REWARD)];
+
+        let unproven = chain.build_block(&transactions).unwrap();
+        let target = unproven.target;
+        let min_timestamp = unproven.min_timestamp;
+        let (inputs, outputs) = (unproven.inputs.clone(), unproven.outputs.clone());
+        let proof = prover::prove_block(&inputs, &outputs, &transactions, [3; 32]).unwrap();
+        let mut real = unproven.finish(proof);
+        real.header.timestamp = real.header.timestamp.max(min_timestamp);
+        assert!(mine_block(&mut real, &target, 100_000));
+
+        let mut fake = real.clone();
+        fake.body.proof = prover::Proof::placeholder();
+        fake.header.body_hash = fake.body.body_hash();
+        assert!(mine_block(&mut fake, &target, 100_000));
+        assert!(matches!(chain.apply_block(&fake), Err(Error::InvalidBlock)));
+
+        chain.apply_block(&real).unwrap();
     }
 }

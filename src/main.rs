@@ -1,18 +1,30 @@
 mod bitmap;
+mod aggregate;
 mod block;
+mod block_air;
+mod bus;
 mod chain;
+mod circuit;
 mod discovery;
 mod e2e;
+mod ext;
+mod field;
 mod fri;
 mod merkle;
 mod net;
+mod ntt;
 mod output;
+mod parallel;
 mod peers;
 mod pmmr;
 mod poseidon2;
+mod poseidon2_air;
 mod pow;
 mod prover;
+mod recursion;
+mod stark;
 mod storage;
+mod symbolic;
 mod transaction;
 mod transfer;
 mod transcript;
@@ -30,12 +42,6 @@ use output::Output;
 use peers::PeerTable;
 use storage::Storage;
 use transaction::Transaction;
-
-/// Every block's reward claim, in full -- arbitrary for now. Nothing
-/// anywhere checks this is the "right" amount (see `docs/BLOCK_TODO.md`
-/// #1): that's permanently the future ZK proof's job, not something
-/// this driver or `chain`/`block` enforce in plaintext.
-const REWARD: u64 = 50;
 
 /// How many leading zero bits this driver's starting PoW target has --
 /// the knob to turn if the first few blocks feel too fast or too slow.
@@ -79,7 +85,6 @@ const MAX_HOST_FAILURES: u8 = 3;
 const PROBE_INTERVAL_MS: u64 = 60_000;
 const RESPONSE_TIMEOUT_MS: u64 = 5_000;
 /// Block transfer knobs (see `transfer`). Also starting points.
-const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const CHUNK_WINDOW: u16 = 32;
 const CHUNK_TIMEOUT_MS: u64 = 1_000;
 const MAX_CHUNK_RETRIES: u32 = 5;
@@ -97,6 +102,51 @@ const SOCKET_READ_TIMEOUT_MS: u64 = 20;
 /// template if the tip moved -- so this bounds how long it can keep
 /// mining on a stale tip.
 const MINE_BATCH: u64 = 200_000;
+
+/// This network's retargeting configuration.
+fn difficulty_config() -> chain::DifficultyConfig {
+    chain::DifficultyConfig {
+        initial_target: pow::max_hash_with_leading_zero_bits(INITIAL_LEADING_ZERO_BITS),
+        interval: RETARGET_INTERVAL,
+        target_block_time_ms: TARGET_BLOCK_TIME_MS,
+        max_adjustment_factor: MAX_ADJUSTMENT_FACTOR,
+    }
+}
+
+/// This network's genesis block, mined once (see the `mine_genesis` test)
+/// and fixed from then on: every node starts its chain from exactly this
+/// block, and accepts no other at height 0 (see `Chain::open`). Its body
+/// is empty, so the roots are those of an empty PMMR and bitmap; its
+/// timestamp is the floor every later block's must climb from.
+const GENESIS_TIMESTAMP_MS: u64 = 1_791_152_721_925;
+const GENESIS_PMMR_ROOT: &str = "136a8c43079d821b5d16f870ba686501fb73124c7f2f684f6bd00f741cbd0675";
+const GENESIS_BITMAP_ROOT: &str = "a800d34b66c57962f6aab87343c0064fdd5e933c7168454d5eb8b760affab20f";
+const GENESIS_BODY_HASH: &str = "9fc4302cb42e2d003c16622e59bafe2f8a23d667ba38930fc90d9767519cac06";
+const GENESIS_NONCE: &str = "bc8e000000000000000000000000000000000000000000000000000000000000";
+const GENESIS_HASH: &str = "00000146ddd8d725363a0e45d40e7a3017b20276d7a50c4777ab2b6b11e93f05";
+
+fn from_hex32(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("valid hex constant");
+    }
+    out
+}
+
+fn genesis_block() -> Block {
+    Block {
+        header: block::BlockHeader {
+            prev_hash: chain::GENESIS_PARENT_HASH,
+            pmmr_root: from_hex32(GENESIS_PMMR_ROOT),
+            bitmap_root: from_hex32(GENESIS_BITMAP_ROOT),
+            body_hash: from_hex32(GENESIS_BODY_HASH),
+            height: 0,
+            timestamp: GENESIS_TIMESTAMP_MS,
+            nonce: from_hex32(GENESIS_NONCE),
+        },
+        body: block::BlockBody::new(),
+    }
+}
 
 fn default_data_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").expect("HOME environment variable must be set");
@@ -193,7 +243,7 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> (Rec
         random_key(),
     );
     let transfer = transfer::Transfer::new(transfer::Config {
-        max_block_bytes: MAX_BLOCK_BYTES,
+        max_block_bytes: block::MAX_BLOCK_BYTES,
         window: CHUNK_WINDOW,
         chunk_timeout_ms: CHUNK_TIMEOUT_MS,
         max_retries: MAX_CHUNK_RETRIES,
@@ -413,13 +463,16 @@ fn main() {
     }
 
     let storage = Storage::open(&path).expect("failed to open storage");
-    let difficulty = chain::DifficultyConfig {
-        initial_target: pow::max_hash_with_leading_zero_bits(INITIAL_LEADING_ZERO_BITS),
-        interval: RETARGET_INTERVAL,
-        target_block_time_ms: TARGET_BLOCK_TIME_MS,
-        max_adjustment_factor: MAX_ADJUSTMENT_FACTOR,
-    };
-    let mut chain = Chain::open(&storage, difficulty, MAX_REORG_DEPTH).expect("failed to open chain");
+    let genesis = genesis_block();
+    assert_eq!(hex(&genesis.header.hash()), GENESIS_HASH, "genesis constants are inconsistent");
+    println!("Genesis block: {GENESIS_HASH}");
+    let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
+        eprintln!("failed to open chain at {}: {e}", path.display());
+        if matches!(e, chain::Error::WrongGenesis) {
+            eprintln!("(its data is from a chain with a different genesis block -- delete it, or use another --data-dir)");
+        }
+        std::process::exit(1);
+    });
 
     {
         let rtxn = storage.read_txn().expect("failed to open read transaction");
@@ -483,13 +536,14 @@ fn main() {
         let (_secret_key, public_key) = wots::keygen(&seed);
 
         let mut reward_tx = Transaction::new();
-        reward_tx.add_output(Output::new(&public_key, REWARD)).expect("fresh transaction never finalized");
+        reward_tx.add_output(Output::new(&public_key, prover::REWARD)).expect("fresh transaction never finalized");
         let transactions = vec![reward_tx];
 
         let unproven = chain.build_block(&transactions).expect("build_block failed");
         let target = unproven.target;
-        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &transactions)
-            .expect("prove_block failed (the stub prover should always succeed)");
+        let min_timestamp = unproven.min_timestamp;
+        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &transactions, random_key())
+            .expect("a block of this node's own valid, balanced transactions always proves");
         let mut block = unproven.finish(proof);
 
         let started = std::time::Instant::now();
@@ -503,8 +557,9 @@ fn main() {
                 break false; // the tip moved under us: this template is stale
             }
             // A fresh timestamp changes the preimage, opening up an
-            // entirely new nonce space for the next batch.
-            block.header.timestamp = now_millis();
+            // entirely new nonce space for the next batch -- never earlier
+            // than the parent's allows, since timestamps must increase.
+            block.header.timestamp = now_millis().max(min_timestamp);
         };
         if !mined {
             continue;
@@ -534,6 +589,87 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex32(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn temp_storage(name: &str) -> (std::path::PathBuf, Storage) {
+        let dir = std::env::temp_dir().join(format!("main-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open(&dir).unwrap();
+        (dir, storage)
+    }
+
+    #[test]
+    fn the_genesis_block_is_valid_and_matches_its_recorded_hash() {
+        let genesis = genesis_block();
+        assert_eq!(hex32(&genesis.header.hash()), GENESIS_HASH);
+        // Structure only: genesis is exempt from the proof check (see
+        // `Chain`'s `block_is_valid`) -- its empty body claims no reward.
+        assert!(genesis.validate_structure(&difficulty_config().initial_target));
+    }
+
+    /// Opening an empty chain applies genesis; reopening it is fine.
+    #[test]
+    fn opening_an_empty_chain_starts_it_at_genesis() {
+        let (dir, storage) = temp_storage("genesis-open");
+        let genesis = genesis_block();
+        let chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), genesis.header.hash());
+        assert_eq!(chain.height(&rtxn).unwrap(), Some(0));
+        drop(rtxn);
+        drop(chain);
+        Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Data from a chain with some other first block refuses to open.
+    #[test]
+    fn data_from_a_different_genesis_is_refused() {
+        let (dir, storage) = temp_storage("genesis-other");
+        let mut other = Chain::open(&storage, chain::DifficultyConfig::for_tests(), MAX_REORG_DEPTH, None).unwrap();
+        other.skip_proof_checks();
+        let unproven = other.build_block(&[]).unwrap();
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut first = unproven.finish(proof);
+        assert!(mine_block(&mut first, &target, 100_000));
+        other.apply_block(&first).unwrap();
+        drop(other);
+
+        let result = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis_block()));
+        assert!(matches!(result, Err(chain::Error::WrongGenesis)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mines a fresh genesis block at this network's starting difficulty
+    /// and prints its header fields, for pasting into `genesis_block`.
+    /// Run once, on purpose, with
+    /// `cargo test --release -- --ignored --nocapture mine_genesis`.
+    #[test]
+    #[ignore]
+    fn mine_genesis() {
+        let dir = std::env::temp_dir().join(format!("genesis-{}", std::process::id()));
+        let storage = Storage::open(&dir).unwrap();
+        let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, None).unwrap();
+        let unproven = chain.build_block(&[]).unwrap();
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        while !mine_block(&mut block, &target, MINE_BATCH) {
+            block.header.timestamp = now_millis();
+        }
+        let h = &block.header;
+        println!("GENESIS_TIMESTAMP_MS = {}", h.timestamp);
+        println!("GENESIS_PMMR_ROOT = {}", hex32(&h.pmmr_root));
+        println!("GENESIS_BITMAP_ROOT = {}", hex32(&h.bitmap_root));
+        println!("GENESIS_BODY_HASH = {}", hex32(&h.body_hash));
+        println!("GENESIS_NONCE = {}", hex32(&h.nonce));
+        println!("GENESIS_HASH = {}", hex32(&h.hash()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn u256_to_f64_matches_small_values_exactly() {

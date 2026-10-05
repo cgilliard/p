@@ -26,7 +26,7 @@ pub const P: u32 = 2_013_265_921;
 const HALF_FULL_ROUNDS: usize = 4; // R_F = 8 total (4 initial + 4 final), same for every width here.
 
 /// An element of the BabyBear field, always kept reduced into [0, P).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct BabyBear(u32);
 
 impl BabyBear {
@@ -34,6 +34,11 @@ impl BabyBear {
     pub const ONE: BabyBear = BabyBear(1);
 
     pub fn new(x: u32) -> Self {
+        BabyBear(x % P)
+    }
+
+    /// `new`, usable in a `const`.
+    pub const fn new_const(x: u32) -> Self {
         BabyBear(x % P)
     }
 
@@ -115,6 +120,20 @@ impl std::ops::Mul for BabyBear {
     type Output = BabyBear;
     fn mul(self, rhs: Self) -> Self {
         BabyBear::mul(self, rhs)
+    }
+}
+
+impl std::ops::Sub for BabyBear {
+    type Output = BabyBear;
+    fn sub(self, rhs: Self) -> Self {
+        BabyBear::sub(self, rhs)
+    }
+}
+
+impl std::ops::Neg for BabyBear {
+    type Output = BabyBear;
+    fn neg(self) -> Self {
+        BabyBear::neg(self)
     }
 }
 
@@ -453,10 +472,12 @@ fn apply_internal_layer<const WIDTH: usize>(
 
 /// A Poseidon2 permutation over BabyBear at a given state width.
 pub struct Poseidon2BabyBear<const WIDTH: usize> {
-    ext_initial: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS],
-    ext_final: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS],
-    internal_rc: Vec<BabyBear>,
-    internal_diag: [BabyBear; WIDTH],
+    // Crate-visible so `poseidon2_air` can lay the very same constants out
+    // as a circuit, rather than keeping a second copy that could drift.
+    pub(crate) ext_initial: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS],
+    pub(crate) ext_final: [[BabyBear; WIDTH]; HALF_FULL_ROUNDS],
+    pub(crate) internal_rc: Vec<BabyBear>,
+    pub(crate) internal_diag: [BabyBear; WIDTH],
 }
 
 impl<const WIDTH: usize> Poseidon2BabyBear<WIDTH> {
@@ -555,32 +576,190 @@ impl Poseidon2BabyBear<32> {
     }
 }
 
+impl Default for Poseidon2BabyBear<16> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for Poseidon2BabyBear<24> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for Poseidon2BabyBear<32> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The width-24 permutation, built once and shared. Building one derives
+/// every round constant and the internal diagonal (dozens of field
+/// inversions) -- far more work than a permutation itself -- so anything
+/// hashing in a loop must use this rather than `new()` per call.
+pub fn perm24() -> &'static Poseidon2BabyBear<24> {
+    static PERM: std::sync::OnceLock<Poseidon2BabyBear<24>> = std::sync::OnceLock::new();
+    PERM.get_or_init(Poseidon2BabyBear::<24>::new)
+}
+
+/// `perm24`, for width 16.
+pub fn perm16() -> &'static Poseidon2BabyBear<16> {
+    static PERM: std::sync::OnceLock<Poseidon2BabyBear<16>> = std::sync::OnceLock::new();
+    PERM.get_or_init(Poseidon2BabyBear::<16>::new)
+}
+
 /// t = 16 is the standard BabyBear instantiation (Plonky3/SP1's default).
 pub type Poseidon2BabyBear16 = Poseidon2BabyBear<16>;
 
-/// Hash arbitrary-length bytes down to a fixed 8-element digest, via a
-/// simple sponge-style absorption over the width-24 permutation: 4 bytes
-/// become one field element (little-endian, reduced mod P, zero-padded in
-/// the final partial chunk), absorbed in blocks of up to 24 elements with a
-/// permutation call after each block.
-pub fn hash_bytes(bytes: &[u8]) -> [BabyBear; 8] {
-    let perm24 = Poseidon2BabyBear::<24>::new();
+/// Domain tags for `hash_elements` -- one per purpose, so two different
+/// kinds of hashed data can never collide even on equal element lists.
+pub const DOMAIN_COMMITMENT: u32 = 1;
+pub const DOMAIN_SIGNING: u32 = 2;
+/// `hash_bytes`.
+pub const DOMAIN_BYTES: u32 = 3;
+/// A WOTS public key's hash (`wots::PublicKey::hash`).
+pub const DOMAIN_PUBKEY: u32 = 4;
+/// A Merkle tree leaf (`merkle`).
+pub const DOMAIN_MERKLE_LEAF: u32 = 5;
+/// A compiled constraint program (`symbolic::Program::digest`).
+pub const DOMAIN_PROGRAM: u32 = 6;
+/// A verifying key: the hash of a circuit's preprocessed cap.
+pub const DOMAIN_VK: u32 = 7;
+/// A leaf of an aggregation tree's data: the hash of a proven statement.
+pub const DOMAIN_DATA_LEAF: u32 = 8;
+/// An internal node of an aggregation tree's data.
+pub const DOMAIN_DATA_NODE: u32 = 9;
+/// A Merkle tree internal node, plus its level -- one domain per level.
+pub const DOMAIN_MERKLE_NODE: u32 = 0x100;
+
+/// Elements absorbed per permutation by `hash_elements`.
+pub const SPONGE_RATE: usize = 16;
+
+/// A proper sponge over field elements: width-24 Poseidon2, rate 16,
+/// capacity 8. The capacity starts out holding `domain` and the input's
+/// length, and input is only ever added into the rate part -- so, unlike
+/// `hash_bytes`, a later block can't cancel an earlier one (the capacity
+/// is out of an attacker's direct reach), and inputs of different lengths
+/// can't collide through padding (the length is part of the initial
+/// state). The first 8 elements of the final state are the digest.
+///
+/// Designed to be cheap to recompute inside a STARK: one permutation per
+/// 16 elements, no byte handling.
+pub fn hash_elements(domain: u32, elements: &[BabyBear]) -> [BabyBear; 8] {
+    sponge(domain, elements.len(), elements)
+}
+
+/// `hash_elements`' sponge, with the length recorded in the capacity
+/// given explicitly -- `hash_bytes` records its *byte* length, since its
+/// last element may hold padding.
+fn sponge(domain: u32, length: usize, elements: &[BabyBear]) -> [BabyBear; 8] {
+    assert!(length < P as usize, "input too long to encode its length");
+    let perm24 = perm24();
     let mut state = [BabyBear::ZERO; 24];
-    let mut filled = 0;
-    for chunk in bytes.chunks(4) {
-        let mut padded = [0u8; 4];
-        padded[..chunk.len()].copy_from_slice(chunk);
-        state[filled] = state[filled] + BabyBear::from_bytes(padded);
-        filled += 1;
-        if filled == 24 {
-            state = perm24.permute(state);
-            filled = 0;
-        }
+    state[SPONGE_RATE] = BabyBear::new(domain);
+    state[SPONGE_RATE + 1] = BabyBear::new(length as u32);
+    if elements.is_empty() {
+        state = perm24.permute(state);
     }
-    if filled > 0 {
+    for block in elements.chunks(SPONGE_RATE) {
+        for (slot, &e) in state.iter_mut().zip(block) {
+            *slot = *slot + e;
+        }
         state = perm24.permute(state);
     }
     state[..8].try_into().unwrap()
+}
+
+/// Hash bytes that encode field elements (4 bytes each, little-endian) --
+/// Merkle leaves of trace rows, say -- a quarter fewer elements than
+/// `hash_bytes`' general 3-byte packing. Each 4-byte group is reduced mod
+/// P, so two byte strings encoding the *same* elements (one with a
+/// non-canonical group) hash alike; that's harmless for data only ever
+/// read back as those elements. The byte length is recorded, so a short
+/// final group is unambiguous.
+pub fn hash_words(domain: u32, bytes: &[u8]) -> [BabyBear; 8] {
+    let elements: Vec<BabyBear> = bytes
+        .chunks(4)
+        .map(|chunk| {
+            let mut padded = [0u8; 4];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            BabyBear::from_bytes(padded)
+        })
+        .collect();
+    sponge(domain, bytes.len(), &elements)
+}
+
+/// The leaf hash STARK commitments use, built to be cheap to re-run in a
+/// circuit: `elements` zero-padded to whole octets (8 elements), absorbed
+/// by *overwriting* the rate, two octets per width-24 permutation (a final
+/// lone octet overwrites only the rate's first half). The capacity starts
+/// as `[domain, length, 0, ...]`, `length` being the caller's measure of
+/// the input (its byte length, for `merkle`), so padding is unambiguous.
+/// Overwriting means each permutation's input is whole octets of data plus
+/// the previous permutation's output -- no in-circuit additions.
+pub fn hash_octets(domain: u32, length: usize, elements: &[BabyBear]) -> [BabyBear; 8] {
+    assert!(length < P as usize, "input too long to encode its length");
+    let perm24 = perm24();
+    let mut state = [BabyBear::ZERO; 24];
+    state[SPONGE_RATE] = BabyBear::new(domain);
+    state[SPONGE_RATE + 1] = BabyBear::new(length as u32);
+    if elements.is_empty() {
+        state = perm24.permute(state);
+    }
+    for block in elements.chunks(SPONGE_RATE) {
+        let octets = block.len().div_ceil(8);
+        state[..8 * octets].fill(BabyBear::ZERO);
+        state[..block.len()].copy_from_slice(block);
+        state = perm24.permute(state);
+    }
+    state[..8].try_into().unwrap()
+}
+
+/// Hash two digests into one -- a Merkle node -- in a single permutation
+/// (their 16 elements fill the sponge's rate exactly).
+pub fn hash_pair(domain: u32, left: [BabyBear; 8], right: [BabyBear; 8]) -> [BabyBear; 8] {
+    let mut elements = [BabyBear::ZERO; 16];
+    elements[..8].copy_from_slice(&left);
+    elements[8..].copy_from_slice(&right);
+    sponge(domain, 16, &elements)
+}
+
+/// Eight field elements as 32 bytes (4 each, little-endian) -- how a
+/// digest is stored and published.
+pub fn digest_to_bytes(digest: [BabyBear; 8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, elem) in digest.into_iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&elem.to_bytes());
+    }
+    out
+}
+
+/// The inverse of `digest_to_bytes`. Each 4-byte group is reduced mod P,
+/// so only bytes that came from a digest round-trip exactly.
+pub fn digest_from_bytes(bytes: &[u8; 32]) -> [BabyBear; 8] {
+    std::array::from_fn(|i| BabyBear::from_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()))
+}
+
+/// Hash arbitrary-length bytes down to a fixed 8-element digest: the
+/// bytes packed 3 to an element (little-endian, the last zero-padded),
+/// then `hash_elements`' sponge with the *byte* length recorded in the
+/// capacity.
+///
+/// Three bytes, not four: 24 bits always fit below BabyBear's prime, so
+/// the packing is one-to-one -- with four, different byte strings could
+/// reduce to the same elements. And the byte length (not just the element
+/// count) is what tells `"a"` apart from `"a\0"`, which pack identically.
+pub fn hash_bytes(bytes: &[u8]) -> [BabyBear; 8] {
+    let elements: Vec<BabyBear> = bytes
+        .chunks(3)
+        .map(|chunk| {
+            let mut padded = [0u8; 4];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            BabyBear::new(u32::from_le_bytes(padded))
+        })
+        .collect();
+    sponge(DOMAIN_BYTES, bytes.len(), &elements)
 }
 
 /// `hash_bytes`, flattened to a plain 32-byte array (8 field elements, 4
@@ -597,6 +776,79 @@ pub fn hash_bytes_32(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn elems(values: &[u32]) -> Vec<BabyBear> {
+        values.iter().map(|&v| BabyBear::new(v)).collect()
+    }
+
+    /// Trailing zeros change the length, which is part of the hash -- the
+    /// padding ambiguity `hash_bytes` has can't happen here.
+    #[test]
+    fn hash_elements_distinguishes_trailing_zeros() {
+        let a = hash_elements(DOMAIN_COMMITMENT, &elems(&[1, 2]));
+        let b = hash_elements(DOMAIN_COMMITMENT, &elems(&[1, 2, 0]));
+        let c = hash_elements(DOMAIN_COMMITMENT, &elems(&[1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(hash_elements(DOMAIN_COMMITMENT, &[]), hash_elements(DOMAIN_COMMITMENT, &elems(&[0])));
+    }
+
+    #[test]
+    fn hash_elements_separates_domains() {
+        let input = elems(&[5, 6, 7]);
+        assert_ne!(hash_elements(DOMAIN_COMMITMENT, &input), hash_elements(DOMAIN_SIGNING, &input));
+    }
+
+    /// The attack a capacity-less sponge allows: pick a second message
+    /// whose later block cancels the first block's difference. Here the
+    /// rate part is all an attacker can touch, so the "cancelling" block
+    /// built for a zero-capacity sponge no longer works.
+    #[test]
+    fn hash_elements_resists_cancelling_a_block() {
+        let perm = Poseidon2BabyBear::<24>::new();
+        let first_a: Vec<BabyBear> = (0..16).map(BabyBear::new).collect();
+        let first_b: Vec<BabyBear> = (100..116).map(BabyBear::new).collect();
+        let second_a: Vec<BabyBear> = (200..216).map(BabyBear::new).collect();
+        // Choose second_b so the full state after absorbing it would match
+        // -- only possible in the rate part, so the capacity differs.
+        let start = |first: &[BabyBear]| {
+            let mut s = [BabyBear::ZERO; 24];
+            s[16] = BabyBear::new(DOMAIN_COMMITMENT);
+            s[17] = BabyBear::new(32);
+            for (slot, &e) in s.iter_mut().zip(first) {
+                *slot = *slot + e;
+            }
+            perm.permute(s)
+        };
+        let (sa, sb) = (start(&first_a), start(&first_b));
+        assert_ne!(sa[16..], sb[16..], "the capacity must differ, or there'd be nothing to test");
+        let second_b: Vec<BabyBear> = (0..16).map(|i| sa[i] + second_a[i] - sb[i]).collect();
+        let a = hash_elements(DOMAIN_COMMITMENT, &[first_a, second_a].concat());
+        let b = hash_elements(DOMAIN_COMMITMENT, &[first_b, second_b].concat());
+        assert_ne!(a, b);
+    }
+
+    /// The padding and wrap-around ambiguities the old byte hash had.
+    #[test]
+    fn hash_bytes_distinguishes_padding_and_high_bytes() {
+        assert_ne!(hash_bytes(b"ab"), hash_bytes(b"ab\0"));
+        assert_ne!(hash_bytes(b"ab"), hash_bytes(b"ab\0\0\0\0"));
+        assert_ne!(hash_bytes(b""), hash_bytes(b"\0"));
+        // 0xffffffff would have reduced mod P under 4-byte packing.
+        assert_ne!(hash_bytes(&[0xff; 4]), hash_bytes(&(0xffff_ffffu32 - P).to_le_bytes()));
+    }
+
+    #[test]
+    fn hash_bytes_is_separated_from_hash_elements() {
+        let bytes = [1u8, 0, 0];
+        assert_ne!(hash_bytes(&bytes), hash_elements(DOMAIN_BYTES, &[BabyBear::ONE]));
+    }
+
+    #[test]
+    fn digests_roundtrip_through_bytes() {
+        let d = hash_elements(DOMAIN_SIGNING, &elems(&[9, 8, 7]));
+        assert_eq!(digest_from_bytes(&digest_to_bytes(d)), d);
+    }
 
     /// Plonky3's own known-answer test for `default_babybear_poseidon2_16`
     /// (baby-bear/src/poseidon2.rs, `test_default_babybear_poseidon2_width_16`).
@@ -692,3 +944,4 @@ mod tests {
         assert_eq!(a.sub(BabyBear::ZERO), a);
     }
 }
+

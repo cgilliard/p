@@ -69,7 +69,7 @@ mod tests {
         let unproven = chain.build_block(transactions)?;
         let target = unproven.target;
         let proof =
-            prover::prove_block(&unproven.inputs, &unproven.outputs, transactions).expect("stub prover always succeeds");
+            prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
         chain.apply_block(&block)
@@ -85,7 +85,10 @@ mod tests {
     fn miner_mines_two_blocks_and_pays_another_user() {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let mut chain = Chain::open(&storage, chain::DifficultyConfig::for_tests(), 5).unwrap();
+        let mut chain = Chain::open(&storage, chain::DifficultyConfig::for_tests(), 5, None).unwrap();
+        // About the transaction flow, not proofs: real ones take seconds
+        // each in a debug build (see `prover`'s tests for those).
+        chain.skip_proof_checks();
 
         // The miner's two reward addresses -- a fresh one each time,
         // since a WOTS pubkey can only ever sign once (see

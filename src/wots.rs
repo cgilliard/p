@@ -68,7 +68,7 @@ pub const W: u32 = 8;
 /// Number of hash chains (the "Hashing-Optimized" LeanSig preset).
 pub const V: usize = 64;
 /// Maximum steps per chain.
-const CHAIN_STEPS: u32 = W as u32 - 1;
+pub(crate) const CHAIN_STEPS: u32 = W - 1;
 /// Fixed digit-sum every valid signature's encoding must hit exactly: the
 /// hypercube's central layer (see module docs for why this differs from
 /// the paper's `T = 375`).
@@ -78,13 +78,13 @@ pub const TARGET_SUM: u32 = (V as u32) * (W - 1) / 2;
 /// this preset is small -- tens, not thousands).
 const MAX_TRIALS: u32 = 1 << 12;
 
-const PARAM_LEN: usize = 5;
-const CHAIN_LEN: usize = 8;
-const RAND_LEN: usize = 7;
+pub(crate) const PARAM_LEN: usize = 5;
+pub(crate) const CHAIN_LEN: usize = 8;
+pub(crate) const RAND_LEN: usize = 7;
 const SEED_LEN: usize = 8;
 
-type Param = [BabyBear; PARAM_LEN];
-type ChainValue = [BabyBear; CHAIN_LEN];
+pub(crate) type Param = [BabyBear; PARAM_LEN];
+pub(crate) type ChainValue = [BabyBear; CHAIN_LEN];
 
 /// Domain-separation tags: distinguish the different *purposes* a hash call
 /// serves (deriving the public parameter, deriving secret chains, hashing a
@@ -92,8 +92,8 @@ type ChainValue = [BabyBear; CHAIN_LEN];
 /// on the same input, even accidentally.
 const TAG_PARAM: u32 = 1;
 const TAG_SECRET: u32 = 2;
-const TAG_CHAIN: u32 = 3;
-const TAG_MESSAGE: u32 = 4;
+pub(crate) const TAG_CHAIN: u32 = 3;
+pub(crate) const TAG_MESSAGE: u32 = 4;
 
 pub struct SecretKey {
     param: Param,
@@ -142,6 +142,32 @@ fn decode_elements(bytes: &[u8], count: usize) -> Option<Vec<BabyBear>> {
 pub const PUBLIC_KEY_LEN: usize = (PARAM_LEN + V * CHAIN_LEN) * 4;
 
 impl PublicKey {
+    /// Every field element of the key, in order: `param`, then `tops`
+    /// chain by chain.
+    pub fn elements(&self) -> Vec<BabyBear> {
+        self.param.iter().chain(self.tops.iter().flatten()).copied().collect()
+    }
+
+    /// The key's hash -- what an output records as its owner. Over the
+    /// key's field elements directly (`hash_elements`), so a block's proof
+    /// can recompute it without unpacking bytes: `param` zero-padded to 8
+    /// elements, then the 64 tops. The padding lines every top up with a
+    /// half of one of the sponge's 16-element absorption blocks -- block 0
+    /// takes `param` and top 0, block `k` tops `2k - 1` and `2k`, and the
+    /// last top 63 alone -- so the circuit can absorb each top straight
+    /// from the chain that produced it.
+    pub fn hash(&self) -> [BabyBear; 8] {
+        crate::poseidon2::hash_elements(crate::poseidon2::DOMAIN_PUBKEY, &self.hash_input())
+    }
+
+    /// Exactly what `hash` absorbs.
+    pub fn hash_input(&self) -> Vec<BabyBear> {
+        let mut out = self.param.to_vec();
+        out.resize(CHAIN_LEN, BabyBear::ZERO);
+        out.extend(self.tops.iter().flatten());
+        out
+    }
+
     /// Serialize to little-endian bytes: `param` (5 elements) followed by
     /// `tops` (`V` chains of 8 elements each), 4 bytes per element. This is
     /// the format a real verifier -- a separate process with no access to
@@ -199,24 +225,30 @@ pub fn hash_message(message: &[u8]) -> [BabyBear; 8] {
     crate::poseidon2::hash_bytes(message)
 }
 
-/// One step of a hash chain: `PoseidonCompress_{16,8}(param, tag, chain_index,
-/// step_index, value)`. Domain-separated by chain index and step index so
-/// that no two (chain, step) positions, across any key, ever hash the same
-/// input unless the value does too.
-fn chain_step(
-    perm16: &Poseidon2BabyBear<16>,
+/// One step of a hash chain: `PoseidonCompress_{24,8}(param, tag,
+/// chain_index, step_index, value, 0...)`. Domain-separated by chain index
+/// and step index so that no two (chain, step) positions, across any key,
+/// ever hash the same input unless the value does too.
+///
+/// Width 24 rather than the 16 these 16 input elements would fit: chain
+/// steps are nearly all of what a block's proof computes, and every other
+/// hash in that proof is width 24 -- one permutation circuit for all of
+/// them, rather than two plus a switch between them, roughly halves the
+/// proof's cost.
+pub(crate) fn chain_step(
+    perm24: &Poseidon2BabyBear<24>,
     param: &Param,
     chain_index: usize,
     step_index: u32,
     value: ChainValue,
 ) -> ChainValue {
-    let mut input = [BabyBear::ZERO; 16];
+    let mut input = [BabyBear::ZERO; 24];
     input[0..PARAM_LEN].copy_from_slice(param);
     input[5] = BabyBear::new(TAG_CHAIN);
     input[6] = BabyBear::new(chain_index as u32);
     input[7] = BabyBear::new(step_index);
     input[8..16].copy_from_slice(&value);
-    perm16.compress::<CHAIN_LEN>(input)
+    perm24.compress::<CHAIN_LEN>(input)
 }
 
 /// Derive the target-sum digit vector for (param, message_digest,
@@ -225,12 +257,12 @@ fn chain_step(
 /// ~31 bits, so the bias from the implicit mod-W reduction is negligible --
 /// around 2^-28). The first `V` of the resulting ~80 digits become the
 /// signature's digit vector.
-fn derive_digits(
+pub(crate) fn derive_digits(
     param: &Param,
     message_digest: [BabyBear; 8],
     randomizer: [BabyBear; RAND_LEN],
 ) -> [u32; V] {
-    let perm24 = Poseidon2BabyBear::<24>::new();
+    let perm24 = crate::poseidon2::perm24();
     let mut input = [BabyBear::ZERO; 24];
     input[0..PARAM_LEN].copy_from_slice(param);
     input[5] = BabyBear::new(TAG_MESSAGE);
@@ -260,7 +292,8 @@ fn derive_digits(
 /// signature scheme, reusing a seed (or signing twice with the resulting
 /// secret key) breaks security.
 pub fn keygen(seed: &[u8; 32]) -> (SecretKey, PublicKey) {
-    let perm16 = Poseidon2BabyBear::<16>::new();
+    let perm16 = crate::poseidon2::perm16();
+    let perm24 = crate::poseidon2::perm24();
     let seed_elems = seed_to_elements(seed);
 
     let mut param_input = [BabyBear::ZERO; 16];
@@ -281,7 +314,7 @@ pub fn keygen(seed: &[u8; 32]) -> (SecretKey, PublicKey) {
     for i in 0..V {
         let mut value = chains[i];
         for step in 0..CHAIN_STEPS {
-            value = chain_step(&perm16, &param, i, step, value);
+            value = chain_step(perm24, &param, i, step, value);
         }
         tops[i] = value;
     }
@@ -296,7 +329,7 @@ pub fn keygen(seed: &[u8; 32]) -> (SecretKey, PublicKey) {
 /// `None` is returned only in the astronomically unlikely event that
 /// `MAX_TRIALS` attempts all fail.
 pub fn sign(sk: &SecretKey, message_digest: [BabyBear; 8]) -> Option<Signature> {
-    let perm16 = Poseidon2BabyBear::<16>::new();
+    let perm24 = crate::poseidon2::perm24();
 
     for trial in 0..MAX_TRIALS {
         let mut randomizer = [BabyBear::ZERO; RAND_LEN];
@@ -311,7 +344,7 @@ pub fn sign(sk: &SecretKey, message_digest: [BabyBear; 8]) -> Option<Signature> 
         for i in 0..V {
             let mut value = sk.chains[i];
             for step in 0..digits[i] {
-                value = chain_step(&perm16, &sk.param, i, step, value);
+                value = chain_step(perm24, &sk.param, i, step, value);
             }
             values[i] = value;
         }
@@ -323,7 +356,7 @@ pub fn sign(sk: &SecretKey, message_digest: [BabyBear; 8]) -> Option<Signature> 
 /// Verify a signature against a public key and (pre-hashed, 8-element)
 /// message digest.
 pub fn verify(pk: &PublicKey, message_digest: [BabyBear; 8], sig: &Signature) -> bool {
-    let perm16 = Poseidon2BabyBear::<16>::new();
+    let perm24 = crate::poseidon2::perm24();
 
     let digits = derive_digits(&pk.param, message_digest, sig.randomizer);
     if digits.iter().sum::<u32>() != TARGET_SUM {
@@ -333,7 +366,7 @@ pub fn verify(pk: &PublicKey, message_digest: [BabyBear; 8], sig: &Signature) ->
     for i in 0..V {
         let mut value = sig.values[i];
         for step in digits[i]..CHAIN_STEPS {
-            value = chain_step(&perm16, &pk.param, i, step, value);
+            value = chain_step(perm24, &pk.param, i, step, value);
         }
         if value != pk.tops[i] {
             return false;

@@ -75,6 +75,13 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The largest a block may be, encoded (`Block::to_bytes`) -- a consensus
+/// rule, checked by `Block::validate`. Covers everything a block carries:
+/// header, commitments, and the proof (whose bytes join `to_bytes` once
+/// the real one exists -- the stub has none yet). Also what bounds how
+/// much a peer can make this node download for one block (`transfer`).
+pub const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+
 /// The proof-of-work target used for the very first retarget window,
 /// before `chain::Chain` has adjusted anything: first byte zero, the
 /// rest maxed out, so a candidate hash meets it iff its own first byte
@@ -114,11 +121,12 @@ pub struct BlockHeader {
     /// `0`). See `HEADER_LEN`'s docs for why this is a header field.
     pub height: u64,
     /// Unix time, in **milliseconds**, this header was assembled, as
-    /// claimed by whoever built it -- not yet validated against
-    /// anything (no monotonicity or future-time bound check exists
-    /// yet; see `docs/BLOCK_TODO.md`). Committed to by PoW just like
-    /// every other field, so it can't be altered after mining without
-    /// invalidating the nonce. Milliseconds, not seconds, so a short
+    /// claimed by whoever built it. `chain::Chain` checks it two ways:
+    /// strictly later than the parent's, and no more than
+    /// `MAX_FUTURE_DRIFT_MS` ahead of the checking node's own clock.
+    /// Committed to by PoW just like every other field, so it can't be
+    /// altered after mining without invalidating the nonce.
+    /// Milliseconds, not seconds, so a short
     /// retarget window (`chain::DifficultyConfig`) can target sub-
     /// second block times for fast tests without losing precision --
     /// `u64` milliseconds since the epoch doesn't overflow for about
@@ -231,7 +239,7 @@ impl BlockBody {
         BlockBody {
             inputs: Vec::new(),
             outputs: Vec::new(),
-            proof: Proof,
+            proof: Proof::default(),
         }
     }
 
@@ -248,11 +256,11 @@ impl BlockBody {
             return false;
         }
         for input in &tx.inputs {
-            let commitment = hash_bytes_32(&Output::new(&input.pubkey, input.amount).to_bytes());
+            let commitment = Output::new(&input.pubkey, input.amount).commitment();
             self.push_input(commitment);
         }
         for output in &tx.outputs {
-            self.push_output(hash_bytes_32(&output.to_bytes()));
+            self.push_output(output.commitment());
         }
         true
     }
@@ -306,24 +314,23 @@ impl BlockBody {
     }
 
     /// Whether `proof` actually attests to this body's `inputs`/
-    /// `outputs` -- see `prover`'s docs for why this is a stub (always
-    /// `true`) for now.
+    /// `outputs` -- see `prover`'s docs. By far the most expensive check
+    /// a block gets.
     pub fn proof_is_valid(&self) -> bool {
         self.proof.verify(&self.inputs, &self.outputs)
     }
 
+    /// `to_bytes().len()`, without building the bytes.
+    pub fn encoded_len(&self) -> usize {
+        4 + 32 * self.inputs.len() + 4 + 32 * self.outputs.len() + 4 + self.proof.len()
+    }
+
     /// Serialize: a 4-byte big-endian input count, that many 32-byte
-    /// commitments, then a 4-byte big-endian output count, that many
-    /// 32-byte commitments. Always produces canonically-ordered bytes,
-    /// since `inputs`/`outputs` are only ever populated in that order in
-    /// the first place (`push_input`/`push_output`).
-    ///
-    /// **`proof` is not yet part of this wire format.** The stub type
-    /// (see `prover`'s docs) has exactly one possible value, so there's
-    /// nothing to lose by omitting it -- `from_bytes` just fills in that
-    /// one value. This is a deliberate, temporary gap: once `Proof` has
-    /// a real byte representation, encoding/decoding it becomes part of
-    /// this format too.
+    /// commitments, a 4-byte big-endian output count, that many 32-byte
+    /// commitments, then a 4-byte big-endian proof length and the proof's
+    /// bytes. Always produces canonically-ordered bytes, since `inputs`/
+    /// `outputs` are only ever populated in that order in the first place
+    /// (`push_input`/`push_output`).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.inputs.len() as u32).to_be_bytes());
@@ -334,6 +341,8 @@ impl BlockBody {
         for commitment in &self.outputs {
             out.extend_from_slice(commitment);
         }
+        out.extend_from_slice(&(self.proof.len() as u32).to_be_bytes());
+        out.extend_from_slice(self.proof.as_bytes());
         out
     }
 
@@ -353,7 +362,12 @@ impl BlockBody {
         }
 
         fn read_commitments(bytes: &[u8], offset: &mut usize, count: u32) -> Result<Vec<[u8; 32]>> {
-            let mut out = Vec::with_capacity(count as usize);
+            // Never reserve more than the bytes actually present could
+            // fill: `count` comes off the wire, and a lie there (four
+            // billion, say) must fail as `Truncated`, not as an
+            // allocation of hundreds of gigabytes.
+            let room = bytes.len().saturating_sub(*offset) / 32;
+            let mut out = Vec::with_capacity((count as usize).min(room));
             for _ in 0..count {
                 let slice = bytes.get(*offset..*offset + 32).ok_or(Error::Truncated)?;
                 *offset += 32;
@@ -367,6 +381,9 @@ impl BlockBody {
         let inputs = read_commitments(bytes, &mut offset, input_count)?;
         let output_count = read_u32(bytes, &mut offset)?;
         let outputs = read_commitments(bytes, &mut offset, output_count)?;
+        let proof_len = read_u32(bytes, &mut offset)? as usize;
+        let proof = bytes.get(offset..offset.saturating_add(proof_len)).ok_or(Error::Truncated)?;
+        offset += proof_len;
 
         if offset != bytes.len() {
             return Err(Error::Truncated); // trailing garbage
@@ -375,7 +392,7 @@ impl BlockBody {
         Ok(BlockBody {
             inputs,
             outputs,
-            proof: Proof,
+            proof: Proof::from_bytes(proof.to_vec()),
         })
     }
 
@@ -429,6 +446,10 @@ pub struct UnprovenBlock {
     pub prev_hash: [u8; 32],
     pub height: u64,
     pub target: [u8; 32],
+    /// The earliest `timestamp` this block may carry: one millisecond
+    /// past its parent's, since timestamps must strictly increase (a
+    /// consensus rule -- see `chain`'s docs). `0` for a first block.
+    pub min_timestamp: u64,
     pub pmmr_root: [u8; 32],
     pub bitmap_root: [u8; 32],
     pub inputs: Vec<[u8; 32]>,
@@ -442,7 +463,10 @@ impl UnprovenBlock {
     /// `timestamp` is stamped as "now," at assembly time -- later than
     /// `Chain::build_block` (which may have run well before proving
     /// finished, if proving is slow) and right before mining, which is
-    /// the point at which this block is otherwise complete. `nonce` is
+    /// the point at which this block is otherwise complete -- or as
+    /// `min_timestamp`, if that's later (a parent stamped ahead of this
+    /// node's clock). Anyone re-stamping it while mining must keep to
+    /// `min_timestamp` too. `nonce` is
     /// left at `[0; 32]` -- `pow::mine_block` is the only thing that
     /// sets it, and only once this has already happened.
     pub fn finish(self, proof: Proof) -> Block {
@@ -457,7 +481,7 @@ impl UnprovenBlock {
             bitmap_root: self.bitmap_root,
             body_hash: body.body_hash(),
             height: self.height,
-            timestamp: now_millis(),
+            timestamp: now_millis().max(self.min_timestamp),
             nonce: [0u8; 32],
         };
         Block { header, body }
@@ -512,7 +536,20 @@ impl Block {
     /// constructed, rather than a check that's only honest if you also
     /// know it arrived via `from_bytes`.
     pub fn validate(&self, target: &[u8; 32]) -> bool {
+        self.validate_structure(target) && self.body.proof_is_valid()
+    }
+
+    /// Everything `validate` checks *except* the proof -- every cheap,
+    /// structural rule. Separate so a caller can run these first, or (in
+    /// tests about other things) skip the proof entirely.
+    pub fn validate_structure(&self, target: &[u8; 32]) -> bool {
         if !self.header.pow_valid(target) {
+            return false;
+        }
+        if !self.body.inputs.iter().chain(&self.body.outputs).all(crate::prover::is_canonical) {
+            return false;
+        }
+        if self.encoded_len() > MAX_BLOCK_BYTES {
             return false;
         }
         if !self.body.is_canonically_ordered() {
@@ -521,17 +558,16 @@ impl Block {
         if self.body.spends_its_own_output() {
             return false;
         }
-        if self.body.body_hash() != self.header.body_hash {
-            return false;
-        }
-        if !self.body.proof_is_valid() {
-            return false;
-        }
-        true
+        self.body.body_hash() == self.header.body_hash
     }
 
     /// Serialize: the header's fixed-width encoding, followed by the
     /// body's.
+    /// `to_bytes().len()`, without building the bytes.
+    pub fn encoded_len(&self) -> usize {
+        HEADER_LEN + self.body.encoded_len()
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = self.header.to_bytes().to_vec();
         out.extend_from_slice(&self.body.to_bytes());
@@ -594,7 +630,7 @@ mod tests {
     /// publish -- computed independently of `add_transaction`, so tests
     /// asserting against it are actually checking something.
     fn commitment_of(pubkey: &PublicKey, amount: u64) -> [u8; 32] {
-        hash_bytes_32(&Output::new(pubkey, amount).to_bytes())
+        Output::new(pubkey, amount).commitment()
     }
 
     /// Mine a real nonce for `header` (with `nonce` still unset) against
@@ -636,7 +672,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(block.validate(&INITIAL_MAX_HASH));
+        assert!(block.validate_structure(&INITIAL_MAX_HASH));
     }
 
     /// PoW is checked first -- an arbitrary (wrong) `body_hash` is fine
@@ -661,7 +697,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(!block.validate(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
     }
 
     /// A header whose `body_hash` doesn't match the actual body is
@@ -684,7 +720,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(!block.validate(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
     }
 
     /// A transaction that doesn't verify (unsigned) is rejected by
@@ -836,7 +872,7 @@ mod tests {
         let decoded = Block::from_bytes(&block.to_bytes()).unwrap();
         assert_eq!(decoded.header, block.header);
         assert_eq!(decoded.body, block.body);
-        assert!(decoded.validate(&INITIAL_MAX_HASH));
+        assert!(decoded.validate_structure(&INITIAL_MAX_HASH));
     }
 
     /// `BlockBody::from_bytes` only checks byte-level well-formedness --
@@ -929,7 +965,7 @@ mod tests {
         });
         let block = Block { header, body };
 
-        assert!(!block.validate(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
     }
 
     /// The end-to-end version of the point above: a block whose body is
@@ -961,7 +997,7 @@ mod tests {
         });
         let block = Block { header, body };
 
-        assert!(!block.validate(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
     }
 
     #[test]
@@ -981,6 +1017,68 @@ mod tests {
         let mut bytes = body.to_bytes();
         bytes.push(0xFF); // one byte more than the (empty) body needs
 
+        assert_eq!(BlockBody::from_bytes(&bytes).unwrap_err(), Error::Truncated);
+    }
+
+    /// A body of `n` distinct, sorted output commitments.
+    /// A body of `n` distinct, sorted, canonical output commitments: `i`
+    /// big-endian in the first three bytes (sorting bytewise sorts by `i`),
+    /// with the fourth zero so that group stays far below P.
+    fn body_with_outputs(n: usize) -> BlockBody {
+        let outputs = (0..n as u32)
+            .map(|i| {
+                let mut c = [0u8; 32];
+                c[..3].copy_from_slice(&i.to_be_bytes()[1..]);
+                c
+            })
+            .collect();
+        BlockBody {
+            outputs,
+            ..Default::default()
+        }
+    }
+
+    fn mined_block(body: BlockBody) -> Block {
+        let header = mined_header(BlockHeader {
+            prev_hash: [0u8; 32],
+            pmmr_root: [0u8; 32],
+            bitmap_root: [0u8; 32],
+            body_hash: body.body_hash(),
+            height: 0,
+            timestamp: 0,
+            nonce: [0u8; 32],
+        });
+        Block { header, body }
+    }
+
+    #[test]
+    fn encoded_len_matches_to_bytes() {
+        for n in [0, 1, 7] {
+            let block = mined_block(body_with_outputs(n));
+            assert_eq!(block.encoded_len(), block.to_bytes().len());
+        }
+    }
+
+    /// Exactly at `MAX_BLOCK_BYTES` is fine; one commitment more isn't.
+    /// (Counts and proof length take 12 bytes; this proof is empty.)
+    #[test]
+    fn validate_enforces_the_block_size_limit() {
+        let fits = (MAX_BLOCK_BYTES - HEADER_LEN - 12) / 32;
+        let at_limit = mined_block(body_with_outputs(fits));
+        assert!(at_limit.encoded_len() <= MAX_BLOCK_BYTES);
+        assert!(at_limit.validate_structure(&INITIAL_MAX_HASH));
+
+        let over = mined_block(body_with_outputs(fits + 1));
+        assert!(over.encoded_len() > MAX_BLOCK_BYTES);
+        assert!(!over.validate_structure(&INITIAL_MAX_HASH));
+    }
+
+    /// A count that claims far more records than the bytes hold fails as
+    /// `Truncated` -- without first trying to allocate room for them all.
+    #[test]
+    fn body_from_bytes_survives_a_huge_declared_count() {
+        let mut bytes = u32::MAX.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
         assert_eq!(BlockBody::from_bytes(&bytes).unwrap_err(), Error::Truncated);
     }
 }

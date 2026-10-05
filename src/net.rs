@@ -292,7 +292,8 @@ mod tests {
     fn test_node(seeds: Vec<SocketAddrV4>, socket: UdpSocket, key: u8) -> TestNode {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5, None).unwrap();
+        chain.skip_proof_checks();
         let table = PeerTable::open(&storage, 100, 3).unwrap();
         let discovery = Discovery::new(
             discovery::Config {
@@ -305,7 +306,7 @@ mod tests {
             [key; 32],
         );
         let transfer = Transfer::new(transfer::Config {
-            max_block_bytes: 2 * 1024 * 1024,
+            max_block_bytes: crate::block::MAX_BLOCK_BYTES,
             window: 8,
             chunk_timeout_ms: 200,
             max_retries: 5,
@@ -413,7 +414,7 @@ mod tests {
                 .collect();
             let unproven = a.chain.build_block(&transactions).unwrap();
             let target = unproven.target;
-            let proof = crate::prover::prove_block(&unproven.inputs, &unproven.outputs, &transactions).unwrap();
+            let proof = crate::prover::Proof::placeholder();
             let mut block = unproven.finish(proof);
             assert!(crate::block::mine_block(&mut block, &target, 100_000));
             assert!(block.to_bytes().len() > crate::wire::CHUNK_LEN);

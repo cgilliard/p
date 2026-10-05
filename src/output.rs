@@ -19,13 +19,23 @@
 // piecemeal -- this module exists to be exercised by its tests for now.
 #![allow(dead_code)]
 
-use crate::poseidon2::hash_bytes_32;
+use crate::poseidon2::{BabyBear, DOMAIN_COMMITMENT, digest_from_bytes, digest_to_bytes, hash_elements};
 use crate::wots::PublicKey;
 
 /// 8 BabyBear field elements, 4 bytes each.
 const PUBKEY_HASH_LEN: usize = 32;
 /// `PUBKEY_HASH_LEN` bytes of hash, plus 8 bytes of little-endian amount.
 pub const OUTPUT_LEN: usize = PUBKEY_HASH_LEN + 8;
+
+/// Bits per amount limb in a commitment -- see `Output::commitment`.
+pub const AMOUNT_LIMB_BITS: u32 = 16;
+/// Limbs per amount: 64 bits / 16.
+pub const AMOUNT_LIMBS: usize = 4;
+
+/// `amount` as four 16-bit limbs, least-significant first.
+pub fn amount_limbs(amount: u64) -> [BabyBear; AMOUNT_LIMBS] {
+    std::array::from_fn(|i| BabyBear::new(((amount >> (AMOUNT_LIMB_BITS as usize * i)) & 0xffff) as u32))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Output {
@@ -37,9 +47,26 @@ pub struct Output {
 impl Output {
     pub fn new(pk: &PublicKey, amount: u64) -> Self {
         Output {
-            pubkey_hash: hash_bytes_32(&pk.to_bytes()),
+            pubkey_hash: digest_to_bytes(pk.hash()),
             amount,
         }
+    }
+
+    /// The commitment published for this output (and, when it's spent,
+    /// for the input spending it): `hash_elements` over the public-key
+    /// hash's 8 elements and the amount as four 16-bit limbs,
+    /// least-significant first.
+    ///
+    /// Limbs, rather than the amount's raw bytes, so every `u64` amount
+    /// has exactly one encoding: a 32-bit half of the amount can exceed
+    /// BabyBear's prime and would wrap around if taken as one element, so
+    /// two different amounts could share a commitment -- spendable as the
+    /// larger one. 16-bit limbs never wrap, and a circuit range-checks
+    /// them directly.
+    pub fn commitment(&self) -> [u8; 32] {
+        let mut elements = digest_from_bytes(&self.pubkey_hash).to_vec();
+        elements.extend(amount_limbs(self.amount));
+        digest_to_bytes(hash_elements(DOMAIN_COMMITMENT, &elements))
     }
 
     pub fn to_bytes(&self) -> [u8; OUTPUT_LEN] {
@@ -68,6 +95,39 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The collision the old byte encoding allowed: one 32-bit half of the
+    /// amount past BabyBear's prime wrapped onto a smaller amount.
+    #[test]
+    fn amounts_that_used_to_collide_get_different_commitments() {
+        let (_, pk) = crate::wots::keygen(&[1; 32]);
+        let small = 2_147_483_648u64 - crate::poseidon2::P as u64; // 134,217,727
+        let large = 2_147_483_648u64;
+        assert_ne!(Output::new(&pk, small).commitment(), Output::new(&pk, large).commitment());
+    }
+
+    #[test]
+    fn limbs_reassemble_to_the_amount() {
+        for amount in [0, 1, 0xffff, 0x1_0000, 1_000_000_000, u64::MAX] {
+            let limbs = amount_limbs(amount);
+            let back = limbs
+                .iter()
+                .enumerate()
+                .fold(0u64, |acc, (i, l)| acc | ((l.value() as u64) << (16 * i)));
+            assert_eq!(back, amount);
+            assert!(limbs.iter().all(|l| l.value() < 1 << 16));
+        }
+    }
+
+    #[test]
+    fn the_commitment_binds_both_owner_and_amount() {
+        let (_, pk_a) = crate::wots::keygen(&[1; 32]);
+        let (_, pk_b) = crate::wots::keygen(&[2; 32]);
+        let base = Output::new(&pk_a, 50).commitment();
+        assert_ne!(base, Output::new(&pk_a, 51).commitment());
+        assert_ne!(base, Output::new(&pk_b, 50).commitment());
+        assert_eq!(base, Output::new(&pk_a, 50).commitment());
+    }
     use crate::wots::keygen;
 
     fn seed(byte: u8) -> [u8; 32] {

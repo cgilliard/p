@@ -11,8 +11,20 @@ rule, and building it against an unspecified rule means redoing it.
 
 ## 1. No economic enforcement (unbounded minting) -- this *is* the proof
 
-**Status:** not started. This is the real proof's core job, not a
-separate task alongside it.
+**Status:** done for a single block (no recursion yet). Every block
+carries a zero-knowledge STARK proof (`prover`, circuit in `block_air`)
+that every input is authorized by its owner's WOTS signature over its
+transaction, every commitment is well-formed, and `sum(inputs) + REWARD
+== sum(outputs)` exactly; `Block::validate` verifies it. At the
+consensus parameters (blowup 16, 20 queries, 20-bit grinding): ~82 KB for
+a reward-only block, ~119 KB with one spend, ~8.5 ms to verify.
+
+**Scale target: 5,000-10,000 transactions per block.** One trace can't
+hold that (BabyBear's 2^27 domain caps it at a few hundred inputs), so
+the next step is recursion -- chunk proofs aggregated into one published
+proof. Design: `docs/RECURSION.md`. Also open: recursive composition
+across the whole chain (for light clients), and timestamp monotonicity
+inside that recursion.
 
 **Note on scope:** the proof's job isn't just hiding amounts/pubkeys --
 the goal is a *recursive* proof, so a light client (or new node) can
@@ -50,15 +62,31 @@ slack in that equation, which the miner's own reward output can be
 sized to absorb. That slack *is* the fee; it falls out of the one
 equation for free, with no separate mechanism.
 
-What the circuit needs pinned down:
+What the circuit needs pinned down -- **decided 2026-10-04**:
 
-- A fixed (or schedule-based, see #3) block reward amount.
-- A rule for how many reward-claiming transactions a block may contain
-  (exactly one?).
-- The one balance equation above.
-- Timestamp monotonicity: `header.timestamp >= previous_header.timestamp`,
-  checked at each recursive step against the previous (already-verified)
-  timestamp -- see the scope note above and #3.
+- **Who proves:** the miner, over every transaction in its block, from
+  plaintext (pubkeys, amounts, signatures). Miners and relays see
+  transaction contents; chain observers see only commitments.
+  Per-sender proving with aggregation can come later without changing
+  the block format.
+- **Block reward:** a flat 1,000,000,000 units per block, at every
+  height. Cumulative supply reaches 2^64 only after ~1.8e10 blocks, so
+  64-bit amounts and sums never overflow in practice (the circuit still
+  range-checks them).
+- **Balance:** exact equality, `sum(inputs) + reward == sum(outputs)`
+  -- nothing may be burned. Fees are whatever the miner's own output
+  absorbs.
+- **Reward-claiming transactions:** no special rule needed. With one
+  equation over the whole block, how many zero-input transactions a
+  block has doesn't matter -- together they can only ever claim exactly
+  the reward plus fees.
+- **Timestamps:** strictly increasing, already enforced in plaintext
+  (see #3); the recursive proof should attest the same rule for light
+  clients.
+- **Amounts in BabyBear:** the field is ~31 bits, so 64-bit amounts and
+  their sums are decomposed into range-checked limbs inside the circuit,
+  with carries tracked explicitly -- a sum that silently wrapped mod p
+  would be a way to mint money.
 
 What's still ordinary (non-proof) plumbing, once the circuit exists:
 the miner needs to compute `sum(their plaintext inputs) -
@@ -142,11 +170,22 @@ proof, the other structurally never can.
   at proving time. Every verifier checks this locally, against its own
   clock, no matter how much of the rest of chain validity eventually
   gets folded into a recursive proof.
-- **Monotonicity check: deferred to the proof**, folded into #1 instead
-  of implemented here in plaintext. Unlike the future-bound check, this
-  one *is* a fixed, recursively-composable fact (each header's
-  timestamp relative to the one before it), so it belongs in the same
-  place the balance equation does -- see #1's scope note.
+- **Monotonicity check: implemented**, in plaintext, in `Chain`:
+  every block's timestamp must be strictly later than its parent's
+  (`Error::TimestampNotAfterParent`), anchored by the fixed genesis
+  block's timestamp. Originally deferred to the proof, but a full node
+  checking it costs nothing, and without it a miner could backdate the
+  first block of a retarget window to fake a slow window and drag
+  difficulty down (the "timewarp" attack) -- the proof isn't there yet
+  to stop that. The recursive proof should still attest the same rule,
+  for light clients that never see the headers; that's in addition to
+  this check, not instead of it.
+- **Genesis block: fixed.** `main.rs` hardcodes this network's genesis
+  (mined once by the ignored `mine_genesis` test); `Chain::open` applies
+  it to an empty chain and refuses any other block at height 0
+  (`Error::WrongGenesis`), and refuses data from a different genesis.
+- **Block size: capped** at `block::MAX_BLOCK_BYTES` (2 MiB, encoded,
+  proof included once it has bytes), checked by `Block::validate`.
 
 This also settles #1's dependency on a schedule-based reward (height
 is now available to key a reward-halving schedule off of, whenever #1
