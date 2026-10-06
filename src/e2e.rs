@@ -3,7 +3,7 @@
 //! a real miner would run (`Chain::build_block` -> `prover::prove_block`
 //! -> `block::UnprovenBlock::finish` -> `block::mine_block`, then
 //! `Chain::apply_block`). Nothing here reaches into `Chain`'s private
-//! `pmmr`/`bitmap`/`utxo` fields -- they aren't even visible from this
+//! `state`/`utxo` fields -- they aren't even visible from this
 //! module -- so every assertion goes through the same surface a real
 //! caller would have.
 
@@ -79,7 +79,7 @@ mod tests {
     /// reward, the second claims a fresh reward *and* sends the first
     /// block's reward on to another user. Confirms the send actually
     /// worked, and that the spent output can't be spent again -- using
-    /// only `Chain`'s public API, never reaching into `pmmr`/`bitmap`/
+    /// only `Chain`'s public API, never reaching into its `state`/
     /// `utxo` directly.
     #[test]
     fn miner_mines_two_blocks_and_pays_another_user() {
@@ -230,9 +230,9 @@ mod tests {
             let unproven = chain.build_block(&transactions).unwrap();
             let (target, min_timestamp, inputs) = (unproven.target, unproven.min_timestamp, unproven.inputs.len());
             let start = std::time::Instant::now();
-            let proof = prover::prove_block_auto(&unproven.inputs, &unproven.outputs, &transactions, [7; 32]).unwrap();
+            let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &transactions, &unproven.plan, [7; 32]).unwrap();
             let proving = start.elapsed();
-            let tree = proof.is_tree();
+            let tree = unproven.plan.chunks.len() > 1;
             let size = proof.len();
             let mut block = unproven.finish(proof);
             block.header.timestamp = block.header.timestamp.max(min_timestamp);
@@ -309,7 +309,7 @@ mod tests {
         let transactions: Vec<Transaction> = std::iter::once(reward_tx).chain(txs).collect();
         let unproven = chain.build_block(&transactions).unwrap();
         let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
-        let proof = prover::prove_block_auto(&unproven.inputs, &unproven.outputs, &transactions, [7; 32]).unwrap();
+        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &transactions, &unproven.plan, [7; 32]).unwrap();
         let mut block = unproven.finish(proof);
         block.header.timestamp = block.header.timestamp.max(min_timestamp);
         assert!(mine_block(&mut block, &target, u64::MAX));

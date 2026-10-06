@@ -34,7 +34,7 @@ use crate::peers::{self, ADDR_LEN};
 use std::net::SocketAddrV4;
 
 pub const MAGIC: [u8; 4] = *b"TBRN";
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 7;
 
 /// Largest packet this protocol ever sends or accepts -- comfortably
 /// under the 1280-byte IPv6 minimum MTU (and every realistic IPv4 path

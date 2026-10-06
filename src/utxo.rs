@@ -1,14 +1,14 @@
 //! A UTXO index: a reverse lookup from an output's commitment hash to its
-//! position in the `pmmr`. This is the piece `chain` validation needs to
-//! turn a spend into "where in the `pmmr` is the real output it's
-//! spending" -- without it, there's no way to check a spend against real
+//! position in the state tree (`state_tree`). This is the piece `chain`
+//! validation needs to turn a spend into "where in the state tree is the
+//! real output it's spending" -- without it, there's no way to check a spend against real
 //! chain state at all.
 //!
 //! Keyed by the *full commitment* `H(H(pubkey) || amount)` -- the same
-//! hash `pmmr` stores as the leaf, and the same hash both a spend
+//! hash the state tree holds as the leaf, and the same hash both a spend
 //! (`block::BlockBody.inputs`) and the output that created it
 //! (`block::BlockBody.outputs`) publish. Deliberately **not** keyed by
-//! `pubkey_hash` alone: this index, like `pmmr` and the published block
+//! `pubkey_hash` alone: this index, like the state tree and the published block
 //! body, never sees a plaintext `pubkey` or `amount` -- only the opaque
 //! commitment -- which is what hides both. The value is just `position`;
 //! there's no `amount` to store here anymore, since nothing on this side
@@ -19,7 +19,7 @@
 //! moment it's spent (`remove`), so a lookup naturally returns `None` for
 //! anything already spent or never created -- the same shape as a real
 //! UTXO set, and a second line of defense against double-spending a
-//! position within a block, on top of whatever the `bitmap` catches.
+//! position within a block, on top of the state tree's own spent leaves.
 //!
 //! Because the key folds in `amount`, two outputs that happen to share a
 //! public key no longer collide the way they would under a
@@ -29,8 +29,8 @@
 //! that judgment call (is a new output allowed to reuse a key that's
 //! still live) belongs to `chain` validation, which can call `get` first.
 //!
-//! Backed by LMDB via the same shared `storage::Storage` context `pmmr`
-//! and `bitmap` already use, so all three stay in one environment.
+//! Backed by LMDB via the same shared `storage::Storage` context the state
+//! tree uses, so they stay in one environment.
 
 #![allow(dead_code)]
 

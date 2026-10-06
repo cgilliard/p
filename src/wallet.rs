@@ -80,6 +80,13 @@ const PASSPHRASE_KEY: &[u8] = b"backup_passphrase";
 /// never confirmed (unanswered slates, rewards for blocks others won).
 pub const RECOVERY_INDEX_MARGIN: u32 = 1000;
 
+/// The margin instead, on a chain without spent outputs' history (a
+/// fast-synced node: its state holds only unspent outputs). Recovery then
+/// can't see keys whose outputs were all spent -- which signed, and must
+/// never be handed out again -- so it leaves a far wider gap. Indices are
+/// 32-bit, so the gap costs nothing.
+pub const RECOVERY_INDEX_MARGIN_WITHOUT_HISTORY: u32 = 100_000;
+
 /// A recovered output can't be spent until this many blocks after
 /// recovery: if the lost wallet had signed a spend of it that's still in
 /// flight, that spend gets time to show up (`observe_spend`) or confirm --
@@ -98,6 +105,12 @@ pub trait ChainView {
     /// "seen now", and skips the nonce check).
     fn output_record(&self, _commitment: &[u8; 32]) -> Option<(u64, [u8; NONCE_LEN])> {
         None
+    }
+    /// Whether this view knows every output the chain ever created, spent
+    /// ones included -- false on a node that fast-synced from a snapshot of
+    /// unspent outputs (recovery then uses a wider key margin).
+    fn has_full_history(&self) -> bool {
+        true
     }
     /// Call `f(commitment, height, nonce, unspent)` for every output the
     /// active chain has created -- what recovery scans. Returns whether
@@ -592,9 +605,12 @@ impl Wallet {
                 },
             )?;
         }
-        let resume = max_index
-            .map_or(0, |m| m.saturating_add(1))
-            .saturating_add(RECOVERY_INDEX_MARGIN);
+        let margin = if chain.has_full_history() {
+            RECOVERY_INDEX_MARGIN
+        } else {
+            RECOVERY_INDEX_MARGIN_WITHOUT_HISTORY
+        };
+        let resume = max_index.map_or(0, |m| m.saturating_add(1)).saturating_add(margin);
         let current = match self.meta.get(&wtxn, NEXT_INDEX_KEY)? {
             Some(b) => u32::from_le_bytes(b.try_into().map_err(|_| Error::Corrupt("next index"))?),
             None => 0,
@@ -1138,6 +1154,8 @@ mod tests {
     /// nonce, as the real chain's output index keeps them.
     #[derive(Default)]
     struct FakeChain {
+        /// Pretend to be fast-synced: no spent history.
+        partial: bool,
         unspent: RefCell<HashSet<[u8; 32]>>,
         height: RefCell<u64>,
         records: RefCell<std::collections::HashMap<[u8; 32], OnChain>>,
@@ -1187,9 +1205,15 @@ mod tests {
         fn output_record(&self, commitment: &[u8; 32]) -> Option<(u64, [u8; NONCE_LEN])> {
             self.records.borrow().get(commitment).copied()
         }
+        fn has_full_history(&self) -> bool {
+            !self.partial
+        }
         fn for_each_output(&self, f: &mut dyn FnMut([u8; 32], u64, [u8; NONCE_LEN], bool)) -> bool {
             for (c, &(height, nonce)) in self.records.borrow().iter() {
-                f(*c, height, nonce, self.is_unspent(c));
+                // Without history, only unspent outputs are known.
+                if self.is_unspent(c) || !self.partial {
+                    f(*c, height, nonce, self.is_unspent(c));
+                }
             }
             true
         }
@@ -1352,15 +1376,16 @@ mod tests {
     fn coin_selection_limits() {
         let da = TempDir::new("select");
         let chain = FakeChain::default();
-        // Twelve small outputs: only ten may be spent at once.
+        // Twelve small outputs: only eight (a chunk's inputs) may be spent
+        // at once.
         let alice = funded(&da, "alice5", &chain, &[100; 12]);
         let tip = chain.tip_height();
         assert!(matches!(
-            alice.send(1_050, 0, tip),
-            Err(Error::InsufficientFunds { spendable: 1_000, needed: 1_050 })
+            alice.send(850, 0, tip),
+            Err(Error::InsufficientFunds { spendable: 800, needed: 850 })
         ));
-        let s1 = alice.send(950, 10, tip).unwrap();
-        assert_eq!(s1.inputs.len(), 10);
+        let s1 = alice.send(750, 10, tip).unwrap();
+        assert_eq!(s1.inputs.len(), 8);
         // Immature rewards don't count.
         let db = TempDir::new("select-young");
         let young = open(&db, "young");
@@ -1619,6 +1644,27 @@ mod tests {
         let (plain_words, pp) = plain.backup_words().unwrap();
         assert!(!pp);
         assert_eq!(Keychain::from_phrase(&plain_words).unwrap().seed(), plain.keychain().seed());
+    }
+
+    /// On a chain without spent history, recovery can't see a spent
+    /// output's key -- possibly the highest ever used -- so it resumes
+    /// keys far past what it does see.
+    #[test]
+    fn without_spent_history_recovery_leaves_a_wider_gap() {
+        let (da, dr) = (TempDir::new("partial"), TempDir::new("partial-restored"));
+        let mut chain = FakeChain::default();
+        let lost = funded(&da, "partial", &chain, &[REWARD, REWARD]);
+        // Spend the newest reward entirely (its key is the highest used).
+        let newest = lost.outputs().unwrap().into_iter().max_by_key(|o| o.key.index).unwrap().commitment;
+        chain.mine_tx(&lost.self_transfer(Some(&[newest]), &[REWARD - 10], 10, chain.tip_height()).unwrap());
+        let used = lost.outputs().unwrap().iter().map(|o| o.key.index).max().unwrap();
+        let seed = *lost.keychain().seed();
+        drop(lost);
+        chain.partial = true;
+        let restored = Wallet::restore(&dr.0, Keychain::from_seed(seed)).unwrap();
+        let report = restored.finish_recovery(&chain).unwrap();
+        assert!(report.next_index >= RECOVERY_INDEX_MARGIN_WITHOUT_HISTORY);
+        assert!(report.next_index > used + RECOVERY_INDEX_MARGIN);
     }
 
     #[test]

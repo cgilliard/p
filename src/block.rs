@@ -9,14 +9,14 @@
 //! output publishes that hash when it's created; spending it later
 //! republishes the exact same hash. Nobody outside the prover ever learns
 //! what's behind it: not the owner, not the value. This is what makes
-//! `pmmr`'s leaves, this body, and the `utxo` index all the same kind of
+//! the state tree's leaves, this body, and the `utxo` index all the same kind of
 //! opaque value everywhere -- there's no plaintext form of this data
 //! anywhere on-chain to leak, by construction, not by discipline.
 //!
 //! **This module knows nothing about chain state.** `Block::validate`
 //! checks only what's intrinsic to the block itself -- proof of work, and
 //! that the header's `body_hash` actually matches the body -- with no
-//! `Pmmr`, `Bitmap`, or `UtxoIndex` anywhere in sight. Resolving spends
+//! `StateTree` or `UtxoIndex` anywhere in sight. Resolving spends
 //! against real chain state, catching double-spends, and applying the
 //! resulting updates are all a different, separate concern:
 //! `chain::Chain::apply_block` builds on top of this module to do that.
@@ -97,8 +97,8 @@ pub const INITIAL_MAX_HASH: [u8; 32] = {
     b
 };
 
-/// `prev_hash`, `pmmr_root`, `bitmap_root`, `body_hash` (32 bytes each),
-/// then `height` (8 bytes), `timestamp` (8 bytes), and `nonce` (32
+/// `prev_hash`, `state_root`, `body_hash` (32 bytes each), then
+/// `output_count`, `height`, `timestamp` (8 bytes each), and `nonce` (32
 /// bytes) -- `BlockHeader`'s fixed encoded width.
 ///
 /// `height` **is** a header field, deliberately -- a full node
@@ -110,14 +110,19 @@ pub const INITIAL_MAX_HASH: [u8; 32] = {
 /// block itself, without trusting an unverifiable claim or replaying
 /// anything. See `chain::Chain`'s docs for how a full node still
 /// double-checks a claimed height against what it already knows.
-pub const HEADER_LEN: usize = 32 * 4 + 8 + 8 + 32;
+pub const HEADER_LEN: usize = 32 * 3 + 8 * 3 + 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
     pub prev_hash: [u8; 32],
-    pub pmmr_root: [u8; 32],
-    pub bitmap_root: [u8; 32],
+    /// The root of the chain's state tree after this block
+    /// (`state_tree`): every output ever created, by position -- each
+    /// unspent one's commitment, or spent.
+    pub state_root: [u8; 32],
     pub body_hash: [u8; 32],
+    /// How many outputs the state tree holds after this block: the
+    /// position the next output gets.
+    pub output_count: u64,
     /// How many blocks precede this one (the first real block is height
     /// `0`). See `HEADER_LEN`'s docs for why this is a header field.
     pub height: u64,
@@ -144,12 +149,12 @@ impl BlockHeader {
     pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
         out[0..32].copy_from_slice(&self.prev_hash);
-        out[32..64].copy_from_slice(&self.pmmr_root);
-        out[64..96].copy_from_slice(&self.bitmap_root);
-        out[96..128].copy_from_slice(&self.body_hash);
-        out[128..136].copy_from_slice(&self.height.to_be_bytes());
-        out[136..144].copy_from_slice(&self.timestamp.to_be_bytes());
-        out[144..176].copy_from_slice(&self.nonce);
+        out[32..64].copy_from_slice(&self.state_root);
+        out[64..96].copy_from_slice(&self.body_hash);
+        out[96..104].copy_from_slice(&self.output_count.to_be_bytes());
+        out[104..112].copy_from_slice(&self.height.to_be_bytes());
+        out[112..120].copy_from_slice(&self.timestamp.to_be_bytes());
+        out[120..152].copy_from_slice(&self.nonce);
         out
     }
 
@@ -166,12 +171,12 @@ impl BlockHeader {
         }
         Ok(BlockHeader {
             prev_hash: bytes[0..32].try_into().unwrap(),
-            pmmr_root: bytes[32..64].try_into().unwrap(),
-            bitmap_root: bytes[64..96].try_into().unwrap(),
-            body_hash: bytes[96..128].try_into().unwrap(),
-            height: u64::from_be_bytes(bytes[128..136].try_into().unwrap()),
-            timestamp: u64::from_be_bytes(bytes[136..144].try_into().unwrap()),
-            nonce: bytes[144..176].try_into().unwrap(),
+            state_root: bytes[32..64].try_into().unwrap(),
+            body_hash: bytes[64..96].try_into().unwrap(),
+            output_count: u64::from_be_bytes(bytes[96..104].try_into().unwrap()),
+            height: u64::from_be_bytes(bytes[104..112].try_into().unwrap()),
+            timestamp: u64::from_be_bytes(bytes[112..120].try_into().unwrap()),
+            nonce: bytes[120..152].try_into().unwrap(),
         })
     }
 
@@ -184,11 +189,11 @@ impl BlockHeader {
     /// commits to it (see `BlockBody`'s docs), so PoW covers it
     /// transitively.
     pub(crate) fn pow_preimage(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(32 * 4 + 8 + 8);
+        let mut bytes = Vec::with_capacity(HEADER_LEN - 32);
         bytes.extend_from_slice(&self.prev_hash);
-        bytes.extend_from_slice(&self.pmmr_root);
-        bytes.extend_from_slice(&self.bitmap_root);
+        bytes.extend_from_slice(&self.state_root);
         bytes.extend_from_slice(&self.body_hash);
+        bytes.extend_from_slice(&self.output_count.to_be_bytes());
         bytes.extend_from_slice(&self.height.to_be_bytes());
         bytes.extend_from_slice(&self.timestamp.to_be_bytes());
         bytes
@@ -341,10 +346,11 @@ impl BlockBody {
     }
 
     /// Whether `proof` actually attests to this body's `inputs`/
-    /// `outputs` -- see `prover`'s docs. By far the most expensive check
-    /// a block gets.
-    pub fn proof_is_valid(&self) -> bool {
-        self.proof.verify(&self.inputs, &self.outputs, &self.nonces)
+    /// `outputs`, and to the state moving as `state` says (from the
+    /// parent's root and output count to the header's) -- see `prover`'s
+    /// docs. By far the most expensive check a block gets.
+    pub fn proof_is_valid(&self, state: &crate::aggregate::StateChange) -> bool {
+        self.proof.verify(&self.inputs, &self.outputs, &self.nonces, state)
     }
 
     /// `to_bytes().len()`, without building the bytes.
@@ -462,8 +468,8 @@ impl BlockBody {
 }
 
 /// What `chain::Chain::build_block` actually produces: every chain-
-/// state-dependent field resolved (`prev_hash`, `height`, `pmmr_root`,
-/// `bitmap_root`, and the flat `inputs`/`outputs` lists), but no proof
+/// state-dependent field resolved (`prev_hash`, `height`, `state_root`,
+/// `output_count`, and the flat `inputs`/`outputs` lists), but no proof
 /// yet, and so no `Block` yet either -- `BlockBody`/`Block` both require
 /// a real `proof` (see `BlockBody`'s docs), and this type deliberately
 /// doesn't carry one. `finish` is the only way to turn this into an
@@ -485,11 +491,14 @@ pub struct UnprovenBlock {
     /// past its parent's, since timestamps must strictly increase (a
     /// consensus rule -- see `chain`'s docs). `0` for a first block.
     pub min_timestamp: u64,
-    pub pmmr_root: [u8; 32],
-    pub bitmap_root: [u8; 32],
+    pub state_root: [u8; 32],
+    pub output_count: u64,
     pub inputs: Vec<[u8; 32]>,
     pub outputs: Vec<[u8; 32]>,
     pub nonces: Vec<[u8; NONCE_LEN]>,
+    /// How to prove it: its transactions' chunks and each chunk's state
+    /// transition, worked out against the parent's state.
+    pub plan: crate::prover::BlockPlan,
 }
 
 impl UnprovenBlock {
@@ -506,6 +515,14 @@ impl UnprovenBlock {
     /// left at `[0; 32]` -- `pow::mine_block` is the only thing that
     /// sets it, and only once this has already happened.
     pub fn finish(self, proof: Proof) -> Block {
+        // A placeholder (empty) proof, for chains that skip proof checks,
+        // still records the chunks, so applying the block appends its
+        // outputs in the order this plan did.
+        let proof = if proof.is_empty() && !self.plan.body_chunks.is_empty() {
+            Proof::header_only(self.inputs.len(), self.outputs.len(), &self.plan.body_chunks)
+        } else {
+            proof
+        };
         let body = BlockBody {
             inputs: self.inputs,
             outputs: self.outputs,
@@ -514,8 +531,8 @@ impl UnprovenBlock {
         };
         let header = BlockHeader {
             prev_hash: self.prev_hash,
-            pmmr_root: self.pmmr_root,
-            bitmap_root: self.bitmap_root,
+            state_root: self.state_root,
+            output_count: self.output_count,
             body_hash: body.body_hash(),
             height: self.height,
             timestamp: now_millis().max(self.min_timestamp),
@@ -572,8 +589,23 @@ impl Block {
     /// against this target" regardless of how the value in hand was
     /// constructed, rather than a check that's only honest if you also
     /// know it arrived via `from_bytes`.
-    pub fn validate(&self, target: &[u8; 32]) -> bool {
-        self.validate_structure(target) && self.body.proof_is_valid()
+    ///
+    /// The proof also attests the state transition, so it's checked
+    /// against the parent's state: `parent_state` is its `(state_root,
+    /// output_count)`.
+    pub fn validate(&self, target: &[u8; 32], parent_state: ([u8; 32], u64)) -> bool {
+        self.validate_structure(target) && self.body.proof_is_valid(&self.state_change(parent_state))
+    }
+
+    /// The state change this block claims, from its parent's state.
+    pub fn state_change(&self, (root, count): ([u8; 32], u64)) -> crate::aggregate::StateChange {
+        use crate::poseidon2::digest_from_bytes;
+        crate::aggregate::StateChange {
+            root_in: digest_from_bytes(&root),
+            count_in: count,
+            root_out: digest_from_bytes(&self.header.state_root),
+            count_out: self.header.output_count,
+        }
     }
 
     /// Everything `validate` checks *except* the proof -- every cheap,
@@ -700,8 +732,8 @@ mod tests {
     fn empty_block_with_correct_pow_and_body_hash_validates() {
         let header = mined_header(BlockHeader {
             prev_hash: [1u8; 32],
-            pmmr_root: [2u8; 32],
-            bitmap_root: [3u8; 32],
+            state_root: [2u8; 32],
+            output_count: 3,
             body_hash: BlockBody::new().body_hash(),
             height: 0,
             timestamp: 0,
@@ -721,8 +753,8 @@ mod tests {
     fn wrong_pow_is_rejected() {
         let header = BlockHeader {
             prev_hash: [1u8; 32],
-            pmmr_root: [2u8; 32],
-            bitmap_root: [3u8; 32],
+            state_root: [2u8; 32],
+            output_count: 3,
             body_hash: [4u8; 32],
             height: 0,
             timestamp: 0,
@@ -748,8 +780,8 @@ mod tests {
     fn wrong_body_hash_is_rejected() {
         let header = mined_header(BlockHeader {
             prev_hash: [1u8; 32],
-            pmmr_root: [2u8; 32],
-            bitmap_root: [3u8; 32],
+            state_root: [2u8; 32],
+            output_count: 3,
             body_hash: [0xABu8; 32], // does not match BlockBody::new()'s hash
             height: 0,
             timestamp: 0,
@@ -803,8 +835,8 @@ mod tests {
     fn header_round_trips_through_bytes() {
         let header = mined_header(BlockHeader {
             prev_hash: [1u8; 32],
-            pmmr_root: [2u8; 32],
-            bitmap_root: [3u8; 32],
+            state_root: [2u8; 32],
+            output_count: 3,
             body_hash: [4u8; 32],
             height: 0,
             timestamp: 1_700_000_000,
@@ -820,8 +852,8 @@ mod tests {
     fn tampering_timestamp_after_mining_invalidates_pow() {
         let header = mined_header(BlockHeader {
             prev_hash: [1u8; 32],
-            pmmr_root: [2u8; 32],
-            bitmap_root: [3u8; 32],
+            state_root: [2u8; 32],
+            output_count: 3,
             body_hash: [4u8; 32],
             height: 0,
             timestamp: 1_700_000_000,
@@ -841,8 +873,8 @@ mod tests {
     fn header_from_bytes_rejects_wrong_length() {
         let header = mined_header(BlockHeader {
             prev_hash: [1u8; 32],
-            pmmr_root: [2u8; 32],
-            bitmap_root: [3u8; 32],
+            state_root: [2u8; 32],
+            output_count: 3,
             body_hash: [4u8; 32],
             height: 0,
             timestamp: 0,
@@ -900,8 +932,8 @@ mod tests {
         });
         let header = mined_header(BlockHeader {
             prev_hash: [9u8; 32],
-            pmmr_root: [8u8; 32],
-            bitmap_root: [7u8; 32],
+            state_root: [8u8; 32],
+            output_count: 7,
             body_hash: body.body_hash(),
             height: 0,
             timestamp: 0,
@@ -996,8 +1028,8 @@ mod tests {
 
         let header = mined_header(BlockHeader {
             prev_hash: [0u8; 32],
-            pmmr_root: [0u8; 32],
-            bitmap_root: [0u8; 32],
+            state_root: [0u8; 32],
+            output_count: 0,
             body_hash: body.body_hash(),
             height: 0,
             timestamp: 0,
@@ -1028,8 +1060,8 @@ mod tests {
 
         let header = mined_header(BlockHeader {
             prev_hash: [0u8; 32],
-            pmmr_root: [0u8; 32],
-            bitmap_root: [0u8; 32],
+            state_root: [0u8; 32],
+            output_count: 0,
             body_hash: body.body_hash(), // matches honestly, PoW is fine
             height: 0,
             timestamp: 0,
@@ -1082,8 +1114,8 @@ mod tests {
     fn mined_block(body: BlockBody) -> Block {
         let header = mined_header(BlockHeader {
             prev_hash: [0u8; 32],
-            pmmr_root: [0u8; 32],
-            bitmap_root: [0u8; 32],
+            state_root: [0u8; 32],
+            output_count: 0,
             body_hash: body.body_hash(),
             height: 0,
             timestamp: 0,

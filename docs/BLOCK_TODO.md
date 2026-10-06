@@ -1,5 +1,11 @@
 # Block/chain TODO
 
+> Note (2026-10-06): the PMMR and bitmap mentioned below were replaced by
+> one fixed-depth state tree (`state_tree.rs`; see
+> `docs/CHAIN_RECURSION.md`). Unwinding a block now restores spent leaves
+> and truncates the appended ones; the header carries `state_root` and
+> `output_count`.
+
 Gaps identified after `chain.rs`/`block.rs`/`prover.rs` (stub) were wired
 together and verified end-to-end (`e2e.rs`: a miner mining two blocks,
 paying another user, the recipient spending onward, a double-spend

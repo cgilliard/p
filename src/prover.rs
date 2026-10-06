@@ -14,7 +14,7 @@
 //!
 //! Deliberately generic over raw commitment lists (`inputs`/`outputs` as
 //! `&[[u8; 32]]`), not `block::BlockBody` -- same layering discipline
-//! already used by `pmmr`/`bitmap`: this module doesn't need to know
+//! already used by `state_tree`/`utxo`: this module doesn't need to know
 //! `BlockBody`'s specific shape, just the commitments it's attesting
 //! about. It also avoids a dependency cycle: `BlockBody` holds a `Proof`
 //! (see that module's docs), so `Proof` can't be defined in terms of
@@ -26,10 +26,9 @@
 #![allow(dead_code)]
 
 use crate::recovery::NONCE_LEN;
-use crate::aggregate::{self, Key, TreeParams, VerifyingKey};
+use crate::aggregate::{self, ChunkTransition, Key, StateChange, TreeParams, VerifyingKey};
 use crate::block_air::{self, BlockAir, ChunkShape};
 use crate::poseidon2::{BabyBear, P, digest_from_bytes, hash_bytes_32};
-use crate::poseidon2_air::ROWS;
 use crate::stark::{self, Params};
 use crate::transaction::Transaction;
 
@@ -51,27 +50,24 @@ pub const PARAMS: Params = Params {
     hiding: true,
 };
 
-/// Every proof starts with its kind.
-const KIND_DIRECT: u8 = 0;
+/// Every proof starts with its kind. (Kind 0, a direct proof of the
+/// whole block in one trace, was retired: a chain step can only verify
+/// one fixed proof shape -- `docs/CHAIN_RECURSION.md`.)
 const KIND_TREE: u8 = 1;
 
 /// An encoded block proof -- what's published and hashed into
-/// `body_hash`, decoded only to verify. Either kind proves the same
-/// statement about the body's commitment lists, and consensus accepts
-/// either for any block:
+/// `body_hash`, decoded only to verify. The block's transactions are
+/// proven in chunks (`CHUNK_SHAPE`), each chunk's proof wrapped together
+/// with the chunk's state transition, and the wraps aggregated
+/// (`aggregate`) -- encoded as: the kind (`KIND_TREE`), the root's amount
+/// totals `A`, `B` (`u64`s; `A - B` must be `REWARD`), the chunk count
+/// (`u16`), every input's and then every output's chunk (`u16` each, in
+/// body order), and the root `stark::Proof`.
 ///
-/// - **Direct** (`KIND_DIRECT`): the whole block in one `block_air`
-///   trace -- then the trace's block count (`u32`, little-endian) and the
-///   `stark::Proof`. Cheapest for small blocks; one trace can hold only
-///   so much.
-/// - **Tree** (`KIND_TREE`): the block's transactions proven in chunks
-///   (`CHUNK_SHAPE`) and aggregated (`aggregate`) -- then the root's
-///   amount totals `A`, `B` (`u64`s; `A - B` must be `REWARD`), the chunk
-///   count (`u16`), every input's and then every output's chunk (`u16`
-///   each, in body order), and the root `stark::Proof`. Any size.
-///
-/// Which kind to make is the miner's choice; `prove_block_auto` is the
-/// reference miner's rule.
+/// It attests that the body's commitments are authorized and balance,
+/// **and** that applying them -- chunk by chunk, inputs spent, outputs
+/// appended in chunk order -- takes the parent's state (`state_tree`
+/// root and output count) to the block's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Proof {
     bytes: Vec<u8>,
@@ -97,13 +93,15 @@ fn nonce_elements(nonces: &[[u8; NONCE_LEN]]) -> Vec<[BabyBear; 8]> {
 
 // ---- Tree proofs: consensus constants ----------------------------------------
 
-/// Every chunk's shape: up to 10 inputs and 256 outputs, padded to 2^17
-/// rows (4096 blocks; ten inputs take about 2,600). A transaction with
-/// more inputs than a chunk holds can only go in a direct proof.
+/// Every chunk's shape: up to 8 inputs and 20 outputs, padded to 2^17
+/// rows (4096 blocks). Also the most one transaction may have, since a
+/// transaction is proven whole in one chunk. Sized so the wrap circuit --
+/// which verifies the chunk proof *and* applies the chunk's 28 state
+/// updates -- fits the tree's 2^18 rows.
 pub const CHUNK_SHAPE: ChunkShape = ChunkShape {
     num_blocks: 4096,
-    inputs: 10,
-    outputs: 256,
+    inputs: 8,
+    outputs: 20,
 };
 
 /// Chunk proofs use the block parameters (zero knowledge: their witness
@@ -131,8 +129,8 @@ const TREE_LOG_LDE: usize = 24;
 /// The verifying keys: the wrap and aggregation circuits' preprocessed
 /// caps, as hex. Derived from the circuits (see the `tree_keys` test,
 /// which regenerates them); any change to those circuits changes these.
-const WRAP_CAP: &str = "50fc1065320d304ed895ba1f2d3e5125e32cd16a0d2c426eab165671bcbb0325c08ff50eda98885290d340586cf83f4424b0a44477884823afa3430b21f9706d40552b453dafd4497429e221d114c83ea62dca7357cc18226044e9426ab2623b1008a4288052a31f7a40f152cf6c960e789c0d1bd0f1f55d2744576dada872489a77fa3934638e1e5339a64667e9c72b92462f5646018a75636c0e0df2b7c9583702f15b2b5c5e74d64b0f5e37963f075876d409e8581c614e6178052c7f142eb2a3bc6ae1f7f2474f177b1cc451822cd17de2109dc69f2362f9d54c233b6d761930176eabb30463c624a82ff6b48857d162c773e3d80777a505fa282ae9bc4eec9dcd55c04e75309352541b75584b0a3b27fb0fc2052937ff7d154ae913bc14d29f99485f9276461bb51935c026bb4a86815060f9c7c253d1b8b4133856794893fd1c37582e7e3f56b1bd57d20e2a41613fe135a400310a7757f36576b33e3a128c5a17fea3cc4880c86e1728e2ab00c9781f648d277f46b8bd457232037f02104fcd35a170645ee8f9be150b4c4d69d1871852355f2935a326f9716829725e28610e3d63ddc51037b1f06fda824b71a0d2cb48d427115a31da190618a9966487ff1537d52004405636d95b3b74a12f417c4e453aaffd30f23d9a1e63409965dd2df5486f095373c51b6008e7b6c473d5a5ef2624824200ead5d33fc520ce1e9127ab71c8d409537b381151b964f410e5cc91337ab108183caf723f3e240c2635a181607ee0472d21b876248b0e012dc1f5d06663526048eaeee2642be3420fb3d16153e414e03c9238f141bf232a748c043006cd0c9977e9c652230bf80219012b071e416e976e8ab4017402f64b57c574f95e58d94a2491724839950e2e2a3be311566c473e752a926f614c7f315b135aca521eb9fc487aebe125396190518cf7b349e309505a6d1b1243a19b7e34cce2053db00e79281167a62b990cde137f3bb272936632596ff5397119e3e80693fd794360645d58e9579b52442c1532ed43323d98911c06e34eea489aaa1d028a2efc2245bf786bc6ed3041de19103f24e9fb6536c5ac27ebada61968498823e6021408815a6f727d7b2275bd09da2ac00b1a07aa7c4f6a80c190447b05ee469526571fa446e7042a1c320399ffa91252f3376274980f5238fd7d30e8de5250f6b1e158b5f87e2d8311d06d1f6bf90f2307e906b3461d32943fb500891bb4095695e02de6bf935a1a966146f0a6fa7003a96b75f1b6d20ab0e0d574a541dc1d905b8e43379d494a4ab77c778dfcb726555f4a713c1be91ea0f4385e2a8fdb3d83789d1e6250bd477619534ed5c68f4b995cc429a58dcd2885f4f41870d86964045d78618eba0d014a08d26a9e4832541500ac3fc171285478532d366740c765e5e6963cc3f4344af86ab30e05358908";
-const AGGREGATE_CAP: &str = "34f3753a5695284bfe15c03ef2d73513157321718ab749542edecc70c4b9d50df7bbcb40d52d8c4214722733767eb028877f685238138769ceb3350868e3152536e20a5b0bf1180a36b3b531f36e1f17d896b12fe868fd738e341f4036fbf44e08b79b415e55c66817459b14f021df05762dc53ccca7171dff1099345a48361c657e3f12da9cb4061546790aa2afba3041ac4a2393cab95324dd2e4025fd074bcb531c24d23942011ff2531d1f16021b39ef9a3314af2d33bb66272011fc436dd54dc854c568156817308671ffb2e80227df800496e45239185cc63859e2ea480068423192950131b4161b38eccd6741990e2d138e7289044570961e9099b66244e1d051a40e792c349aca12290e110d82c6db082af5605d9afc8d1ed7ba544fe19edf030af45402de1c2f05e536405ac9d4396160b99d0cf140d81d3a63d063567a1a54a92a8c6355fa23381741e4230a62a84bfeedec24c7a82c25c82b6f31b1208a746e23006d13fecf7687e5c226f9de0740b241a015116595597a09923af0e31f2e3bd6d62fa9abc066a06ac63b1d8600042952212adc16d43ecd89834a18299d4d08666a5408be83684f90eb38fa124f2465612b312c0b6924aa7efc51b2068c5099d94e335dc9fc59cc53276b7c3fbb0802be111a90244a4d238cb85fb7d43f4118ef2507919516401005be5bb9e91f50e08fcf4a9d0e98047f29981da439696e6a207b5edc1b3b52c5baad6cf75e201dc4c08a4dee997772acd6ae377630c8177c792f6fb9b89c74b4df901bdf01720a6e5f1972a5fed7133a50ec084dec286d19a3fd551b02cb28b0f9324ab8039c0ba1eebe752bd9c17591c0225d53609e4664237d4e69e8d009b8052475a279903337cb563f29c9063e0d26d120979eac76ad894c2f43b4a70b0d5c172bbf268755601af1544200622483404a60097f834a860f6e2ef77f835a860a5a02b10ced1b5ec2bf4a224a681f62f632290fbd2b0a6260bd3f02a5904c0de4524b160ee11bba89f73608f14b60781d1e177bdae568df80830536fcdf660cd3090253be5143d76672631b5c104b266eb93d20a0826489fd6d01bb5db4290239dc296c0c6a00e048d30e2e202204b0fd7e11207e680d2d9da047f955325cc49f19722899b26d20130167b3cefa76bc3ad84df58c826a5784536d01717171c9e1a341fb69fb60a560a248afcc89481fdb2f40300e6d58991cae258b1c7e255828d56a59124a639d2d4a6d888053173bea833289bb604f27f67d2529383561614b873cdf72a569db6d4b36e131ee0a24b569552f8ee31dd38d0657a9240217066ee802e40a307601e20d148dfc07628730ba6777cc551d0f581d1584fa394a75dc7d6f5bff903597891d6c6203c72920d23132df6eb85a3257254b72d4bd39efcaeb60f0a7a3723ea95c6ebc80474ea1a8e54d";
+const WRAP_CAP: &str = "afb2257750e6971509069a77563a73227ad0e15fb5401a09d639a906bc7ba2710f658927aadc762226170509e14e903e635c3814e9be4f431b0ea46da85c631c1b1b6f0f76c6081fb9dec31c622e8749e92118389c80d94d3b03e82e962cf80ad210ad481fc8385c41cbfc1320286a4c9241b92c67764201570a2c3b4de1286084f4052bdfea616fb1cce65462121e51ee62eb6aa8a0ff3f85075725a8e0804541935015fa0174224096b1662392b600db78ec264d0ea220c1f09e210fc8ba4257245c0a9ad5e154b66ca140b65e3c3a8028ca1f92bfaa578dd7675103d0685dae7e5a350b5b6207f798a627b5b8ec4d4a6b525ec308a53db77383068e74690bce5c5a3041b74776b1dae05bfb5b3e46461e231e3eb7fc2f8ab08c3063cf7d0994634e55ead5d7442828a50f4bcef2310d248e6f82eca036bb6dcd4479dc2d02bd4b491eb0b52a6f9b32c05a097d8b103c2f9c24e07f790aba321620e0fff06500fef302ee51900357111f1ab95a276637fadc5ad815035ed66e116d37885420bb28b85b3eb08976b2f6f6671c72e0201fb94d50cbf84c46e5be1e0f24a0ca69b6330305c9799606c3503966e708cb59811174163ba4e62fb1ef385cf7914a77473a0218452c620bda402433049d3d04cf54b04ce2660d168ce2a13571d8ac67c46a6e3bc3ad1119ca2a873072603e1783345950c1ceff5caf95b61596246501bfe95b054950a656e4ea932e8f7d1143a23954495bf73903b6a42416f22c06639046912fd5253d3f74e8404ed3617212e76d4a0169f445679ca7a523dc7f85134e248126454427313f2e185728bcf74626985270ae60c8751196f11377a8886c35552c6645803d5fa9ef441940f292518288154d03e76442511fe82c43d2024fc42ca32505d3f204ed51b2013fbcfd336bba1e32a8e6390afbcbae17f0c92a2f758f6658a05f6477b8ce535422958f3c2de6a94a6f37ce1206f96555d054ea58381e4450ef6eda748c38e0427d27f360fdec7d5da1929215ca8b9247ecdba854079c1e5b0591d55a1bf844445c5b22742edab43ff426dc6c6b8fba518b482725560e00352ba6dc03477320577fbe312802acad33b0a503597bb6605248fa435b4283621dc8c0783bcd76e7562640d9266a4996228b9702062a417b1d595ddf3e499790600a275a0ace0eda0f5732d76fa7d6831fed8e231b41f597665d6ba05fd4c1f762beb1696d4133d22141cdae26a8ca6812538075105a0f35429587a60dd41927083b442b5b0a271d61408c2131fa1d7036f66025179cc0b53c0f3bdf5a071299619beb061570d46a036b3f68742b061c053d31c55293d9d13aff7c4544eb2ea13a388a1337c6919300a2b42244d67ac65f4a721a4ad79d956fb03c16163d51dd761b596520e3750d1af0983a1b66edae65b2d19953afa2aa6947de913e";
+const AGGREGATE_CAP: &str = "c8666b02152ab74925db740796d448599c6a1733c35cfd00ecad83391d31cc4742f5fd1bcfda622750dc324e110b72013bf26f1c0283ec04f652cf741583f76162932757217f9629add59429740cdd14892cce77fcc0501aaf87bc47fea958110da3cf6b0b5aa315a9174453df89613c81aaa60ac16fa4731bf9d146df17c75e2cc144715800a910f00d7c365c2a0950e10c293c4c0fe3016f69005fe78b941579ad6721da0c020535ccb476b8cfc23630789738457a234669d961449e53721ebe05a21265293e37cf1428615509fc71b3c6310d38313e4a02afc921b96df43b9054496cb6ec5f4d91dae3662cb38e2112b67462a002d75d40309c55a63fda6eab9983127786b832e02213021a5f037283e98e29908fdd4e6361912ebba60433ce9dd865c1ca3212530d2b6d4afd9b40f761f652dd3fd8594247af7351336d0a24f217485d1d75635d0dad5678e72967c954f6408c076e34ab41142d71462a1017ad37354de63165c29c4f37b3c3ff5aace7c200785782348212e03be34e6d0f5b5a946fbced985e8e7147556d61bf224bcfc0620eccc768e76e1a290adaee1e37947107e1d3094f36e451527111120792569065de8ea40fa7519b28fe96a417b1f3dc3af287680009da49739e22f103ed9f58738531346e22e771706884ad59dc9c131213aa93742f941b20bfff5770430c083ec53a23555296e574240ee7262d7e2b4085c3533f39a686751ca272496818a54ba6ff811fdd45215ea034865580c9b71cea5eab0f074ae13d99304e7293915170570c0b6a9a87ae0da3f08365647e0310925e4223ad5df34eb42dc26e4175773556abb12097aa3821ea00c955a8f7316338f26149847035368385731b247c712166365f507f80574c440f3b1c3b3f556f592fcd58c0eb840c26edc3734626e2261b4f680a95c2f5292dcd877415ade800fc95290ff8d0b56817b7562be276cf1bf654cd5b251c0500b209a6457b8d515a6614a303ad3ddc43dbbca5255a16ff2f3632af3e136f7b1bac28495c1abd0a216b132d220723c35bb22fca39d889a2218d5fb759cf48392c8ed1f037ce0ef708a9ccd708ae737a56b710f86c970c902968a3d4197819ad2ab9225b701c00c655566f814d4f81a4205505ed42807df40f5770246d2f57584fd0adfa4601d81c070764bb44f2f5894559fb5f0f4bd22f6426de93251db9744c3707854ce6259a2fdaf00d2311d833252d999319cce5a15d3821846f8c8f6a25861d657103505a2646ed140bd54fd312d59d190f8e523c67b0487a645a47a066a80b962025535e010dd869096585e54debe11e522f792509d0b02377cfc6c01e185bf65d5dd2432f6db85044c134cc610eb9e26a8cb62c421eaed649ca35e911050d543a8bf1c26d5de9b400ee26c04343e6443883ca734727f51c1ff078a10157cd711c";
 
 fn cap_from_hex(hex: &str) -> Vec<[u8; 32]> {
     let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
@@ -190,9 +188,25 @@ impl Proof {
         self.bytes.is_empty()
     }
 
-    /// Whether this is a tree proof (else direct, or garbage).
+    /// Whether this is a tree proof (else garbage).
     pub fn is_tree(&self) -> bool {
         self.bytes.first() == Some(&KIND_TREE)
+    }
+
+    /// Which chunk each of the body's inputs and outputs is in -- the
+    /// order the state applies them in (chunk by chunk) -- as each chunk's
+    /// indices into the body's lists, body order within each. `None` if
+    /// the proof's header doesn't parse for lists of these lengths.
+    pub fn chunk_assignment(&self, inputs: usize, outputs: usize) -> Option<Vec<(Vec<usize>, Vec<usize>)>> {
+        let (_, count, input_chunks, output_chunks, _) = parse_header_and_rest(&self.bytes, inputs, outputs)?;
+        let mut chunks = vec![(Vec::new(), Vec::new()); count];
+        for (i, &c) in input_chunks.iter().enumerate() {
+            chunks[c as usize].0.push(i);
+        }
+        for (o, &c) in output_chunks.iter().enumerate() {
+            chunks[c as usize].1.push(o);
+        }
+        Some(chunks)
     }
 
     /// An empty stand-in proof, for tests about everything *but* proofs
@@ -202,6 +216,29 @@ impl Proof {
         Proof::default()
     }
 
+    /// A proof with only a header -- the chunk each of the body's inputs
+    /// and outputs is in -- and no STARK proof: for chains that skip
+    /// proof checks (tests), so a block still says the order its outputs
+    /// are appended in. Never valid.
+    pub fn header_only(inputs: usize, outputs: usize, body_chunks: &[(Vec<usize>, Vec<usize>)]) -> Self {
+        let (mut input_chunks, mut output_chunks) = (vec![0u16; inputs], vec![0u16; outputs]);
+        for (k, (ins, outs)) in body_chunks.iter().enumerate() {
+            for &i in ins {
+                input_chunks[i] = k as u16;
+            }
+            for &o in outs {
+                output_chunks[o] = k as u16;
+            }
+        }
+        let mut bytes = vec![KIND_TREE];
+        bytes.extend([0u8; 16]);
+        bytes.extend((body_chunks.len() as u16).to_le_bytes());
+        for c in input_chunks.iter().chain(&output_chunks) {
+            bytes.extend(c.to_le_bytes());
+        }
+        Proof { bytes }
+    }
+
     /// What `BlockBody::body_hash` folds in to commit to the proof.
     pub fn commitment_hash(&self) -> [u8; 32] {
         hash_bytes_32(&self.bytes)
@@ -209,34 +246,34 @@ impl Proof {
 
     /// Whether this proves the block statement for exactly these public
     /// commitment lists and outputs' recovery nonces (`nonces[i]` is
-    /// `outputs[i]`'s) -- of either kind.
-    pub fn verify(&self, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]]) -> bool {
+    /// `outputs[i]`'s), with the state moving as `state` says.
+    pub fn verify(&self, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange) -> bool {
         if !inputs.iter().chain(outputs).all(is_canonical) || nonces.len() != outputs.len() {
             return false;
         }
-        let mut r = Bytes(&self.bytes);
-        match r.take(1).map(|k| k[0]) {
-            Some(KIND_DIRECT) => verify_direct(r, inputs, outputs, nonces),
-            Some(KIND_TREE) => verify_tree(r, inputs, outputs, nonces),
-            _ => false,
-        }
+        verify_tree(&self.bytes, inputs, outputs, nonces, state)
     }
 }
 
-fn verify_direct(mut r: Bytes, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]]) -> bool {
-    let Some(num_blocks) = r.u32().map(|n| n as usize) else {
-        return false;
-    };
-    let max_blocks = (1 << block_air::max_log_rows(&PARAMS)) / ROWS;
-    if !num_blocks.is_power_of_two() || num_blocks < 2 || num_blocks > max_blocks {
-        return false;
+/// A tree proof's header: amounts, chunk count, every input's and every
+/// output's chunk; and the root proof's bytes.
+type Header<'a> = ((u64, u64), usize, Vec<u16>, Vec<u16>, &'a [u8]);
+
+fn parse_header_and_rest(bytes: &[u8], inputs: usize, outputs: usize) -> Option<Header<'_>> {
+    let mut r = Bytes(bytes);
+    if r.take(1)? != [KIND_TREE] {
+        return None;
     }
-    let Some(proof) = stark::Proof::from_bytes(r.0) else {
-        return false;
-    };
-    let air = BlockAir::new(num_blocks, elements(inputs), elements(outputs), nonce_elements(nonces), REWARD);
-    stark::verify(&air, &proof, &PARAMS)
+    let amounts = (r.u64()?, r.u64()?);
+    let count = r.u16()? as usize;
+    let input_chunks: Vec<u16> = (0..inputs).map(|_| r.u16()).collect::<Option<_>>()?;
+    let output_chunks: Vec<u16> = (0..outputs).map(|_| r.u16()).collect::<Option<_>>()?;
+    if count == 0 || input_chunks.iter().chain(&output_chunks).any(|&c| c as usize >= count) {
+        return None;
+    }
+    Some((amounts, count, input_chunks, output_chunks, r.0))
 }
+
 
 /// One chunk's input and output commitments, and its outputs' nonces.
 type ChunkLists = (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<[u8; NONCE_LEN]>);
@@ -278,76 +315,41 @@ fn chunk_air(inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN
     )
 }
 
-fn verify_tree(mut r: Bytes, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]]) -> bool {
-    let header = (|| {
-        let amounts = (r.u64()?, r.u64()?);
-        let count = r.u16()? as usize;
-        let input_chunks: Vec<u16> = (0..inputs.len()).map(|_| r.u16()).collect::<Option<_>>()?;
-        let output_chunks: Vec<u16> = (0..outputs.len()).map(|_| r.u16()).collect::<Option<_>>()?;
-        Some((amounts, count, input_chunks, output_chunks))
-    })();
-    let Some((amounts, count, input_chunks, output_chunks)) = header else {
+fn verify_tree(bytes: &[u8], inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange) -> bool {
+    let Some((amounts, count, input_chunks, output_chunks, rest)) = parse_header_and_rest(bytes, inputs.len(), outputs.len()) else {
         return false;
     };
-    if count == 0 {
-        return false;
-    }
     let Some(chunks) = chunk_lists(count, &input_chunks, &output_chunks, inputs, outputs, nonces) else {
         return false;
     };
-    let Some(proof) = stark::Proof::from_bytes(r.0) else {
+    let Some(proof) = stark::Proof::from_bytes(rest) else {
         return false;
     };
     // A chunk's data leaves its amounts out, so any will do here.
     let airs: Vec<BlockAir> = chunks.iter().map(|(i, o, n)| chunk_air(i, o, n, (0, 0))).collect();
-    tree_verifying_key().verify_block(&airs, amounts, REWARD, &proof)
+    tree_verifying_key().verify_block(&airs, amounts, REWARD, state, &proof)
 }
 
-/// Prove the block statement for `transactions` (each fully signed),
-/// whose commitments must come out to exactly `inputs` and `outputs` --
-/// the lists the block body will publish -- as a direct proof. `seed`
-/// must be fresh random bytes for every proof: it's what keeps the proof
-/// zero-knowledge (see `stark`'s docs). `None` if the transactions don't
-/// verify, don't balance against `REWARD`, don't match the lists, or
-/// don't fit one trace.
-pub fn prove_block(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions: &[Transaction], seed: [u8; 32]) -> Option<Proof> {
-    let witness = block_air::build(transactions, REWARD).ok()?;
-    if witness.air.public_inputs() != elements(inputs) || witness.air.public_outputs() != elements(outputs) {
-        return None;
-    }
-    let proof = stark::prove(&witness.air, &witness.trace, &PARAMS, seed).ok()?;
-    let mut bytes = vec![KIND_DIRECT];
-    bytes.extend((witness.air.num_blocks() as u32).to_le_bytes());
-    bytes.extend(proof.to_bytes());
-    Some(Proof { bytes })
+/// How a block's transactions are proven: grouped, in order, into chunks
+/// (`plan_chunks`), and each chunk's state transition -- what
+/// `chain::Chain::build_block` works out against the parent's state.
+#[derive(Clone, Debug)]
+pub struct BlockPlan {
+    /// Each chunk's transactions, as indices into the block's list.
+    pub chunks: Vec<Vec<usize>>,
+    /// Each chunk's commitments, as indices into the body's input and
+    /// output lists (body order within each).
+    pub body_chunks: Vec<(Vec<usize>, Vec<usize>)>,
+    pub transitions: Vec<ChunkTransition>,
 }
 
-/// The reference miner's rule: a direct proof for blocks of up to
-/// `CHUNK_SHAPE.inputs` inputs, a tree proof beyond (falling back to
-/// direct if the block can't be chunked -- a transaction with too many
-/// inputs or outputs for one chunk). Consensus accepts either kind for any
-/// block; this is only a cost choice.
-pub fn prove_block_auto(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions: &[Transaction], seed: [u8; 32]) -> Option<Proof> {
-    if prefers_tree(inputs.len())
-        && let Some(proof) = prove_block_tree(inputs, outputs, transactions, seed)
-    {
-        return Some(proof);
-    }
-    prove_block(inputs, outputs, transactions, seed)
-}
-
-/// The reference rule: a tree for blocks with more inputs than one chunk
-/// holds.
-fn prefers_tree(inputs: usize) -> bool {
-    inputs > CHUNK_SHAPE.inputs
-}
-
-/// Group transactions, in order, into chunks that fit `CHUNK_SHAPE`;
-/// `None` if one doesn't fit even alone.
-fn partition(transactions: &[Transaction]) -> Option<Vec<Vec<Transaction>>> {
-    let mut chunks: Vec<Vec<Transaction>> = Vec::new();
+/// Group transactions, in order, into chunks that fit `CHUNK_SHAPE`, as
+/// indices; `None` if one doesn't fit even alone (consensus: no
+/// transaction may have more inputs or outputs than a chunk holds).
+pub fn plan_chunks(transactions: &[Transaction]) -> Option<Vec<Vec<usize>>> {
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
     let (mut ins, mut outs) = (usize::MAX, usize::MAX);
-    for tx in transactions {
+    for (t, tx) in transactions.iter().enumerate() {
         let (i, o) = (tx.inputs.len(), tx.outputs.len());
         if i > CHUNK_SHAPE.inputs || o > CHUNK_SHAPE.outputs {
             return None;
@@ -356,15 +358,14 @@ fn partition(transactions: &[Transaction]) -> Option<Vec<Vec<Transaction>>> {
             chunks.push(Vec::new());
             (ins, outs) = (0, 0);
         }
-        chunks.last_mut().unwrap().push(tx.clone());
+        chunks.last_mut().unwrap().push(t);
         (ins, outs) = (ins + i, outs + o);
     }
     Some(chunks)
 }
 
-/// The tree circuits' proving keys -- derived from the first tree block
-/// this process proves (their fixed columns don't depend on which), then
-/// kept.
+/// The tree circuits' proving keys -- derived from the first block this
+/// process proves (their fixed columns don't depend on which), then kept.
 struct TreeKeys {
     wrap: Key,
     aggregate: Option<Key>,
@@ -372,20 +373,36 @@ struct TreeKeys {
 
 static TREE_KEYS: std::sync::Mutex<Option<TreeKeys>> = std::sync::Mutex::new(None);
 
-/// Prove the block as a tree: chunks, wraps, aggregation. `None` as for
-/// `prove_block`, or if the transactions can't be chunked.
-pub fn prove_block_tree(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions: &[Transaction], seed: [u8; 32]) -> Option<Proof> {
-    let groups = partition(transactions)?;
-    let derive = |k: u8| {
+/// Prove the block whose body is `inputs`/`outputs`/`nonces`, from its
+/// `transactions` (each fully signed) and `plan`: chunk proofs, wraps
+/// (each applying its chunk to the state), aggregation. `seed` must be
+/// fresh random bytes for every proof (it's what keeps chunk proofs
+/// zero-knowledge). `None` if the transactions don't verify, don't
+/// balance against `REWARD`, or don't match the body or the plan.
+pub fn prove_block(
+    inputs: &[[u8; 32]],
+    outputs: &[[u8; 32]],
+    nonces: &[[u8; NONCE_LEN]],
+    transactions: &[Transaction],
+    plan: &BlockPlan,
+    seed: [u8; 32],
+) -> Option<Proof> {
+    if plan.chunks.len() != plan.transitions.len() || plan.chunks.is_empty() {
+        return None;
+    }
+    let derive = |k: u16| {
         let mut s = seed;
-        s[31] ^= k;
-        s[30] ^= 0x5a;
+        s[31] ^= k as u8;
+        s[30] ^= 0x5a ^ (k >> 8) as u8;
         s
     };
     // Each chunk's net: what its outputs take beyond its inputs (a), or
-    // the reverse (b) -- its share of reward and fees.
-    let mut chunks = Vec::with_capacity(groups.len());
-    for (k, txs) in groups.iter().enumerate() {
+    // the reverse (b) -- its share of reward and fees. All laid out (and
+    // checked against the body) before any proving.
+    let mut witnesses = Vec::with_capacity(plan.chunks.len());
+    let mut totals = (0u128, 0u128);
+    for indices in &plan.chunks {
+        let txs: Vec<Transaction> = indices.iter().map(|&i| transactions.get(i).cloned()).collect::<Option<_>>()?;
         let spent: u128 = txs.iter().flat_map(|t| &t.inputs).map(|i| i.amount as u128).sum();
         let created: u128 = txs.iter().flat_map(|t| &t.outputs).map(|o| o.amount as u128).sum();
         let net = if created >= spent {
@@ -393,15 +410,18 @@ pub fn prove_block_tree(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions:
         } else {
             (0, u64::try_from(spent - created).ok()?)
         };
-        let witness = block_air::build_chunk(txs, net, CHUNK_SHAPE).ok()?;
-        let proof = stark::prove(&witness.air, &witness.trace, &CHUNK_PARAMS, derive(k as u8)).ok()?;
-        chunks.push((witness.air, proof));
+        totals = (totals.0 + net.0 as u128, totals.1 + net.1 as u128);
+        witnesses.push(block_air::build_chunk(&txs, net, CHUNK_SHAPE).ok()?);
+    }
+    // The block must claim exactly the reward (plus fees, which cancel).
+    if totals.0.checked_sub(totals.1) != Some(REWARD as u128) {
+        return None;
     }
 
     // Each body commitment's chunk.
     let mut chunk_of: std::collections::HashMap<[u8; 32], u16> = Default::default();
-    for (k, (air, _)) in chunks.iter().enumerate() {
-        for c in air.public_inputs().iter().chain(air.public_outputs()) {
+    for (k, w) in witnesses.iter().enumerate() {
+        for c in w.air.public_inputs().iter().chain(w.air.public_outputs()) {
             chunk_of.insert(crate::poseidon2::digest_to_bytes(*c), k as u16);
         }
     }
@@ -411,16 +431,22 @@ pub fn prove_block_tree(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions:
         return None; // the transactions' commitments aren't exactly the body's
     }
 
+    let mut chunks = Vec::with_capacity(witnesses.len());
+    for (k, w) in witnesses.into_iter().enumerate() {
+        let proof = stark::prove(&w.air, &w.trace, &CHUNK_PARAMS, derive(k as u16)).ok()?;
+        chunks.push((w.air, proof));
+    }
+
     let mut keys = TREE_KEYS.lock().unwrap();
     if keys.is_none() {
         let (air, proof) = &chunks[0];
-        let wrap = aggregate::wrap_key(air, proof, &CHUNK_PARAMS, &TREE).ok()?;
+        let wrap = aggregate::wrap_key(air, proof, &plan.transitions[0], &CHUNK_PARAMS, &TREE).ok()?;
         *keys = Some(TreeKeys { wrap, aggregate: None });
     }
     let keys = keys.as_mut().unwrap();
     let mut wraps = Vec::with_capacity(chunks.len());
-    for (k, (air, proof)) in chunks.iter().enumerate() {
-        wraps.push(aggregate::wrap(&keys.wrap, air, proof, &CHUNK_PARAMS, &TREE, derive(0x80 | k as u8)).ok()?);
+    for (k, ((air, proof), transition)) in chunks.iter().zip(&plan.transitions).enumerate() {
+        wraps.push(aggregate::wrap(&keys.wrap, air, proof, transition, &CHUNK_PARAMS, &TREE, derive(0x8000 | k as u16)).ok()?);
     }
     let root = if wraps.len() == 1 {
         wraps.pop().unwrap()
@@ -428,7 +454,7 @@ pub fn prove_block_tree(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions:
         if keys.aggregate.is_none() {
             keys.aggregate = Some(aggregate::aggregate_key([&wraps[0], &wraps[1]], &keys.wrap, &TREE).ok()?);
         }
-        aggregate::aggregate_all(keys.aggregate.as_ref().unwrap(), &keys.wrap, wraps, &TREE, derive(0xff)).ok()?
+        aggregate::aggregate_all(keys.aggregate.as_ref().unwrap(), &keys.wrap, wraps, &TREE, derive(0xffff)).ok()?
     };
 
     let mut bytes = vec![KIND_TREE];
@@ -441,12 +467,15 @@ pub fn prove_block_tree(inputs: &[[u8; 32]], outputs: &[[u8; 32]], transactions:
     bytes.extend(root.proof.to_bytes());
     // Check against the consensus key before anyone else has to: keys
     // derived here that don't match it (stale constants) would make every
-    // tree proof this miner publishes invalid.
+    // proof this miner publishes invalid.
     let proof = Proof { bytes };
-    let nonce_of: std::collections::HashMap<[u8; 32], [u8; NONCE_LEN]> =
-        transactions.iter().flat_map(|t| &t.outputs).map(|o| (o.commitment(), o.nonce)).collect();
-    let nonces: Vec<[u8; NONCE_LEN]> = outputs.iter().map(|c| nonce_of.get(c).copied()).collect::<Option<_>>()?;
-    proof.verify(inputs, outputs, &nonces).then_some(proof)
+    let state = StateChange {
+        root_in: plan.transitions[0].change.root_in,
+        count_in: plan.transitions[0].change.count_in,
+        root_out: plan.transitions.last().unwrap().change.root_out,
+        count_out: plan.transitions.last().unwrap().change.count_out,
+    };
+    proof.verify(inputs, outputs, nonces, &state).then_some(proof)
 }
 
 #[cfg(test)]
@@ -454,77 +483,144 @@ mod tests {
     use super::*;
     use crate::block::BlockBody;
     use crate::output::Output;
+    use crate::poseidon2::digest_from_bytes;
     use crate::stark::Air;
     use crate::wots;
 
-    /// A block's public lists -- inputs, outputs, the outputs' nonces --
-    /// and the transactions behind them.
-    type TestBlock = (Vec<[u8; 32]>, Vec<[u8; 32]>, Vec<[u8; NONCE_LEN]>, Vec<Transaction>);
-
-    fn reward_block() -> TestBlock {
-        let (_, pk) = wots::keygen(&[1; 32]);
-        let mut tx = Transaction::new();
-        tx.add_output(Output::new(&pk, REWARD)).unwrap();
-        let body = BlockBody::from_transactions(std::slice::from_ref(&tx)).unwrap();
-        (body.inputs, body.outputs, body.nonces, vec![tx])
+    /// A block: its body's lists, its transactions, and how to prove it
+    /// against a state that holds its inputs (with zero nonces) -- what
+    /// `chain::Chain::build_block` works out against the real state.
+    struct TestBlock {
+        inputs: Vec<[u8; 32]>,
+        outputs: Vec<[u8; 32]>,
+        nonces: Vec<[u8; NONCE_LEN]>,
+        txs: Vec<Transaction>,
+        plan: BlockPlan,
+        state: StateChange,
     }
 
-    #[test]
-    fn a_reward_proof_verifies_against_its_lists_and_no_others() {
-        let (inputs, outputs, nonces, txs) = reward_block();
-        let proof = prove_block(&inputs, &outputs, &txs, [1; 32]).unwrap();
-        assert!(proof.verify(&inputs, &outputs, &nonces));
+    fn block(txs: Vec<Transaction>) -> TestBlock {
+        use crate::state_circuit::MemTree;
+        use crate::state_tree::compress_leaf;
+        let body = BlockBody::from_transactions(&txs).unwrap();
+        let chunks = plan_chunks(&txs).unwrap();
+        let zero = [0; NONCE_LEN];
+        let leaf = |c: &[u8; 32], n: &[u8; NONCE_LEN]| compress_leaf(&digest_from_bytes(c), &crate::output::nonce_limbs(n));
+        let mut tree = MemTree::default();
+        for c in &body.inputs {
+            tree.append(leaf(c, &zero));
+        }
+        let (root_in, count_in) = (tree.root(), tree.count());
+        let mut transitions = Vec::new();
+        let mut body_chunks = Vec::new();
+        for indices in &chunks {
+            let mut ins: Vec<[u8; 32]> = indices.iter().flat_map(|&t| &txs[t].inputs).map(|i| Output::new(&i.pubkey, i.amount).commitment()).collect();
+            let mut outs: Vec<([u8; 32], [u8; NONCE_LEN])> = indices.iter().flat_map(|&t| &txs[t].outputs).map(|o| (o.commitment(), o.nonce)).collect();
+            ins.sort();
+            outs.sort();
+            body_chunks.push((
+                ins.iter().map(|c| body.inputs.binary_search(c).unwrap()).collect(),
+                outs.iter().map(|(c, _)| body.outputs.binary_search(c).unwrap()).collect(),
+            ));
+            let (root, count) = (tree.root(), tree.count());
+            let mut t_inputs = Vec::new();
+            for slot in 0..CHUNK_SHAPE.inputs {
+                match ins.get(slot) {
+                    Some(c) => {
+                        let p = tree.position_of(&leaf(c, &zero)).unwrap();
+                        t_inputs.push((p, zero, tree.path(p)));
+                        tree.spend(&leaf(c, &zero));
+                    }
+                    None => t_inputs.push((tree.count(), zero, tree.path(tree.count()))),
+                }
+            }
+            let mut t_outputs = Vec::new();
+            for slot in 0..CHUNK_SHAPE.outputs {
+                t_outputs.push(tree.path(tree.count()));
+                if let Some((c, n)) = outs.get(slot) {
+                    tree.append(leaf(c, n));
+                }
+            }
+            transitions.push(ChunkTransition {
+                change: StateChange { root_in: root, count_in: count, root_out: tree.root(), count_out: tree.count() },
+                inputs: t_inputs,
+                outputs: t_outputs,
+            });
+        }
+        TestBlock {
+            inputs: body.inputs.clone(),
+            outputs: body.outputs,
+            nonces: body.nonces,
+            txs,
+            plan: BlockPlan { body_chunks, chunks, transitions },
+            state: StateChange { root_in, count_in, root_out: tree.root(), count_out: tree.count() },
+        }
+    }
 
-        let mut other = outputs.clone();
-        other[0][0] ^= 1;
-        assert!(!proof.verify(&inputs, &other, &nonces));
-        assert!(!proof.verify(&inputs, &[], &[]));
-        // The outputs' nonces are part of the statement.
-        let mut altered = nonces.clone();
-        altered[0][0] ^= 1;
-        assert!(!proof.verify(&inputs, &outputs, &altered));
+    fn reward_tx(amount: u64) -> Transaction {
+        let (_, pk) = wots::keygen(&[1; 32]);
+        let mut tx = Transaction::new();
+        tx.add_output(Output::new(&pk, amount)).unwrap();
+        tx
+    }
+
+    /// `count` single-input spends (each paying a fee of 10) and the reward
+    /// transaction claiming the reward plus all fees.
+    fn spends(count: u8) -> Vec<Transaction> {
+        let mut txs = Vec::new();
+        for k in 0..count {
+            let (sk, pk) = wots::keygen(&[100 + k; 32]);
+            let (_, to) = wots::keygen(&[200 - k; 32]);
+            let mut tx = Transaction::new();
+            tx.add_input(&pk, 1000).unwrap();
+            tx.add_output(Output::new(&to, 990)).unwrap();
+            assert!(tx.sign_input(&pk, &sk));
+            txs.push(tx);
+        }
+        let (_, miner) = wots::keygen(&[7; 32]);
+        let mut reward = Transaction::new();
+        reward.add_output(Output::new(&miner, REWARD + 10 * count as u64)).unwrap();
+        txs.push(reward);
+        txs
     }
 
     #[test]
     fn proving_refuses_lists_that_dont_match_the_transactions() {
-        let (inputs, mut outputs, _nonces, txs) = reward_block();
-        outputs[0][0] ^= 1;
-        assert!(prove_block(&inputs, &outputs, &txs, [1; 32]).is_none());
+        let mut b = block(vec![reward_tx(REWARD)]);
+        b.outputs[0][0] ^= 1;
+        assert!(prove_block(&b.inputs, &b.outputs, &b.nonces, &b.txs, &b.plan, [1; 32]).is_none());
     }
 
     #[test]
     fn proving_refuses_a_block_that_overclaims_the_reward() {
-        let (_, pk) = wots::keygen(&[1; 32]);
-        let mut tx = Transaction::new();
-        tx.add_output(Output::new(&pk, REWARD + 1)).unwrap();
-        let body = BlockBody::from_transactions(std::slice::from_ref(&tx)).unwrap();
-        assert!(prove_block(&body.inputs, &body.outputs, &[tx], [1; 32]).is_none());
+        let b = block(vec![reward_tx(REWARD + 1)]);
+        assert!(prove_block(&b.inputs, &b.outputs, &b.nonces, &b.txs, &b.plan, [1; 32]).is_none());
     }
 
     #[test]
     fn garbage_and_placeholder_proofs_dont_verify() {
-        let (inputs, outputs, nonces, _) = reward_block();
-        assert!(!Proof::placeholder().verify(&inputs, &outputs, &nonces));
-        assert!(!Proof::from_bytes(vec![4, 0, 0, 0, 1, 2, 3]).verify(&inputs, &outputs, &nonces));
-        assert!(!Proof::from_bytes(vec![3, 0, 0, 0]).verify(&inputs, &outputs, &nonces));
+        let b = block(vec![reward_tx(REWARD)]);
+        for proof in [Proof::placeholder(), Proof::from_bytes(vec![4, 0, 0, 0, 1, 2, 3]), Proof::from_bytes(vec![0, 0, 0, 0])] {
+            assert!(!proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state));
+        }
     }
 
     #[test]
     fn tree_proof_headers_are_checked_before_anything_expensive() {
-        let (inputs, outputs, nonces, _) = reward_block();
+        let b = block(vec![reward_tx(REWARD)]);
         // Truncated header, zero chunks, an out-of-range chunk index.
         let mut header = vec![KIND_TREE];
         header.extend(REWARD.to_le_bytes());
         header.extend(0u64.to_le_bytes());
-        assert!(!Proof::from_bytes(header.clone()).verify(&inputs, &outputs, &nonces));
+        assert!(!Proof::from_bytes(header.clone()).verify(&b.inputs, &b.outputs, &b.nonces, &b.state));
         let mut zero = header.clone();
         zero.extend(0u16.to_le_bytes());
         zero.extend(0u16.to_le_bytes());
-        assert!(!Proof::from_bytes(zero).verify(&inputs, &outputs, &nonces));
+        assert!(!Proof::from_bytes(zero).verify(&b.inputs, &b.outputs, &b.nonces, &b.state));
         let mut out_of_range = header;
         out_of_range.extend(1u16.to_le_bytes());
         out_of_range.extend(5u16.to_le_bytes());
-        assert!(!Proof::from_bytes(out_of_range).verify(&inputs, &outputs, &nonces));
+        assert!(!Proof::from_bytes(out_of_range).verify(&b.inputs, &b.outputs, &b.nonces, &b.state));
     }
 
     #[test]
@@ -541,46 +637,20 @@ mod tests {
         assert_eq!(chunks[0].0[0], commitment(1));
     }
 
-    /// `count` single-input spends (each paying a fee of 10) and the reward
-    /// transaction claiming the reward plus all fees.
-    fn spends(count: u8) -> TestBlock {
-        let mut txs = Vec::new();
-        for k in 0..count {
-            let (sk, pk) = wots::keygen(&[100 + k; 32]);
-            let (_, to) = wots::keygen(&[200 - k; 32]);
-            let mut tx = Transaction::new();
-            tx.add_input(&pk, 1000).unwrap();
-            tx.add_output(Output::new(&to, 990)).unwrap();
-            assert!(tx.sign_input(&pk, &sk));
-            txs.push(tx);
-        }
-        let (_, miner) = wots::keygen(&[7; 32]);
-        let mut reward = Transaction::new();
-        reward.add_output(Output::new(&miner, REWARD + 10 * count as u64)).unwrap();
-        txs.push(reward);
-        let body = BlockBody::from_transactions(&txs).unwrap();
-        (body.inputs, body.outputs, body.nonces, txs)
-    }
-
     #[test]
-    fn the_reference_rule_uses_a_tree_beyond_one_chunk_of_inputs() {
-        assert!(!prefers_tree(0) && !prefers_tree(10));
-        assert!(prefers_tree(11) && prefers_tree(10_000));
-    }
-
-    #[test]
-    fn transactions_partition_into_chunks_in_order() {
-        let (_, _, _, txs) = spends(12);
-        let chunks = partition(&txs).unwrap();
-        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), vec![10, 3]);
+    fn transactions_plan_into_chunks_in_order() {
+        let txs = spends(12);
+        let chunks = plan_chunks(&txs).unwrap();
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), vec![8, 5]);
+        assert_eq!(chunks[0][0], 0);
         let mut big = Transaction::new();
         for k in 0..=CHUNK_SHAPE.inputs as u8 {
             big.add_input(&wots::keygen(&[k; 32]).1, 1).unwrap();
         }
-        assert!(partition(&[big]).is_none());
+        assert!(plan_chunks(&[big]).is_none(), "more inputs than a chunk holds");
     }
 
-    /// Prove an 11-input block as a tree with the consensus parameters,
+    /// Prove an 11-input block (two chunks) with the consensus parameters,
     /// and print the tree circuits' verifying keys -- run after changing
     /// any circuit, then update `WRAP_CAP` / `AGGREGATE_CAP`. Then checks
     /// the proof verifies, and tampering is refused. Slow (minutes):
@@ -588,9 +658,9 @@ mod tests {
     #[test]
     #[ignore]
     fn tree_keys() {
-        let (inputs, outputs, nonces, txs) = spends(11);
+        let b = block(spends(11));
         let start = std::time::Instant::now();
-        let proof = prove_block_tree(&inputs, &outputs, &txs, [3; 32]);
+        let proof = prove_block(&b.inputs, &b.outputs, &b.nonces, &b.txs, &b.plan, [3; 32]);
         println!("proved in {:.2?}", start.elapsed());
         // (The lock is released at the end of this block: proving again
         // below takes it.)
@@ -609,95 +679,88 @@ mod tests {
             panic!("the verifying-key constants are stale: update them to the above");
         }
         let proof = proof.expect("a tree proof that verifies");
-        assert!(proof.is_tree());
         println!("tree proof: {} KB", proof.len() / 1024);
         let start = std::time::Instant::now();
-        assert!(proof.verify(&inputs, &outputs, &nonces));
+        assert!(proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state));
         println!("verified in {:.2?}", start.elapsed());
-        // Other lists, or a different claimed split of the totals.
-        let mut other = outputs.clone();
+        // Other lists, a different claimed split of the totals, or another
+        // state change.
+        let mut other = b.outputs.clone();
         other.swap(0, 1);
-        assert!(!proof.verify(&inputs, &other, &nonces));
+        assert!(!proof.verify(&b.inputs, &other, &b.nonces, &b.state));
         let mut bytes = proof.as_bytes().to_vec();
         bytes[1] ^= 1; // A
         bytes[9] ^= 1; // B, keeping A - B
-        assert!(!Proof::from_bytes(bytes).verify(&inputs, &outputs, &nonces));
-        // The reference rule makes a small block's proof direct.
-        let (i, o, n, t) = spends(2);
-        let small = prove_block_auto(&i, &o, &t, [5; 32]).unwrap();
-        assert!(!small.is_tree() && small.verify(&i, &o, &n));
+        assert!(!Proof::from_bytes(bytes).verify(&b.inputs, &b.outputs, &b.nonces, &b.state));
+        let mut state = b.state;
+        state.count_out += 1;
+        assert!(!proof.verify(&b.inputs, &b.outputs, &b.nonces, &state));
+        let mut nonces = b.nonces.clone();
+        nonces[0][0] ^= 1;
+        assert!(!proof.verify(&b.inputs, &b.outputs, &nonces, &b.state));
+        // A one-chunk block: its root is the wrap.
+        let small = block(vec![reward_tx(REWARD)]);
+        let proof = prove_block(&small.inputs, &small.outputs, &small.nonces, &small.txs, &small.plan, [5; 32]).unwrap();
+        assert!(proof.verify(&small.inputs, &small.outputs, &small.nonces, &small.state));
     }
 
-    /// Not a correctness test: proving costs, one case per process (so
-    /// peak memory can be measured per case, e.g. with `/usr/bin/time -v`).
-    /// `COST=direct INPUTS=n`: a direct proof of a block with `n` one-input
-    /// spends plus the reward. `COST=chunk`: one chunk proof (fixed shape,
-    /// so any chunk costs the same). `COST=tree INPUTS=n`: a whole tree
-    /// block, stage by stage. Run with
-    /// `COST=... cargo test --release -- --ignored --nocapture proof_costs`.
+    /// The wrap circuit's size for a full chunk (verifying its proof and
+    /// applying its 28 state updates) against its 2^18 rows.
+    /// `cargo test --release -- --ignored --nocapture wrap_rows`.
+    #[test]
+    #[ignore]
+    fn wrap_rows() {
+        let b = block(spends(3));
+        let k = 0;
+        let txs: Vec<Transaction> = b.plan.chunks[k].iter().map(|&i| b.txs[i].clone()).collect();
+        let spent: u64 = txs.iter().flat_map(|t| &t.inputs).map(|i| i.amount).sum();
+        let created: u64 = txs.iter().flat_map(|t| &t.outputs).map(|o| o.amount).sum();
+        let chunk = block_air::build_chunk(&txs, (created - spent, 0), CHUNK_SHAPE).unwrap();
+        let start = std::time::Instant::now();
+        let proof = stark::prove(&chunk.air, &chunk.trace, &CHUNK_PARAMS, [1; 32]).unwrap();
+        println!("chunk proof: {:.2?}", start.elapsed());
+        let rows = aggregate::wrap_rows(&chunk.air, &proof, &b.plan.transitions[k], &CHUNK_PARAMS).unwrap();
+        println!("wrap circuit: {rows} rows of {} ({:.0}%)", TREE.trace_len, 100.0 * rows as f64 / TREE.trace_len as f64);
+    }
+
+    /// Not a correctness test: proving costs. `COST=chunk`: one chunk
+    /// proof (fixed shape, so any chunk costs the same). `COST=block
+    /// INPUTS=n`: a whole block of `n` one-input spends plus the reward.
+    /// Run with `COST=... cargo test --release -- --ignored --nocapture
+    /// proof_costs` (under `/usr/bin/time -v` for peak memory).
     #[test]
     #[ignore]
     fn proof_costs() {
         let case = std::env::var("COST").unwrap_or_default();
         let count: u8 = std::env::var("INPUTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-        let (inputs, outputs, nonces, txs) = spends(count);
+        let b = block(spends(count));
         let time = std::time::Instant::now;
         match case.as_str() {
-            "direct" => {
-                let witness = block_air::build(&txs, REWARD).unwrap();
-                let start = time();
-                let proof = prove_block(&inputs, &outputs, &txs, [1; 32]).unwrap();
-                let proving = start.elapsed();
-                let start = time();
-                assert!(proof.verify(&inputs, &outputs, &nonces));
-                println!(
-                    "direct, {count} inputs: {} rows; prove {proving:.2?}; {:.1} KB; verify {:.2?}",
-                    witness.air.trace_len(),
-                    proof.len() as f64 / 1024.0,
-                    start.elapsed()
-                );
-            }
             "chunk" => {
-                let chunk = block_air::build_chunk(&txs, (REWARD, 0), CHUNK_SHAPE).unwrap();
+                let chunk = block_air::build_chunk(&b.txs, (REWARD, 0), CHUNK_SHAPE).unwrap();
                 let start = time();
                 let proof = stark::prove(&chunk.air, &chunk.trace, &CHUNK_PARAMS, [1; 32]).unwrap();
                 println!(
-                    "chunk, {count} inputs: {} rows; prove {:.2?}; {:.1} KB",
+                    "chunk: {} rows; prove {:.2?}; {:.1} KB",
                     chunk.air.trace_len(),
                     start.elapsed(),
                     proof.to_bytes().len() as f64 / 1024.0
                 );
             }
-            "tree" => {
-                let groups = partition(&txs).unwrap();
-                let mut chunks = Vec::new();
-                for txs in &groups {
-                    let spent: u64 = txs.iter().flat_map(|t| &t.inputs).map(|i| i.amount).sum();
-                    let created: u64 = txs.iter().flat_map(|t| &t.outputs).map(|o| o.amount).sum();
-                    let net = if created >= spent { (created - spent, 0) } else { (0, spent - created) };
-                    let w = block_air::build_chunk(txs, net, CHUNK_SHAPE).unwrap();
-                    let start = time();
-                    let proof = stark::prove(&w.air, &w.trace, &CHUNK_PARAMS, [1; 32]).unwrap();
-                    println!("  chunk proof: {:.2?}", start.elapsed());
-                    chunks.push((w.air, proof));
-                }
+            "block" => {
                 let start = time();
-                let wrap_key = aggregate::wrap_key(&chunks[0].0, &chunks[0].1, &CHUNK_PARAMS, &TREE).unwrap();
-                println!("  wrap key (one-time): {:.2?}", start.elapsed());
-                let mut wraps = Vec::new();
-                for (air, proof) in &chunks {
-                    let start = time();
-                    wraps.push(aggregate::wrap(&wrap_key, air, proof, &CHUNK_PARAMS, &TREE, [2; 32]).unwrap());
-                    println!("  wrap: {:.2?}", start.elapsed());
-                }
+                let proof = prove_block(&b.inputs, &b.outputs, &b.nonces, &b.txs, &b.plan, [1; 32]).unwrap();
+                let proving = start.elapsed();
                 let start = time();
-                let key = aggregate::aggregate_key([&wraps[0], &wraps[1]], &wrap_key, &TREE).unwrap();
-                println!("  aggregation key (one-time): {:.2?}", start.elapsed());
-                let start = time();
-                let root = aggregate::aggregate_all(&key, &wrap_key, wraps, &TREE, [3; 32]).unwrap();
-                println!("  aggregation(s): {:.2?}; root {:.1} KB", start.elapsed(), root.proof.to_bytes().len() as f64 / 1024.0);
+                assert!(proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state));
+                println!(
+                    "{count} inputs, {} chunk(s): prove {proving:.2?} (keys included); {:.1} KB; verify {:.2?}",
+                    b.plan.chunks.len(),
+                    proof.len() as f64 / 1024.0,
+                    start.elapsed()
+                );
             }
-            _ => panic!("set COST to direct, chunk or tree"),
+            _ => panic!("set COST to chunk or block"),
         }
     }
 

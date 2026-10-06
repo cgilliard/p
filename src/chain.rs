@@ -1,5 +1,5 @@
 //! Chain-state-dependent block processing: resolving a block's inputs and
-//! outputs against the real `Pmmr`/`Bitmap`/`UtxoIndex`, applying the
+//! outputs against the real `StateTree`/`UtxoIndex`, applying the
 //! resulting updates, and checking the header's claimed roots match what
 //! applying the block actually produced -- everything `block::Block`
 //! deliberately doesn't do on its own, since it has no access to (or need
@@ -33,10 +33,10 @@
 //!
 //! # Atomicity
 //!
-//! `Pmmr`, `Bitmap`, and `UtxoIndex` hold no in-memory state of their own
+//! `StateTree` and `UtxoIndex` hold no in-memory state of their own
 //! to desync -- every read and write they do goes through a caller-
 //! supplied LMDB transaction (see each module's docs). That's what lets
-//! `apply_block` update all three through one shared `heed::RwTxn` and
+//! `apply_block` update all of them through one shared `heed::RwTxn` and
 //! commit them together: if any check fails partway through, the
 //! function returns before ever calling `commit`, the transaction is
 //! simply dropped, and LMDB aborts it -- every write attempted so far is
@@ -81,9 +81,8 @@
 #![allow(dead_code)]
 
 use crate::recovery::NONCE_LEN;
-use crate::bitmap::Bitmap;
 use crate::block::{Block, BlockBody, BlockHeader, HEADER_LEN, UnprovenBlock, now_millis};
-use crate::pmmr::Pmmr;
+use crate::state_tree::StateTree;
 use crate::pow;
 use crate::storage::Storage;
 use crate::transaction::Transaction;
@@ -107,7 +106,7 @@ pub const GENESIS_PARENT_HASH: [u8; 32] = [0u8; 32];
 const MAX_FUTURE_DRIFT_MS: u64 = 2 * 60 * 60 * 1000;
 
 /// The tip's full header, the one thing `Chain` persists in its own
-/// `chain_meta` database beyond what `pmmr`/`bitmap`/`utxo` already
+/// `chain_meta` database beyond what `state`/`utxo` already
 /// track. Everything else `Chain` needs to know about the tip --
 /// its hash, its height -- is derived from this single stored value
 /// rather than kept as separate, independently-updated counters, so
@@ -245,8 +244,7 @@ const MAX_ORPHANS: usize = 100;
 pub enum Error {
     Storage(crate::storage::Error),
     Heed(heed::Error),
-    Pmmr(crate::pmmr::Error),
-    Bitmap(crate::bitmap::Error),
+    State(crate::state_tree::Error),
     Utxo(crate::utxo::Error),
     /// The on-disk tip entry wasn't a validly encoded hash.
     Corrupt(&'static str),
@@ -269,16 +267,19 @@ pub enum Error {
     /// An output's commitment collides with one that's already live
     /// (created, and not yet spent).
     DuplicateOutput([u8; 32]),
-    /// Applying the body produced a PMMR root different from the one the
+    /// Applying the body produced a state root different from the one the
     /// header claims.
-    PmmrRootMismatch,
-    /// Applying the body produced a bitmap root different from the one
-    /// the header claims.
-    BitmapRootMismatch,
+    StateRootMismatch,
+    /// Applying the body left a different number of outputs than the
+    /// header claims.
+    OutputCountMismatch,
     /// One of the transactions handed to `build_block` failed its own
     /// `Transaction::verify()` -- the index is its position in the slice
     /// that was passed in.
     InvalidTransaction(usize),
+    /// A transaction handed to `build_block` has more inputs or outputs
+    /// than one chunk holds (`prover::CHUNK_SHAPE`) -- a consensus limit.
+    TransactionTooLarge,
     /// A side-branch block's own header is unsound -- `Block::validate`
     /// against the target its own branch's history implies failed.
     InvalidSideBranchBlock,
@@ -322,8 +323,8 @@ impl Error {
                 | Error::WrongHeight
                 | Error::UnresolvedInput(_)
                 | Error::DuplicateOutput(_)
-                | Error::PmmrRootMismatch
-                | Error::BitmapRootMismatch
+                | Error::StateRootMismatch
+                | Error::OutputCountMismatch
                 | Error::TimestampNotAfterParent
                 | Error::WrongGenesis
         )
@@ -342,17 +343,12 @@ impl From<heed::Error> for Error {
     }
 }
 
-impl From<crate::pmmr::Error> for Error {
-    fn from(e: crate::pmmr::Error) -> Self {
-        Error::Pmmr(e)
+impl From<crate::state_tree::Error> for Error {
+    fn from(e: crate::state_tree::Error) -> Self {
+        Error::State(e)
     }
 }
 
-impl From<crate::bitmap::Error> for Error {
-    fn from(e: crate::bitmap::Error) -> Self {
-        Error::Bitmap(e)
-    }
-}
 
 impl From<crate::utxo::Error> for Error {
     fn from(e: crate::utxo::Error) -> Self {
@@ -365,8 +361,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Storage(e) => write!(f, "storage error: {e}"),
             Error::Heed(e) => write!(f, "LMDB error: {e}"),
-            Error::Pmmr(e) => write!(f, "pmmr error: {e}"),
-            Error::Bitmap(e) => write!(f, "bitmap error: {e}"),
+            Error::State(e) => write!(f, "state tree error: {e}"),
             Error::Utxo(e) => write!(f, "utxo error: {e}"),
             Error::Corrupt(msg) => write!(f, "corrupt chain metadata: {msg}"),
             Error::InvalidBlock => write!(f, "block failed its own validate()"),
@@ -375,9 +370,10 @@ impl std::fmt::Display for Error {
             Error::TimestampTooFarInFuture => write!(f, "header timestamp is too far ahead of this node's clock"),
             Error::UnresolvedInput(c) => write!(f, "input {} does not resolve to a live unspent output", hex(c)),
             Error::DuplicateOutput(c) => write!(f, "output {} collides with a still-live output", hex(c)),
-            Error::PmmrRootMismatch => write!(f, "header's pmmr_root does not match the result of applying the body"),
-            Error::BitmapRootMismatch => write!(f, "header's bitmap_root does not match the result of applying the body"),
+            Error::StateRootMismatch => write!(f, "header's state_root does not match the result of applying the body"),
+            Error::OutputCountMismatch => write!(f, "header's output_count does not match the result of applying the body"),
             Error::InvalidTransaction(i) => write!(f, "transaction at index {i} failed verify()"),
+            Error::TransactionTooLarge => write!(f, "a transaction has more inputs or outputs than one chunk holds"),
             Error::InvalidSideBranchBlock => write!(f, "side-branch block failed validate() against the active target"),
             Error::InvalidSideBranchLineage => write!(f, "side-branch block's prev_hash/height doesn't match its claimed parent"),
             Error::ReorgTooDeep => write!(f, "competing chain's common ancestor is beyond max_reorg_depth"),
@@ -394,10 +390,15 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// `resolve_and_apply`'s result: the resulting `(pmmr_root,
-/// bitmap_root)`, plus every spent input's `(commitment, position)`
-/// from before it was removed -- see that method's docs.
-type ResolveResult = ([u8; 32], [u8; 32], Vec<([u8; 32], u64)>);
+/// `resolve_and_apply`'s result: the resulting `(state_root,
+/// output_count)`, every spent input's `(commitment, position)` from
+/// before it was removed, and (if asked for) each chunk's state
+/// transition witness -- see that method's docs.
+type ResolveResult = ([u8; 32], u64, Vec<([u8; 32], u64)>, Vec<crate::aggregate::ChunkTransition>);
+
+/// Which of a body's inputs and outputs each chunk holds, as indices
+/// into its lists (body order within each chunk).
+type ChunkIndices = Vec<(Vec<usize>, Vec<usize>)>;
 
 /// `BLOCK_HEIGHTS_DB`'s key for a block: big-endian height first, so
 /// keys sort by height, then the hash to keep same-height blocks apart.
@@ -477,7 +478,7 @@ impl RetargetState {
 /// own mutations ran. None of this is recoverable any other way once
 /// those mutations have happened: the tip header and retargeting
 /// state (`current_target`/`window_start_timestamp`) get overwritten
-/// in place, not appended, and a spent input's original PMMR position
+/// in place, not appended, and a spent input's original position
 /// is deleted from `utxo` the moment it's spent -- the one instant
 /// `resolve_and_apply` has it in hand is the only chance to record it.
 /// This is genuinely the same "undo data" Bitcoin Core keeps per
@@ -677,7 +678,7 @@ fn is_connected(outcome: &AcceptOutcome) -> bool {
     )
 }
 
-/// A full node's chain state: the real `Pmmr`, `Bitmap`, and `UtxoIndex`,
+/// A full node's chain state: the real `StateTree` and `UtxoIndex`,
 /// plus the metadata none of those three know about on their own -- which
 /// header is the current tip, and at what height.
 /// The active chain at one moment, for the wallet (`Chain::view`).
@@ -730,8 +731,9 @@ impl crate::wallet::ChainView for ChainState<'_> {
 
 pub struct Chain {
     storage: Storage,
-    pmmr: Pmmr,
-    bitmap: Bitmap,
+    /// Every output ever created, by position: commitment while unspent,
+    /// then spent (`state_tree`).
+    state: StateTree,
     utxo: UtxoIndex,
     meta: Database<Bytes, Bytes>,
     blocks: Database<Bytes, Bytes>,
@@ -796,8 +798,7 @@ impl Chain {
         max_reorg_depth: u64,
         genesis: Option<&Block>,
     ) -> Result<Self> {
-        let pmmr = Pmmr::open(storage)?;
-        let bitmap = Bitmap::open(storage)?;
+        let state = StateTree::open(storage)?;
         let utxo = UtxoIndex::open(storage)?;
         let meta = storage.database("chain_meta")?;
         let blocks = storage.database(BLOCKS_DB)?;
@@ -810,8 +811,7 @@ impl Chain {
         let output_index = storage.database(OUTPUT_INDEX_DB)?;
         let mut chain = Chain {
             storage: storage.clone(),
-            pmmr,
-            bitmap,
+            state,
             utxo,
             meta,
             blocks,
@@ -855,12 +855,36 @@ impl Chain {
     /// proofs are being skipped, or this is the chain's fixed genesis,
     /// which is trusted by consensus (it's hardcoded) and couldn't prove
     /// anything anyway: its empty body claims no reward.
-    fn block_is_valid(&self, block: &Block, target: &[u8; 32]) -> bool {
+    fn block_is_valid(&self, txn: &heed::RoTxn, block: &Block, target: &[u8; 32]) -> Result<bool> {
         if !block.validate_structure(target) {
-            return false;
+            return Ok(false);
         }
         let is_genesis = self.genesis_hash == Some(block.header.hash());
-        !self.check_proofs || is_genesis || block.body.proof_is_valid()
+        if !self.check_proofs || is_genesis {
+            return Ok(true);
+        }
+        let parent = self.parent_state(txn, block.header.prev_hash)?;
+        Ok(block.body.proof_is_valid(&block.state_change(parent)))
+    }
+
+    /// The `(state_root, output_count)` after the block `prev_hash` --
+    /// the state a block extending it starts from.
+    fn parent_state(&self, txn: &heed::RoTxn, prev_hash: [u8; 32]) -> Result<([u8; 32], u64)> {
+        if prev_hash == GENESIS_PARENT_HASH {
+            return Ok((crate::state_tree::empty_root(), 0));
+        }
+        let bytes = self.blocks.get(txn, &prev_hash)?.ok_or(Error::Corrupt("a parent block is not stored"))?;
+        let header = BlockHeader::from_bytes(&bytes[..HEADER_LEN.min(bytes.len())]).map_err(|_| Error::Corrupt("a stored block was corrupt"))?;
+        Ok((header.state_root, header.output_count))
+    }
+
+    /// The chunks a received block's proof says to apply its body in; one
+    /// chunk of everything if the proof doesn't say (it's then invalid
+    /// anyway, unless proofs aren't being checked).
+    fn chunks_of(body: &BlockBody) -> ChunkIndices {
+        body.proof
+            .chunk_assignment(body.inputs.len(), body.outputs.len())
+            .unwrap_or_else(|| vec![((0..body.inputs.len()).collect(), (0..body.outputs.len()).collect())])
     }
 
     /// `Error::WrongGenesis` if `header` claims to be a first block but
@@ -1130,10 +1154,11 @@ impl Chain {
 
     /// Resolve and apply `body`'s inputs and outputs against real chain
     /// state, through `wtxn`: every input must resolve to a currently
-    /// live (unspent) output, which is then marked spent in `bitmap` and
-    /// removed from `utxo`; every output must not collide with one still
-    /// live, and is then appended to `pmmr` and recorded in `utxo`.
-    /// Returns the resulting `(pmmr_root, bitmap_root, spent_inputs)` --
+    /// live (unspent) output, which is then marked spent in the state
+    /// tree and removed from `utxo`; every output must not collide with
+    /// one still live, and is then appended to the state tree and recorded
+    /// in `utxo`. Returns the resulting `(state_root, output_count,
+    /// spent_inputs)` --
     /// the third element is each input's `(commitment, position)`
     /// *before* it was removed, which is exactly `UndoData` needs to
     /// undo this later (see that type's docs); `build_block` just
@@ -1141,33 +1166,90 @@ impl Chain {
     /// place. Nothing here is specific to a real header -- `apply_block`
     /// checks the roots against one, `build_block` just wants them --
     /// and nothing here commits `wtxn`; that's always the caller's job.
-    fn resolve_and_apply(&mut self, wtxn: &mut heed::RwTxn, body: &BlockBody) -> Result<ResolveResult> {
+    ///
+    /// Applied chunk by chunk (`chunks`): each chunk's inputs spent, then
+    /// its outputs appended -- so outputs get positions in chunk order,
+    /// as the block's proof applies them. With `record`, also returns each
+    /// chunk's state transition witness (positions, nonces, paths, every
+    /// `CHUNK_SHAPE` slot), for proving.
+    fn resolve_and_apply(&mut self, wtxn: &mut heed::RwTxn, body: &BlockBody, chunks: &ChunkIndices, record: bool) -> Result<ResolveResult> {
+        use crate::aggregate::{ChunkTransition, StateChange};
+        use crate::poseidon2::digest_from_bytes;
+        use crate::prover::CHUNK_SHAPE;
         let mut spent_inputs = Vec::with_capacity(body.inputs.len());
-        for commitment in &body.inputs {
-            let position = self
-                .utxo
-                .get(wtxn, *commitment)?
-                .ok_or(Error::UnresolvedInput(*commitment))?;
-            self.bitmap.set(wtxn, position, true)?;
-            self.utxo.remove(wtxn, *commitment)?;
-            spent_inputs.push((*commitment, position));
-        }
-
-        for commitment in &body.outputs {
-            if self.utxo.get(wtxn, *commitment)?.is_some() {
-                return Err(Error::DuplicateOutput(*commitment));
+        let mut transitions = Vec::new();
+        let mut seen_inputs = 0;
+        let mut seen_outputs = 0;
+        for (ins, outs) in chunks {
+            seen_inputs += ins.len();
+            seen_outputs += outs.len();
+            if record && (ins.len() > CHUNK_SHAPE.inputs || outs.len() > CHUNK_SHAPE.outputs) {
+                return Err(Error::TransactionTooLarge);
             }
-            let position = self.pmmr.push(wtxn, *commitment)?;
-            self.utxo.insert(wtxn, *commitment, position)?;
+            let root_in = self.state.root(wtxn)?;
+            let count_in = self.state.count(wtxn)?;
+            let mut t_inputs = Vec::new();
+            let mut t_outputs = Vec::new();
+            for &i in ins {
+                let commitment = body.inputs[i];
+                let position = self
+                    .utxo
+                    .get(wtxn, commitment)?
+                    .ok_or(Error::UnresolvedInput(commitment))?;
+                if record {
+                    let nonce = self
+                        .output_record(wtxn, &commitment)?
+                        .ok_or(Error::Corrupt("an unspent output's record is missing"))?
+                        .nonce;
+                    t_inputs.push((position, nonce, self.state.path(wtxn, position)?));
+                }
+                self.state.spend(wtxn, position)?;
+                self.utxo.remove(wtxn, commitment)?;
+                spent_inputs.push((commitment, position));
+            }
+            if record {
+                let count = self.state.count(wtxn)?;
+                for _ in ins.len()..CHUNK_SHAPE.inputs {
+                    t_inputs.push((count, [0; crate::recovery::NONCE_LEN], self.state.path(wtxn, count)?));
+                }
+            }
+            for &o in outs {
+                let (commitment, nonce) = (body.outputs[o], body.nonces[o]);
+                if self.utxo.get(wtxn, commitment)?.is_some() {
+                    return Err(Error::DuplicateOutput(commitment));
+                }
+                if record {
+                    let count = self.state.count(wtxn)?;
+                    t_outputs.push(self.state.path(wtxn, count)?);
+                }
+                let position = self.state.push(wtxn, &commitment, &nonce)?;
+                self.utxo.insert(wtxn, commitment, position)?;
+            }
+            if record {
+                let count = self.state.count(wtxn)?;
+                for _ in outs.len()..CHUNK_SHAPE.outputs {
+                    t_outputs.push(self.state.path(wtxn, count)?);
+                }
+                transitions.push(ChunkTransition {
+                    change: StateChange {
+                        root_in: digest_from_bytes(&root_in),
+                        count_in,
+                        root_out: digest_from_bytes(&self.state.root(wtxn)?),
+                        count_out: self.state.count(wtxn)?,
+                    },
+                    inputs: t_inputs,
+                    outputs: t_outputs,
+                });
+            }
         }
-
-        let pmmr_root = self.pmmr.root(wtxn)?;
-        let bitmap_root = self.bitmap.root(wtxn)?;
-        Ok((pmmr_root, bitmap_root, spent_inputs))
+        if seen_inputs != body.inputs.len() || seen_outputs != body.outputs.len() {
+            return Err(Error::InvalidBlock);
+        }
+        Ok((self.state.root(wtxn)?, self.state.count(wtxn)?, spent_inputs, transitions))
     }
 
     /// Apply `block` to the chain: resolve its inputs/outputs against
-    /// real state, update `pmmr`/`bitmap`/`utxo`, and advance the tip --
+    /// real state, update `state`/`utxo`, and advance the tip --
     /// all in one LMDB write transaction, committed only once every check
     /// passes. On any error, the transaction is simply never committed
     /// (see the module docs on atomicity): every store is left exactly
@@ -1207,7 +1289,7 @@ impl Chain {
         }
 
         let target = self.current_target(wtxn)?;
-        if !self.block_is_valid(block, &target) {
+        if !self.block_is_valid(wtxn, block, &target)? {
             return Err(Error::InvalidBlock);
         }
 
@@ -1233,16 +1315,17 @@ impl Chain {
         let prev_window_start_timestamp = self.window_start_timestamp(wtxn)?;
         let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
 
-        let (pmmr_root, bitmap_root, spent_inputs) = self.resolve_and_apply(wtxn, &block.body)?;
+        let chunks = Self::chunks_of(&block.body);
+        let (state_root, output_count, spent_inputs, _) = self.resolve_and_apply(wtxn, &block.body, &chunks, false)?;
         for (commitment, nonce) in block.body.outputs.iter().zip(&block.body.nonces) {
             let record = [&block.header.height.to_be_bytes()[..], nonce].concat();
             self.output_index.put(wtxn, commitment, &record)?;
         }
-        if pmmr_root != block.header.pmmr_root {
-            return Err(Error::PmmrRootMismatch);
+        if state_root != block.header.state_root {
+            return Err(Error::StateRootMismatch);
         }
-        if bitmap_root != block.header.bitmap_root {
-            return Err(Error::BitmapRootMismatch);
+        if output_count != block.header.output_count {
+            return Err(Error::OutputCountMismatch);
         }
 
         let retarget = self.retarget_if_due(wtxn, &block.header)?;
@@ -1265,7 +1348,7 @@ impl Chain {
 
     /// Undo the current tip, through `wtxn`, restoring the chain to
     /// exactly the state it was in right before that block was ever
-    /// applied -- the PMMR/bitmap/utxo effects reversed using the
+    /// applied -- the state-tree/utxo effects reversed using the
     /// block's own stored `UndoData`, and the tip header/retargeting
     /// state restored from the same snapshot. Nothing is committed
     /// here; that's the caller's job, same as everywhere else in this
@@ -1296,7 +1379,12 @@ impl Chain {
         // Reverse the inputs: every spent output goes back to live, at
         // exactly the position it occupied before.
         for (commitment, position) in &undo.spent_inputs {
-            self.bitmap.set(wtxn, *position, false)?;
+            // Its nonce: the output index keeps spent outputs' records
+            // (until the block that created them is itself unwound).
+            let record = self
+                .output_record(wtxn, commitment)?
+                .ok_or(Error::Corrupt("a spent output's record is missing"))?;
+            self.state.unspend(wtxn, *position, commitment, &record.nonce)?;
             self.utxo.insert(wtxn, *commitment, *position)?;
         }
         // Reverse the outputs: each one this block created disappears
@@ -1305,14 +1393,10 @@ impl Chain {
             self.utxo.remove(wtxn, *commitment)?;
             self.output_index.delete(wtxn, commitment)?;
         }
-        // Reverse the PMMR append -- this block pushed exactly
-        // `body.outputs.len()` leaves, contiguously, and nothing else
-        // has touched the PMMR since (we're unwinding the tip).
-        let new_leaf_count = self
-            .pmmr
-            .leaf_count(wtxn)?
-            .saturating_sub(block.body.outputs.len() as u64);
-        self.pmmr.truncate(wtxn, new_leaf_count)?;
+        // Reverse the appends -- this block appended exactly
+        // `body.outputs.len()` outputs, the last ones, and nothing else
+        // has been appended since (we're unwinding the tip).
+        self.state.truncate(wtxn, block.body.outputs.len() as u64)?;
 
         self.active_heights.delete(wtxn, &block.header.height.to_be_bytes())?;
 
@@ -1384,7 +1468,7 @@ impl Chain {
     }
 
     /// Validate and store `block` as a side-branch candidate, through
-    /// `wtxn` -- *not* applied to live `pmmr`/`bitmap`/`utxo` state
+    /// `wtxn` -- *not* applied to live `state`/`utxo` state
     /// (it might not even be valid relative to that state -- it could
     /// spend an output only its own branch believes exists, or double
     /// spend one the active chain already spent differently; there's
@@ -1405,7 +1489,7 @@ impl Chain {
     /// block it claims to extend.
     fn store_side_branch_block(&mut self, wtxn: &mut heed::RwTxn, block: &Block) -> Result<()> {
         let parent_retarget = self.retarget_state_after(wtxn, block.header.prev_hash)?;
-        if !self.block_is_valid(block, &parent_retarget.target) {
+        if !self.block_is_valid(wtxn, block, &parent_retarget.target)? {
             return Err(Error::InvalidSideBranchBlock);
         }
 
@@ -1607,7 +1691,7 @@ impl Chain {
     /// fresh `BlockBody` (failing if any doesn't verify on its own
     /// terms), then resolve and speculatively apply that body against
     /// real chain state -- in its own write transaction, deliberately
-    /// never committed -- to compute the `pmmr_root`/`bitmap_root` it
+    /// never committed -- to compute the `state_root`/`output_count` it
     /// would actually produce.
     ///
     /// Returns an `UnprovenBlock`, not a `Block`: there's no proof yet
@@ -1631,7 +1715,27 @@ impl Chain {
         let (prev_hash, height) = self.next_prev_hash_and_height(&wtxn)?;
         let min_timestamp = self.tip_header(&wtxn)?.map_or(0, |parent| parent.timestamp + 1);
         let target = self.current_target(&wtxn)?;
-        let (pmmr_root, bitmap_root, _spent_inputs) = self.resolve_and_apply(&mut wtxn, &body)?;
+        // The chunks to prove it in, and so the order its outputs are
+        // appended in: each chunk's transactions' commitments, by their
+        // place in the body.
+        let plan_chunks = crate::prover::plan_chunks(transactions).ok_or(Error::TransactionTooLarge)?;
+        let index = |list: &[[u8; 32]], c: &[u8; 32]| list.binary_search(c).map_err(|_| Error::InvalidBlock);
+        let mut chunks: ChunkIndices = Vec::with_capacity(plan_chunks.len());
+        for txs in &plan_chunks {
+            let (mut ins, mut outs) = (Vec::new(), Vec::new());
+            for &t in txs {
+                for input in &transactions[t].inputs {
+                    ins.push(index(&body.inputs, &crate::output::Output::new(&input.pubkey, input.amount).commitment())?);
+                }
+                for output in &transactions[t].outputs {
+                    outs.push(index(&body.outputs, &output.commitment())?);
+                }
+            }
+            ins.sort_unstable();
+            outs.sort_unstable();
+            chunks.push((ins, outs));
+        }
+        let (state_root, output_count, _spent_inputs, transitions) = self.resolve_and_apply(&mut wtxn, &body, &chunks, true)?;
         // Deliberately never committed -- see the module docs. `wtxn`
         // drops here, and LMDB aborts it.
 
@@ -1640,11 +1744,16 @@ impl Chain {
             height,
             target,
             min_timestamp,
-            pmmr_root,
-            bitmap_root,
+            state_root,
+            output_count,
             inputs: body.inputs,
             outputs: body.outputs,
             nonces: body.nonces,
+            plan: crate::prover::BlockPlan {
+                chunks: plan_chunks,
+                body_chunks: chunks,
+                transitions,
+            },
         })
     }
 }
@@ -1763,7 +1872,7 @@ mod tests {
         block
     }
 
-    /// The key correctness property, same spirit as `pmmr::truncate`'s
+    /// The key correctness property, same spirit as `state_tree`'s undo
     /// round-trip tests: unwinding the tip must restore *exactly* the
     /// state that existed right before that block was ever applied --
     /// not just a plausible-looking state.
@@ -1777,8 +1886,8 @@ mod tests {
         let rtxn = storage.read_txn().unwrap();
         let tip_after_block1 = chain.tip_hash(&rtxn).unwrap();
         let height_after_block1 = chain.height(&rtxn).unwrap();
-        let pmmr_root_after_block1 = chain.pmmr.root(&rtxn).unwrap();
-        let bitmap_root_after_block1 = chain.bitmap.root(&rtxn).unwrap();
+        let root_after_block1 = chain.state.root(&rtxn).unwrap();
+        let count_after_block1 = chain.state.count(&rtxn).unwrap();
         let target_after_block1 = chain.current_target(&rtxn).unwrap();
         drop(rtxn);
 
@@ -1792,8 +1901,8 @@ mod tests {
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), tip_after_block1);
         assert_eq!(chain.height(&rtxn).unwrap(), height_after_block1);
-        assert_eq!(chain.pmmr.root(&rtxn).unwrap(), pmmr_root_after_block1);
-        assert_eq!(chain.bitmap.root(&rtxn).unwrap(), bitmap_root_after_block1);
+        assert_eq!(chain.state.root(&rtxn).unwrap(), root_after_block1);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), count_after_block1);
         assert_eq!(chain.current_target(&rtxn).unwrap(), target_after_block1);
         // block2's own output must be gone again.
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
@@ -1813,7 +1922,7 @@ mod tests {
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), GENESIS_PARENT_HASH);
         assert_eq!(chain.height(&rtxn).unwrap(), None);
-        assert_eq!(chain.pmmr.leaf_count(&rtxn).unwrap(), 0);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), 0);
         assert_eq!(chain.current_target(&rtxn).unwrap(), DifficultyConfig::for_tests().initial_target);
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk, 50)).unwrap(), None);
     }
@@ -1839,7 +1948,7 @@ mod tests {
 
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(), None);
-        assert!(chain.bitmap.get(&rtxn, position_a).unwrap());
+        assert!((chain.state.leaf_at(&rtxn, position_a).unwrap() == crate::state_tree::SPENT));
         drop(rtxn);
 
         unwind_committed(&storage, &mut chain);
@@ -1850,7 +1959,7 @@ mod tests {
             chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(),
             Some(position_a)
         );
-        assert!(!chain.bitmap.get(&rtxn, position_a).unwrap());
+        assert!(!(chain.state.leaf_at(&rtxn, position_a).unwrap() == crate::state_tree::SPENT));
         // pk_b's output (created by the now-undone block) is gone.
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
     }
@@ -2172,9 +2281,9 @@ mod tests {
         let commitment = commitment_of(&pk, 50);
         let position = chain.utxo.get(&rtxn, commitment).unwrap();
         assert!(position.is_some());
-        assert!(!chain.bitmap.get(&rtxn, position.unwrap()).unwrap());
-        assert_eq!(chain.pmmr.root(&rtxn).unwrap(), block.header.pmmr_root);
-        assert_eq!(chain.bitmap.root(&rtxn).unwrap(), block.header.bitmap_root);
+        assert_ne!(chain.state.leaf_at(&rtxn, position.unwrap()).unwrap(), crate::state_tree::SPENT);
+        assert_eq!(chain.state.root(&rtxn).unwrap(), block.header.state_root);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), block.header.output_count);
     }
 
     #[test]
@@ -2309,8 +2418,8 @@ mod tests {
         assert!(body.add_transaction(&spend_transaction(&sk_a, &pk_a, 50, &pk_b)));
         let header = BlockHeader {
             prev_hash: GENESIS_PARENT_HASH,
-            pmmr_root: [0u8; 32],
-            bitmap_root: [0u8; 32],
+            state_root: [0u8; 32],
+            output_count: 0,
             body_hash: body.body_hash(),
             height: 0,
             timestamp: 0,
@@ -2373,19 +2482,19 @@ mod tests {
         // real result won't match it -- this fails only after inputs/
         // outputs have already been resolved and written against wtxn,
         // exactly the partial-progress scenario atomicity has to cover.
-        unproven.pmmr_root = [0xabu8; 32];
+        unproven.state_root = [0xabu8; 32];
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert!(mine_block(&mut block, &target, 100_000));
 
         let err = chain.apply_block(&block).unwrap_err();
-        assert!(matches!(err, Error::PmmrRootMismatch));
+        assert!(matches!(err, Error::StateRootMismatch));
 
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), GENESIS_PARENT_HASH);
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk, 50)).unwrap(), None);
-        assert_eq!(chain.pmmr.leaf_count(&rtxn).unwrap(), 0);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), 0);
     }
 
     #[test]
@@ -2699,18 +2808,18 @@ mod tests {
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), competing3.header.hash());
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(), None);
-        assert!(chain.bitmap.get(&rtxn, position_a).unwrap());
+        assert!((chain.state.leaf_at(&rtxn, position_a).unwrap() == crate::state_tree::SPENT));
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
         assert!(chain.utxo.get(&rtxn, commitment_of(&pk_c, 50)).unwrap().is_some());
         assert!(chain.utxo.get(&rtxn, commitment_of(&pk_d, 50)).unwrap().is_some());
 
         let builder_rtxn = builder_storage.read_txn().unwrap();
-        assert_eq!(chain.pmmr.root(&rtxn).unwrap(), builder.pmmr.root(&builder_rtxn).unwrap());
-        assert_eq!(chain.bitmap.root(&rtxn).unwrap(), builder.bitmap.root(&builder_rtxn).unwrap());
+        assert_eq!(chain.state.root(&rtxn).unwrap(), builder.state.root(&builder_rtxn).unwrap());
+        assert_eq!(chain.state.count(&rtxn).unwrap(), builder.state.count(&builder_rtxn).unwrap());
     }
 
     /// A heavier branch whose last block is bad (passes its own
-    /// `validate`, but claims the wrong `pmmr_root`): the reorg gets as
+    /// `validate`, but claims the wrong `state_root`): the reorg gets as
     /// far as replaying the branch's good blocks before hitting it, and
     /// must then leave the active chain exactly as it was -- and record
     /// the bad block, so a block built on top of it is refused outright
@@ -2726,8 +2835,8 @@ mod tests {
         chain.apply_block(&active2).unwrap();
 
         let rtxn = storage.read_txn().unwrap();
-        let pmmr_root_before = chain.pmmr.root(&rtxn).unwrap();
-        let bitmap_root_before = chain.bitmap.root(&rtxn).unwrap();
+        let root_before = chain.state.root(&rtxn).unwrap();
+        let count_before = chain.state.count(&rtxn).unwrap();
         drop(rtxn);
 
         let (_builder_dir, _builder_storage, mut builder) = open();
@@ -2742,7 +2851,7 @@ mod tests {
         let (_sk_bad, pk_bad) = keypair(102);
         let bad_txs = [reward_transaction(&pk_bad, 50)];
         let mut unproven = builder.build_block(&bad_txs).unwrap();
-        unproven.pmmr_root = [0xabu8; 32];
+        unproven.state_root = [0xabu8; 32];
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut bad = unproven.finish(proof);
@@ -2764,12 +2873,12 @@ mod tests {
             assert_eq!(chain.accept_block(block).unwrap(), AcceptOutcome::StoredAsSideBranch);
         }
         let err = chain.accept_block(bad.clone()).unwrap_err();
-        assert!(matches!(err, Error::PmmrRootMismatch));
+        assert!(matches!(err, Error::StateRootMismatch));
 
         let rtxn = storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), active2.header.hash());
-        assert_eq!(chain.pmmr.root(&rtxn).unwrap(), pmmr_root_before);
-        assert_eq!(chain.bitmap.root(&rtxn).unwrap(), bitmap_root_before);
+        assert_eq!(chain.state.root(&rtxn).unwrap(), root_before);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), count_before);
         assert!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap().is_some());
         assert!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap().is_some());
         assert!(chain.is_known_invalid(&rtxn, bad.header.hash()).unwrap());
@@ -2864,7 +2973,7 @@ mod tests {
         let builder_rtxn = builder_storage.read_txn().unwrap();
         assert_eq!(chain.tip_hash(&rtxn).unwrap(), post_window.header.hash());
         assert_eq!(chain.current_target(&rtxn).unwrap(), builder.current_target(&builder_rtxn).unwrap());
-        assert_eq!(chain.pmmr.root(&rtxn).unwrap(), builder.pmmr.root(&builder_rtxn).unwrap());
+        assert_eq!(chain.state.root(&rtxn).unwrap(), builder.state.root(&builder_rtxn).unwrap());
     }
 
     /// Below `reorg_floor`, side-branch blocks are dropped entirely and
@@ -3097,7 +3206,10 @@ mod tests {
     /// With proof checks on (as outside tests they always are), a block
     /// carrying a real proof of its transactions is accepted, and the same
     /// block with a placeholder proof in its place is refused.
+    /// Proves a real block (a chunk proof and its wrap): minutes; run
+    /// with `cargo test --release -- --ignored a_chain_checking_proofs`.
     #[test]
+    #[ignore]
     fn a_chain_checking_proofs_accepts_only_a_really_proven_block() {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
@@ -3108,8 +3220,7 @@ mod tests {
         let unproven = chain.build_block(&transactions).unwrap();
         let target = unproven.target;
         let min_timestamp = unproven.min_timestamp;
-        let (inputs, outputs) = (unproven.inputs.clone(), unproven.outputs.clone());
-        let proof = prover::prove_block(&inputs, &outputs, &transactions, [3; 32]).unwrap();
+        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &transactions, &unproven.plan, [3; 32]).unwrap();
         let mut real = unproven.finish(proof);
         real.header.timestamp = real.header.timestamp.max(min_timestamp);
         assert!(mine_block(&mut real, &target, 100_000));

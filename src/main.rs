@@ -1,9 +1,9 @@
-mod bitmap;
 mod aggregate;
 mod block;
 mod block_air;
 mod bus;
 mod chain;
+mod chain_step;
 mod circuit;
 mod cli;
 mod discovery;
@@ -23,7 +23,6 @@ mod ntt;
 mod output;
 mod parallel;
 mod peers;
-mod pmmr;
 mod poseidon2;
 mod poseidon2_air;
 mod pow;
@@ -32,6 +31,8 @@ mod recovery;
 mod recursion;
 mod slate;
 mod stark;
+mod state_circuit;
+mod state_tree;
 mod storage;
 mod symbolic;
 mod transaction;
@@ -129,14 +130,13 @@ fn difficulty_config() -> chain::DifficultyConfig {
 /// This network's genesis block, mined once (see the `mine_genesis` test)
 /// and fixed from then on: every node starts its chain from exactly this
 /// block, and accepts no other at height 0 (see `Chain::open`). Its body
-/// is empty, so the roots are those of an empty PMMR and bitmap; its
+/// is empty, so its state root is an empty state tree's; its
 /// timestamp is the floor every later block's must climb from.
-const GENESIS_TIMESTAMP_MS: u64 = 1_791_260_315_834;
-const GENESIS_PMMR_ROOT: &str = "136a8c43079d821b5d16f870ba686501fb73124c7f2f684f6bd00f741cbd0675";
-const GENESIS_BITMAP_ROOT: &str = "a800d34b66c57962f6aab87343c0064fdd5e933c7168454d5eb8b760affab20f";
+const GENESIS_TIMESTAMP_MS: u64 = 1_791_270_256_362;
+const GENESIS_STATE_ROOT: &str = "5be6bc002e4d0a70dcdf897284a01d5577381315464b6506f65ce56f7d5bc035";
 const GENESIS_BODY_HASH: &str = "78e5073d3554582a18816b49397ac631b629d019a062cf257ef467124ec2c16f";
-const GENESIS_NONCE: &str = "68e5020000000000000000000000000000000000000000000000000000000000";
-const GENESIS_HASH: &str = "000001172b14381562be5e4caf32f07457253912ebbdd96f7e36c4027520943f";
+const GENESIS_NONCE: &str = "343f010000000000000000000000000000000000000000000000000000000000";
+const GENESIS_HASH: &str = "0000016cc4e2345bda9ec954d1365025ee280457e4f8197162bbaf2884398d3d";
 
 fn from_hex32(hex: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -150,8 +150,8 @@ fn genesis_block() -> Block {
     Block {
         header: block::BlockHeader {
             prev_hash: chain::GENESIS_PARENT_HASH,
-            pmmr_root: from_hex32(GENESIS_PMMR_ROOT),
-            bitmap_root: from_hex32(GENESIS_BITMAP_ROOT),
+            state_root: from_hex32(GENESIS_STATE_ROOT),
+            output_count: 0,
             body_hash: from_hex32(GENESIS_BODY_HASH),
             height: 0,
             timestamp: GENESIS_TIMESTAMP_MS,
@@ -539,8 +539,8 @@ fn print_block(block: &Block) {
         format_timestamp(block.header.timestamp)
     );
     info!("  nonce:       {}", hex(&block.header.nonce));
-    info!("  pmmr_root:   {}", hex(&block.header.pmmr_root));
-    info!("  bitmap_root: {}", hex(&block.header.bitmap_root));
+    info!("  state_root:  {}", hex(&block.header.state_root));
+    info!("  outputs:     {} in all", block.header.output_count);
     info!("  body_hash:   {}", hex(&block.header.body_hash));
     info!("  inputs:      {}", block.body.inputs.len());
     for commitment in &block.body.inputs {
@@ -746,8 +746,7 @@ mod tests {
         }
         let h = &block.header;
         println!("GENESIS_TIMESTAMP_MS = {}", h.timestamp);
-        println!("GENESIS_PMMR_ROOT = {}", hex32(&h.pmmr_root));
-        println!("GENESIS_BITMAP_ROOT = {}", hex32(&h.bitmap_root));
+        println!("GENESIS_STATE_ROOT = {}", hex32(&h.state_root));
         println!("GENESIS_BODY_HASH = {}", hex32(&h.body_hash));
         println!("GENESIS_NONCE = {}", hex32(&h.nonce));
         println!("GENESIS_HASH = {}", hex32(&h.hash()));

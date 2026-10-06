@@ -2,7 +2,7 @@
 //! public key and the amount being spent) and outputs, nothing else -- no
 //! scripts.
 //!
-//! This module has **no notion of `pmmr`, a block, or where in the chain an
+//! This module has **no notion of the state tree, a block, or where in the chain an
 //! output actually lives** -- deliberately so. `Transaction` is a small,
 //! self-contained, reusable primitive: building, signing, and checking a
 //! transaction's own internal correctness never needs to know anything

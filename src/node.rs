@@ -478,13 +478,13 @@ impl Node {
                 "block template #{}: {count} transaction(s), fees {} -- proving{}",
                 unproven.height,
                 format_amount(fees),
-                if unproven.inputs.len() > prover::CHUNK_SHAPE.inputs { " (tree proof: this takes a while)" } else { "" }
+                if unproven.plan.chunks.len() > 1 { format!(" ({} chunks: this takes a while)", unproven.plan.chunks.len()) } else { String::new() }
             );
         }
-        let (inputs, outputs) = (unproven.inputs.clone(), unproven.outputs.clone());
+        let (inputs, outputs, nonces, plan) = (unproven.inputs.clone(), unproven.outputs.clone(), unproven.nonces.clone(), unproven.plan.clone());
         let (send, result) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let proof = prover::prove_block_auto(&inputs, &outputs, &transactions, crate::random_key());
+            let proof = prover::prove_block(&inputs, &outputs, &nonces, &transactions, &plan, crate::random_key());
             let _ = send.send(proof);
         });
         self.miner = Miner::Proving {

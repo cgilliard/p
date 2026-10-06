@@ -1,18 +1,11 @@
 //! A shared LMDB storage context: one `heed::Env`, opened once, that every
 //! on-disk component in this crate gets its own named database from.
 //!
-//! Before this module existed, `Pmmr::open` opened its own LMDB environment
-//! directly -- fine when it was the only thing persisted, but the planned
-//! spent-output bitmap (for pruning) needs to live in the *same*
-//! environment as the PMMR's tables, not a second one, so a separate tool
-//! (or the node itself) only ever has one thing to open. This module is
-//! that shared handle; `Pmmr` (and later the bitmap) take one by reference
-//! rather than managing their own.
-
-// `main.rs` doesn't call into this module directly yet (it just prints
-// "Hello world!"), so allow dead code here rather than suppressing warnings
-// piecemeal -- this module exists to be exercised by its own tests and by
-// `pmmr.rs` for now.
+//! Everything a node persists -- chain state, blocks, peers -- lives in
+//! this one environment, so it can be updated together in one transaction
+//! and a tool (or the node itself) only ever has one thing to open; each
+//! component takes the shared handle by reference rather than managing
+//! its own.
 #![allow(dead_code)]
 
 use heed::types::Bytes;
@@ -25,9 +18,8 @@ use std::path::Path;
 pub const DEFAULT_MAP_SIZE: usize = 1 << 30;
 
 /// Upper bound on how many named databases this environment can ever hold;
-/// LMDB requires declaring this upfront. Currently used: `nodes` and `meta`
-/// (by `Pmmr`), `bitmap_pages` and `bitmap_nodes` (by `Bitmap`),
-/// `utxo_index` (by `UtxoIndex`), and `chain_meta`, `blocks`,
+/// LMDB requires declaring this upfront. Currently used: `state_tree` and
+/// `state_meta` (by `StateTree`), `utxo_index` (by `UtxoIndex`), and `chain_meta`, `blocks`,
 /// `block_undo`, `block_work`, `invalid_blocks`, `block_retarget`, and
 /// `block_heights`, and `active_heights` (by `Chain`), and `peers` (by
 /// `PeerTable`) -- 14 of 16, leaving a little headroom before this needs

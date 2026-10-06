@@ -5,14 +5,23 @@ This pins down the shape of `Block` before any of it gets written. Status:
 the fixed difficulty value, and how `Block` relates to `Transaction`) are
 all resolved below.
 
+> **Since then** (2026-10-06): the PMMR + bitmap state was replaced by one
+> fixed-depth state tree (`state_tree.rs`, `docs/CHAIN_RECURSION.md`), so
+> the header carries `state_root` and `output_count`; the header also
+> gained `height` and `timestamp`; outputs carry recovery nonces; and the
+> proof now covers signatures as well as balance. The sections below are
+> updated where they describe the current code.
+
 ## Header
 
 ```rust
 pub struct BlockHeader {
     pub prev_hash: [u8; 32],
-    pub pmmr_root: [u8; 32],
-    pub bitmap_root: [u8; 32],
+    pub state_root: [u8; 32],
     pub body_hash: [u8; 32],
+    pub output_count: u64,
+    pub height: u64,
+    pub timestamp: u64,
     pub nonce: [u8; 32],
 }
 ```
@@ -21,10 +30,12 @@ pub struct BlockHeader {
   an actual chain yet (there's no chain/sync data structure), so for now
   it's just a field that gets hashed and checked for PoW. Validating it
   against real history is later work.
-- `pmmr_root` / `bitmap_root` — the *claimed new* roots after this block's
-  updates are applied. Checked by actually applying the block's inputs and
-  outputs to a real `Pmmr`/`Bitmap` and comparing (see Validation below) —
-  not merely stored.
+- `state_root` / `output_count` — the *claimed* state after this block's
+  updates are applied: the root of the state tree (every output ever
+  created, by position: its commitment while unspent, then `SPENT`) and how
+  many outputs it holds. Checked by actually applying the block's inputs
+  and outputs to the real `StateTree` and comparing (see Validation below)
+  — not merely stored.
 - `body_hash` — commits to the body (next section), but **not** the proof.
   Same reasoning Bitcoin's segwit uses for excluding witness data from the
   txid: the body is the economic content (who pays whom, how much); the
@@ -82,7 +93,7 @@ pub struct BlockBody {
   `Transaction::add_input`/`add_output` already use, just applied across
   *every* transaction in the block at once rather than within one. Picking
   the same key `Transaction` already uses (rather than, say, each input's
-  resolved `pmmr` position) means the body's canonical order doesn't depend
+  resolved state-tree position) means the body's canonical order doesn't depend
   on first resolving anything through the `utxo` index — it's intrinsic to
   the data itself.
 - No per-transaction grouping survives in this representation. This is
@@ -142,18 +153,16 @@ What `Block::validate()` checks:
 2. **Body commitment** — recompute `body_hash` from the stored `BlockBody`
    and check it matches the header's.
 3. **Balance** — `sum(outputs) == sum(inputs) + BLOCK_REWARD`.
-4. **State transition** — for each input, resolve its `(pubkey, amount)`
-   to a position via `UtxoIndex`, check the `Pmmr` leaf at that position
-   actually matches, check the `Bitmap` says it's unspent, then (in a
-   write transaction that only commits if everything checks out) flip
-   that bit to spent and remove the `UtxoIndex` entry; for each output,
-   push it onto the `Pmmr` and insert its new `UtxoIndex` entry. Finally,
-   check the resulting `Pmmr`/`Bitmap` roots match the header's claimed
-   `pmmr_root`/`bitmap_root`.
+4. **State transition** — for each input, resolve its commitment to a
+   position via `UtxoIndex` (present only while unspent), then (in a write
+   transaction that only commits if everything checks out) set that
+   state-tree leaf to `SPENT` and remove the `UtxoIndex` entry; for each
+   output, refuse a duplicate of a live one, append it to the state tree
+   and insert its `UtxoIndex` entry. Finally, check the resulting state
+   root and output count match the header's `state_root`/`output_count`.
 5. **No double-spend within the block** — falls out of step 4 automatically:
-   a second input trying to spend the same position will find the
-   `UtxoIndex` entry already removed (or the `Bitmap` bit already flipped)
-   by the first.
+   a second input trying to spend the same output will find the
+   `UtxoIndex` entry already removed by the first.
 
 **Explicitly not checked, by design, until the proof covers it:** that any
 spent input was actually authorized by its owner. See above.

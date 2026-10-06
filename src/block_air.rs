@@ -191,8 +191,8 @@ const TAG_CH: u32 = 1;
 const TAG_TOP: u32 = 2;
 const TAG_MSG: u32 = 3;
 const TAG_ITEM: u32 = 4;
-const TAG_PIN: u32 = 5;
-const TAG_POUT: u32 = 6;
+pub const TAG_PIN: u32 = 5;
+pub const TAG_POUT: u32 = 6;
 /// The public amounts `a`, `b`: `[TAG_NET, 0, 0, a limbs, b limbs]`.
 pub const TAG_NET: u32 = 7;
 /// `[tag, a, b]` and 16 values: an output's commitment and nonce, the
@@ -299,6 +299,11 @@ impl BlockAir {
 
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
+    }
+
+    /// The public commitment slots `(inputs, outputs)`, if padded.
+    pub fn capacity(&self) -> Option<(usize, usize)> {
+        self.capacity
     }
 
     pub fn public_inputs(&self) -> &[[BabyBear; 8]] {

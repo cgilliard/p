@@ -1,5 +1,11 @@
 # Fork handling: status
 
+> Note (2026-10-06): the PMMR and bitmap mentioned below were replaced by
+> one fixed-depth state tree (`state_tree.rs`; see
+> `docs/CHAIN_RECURSION.md`). Unwinding a block now restores spent leaves
+> and truncates the appended ones; the header carries `state_root` and
+> `output_count`.
+
 Progress on item #2 of `BLOCK_TODO.md` ("No fork handling"): side
 branches, fork-choice by cumulative work, reorgs, and orphans. All 233
 tests pass.

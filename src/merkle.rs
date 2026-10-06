@@ -79,7 +79,7 @@ fn hash_level(level: u32, prev: &[Hash]) -> Vec<Hash> {
 /// `node_hash(level, left, right)`: the two child digests, one
 /// permutation, under a domain per `level` -- the level of the *parent*
 /// (leaves are level 0), the same separation-by-level convention used in
-/// `pmmr`/`bitmap`.
+/// `state_tree`.
 fn node_hash(level: u32, left: Hash, right: Hash) -> Hash {
     digest_to_bytes(hash_pair(DOMAIN_MERKLE_NODE + level, digest_from_bytes(&left), digest_from_bytes(&right)))
 }
