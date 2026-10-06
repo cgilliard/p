@@ -186,6 +186,7 @@ fn public_tuples(vk: Octet, data: Octet, amounts: (u64, u64), state: &StateChang
 
 /// A tree circuit's verifying key: its committed fixed columns (prover
 /// side) and their digest.
+#[derive(Clone)]
 pub struct Key {
     pub preprocessed: Arc<Preprocessed>,
     pub vk: Octet,
@@ -233,14 +234,14 @@ fn compose(b: &mut Builder, limbs: &[EVar]) -> EVar {
 }
 
 /// An amounts octet's eight limbs as base cells.
-fn limbs_of(b: &mut Builder, amounts: OVar) -> Vec<EVar> {
+pub(crate) fn limbs_of(b: &mut Builder, amounts: OVar) -> Vec<EVar> {
     let (lo, hi) = b.halves(amounts);
     (0..8).map(|l| b.lane(if l < 4 { lo } else { hi }, l % 4)).collect()
 }
 
 /// `x + y` for 64-bit amounts as four 16-bit limbs (both canonical),
 /// carried limb by limb; asserts it doesn't overflow 64 bits.
-fn add_amount(b: &mut Builder, x: &[EVar], y: &[EVar]) -> Vec<EVar> {
+pub(crate) fn add_amount(b: &mut Builder, x: &[EVar], y: &[EVar]) -> Vec<EVar> {
     let mut carry = b.zero();
     let mut out = Vec::with_capacity(AMOUNT_LIMBS);
     for j in 0..AMOUNT_LIMBS {
@@ -636,16 +637,30 @@ impl VerifyingKey {
         if amounts.0.checked_sub(amounts.1) != Some(reward) {
             return false;
         }
+        match self.root(chunks, amounts, state, proof.clone()) {
+            Some(root) => stark::verify(&root.air, &root.proof, &self.tree.params),
+            None => false,
+        }
+    }
+
+    /// The tree root `proof` claims to be, for a block with these chunks,
+    /// totals and state change: the node a chain step verifies
+    /// (`chain_step`). Unchecked -- `verify_block` checks it.
+    pub fn root(&self, chunks: &[BlockAir], amounts: (u64, u64), state: &StateChange, proof: Proof) -> Option<Node> {
         let leaves: Vec<(Octet, (u64, u64))> = chunks.iter().map(|c| (chunk_data(c), (0, 0))).collect();
-        let Some((data, _)) = tree_data(&leaves) else {
-            return false;
-        };
+        let (data, _) = tree_data(&leaves)?;
         let air = if chunks.len() == 1 {
             self.circuit(&self.wrap_cap, public_tuples([BabyBear::ZERO; 8], data, amounts, state))
         } else {
             self.circuit(&self.aggregate_cap, public_tuples(vk_digest(&self.aggregate_cap), data, amounts, state))
         };
-        stark::verify(&air, proof, &self.tree.params)
+        Some(Node {
+            air,
+            proof,
+            data,
+            amounts,
+            state: *state,
+        })
     }
 }
 

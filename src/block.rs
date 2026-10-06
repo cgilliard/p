@@ -244,13 +244,21 @@ pub struct BlockBody {
     /// per output.
     pub nonces: Vec<[u8; NONCE_LEN]>,
     pub proof: Proof,
+    /// The **parent's chain proof** (`chain_step`): that the parent block
+    /// is the tip of a valid chain from genesis -- every block's proof,
+    /// state transition, proof of work and retargeting, recursively. It
+    /// can't be in the parent itself (it attests the parent's header,
+    /// nonce and all). Empty for the genesis block. Encoded bytes of the
+    /// proof; what it attests is checked against the chain
+    /// (`chain::Chain`'s apply).
+    pub chain_proof: Vec<u8>,
 }
 
-/// Which body layout `body_hash` commits to -- 2 since outputs carry
-/// recovery nonces. Part of the hashed bytes, so a chain stored under an
-/// older layout (whose genesis hashes differently) is refused at startup
-/// rather than misread.
-const BODY_VERSION: u8 = 2;
+/// Which body layout `body_hash` commits to -- 3 since blocks carry their
+/// parent's chain proof (2: outputs carry recovery nonces). Part of the
+/// hashed bytes, so a chain stored under an older layout (whose genesis
+/// hashes differently) is refused at startup rather than misread.
+const BODY_VERSION: u8 = 3;
 
 impl BlockBody {
     pub fn new() -> Self {
@@ -259,6 +267,7 @@ impl BlockBody {
             outputs: Vec::new(),
             nonces: Vec::new(),
             proof: Proof::default(),
+            chain_proof: Vec::new(),
         }
     }
 
@@ -342,6 +351,7 @@ impl BlockBody {
             bytes.extend_from_slice(nonce);
         }
         bytes.extend_from_slice(&self.proof.commitment_hash());
+        bytes.extend_from_slice(&hash_bytes_32(&self.chain_proof));
         hash_bytes_32(&bytes)
     }
 
@@ -355,7 +365,7 @@ impl BlockBody {
 
     /// `to_bytes().len()`, without building the bytes.
     pub fn encoded_len(&self) -> usize {
-        4 + 32 * self.inputs.len() + 4 + 32 * self.outputs.len() + 4 + NONCE_LEN * self.nonces.len() + 4 + self.proof.len()
+        4 + 32 * self.inputs.len() + 4 + 32 * self.outputs.len() + 4 + NONCE_LEN * self.nonces.len() + 4 + self.proof.len() + 4 + self.chain_proof.len()
     }
 
     /// Serialize: a 4-byte big-endian input count, that many 32-byte
@@ -381,6 +391,8 @@ impl BlockBody {
         }
         out.extend_from_slice(&(self.proof.len() as u32).to_be_bytes());
         out.extend_from_slice(self.proof.as_bytes());
+        out.extend_from_slice(&(self.chain_proof.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.chain_proof);
         out
     }
 
@@ -424,6 +436,9 @@ impl BlockBody {
         let proof_len = read_u32(bytes, &mut offset)? as usize;
         let proof = bytes.get(offset..offset.saturating_add(proof_len)).ok_or(Error::Truncated)?;
         offset += proof_len;
+        let chain_proof_len = read_u32(bytes, &mut offset)? as usize;
+        let chain_proof = bytes.get(offset..offset.saturating_add(chain_proof_len)).ok_or(Error::Truncated)?;
+        offset += chain_proof_len;
 
         if offset != bytes.len() {
             return Err(Error::Truncated); // trailing garbage
@@ -434,6 +449,7 @@ impl BlockBody {
             outputs,
             nonces,
             proof: Proof::from_bytes(proof.to_vec()),
+            chain_proof: chain_proof.to_vec(),
         })
     }
 
@@ -515,6 +531,12 @@ impl UnprovenBlock {
     /// left at `[0; 32]` -- `pow::mine_block` is the only thing that
     /// sets it, and only once this has already happened.
     pub fn finish(self, proof: Proof) -> Block {
+        self.finish_with_chain_proof(proof, Vec::new())
+    }
+
+    /// `finish`, also carrying the parent's chain proof (`chain_step`) --
+    /// what a block needs on a chain that requires chain proofs.
+    pub fn finish_with_chain_proof(self, proof: Proof, chain_proof: Vec<u8>) -> Block {
         // A placeholder (empty) proof, for chains that skip proof checks,
         // still records the chunks, so applying the block appends its
         // outputs in the order this plan did.
@@ -528,6 +550,7 @@ impl UnprovenBlock {
             outputs: self.outputs,
             nonces: self.nonces,
             proof,
+            chain_proof,
         };
         let header = BlockHeader {
             prev_hash: self.prev_hash,

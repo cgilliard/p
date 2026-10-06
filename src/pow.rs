@@ -252,7 +252,7 @@ fn shift_left_1_with_carry_in(x: [u8; 32], carry_in: u8) -> [u8; 32] {
 /// of panicking if it isn't, since there's no meaningful quotient --
 /// the one caller, `work_for_target`, already special-cases its own
 /// zero-divisor-adjacent inputs before ever reaching here.
-fn divmod256(dividend: [u8; 32], divisor: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+pub(crate) fn divmod256(dividend: [u8; 32], divisor: [u8; 32]) -> ([u8; 32], [u8; 32]) {
     if divisor == [0u8; 32] {
         return ([0xffu8; 32], dividend);
     }

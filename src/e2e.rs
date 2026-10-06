@@ -436,4 +436,76 @@ mod tests {
         println!("restored wallet paid Bob at height {}; new keys from {}", tip(&chain), report.next_index);
     }
 
+
+    /// Chain proofs as consensus (`docs/CHAIN_RECURSION.md`, 5c): a chain
+    /// that requires every block to carry its parent's chain proof, every
+    /// block proven for real. Block 1 carries the genesis circuit's proof,
+    /// later ones a step proof -- each verified against the parent as the
+    /// chain records it (height, state, target, work...). A block carrying
+    /// a chain proof of the wrong parent is refused.
+    /// `NETWORK=dev cargo test --release -- --ignored --nocapture chain_proofs_as_consensus`.
+    #[test]
+    #[ignore]
+    fn chain_proofs_as_consensus() {
+        use crate::chain_step::ChainProver;
+        let dir = TempDir::new();
+        let config = chain::DifficultyConfig::for_tests();
+        // A fixed genesis block (empty), as a network has.
+        let genesis = {
+            let scratch = Storage::open(&dir.0.join("scratch")).unwrap();
+            let mut c = Chain::open(&scratch, config, 5, None).unwrap();
+            let unproven = c.build_block(&[]).unwrap();
+            let target = unproven.target;
+            let mut g = unproven.finish(prover::Proof::placeholder());
+            assert!(mine_block(&mut g, &target, u64::MAX));
+            g
+        };
+        let storage = Storage::open(&dir.0.join("chain")).unwrap();
+        let mut chain = Chain::open(&storage, config, 5, Some(&genesis)).unwrap();
+        let mut chain_prover = ChainProver::new(config, prover::tree());
+        let reader = chain::BlockReader::open(&storage).unwrap();
+        let tip = |_: &Chain| reader.tip().unwrap().unwrap().1;
+
+        // Make the next block on the tip, carrying the tip's chain proof.
+        let make = |chain: &mut Chain, chain_prover: &mut ChainProver, k: u8, chain_proof: Option<Vec<u8>>| -> (crate::block::Block, Vec<u8>) {
+            let parent = tip(chain);
+            let start = std::time::Instant::now();
+            let inputs = chain.chain_proof_inputs(parent).unwrap();
+            let second = || reader.active_hash_at(1).ok().flatten().and_then(|h| chain.chain_proof_inputs(h).ok());
+            let made = chain_prover.prove(&inputs, second, [k; 32]).unwrap();
+            let chain_proof_time = start.elapsed();
+            let (_, pk) = wots::keygen(&[90 + k; 32]);
+            let mut reward = Transaction::new();
+            reward.add_output(Output::new(&pk, prover::REWARD)).unwrap();
+            let txs = [reward];
+            let unproven = chain.build_block(&txs).unwrap();
+            let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
+            let start = std::time::Instant::now();
+            let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &txs, &unproven.plan, [k; 32]).unwrap();
+            println!("block {}: chain proof {chain_proof_time:.1?}, block proof {:.1?}", unproven.height, start.elapsed());
+            let mut block = unproven.finish_with_chain_proof(proof, chain_proof.unwrap_or_else(|| made.clone()));
+            block.header.timestamp = block.header.timestamp.max(min_timestamp);
+            assert!(mine_block(&mut block, &target, u64::MAX));
+            (block, made)
+        };
+
+        // Block 1: carries the genesis proof. Requiring chain proofs needs
+        // only the genesis circuit's key for it.
+        let (b1, genesis_proof) = make(&mut chain, &mut chain_prover, 1, None);
+        chain.require_chain_proofs(chain_prover.verifier().unwrap());
+        assert_eq!(chain.accept_block(b1).unwrap(), chain::AcceptOutcome::Applied);
+        // Block 2: its chain proof (of block 1) is the first step proof;
+        // proving it derives the step key, so the full verifier exists.
+        let (b2, _) = make(&mut chain, &mut chain_prover, 2, None);
+        chain.require_chain_proofs(chain_prover.verifier().unwrap());
+        assert_eq!(chain.accept_block(b2).unwrap(), chain::AcceptOutcome::Applied);
+        // Block 3 with the wrong chain proof (genesis's, not block 2's).
+        let (bad, _) = make(&mut chain, &mut chain_prover, 3, Some(genesis_proof));
+        assert!(chain.accept_block(bad).is_err(), "a chain proof of another block");
+        // Block 3, right: a step proof over a step proof.
+        let (b3, _) = make(&mut chain, &mut chain_prover, 3, None);
+        assert_eq!(chain.accept_block(b3).unwrap(), chain::AcceptOutcome::Applied);
+        assert_eq!(reader.tip().unwrap().unwrap().0, 3);
+    }
+
 }

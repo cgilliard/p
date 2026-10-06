@@ -3,6 +3,7 @@ mod block;
 mod block_air;
 mod bus;
 mod chain;
+mod chain_rules;
 mod chain_step;
 mod circuit;
 mod cli;
@@ -137,7 +138,7 @@ fn difficulty_config() -> chain::DifficultyConfig {
 /// Each network (`network`) has its own; they differ only in timestamp
 /// and nonce (the body, and so the state root, is empty in both).
 const GENESIS_STATE_ROOT: &str = "5be6bc002e4d0a70dcdf897284a01d5577381315464b6506f65ce56f7d5bc035";
-const GENESIS_BODY_HASH: &str = "78e5073d3554582a18816b49397ac631b629d019a062cf257ef467124ec2c16f";
+const GENESIS_BODY_HASH: &str = "ab928c73b05ea858df784d11d3ff2f21f3048d5a0c8e6b4714c6f52e56fd8871";
 
 /// A network's genesis: timestamp, nonce, and the resulting hash.
 struct Genesis {
@@ -147,15 +148,15 @@ struct Genesis {
 }
 
 const MAIN_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_270_256_362,
-    nonce: "343f010000000000000000000000000000000000000000000000000000000000",
-    hash: "0000016cc4e2345bda9ec954d1365025ee280457e4f8197162bbaf2884398d3d",
+    timestamp_ms: 1_791_313_050_115,
+    nonce: "2b4d020000000000000000000000000000000000000000000000000000000000",
+    hash: "0000002d0cee266dc68e3b5bcafe751855c1fb2ca617a61261411e67f518564d",
 };
 
 const DEV_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_303_237_548,
-    nonce: "cadb000000000000000000000000000000000000000000000000000000000000",
-    hash: "000000223942ad0a83176867852fe1324fa8e36bb2133161c90d854771ca1000",
+    timestamp_ms: 1_791_313_115_161,
+    nonce: "a45f010000000000000000000000000000000000000000000000000000000000",
+    hash: "00000102fb8485137bd9444e357ffd67631f691b572bda4e23b5b2725cb9b656",
 };
 
 fn genesis() -> &'static Genesis {
@@ -646,7 +647,7 @@ fn main() {
     let genesis = genesis_block();
     assert_eq!(hex(&genesis.header.hash()), self::genesis().hash, "genesis constants are inconsistent");
     info!("Genesis block: {}", self::genesis().hash);
-    let chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
+    let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
         let hint = if matches!(e, chain::Error::WrongGenesis) {
             " (its data is from a chain with a different genesis block -- delete it, or use another --data-dir)"
         } else {
@@ -654,6 +655,8 @@ fn main() {
         };
         die(&format!("failed to open chain at {}: {e}{hint}", path.display()));
     });
+    // Every block after genesis carries its parent's chain proof.
+    chain.require_chain_proofs(chain_step::consensus_verifier());
 
     {
         let rtxn = storage.read_txn().expect("failed to open read transaction");
@@ -710,6 +713,7 @@ fn main() {
     let (requests_tx, requests) = std::sync::mpsc::channel();
     std::thread::spawn(move || cli::run(requests_tx));
     let mut node = node::Node::new(chain, reader, received, received_txs, commands, peer_table, wallet, args.mine, requests);
+    node.chain_prover = std::sync::Arc::new(std::sync::Mutex::new(chain_step::ChainProver::new(difficulty_config(), prover::tree())));
     node.peer_height = peer_height;
     node.standalone = standalone;
     node.run();
@@ -799,6 +803,49 @@ mod tests {
         println!("GENESIS_NONCE = {}", hex32(&h.nonce));
         println!("GENESIS_HASH = {}", hex32(&h.hash()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chain-proof circuits' verifying keys for this network: mine a
+    /// real first block on its genesis, prove the genesis's chain proof and
+    /// the first block's, and print both circuits' caps -- run after any
+    /// change to the circuits, the genesis, or the tree keys, then update
+    /// `chain_step`'s `GENESIS_CAP` / `STEP_CAP` (or `DEV_...`). Slow:
+    /// `[NETWORK=dev] cargo test --release -- --ignored --nocapture chain_keys`.
+    #[test]
+    #[ignore]
+    fn chain_keys() {
+        let (dir, storage) = temp_storage("chain-keys");
+        let genesis = genesis_block();
+        let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap();
+        let mut chain_prover = chain_step::ChainProver::new(difficulty_config(), prover::tree());
+        let g_proof = chain_prover.prove(&chain.chain_proof_inputs(genesis.header.hash()).unwrap(), || None, [1; 32]).unwrap();
+        let (_, pk) = wots::keygen(&[5; 32]);
+        let mut reward = transaction::Transaction::new();
+        reward.add_output(output::Output::new(&pk, prover::REWARD)).unwrap();
+        let txs = [reward];
+        let unproven = chain.build_block(&txs).unwrap();
+        let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
+        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &txs, &unproven.plan, [2; 32]).unwrap();
+        let mut block = unproven.finish_with_chain_proof(proof, g_proof);
+        block.header.timestamp = block.header.timestamp.max(min_timestamp);
+        while !mine_block(&mut block, &target, MINE_BATCH) {
+            block.header.timestamp = now_millis();
+        }
+        let hash = block.header.hash();
+        chain.apply_block(&block).unwrap();
+        let p1 = chain_prover.prove(&chain.chain_proof_inputs(hash).unwrap(), || None, [3; 32]).unwrap();
+        let keys = chain_prover.keys().unwrap();
+        let verifier = chain_step::ChainVerifier::of(&keys, prover::tree());
+        assert!(verifier.verify(&chain.chain_proof_inputs(hash).unwrap().tip, &p1));
+        let prefix = if network::current() == network::Network::Dev { "DEV_" } else { "" };
+        println!("const {prefix}GENESIS_CAP: &str = \"{}\";", chain_step::cap_to_hex(&verifier.genesis_cap));
+        println!("const {prefix}STEP_CAP: &str = \"{}\";", chain_step::cap_to_hex(&verifier.step_cap));
+        let consensus = chain_step::consensus_verifier();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            consensus.genesis_cap == verifier.genesis_cap && consensus.step_cap == verifier.step_cap,
+            "the chain-proof key constants are stale: update them to the above"
+        );
     }
 
     #[test]

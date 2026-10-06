@@ -365,6 +365,17 @@ fn chunk_air(inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN
     )
 }
 
+/// A block proof's tree root, as a chain step verifies it
+/// (`chain_step`): for this body and state change. `None` if the proof
+/// doesn't parse; whether it verifies is `Proof::verify`'s question.
+pub fn block_root(proof: &Proof, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange) -> Option<aggregate::Node> {
+    let (amounts, count, input_chunks, output_chunks, rest) = parse_header_and_rest(&proof.bytes, inputs.len(), outputs.len())?;
+    let chunks = chunk_lists(count, &input_chunks, &output_chunks, inputs, outputs, nonces)?;
+    let root = stark::Proof::from_bytes(rest)?;
+    let airs: Vec<BlockAir> = chunks.iter().map(|(i, o, n)| chunk_air(i, o, n, (0, 0))).collect();
+    tree_verifying_key().root(&airs, amounts, state, root)
+}
+
 fn verify_tree(bytes: &[u8], inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange) -> bool {
     let Some((amounts, count, input_chunks, output_chunks, rest)) = parse_header_and_rest(bytes, inputs.len(), outputs.len()) else {
         return false;
@@ -437,6 +448,19 @@ pub fn prove_block(
     plan: &BlockPlan,
     seed: [u8; 32],
 ) -> Option<Proof> {
+    prove_block_with_root(inputs, outputs, nonces, transactions, plan, seed).map(|(proof, _)| proof)
+}
+
+/// `prove_block`, also returning the tree's root proof itself -- what a
+/// chain step (`chain_step`) verifies.
+pub fn prove_block_with_root(
+    inputs: &[[u8; 32]],
+    outputs: &[[u8; 32]],
+    nonces: &[[u8; NONCE_LEN]],
+    transactions: &[Transaction],
+    plan: &BlockPlan,
+    seed: [u8; 32],
+) -> Option<(Proof, aggregate::Node)> {
     if plan.chunks.len() != plan.transitions.len() || plan.chunks.is_empty() {
         return None;
     }
@@ -525,7 +549,15 @@ pub fn prove_block(
         root_out: plan.transitions.last().unwrap().change.root_out,
         count_out: plan.transitions.last().unwrap().change.count_out,
     };
-    proof.verify(inputs, outputs, nonces, &state).then_some(proof)
+    proof.verify(inputs, outputs, nonces, &state).then_some((proof, root))
+}
+
+/// This network's tree circuits' verifying keys (`aggregate::vk_digest` of
+/// each cap): `(wrap, aggregate)` -- what a chain step accepts a block's
+/// root proof by.
+pub fn tree_vks() -> (crate::circuit::Octet, crate::circuit::Octet) {
+    let vk = tree_verifying_key();
+    (aggregate::vk_digest(&vk.wrap_cap), aggregate::vk_digest(&vk.aggregate_cap))
 }
 
 #[cfg(test)]

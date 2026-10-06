@@ -453,24 +453,29 @@ impl RetargetState {
     /// was expected, becomes the ratio `target` is scaled by (Bitcoin's
     /// own rule -- see the module docs).
     fn after(self, config: &DifficultyConfig, header: &BlockHeader) -> Self {
-        let height = header.height;
-        let interval = config.interval;
-        let mut next = self;
-
-        if height.is_multiple_of(interval) {
-            next.window_start_timestamp = header.timestamp;
-        }
-
-        if (height + 1).is_multiple_of(interval) {
-            let elapsed = header.timestamp.saturating_sub(next.window_start_timestamp);
-            let expected = config.target_block_time_ms * (interval - 1);
-            let factor = config.max_adjustment_factor;
-            let clamped_elapsed = elapsed.clamp(expected / factor, expected * factor);
-            next.target = pow::scale(next.target, clamped_elapsed, expected);
-        }
-
-        next
+        let (target, window_start_timestamp) = next_retarget(config, (self.target, self.window_start_timestamp), header.height, header.timestamp);
+        RetargetState { target, window_start_timestamp }
     }
+}
+
+/// The retarget rule, on its own: the `(target, window start)` in effect
+/// after a block at `height` with `timestamp`, given those before it. A
+/// window starts at every multiple of `config.interval`; at a window's
+/// last block the target scales by its elapsed over expected time,
+/// clamped to within `max_adjustment_factor` (`pow::scale`). Shared with
+/// the chain-proof circuit (`chain_step`), which proves the same rule.
+pub(crate) fn next_retarget(config: &DifficultyConfig, (target, window_start): ([u8; 32], u64), height: u64, timestamp: u64) -> ([u8; 32], u64) {
+    let interval = config.interval;
+    let window_start = if height.is_multiple_of(interval) { timestamp } else { window_start };
+    let mut target = target;
+    if (height + 1).is_multiple_of(interval) {
+        let elapsed = timestamp.saturating_sub(window_start);
+        let expected = config.target_block_time_ms * (interval - 1);
+        let factor = config.max_adjustment_factor;
+        let clamped_elapsed = elapsed.clamp(expected / factor, expected * factor);
+        target = pow::scale(target, clamped_elapsed, expected);
+    }
+    (target, window_start)
 }
 
 /// Everything `Chain::unwind_tip` needs to reverse exactly what
@@ -747,6 +752,11 @@ pub struct Chain {
     /// The one block allowed to have no parent, if this chain has a
     /// fixed one -- see `Chain::open`.
     genesis_hash: Option<[u8; 32]>,
+    /// When set, every block after the first must carry its parent's chain
+    /// proof (`chain_step`), checked against the parent as this chain
+    /// records it. Set by nodes (`require_chain_proofs`); off for tests
+    /// about other things.
+    chain_proofs: Option<crate::chain_step::ChainVerifier>,
     /// Whether blocks' proofs are verified -- always, except in tests that
     /// opt out (`skip_proof_checks`) because they're about something else.
     check_proofs: bool,
@@ -823,6 +833,7 @@ impl Chain {
             active_heights,
             output_index,
             genesis_hash: genesis.map(|g| g.header.hash()),
+            chain_proofs: None,
             check_proofs: true,
             difficulty,
             max_reorg_depth,
@@ -864,7 +875,18 @@ impl Chain {
             return Ok(true);
         }
         let parent = self.parent_state(txn, block.header.prev_hash)?;
-        Ok(block.body.proof_is_valid(&block.state_change(parent)))
+        if !block.body.proof_is_valid(&block.state_change(parent)) {
+            return Ok(false);
+        }
+        // The parent's chain proof: that the parent is the tip of a valid
+        // chain, as this chain records it.
+        if let Some(verifier) = &self.chain_proofs
+            && block.header.prev_hash != GENESIS_PARENT_HASH
+        {
+            let parent_tip = self.chain_tip(txn, block.header.prev_hash)?;
+            return Ok(verifier.verify(&parent_tip, &block.body.chain_proof));
+        }
+        Ok(true)
     }
 
     /// The `(state_root, output_count)` after the block `prev_hash` --
@@ -950,6 +972,66 @@ impl Chain {
         }
         let bytes = self.block_work.get(txn, &hash)?.ok_or(Error::Corrupt("no stored chain work for this block"))?;
         bytes.try_into().map_err(|_| Error::Corrupt("stored chain work was not 32 bytes"))
+    }
+
+    /// What a chain proof of block `hash` attests besides its header: the
+    /// `(target, window start)` in effect after it, and the cumulative
+    /// work up to it.
+    pub(crate) fn proof_state(&self, hash: [u8; 32]) -> Result<([u8; 32], u64, [u8; 32])> {
+        let rtxn = self.storage.read_txn()?;
+        self.proof_state_in(&rtxn, hash)
+    }
+
+    fn proof_state_in(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<([u8; 32], u64, [u8; 32])> {
+        let retarget = self.retarget_state_after(txn, hash)?;
+        Ok((retarget.target, retarget.window_start_timestamp, self.chain_work(txn, hash)?))
+    }
+
+    /// A stored block, active chain or side branch.
+    fn stored_block(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Block> {
+        let bytes = self.blocks.get(txn, &hash)?.ok_or(Error::Corrupt("a block is not stored"))?;
+        Block::from_bytes(bytes).map_err(|_| Error::Corrupt("a stored block was corrupt"))
+    }
+
+    /// The tip a chain proof of block `hash` attests: its header, and what
+    /// this chain records after it.
+    fn chain_tip(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<crate::chain_step::Tip> {
+        let header = self.stored_block(txn, hash)?.header;
+        Ok(crate::chain_step::Tip::new(&header, self.proof_state_in(txn, hash)?))
+    }
+
+    /// Require every block after the first to carry its parent's chain
+    /// proof, checked by `verifier`.
+    pub fn require_chain_proofs(&mut self, verifier: crate::chain_step::ChainVerifier) {
+        self.chain_proofs = Some(verifier);
+    }
+
+    /// Everything needed to prove block `hash`'s chain proof -- which the
+    /// next block on it carries -- from this chain's records.
+    pub fn chain_proof_inputs(&self, hash: [u8; 32]) -> Result<crate::chain_step::ChainProofInputs> {
+        let rtxn = self.storage.read_txn()?;
+        let block = self.stored_block(&rtxn, hash)?;
+        let tip = crate::chain_step::Tip::new(&block.header, self.proof_state_in(&rtxn, hash)?);
+        let inputs = if block.header.prev_hash == GENESIS_PARENT_HASH {
+            None
+        } else {
+            let parent_tip = self.chain_tip(&rtxn, block.header.prev_hash)?;
+            let state = block.state_change((parent_tip.state_root, parent_tip.output_count));
+            Some(crate::chain_step::BlockInputs {
+                inputs: block.body.inputs.clone(),
+                outputs: block.body.outputs.clone(),
+                nonces: block.body.nonces.clone(),
+                proof: block.body.proof.clone(),
+                state,
+                parent_tip,
+                parent_chain_proof: block.body.chain_proof.clone(),
+            })
+        };
+        Ok(crate::chain_step::ChainProofInputs {
+            header: block.header,
+            tip,
+            block: inputs,
+        })
     }
 
     /// The `RetargetState` right after `hash` -- the initial state for
