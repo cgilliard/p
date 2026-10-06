@@ -174,6 +174,11 @@ const CURRENT_TARGET_KEY: &[u8] = b"current_target";
 /// what seeds this without needing a separate genesis special-case.
 const WINDOW_START_TIMESTAMP_KEY: &[u8] = b"window_start_timestamp";
 
+/// `chain_meta` key: the height of the block a fast sync started this
+/// chain at (u64 BE), if one did -- nothing below it is stored but the
+/// genesis block, so no reorg reaches below it (`reorg_floor`).
+const SYNC_BASE_KEY: &[u8] = b"sync_base";
+
 /// Database name: every applied block, in full (`Block::to_bytes`),
 /// keyed by its own header hash. The one place this module keeps
 /// actual block data around after applying it -- needed so a reorg
@@ -267,6 +272,8 @@ pub enum Error {
     /// An output's commitment collides with one that's already live
     /// (created, and not yet spent).
     DuplicateOutput([u8; 32]),
+    /// A fast sync's snapshot was refused: why.
+    Snapshot(&'static str),
     /// Applying the body produced a state root different from the one the
     /// header claims.
     StateRootMismatch,
@@ -370,6 +377,7 @@ impl std::fmt::Display for Error {
             Error::TimestampTooFarInFuture => write!(f, "header timestamp is too far ahead of this node's clock"),
             Error::UnresolvedInput(c) => write!(f, "input {} does not resolve to a live unspent output", hex(c)),
             Error::DuplicateOutput(c) => write!(f, "output {} collides with a still-live output", hex(c)),
+            Error::Snapshot(why) => write!(f, "snapshot refused: {why}"),
             Error::StateRootMismatch => write!(f, "header's state_root does not match the result of applying the body"),
             Error::OutputCountMismatch => write!(f, "header's output_count does not match the result of applying the body"),
             Error::InvalidTransaction(i) => write!(f, "transaction at index {i} failed verify()"),
@@ -732,6 +740,154 @@ impl crate::wallet::ChainView for ChainState<'_> {
             .for_each_output(&self.txn, |r, unspent| f(r.commitment, r.height, r.nonce, unspent))
             .is_ok()
     }
+
+    fn has_full_history(&self) -> bool {
+        matches!(self.chain.sync_base(&self.txn), Ok(None))
+    }
+}
+
+/// Read-only access to what fast-syncing peers ask for -- the state as of
+/// a recent block, in pieces (`snapshot`), and the rest of what the chain
+/// proof of that block attests -- for the network's thread, like
+/// `BlockReader`. Serves any active-chain block from the reorg floor up:
+/// the state then is the current tree with every later block undone
+/// (their undo data says what they spent), computed on the fly, not
+/// stored.
+#[derive(Clone)]
+pub struct StateReader {
+    storage: Storage,
+    state: std::sync::Arc<StateTree>,
+    meta: Database<Bytes, Bytes>,
+    blocks: Database<Bytes, Bytes>,
+    block_undo: Database<Bytes, Bytes>,
+    block_work: Database<Bytes, Bytes>,
+    block_retarget: Database<Bytes, Bytes>,
+    active_heights: Database<Bytes, Bytes>,
+    output_index: Database<Bytes, Bytes>,
+    /// The last view computed: for which block, at which tip.
+    cache: std::sync::Arc<std::sync::Mutex<Option<CachedView>>>,
+}
+
+/// A state view (`StateReader::as_of`): the block it's as of, the tip it
+/// was computed at, and the view.
+type CachedView = ([u8; 32], [u8; 32], std::sync::Arc<crate::state_tree::AsOf>);
+
+impl StateReader {
+    pub fn open(storage: &Storage) -> Result<Self> {
+        Ok(StateReader {
+            storage: storage.clone(),
+            state: std::sync::Arc::new(StateTree::open(storage)?),
+            meta: storage.database("chain_meta")?,
+            blocks: storage.database(BLOCKS_DB)?,
+            block_undo: storage.database(BLOCK_UNDO_DB)?,
+            block_work: storage.database(BLOCK_WORK_DB)?,
+            block_retarget: storage.database(BLOCK_RETARGET_DB)?,
+            active_heights: storage.database(ACTIVE_HEIGHTS_DB)?,
+            output_index: storage.database(OUTPUT_INDEX_DB)?,
+            cache: Default::default(),
+        })
+    }
+
+    fn header(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Option<BlockHeader>> {
+        match self.blocks.get(txn, &hash)? {
+            Some(bytes) => Ok(Some(
+                BlockHeader::from_bytes(&bytes[..HEADER_LEN.min(bytes.len())]).map_err(|_| Error::Corrupt("a stored block was corrupt"))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The active tip's header, and `hash`'s if it's on the active chain.
+    fn active(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Option<(BlockHeader, BlockHeader)>> {
+        let Some(header) = self.header(txn, hash)? else {
+            return Ok(None);
+        };
+        if self.active_heights.get(txn, &header.height.to_be_bytes())? != Some(&hash[..]) {
+            return Ok(None);
+        }
+        let tip = match self.meta.get(txn, TIP_HEADER_KEY)? {
+            Some(bytes) => BlockHeader::from_bytes(bytes).map_err(|_| Error::Corrupt("stored tip header was corrupt"))?,
+            None => return Ok(None),
+        };
+        Ok(Some((tip, header)))
+    }
+
+    /// What the chain proof of active-chain block `hash` attests besides
+    /// its header, if this node still has it.
+    pub fn sync_point(&self, hash: [u8; 32]) -> Result<Option<crate::snapshot::SyncPoint>> {
+        let rtxn = self.storage.read_txn()?;
+        if self.active(&rtxn, hash)?.is_none() {
+            return Ok(None);
+        }
+        let (Some(work), Some(retarget)) = (self.block_work.get(&rtxn, &hash)?, self.block_retarget.get(&rtxn, &hash)?) else {
+            return Ok(None);
+        };
+        let retarget = RetargetState::from_bytes(retarget)?;
+        Ok(Some(crate::snapshot::SyncPoint {
+            target: retarget.target,
+            window_start: retarget.window_start_timestamp,
+            work: work.try_into().map_err(|_| Error::Corrupt("stored chain work was not 32 bytes"))?,
+        }))
+    }
+
+    /// The state as of active-chain block `hash`, from the current tree:
+    /// `None` if it's not on the active chain, or too old to undo to.
+    fn as_of(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Option<std::sync::Arc<crate::state_tree::AsOf>>> {
+        let Some((tip, header)) = self.active(txn, hash)? else {
+            return Ok(None);
+        };
+        let tip_hash = tip.hash();
+        if let Some((at, cached_tip, as_of)) = &*self.cache.lock().unwrap()
+            && *at == hash
+            && *cached_tip == tip_hash
+        {
+            return Ok(Some(as_of.clone()));
+        }
+        let mut as_of = crate::state_tree::AsOf {
+            count: header.output_count,
+            ..Default::default()
+        };
+        for height in header.height + 1..=tip.height {
+            let Some(block) = self.active_heights.get(txn, &height.to_be_bytes())? else {
+                return Ok(None);
+            };
+            let Some(undo) = self.block_undo.get(txn, block)? else {
+                return Ok(None);
+            };
+            for (commitment, position) in UndoData::from_bytes(undo)?.spent_inputs {
+                if position < as_of.count {
+                    let record = self.output_index.get(txn, &commitment)?.ok_or(Error::Corrupt("a spent output's record is missing"))?;
+                    let record = OutputRecord::decode(commitment, record)?;
+                    as_of.restored.insert(position, (commitment, record.nonce));
+                }
+            }
+        }
+        let as_of = std::sync::Arc::new(as_of);
+        *self.cache.lock().unwrap() = Some((hash, tip_hash, as_of.clone()));
+        Ok(Some(as_of))
+    }
+
+    /// Piece `(level, index)` of the state as of active-chain block `hash`
+    /// (`snapshot`), if this node can serve it.
+    pub fn piece(&self, hash: [u8; 32], level: usize, index: u64) -> Result<Option<Vec<u8>>> {
+        use crate::snapshot::{LEAF_LEVEL, child_level};
+        if !crate::snapshot::is_piece(level, index) {
+            return Ok(None);
+        }
+        let rtxn = self.storage.read_txn()?;
+        let Some(as_of) = self.as_of(&rtxn, hash)? else {
+            return Ok(None);
+        };
+        if level == LEAF_LEVEL {
+            let entries = self.state.unspent_as_of(&rtxn, &as_of, index << level, (index + 1) << level)?;
+            return Ok(Some(crate::snapshot::encode_leaves(index, &entries)));
+        }
+        let below = child_level(level);
+        let children = (0..1u64 << (level - below))
+            .map(|j| self.state.node_as_of(&rtxn, &as_of, below, (index << (level - below)) + j))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Some(crate::snapshot::encode_inner(&children)))
+    }
 }
 
 pub struct Chain {
@@ -987,16 +1143,10 @@ impl Chain {
         Ok((retarget.target, retarget.window_start_timestamp, self.chain_work(txn, hash)?))
     }
 
-    /// A stored block, active chain or side branch.
-    fn stored_block(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Block> {
-        let bytes = self.blocks.get(txn, &hash)?.ok_or(Error::Corrupt("a block is not stored"))?;
-        Block::from_bytes(bytes).map_err(|_| Error::Corrupt("a stored block was corrupt"))
-    }
-
     /// The tip a chain proof of block `hash` attests: its header, and what
     /// this chain records after it.
     fn chain_tip(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<crate::chain_step::Tip> {
-        let header = self.stored_block(txn, hash)?.header;
+        let header = self.get_stored_block(txn, hash)?.header;
         Ok(crate::chain_step::Tip::new(&header, self.proof_state_in(txn, hash)?))
     }
 
@@ -1010,7 +1160,7 @@ impl Chain {
     /// next block on it carries -- from this chain's records.
     pub fn chain_proof_inputs(&self, hash: [u8; 32]) -> Result<crate::chain_step::ChainProofInputs> {
         let rtxn = self.storage.read_txn()?;
-        let block = self.stored_block(&rtxn, hash)?;
+        let block = self.get_stored_block(&rtxn, hash)?;
         let tip = crate::chain_step::Tip::new(&block.header, self.proof_state_in(&rtxn, hash)?);
         let inputs = if block.header.prev_hash == GENESIS_PARENT_HASH {
             None
@@ -1077,9 +1227,85 @@ impl Chain {
     /// The single number `accept_block`'s early rejection,
     /// `find_fork_point`'s search bound, and `prune`'s cutoff all share.
     fn reorg_floor(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
-        Ok(self
+        let by_depth = self
             .height(txn)?
-            .and_then(|tip_height| tip_height.checked_sub(self.max_reorg_depth)))
+            .and_then(|tip_height| tip_height.checked_sub(self.max_reorg_depth));
+        Ok(match (by_depth, self.sync_base(txn)?) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        })
+    }
+
+    /// The height a fast sync started this chain at, if one did.
+    fn sync_base(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
+        match self.meta.get(txn, SYNC_BASE_KEY)? {
+            Some(b) => Ok(Some(u64::from_be_bytes(b.try_into().map_err(|_| Error::Corrupt("sync base was not 8 bytes"))?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Start this chain, holding nothing yet but (possibly) its genesis,
+    /// at block `base` -- a fast sync (`snapshot`): `point` is what the
+    /// chain proof of `base` (`chain_proof`, from the block after it)
+    /// attests along with its header, and `unspent` the state tree's
+    /// unspent outputs then (positions in order). Checked: the chain
+    /// proof (when this chain requires them), the body against the
+    /// header, and the snapshot against the header's state root and
+    /// count, with no two unspent outputs alike. Blocks before `base`
+    /// aren't stored, so nothing reorgs below it, and outputs spent
+    /// before it are unknown (`has_full_history`). Imported outputs are
+    /// recorded at `base`'s height: their real heights are older, which
+    /// only matters for the coinbase maturity of outputs younger than
+    /// that, and syncing far enough back leaves none.
+    /// Whether `chain_proof` (from the block after `base`) attests `base`
+    /// with `point` -- a fast sync's sync point, checked before its state
+    /// is downloaded. Only the body's hash is checked when this chain
+    /// doesn't require chain proofs.
+    pub fn check_sync_point(&self, base: &Block, point: &crate::snapshot::SyncPoint, chain_proof: &[u8]) -> Result<()> {
+        let header = &base.header;
+        if header.height == 0 || base.body.body_hash() != header.body_hash {
+            return Err(Error::Snapshot("not a valid base block"));
+        }
+        if let Some(verifier) = &self.chain_proofs {
+            let tip = crate::chain_step::Tip::new(header, (point.target, point.window_start, point.work));
+            if !verifier.verify(&tip, chain_proof) {
+                return Err(Error::Snapshot("the chain proof doesn't attest this block"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn import_snapshot(&mut self, base: &Block, point: &crate::snapshot::SyncPoint, chain_proof: &[u8], unspent: &[crate::state_tree::Entry]) -> Result<()> {
+        let storage = self.storage.clone();
+        let mut wtxn = storage.write_txn()?;
+        if self.height(&wtxn)?.unwrap_or(0) != 0 || self.state.count(&wtxn)? != 0 {
+            return Err(Error::Snapshot("this chain isn't empty"));
+        }
+        self.check_sync_point(base, point, chain_proof)?;
+        let header = &base.header;
+        let root = self.state.import(&mut wtxn, header.output_count, unspent).map_err(|_| Error::Snapshot("malformed unspent set"))?;
+        if root != header.state_root {
+            return Err(Error::StateRootMismatch);
+        }
+        for (position, commitment, nonce) in unspent {
+            if self.utxo.get(&wtxn, *commitment)?.is_some() {
+                return Err(Error::DuplicateOutput(*commitment));
+            }
+            self.utxo.insert(&mut wtxn, *commitment, *position)?;
+            self.output_index.put(&mut wtxn, commitment, &[&header.height.to_be_bytes()[..], nonce].concat())?;
+        }
+        self.meta.put(&mut wtxn, TIP_HEADER_KEY, &header.to_bytes())?;
+        self.meta.put(&mut wtxn, CURRENT_TARGET_KEY, &point.target)?;
+        self.meta.put(&mut wtxn, WINDOW_START_TIMESTAMP_KEY, &point.window_start.to_be_bytes())?;
+        self.meta.put(&mut wtxn, SYNC_BASE_KEY, &header.height.to_be_bytes())?;
+        let retarget = RetargetState {
+            target: point.target,
+            window_start_timestamp: point.window_start,
+        };
+        self.store_block_records(&mut wtxn, base, point.work, retarget)?;
+        self.active_heights.put(&mut wtxn, &header.height.to_be_bytes(), &header.hash())?;
+        wtxn.commit()?;
+        Ok(())
     }
 
     /// For every block strictly below `reorg_floor`, drop what only a
@@ -1524,6 +1750,9 @@ impl Chain {
                 break;
             }
             let block = self.get_stored_block(txn, hash)?;
+            if floor.is_some_and(|floor| block.header.height <= floor) {
+                break;
+            }
             hash = block.header.prev_hash;
             depth += 1;
         }
@@ -1952,6 +2181,88 @@ mod tests {
         let block = chain.unwind_tip(&mut wtxn).unwrap();
         wtxn.commit().unwrap();
         block
+    }
+
+    /// Download the state as of active-chain block `hash` from `reader`,
+    /// piece by piece, as a fast-syncing node does.
+    fn download_state(reader: &StateReader, hash: [u8; 32], header: &BlockHeader) -> Vec<crate::state_tree::Entry> {
+        let mut plan = crate::snapshot::Plan::new(header.state_root, header.output_count);
+        while let Some(piece) = plan.next() {
+            let bytes = reader.piece(hash, piece.level, piece.index).unwrap().unwrap();
+            assert!(plan.accept(&piece, &bytes));
+        }
+        plan.finish()
+    }
+
+    /// Fast sync, natively (`docs/CHAIN_RECURSION.md`, 5d): chain A, with
+    /// spends scattered through its history, serves its state as of block
+    /// H (a few blocks back) from its current tree and undo data; chain B
+    /// downloads it piece by piece, starts at H, then applies H+1 .. tip
+    /// as any node does -- and ends in exactly A's state. B then serves
+    /// the same state itself, and refuses anything below H.
+    #[test]
+    fn fast_sync_from_a_state_snapshot() {
+        let (_da, storage_a, mut a) = open();
+        let mut blocks = Vec::new();
+        let mut live: Vec<(SecretKey, PublicKey)> = Vec::new();
+        for i in 0..12u8 {
+            let mut txs = Vec::new();
+            for j in 0..3u8 {
+                let (sk, pk) = wots::keygen(&std::array::from_fn(|n| [1, i, j].get(n).copied().unwrap_or(0)));
+                txs.push(reward_transaction(&pk, 50));
+                live.push((sk, pk));
+            }
+            // Spend two older outputs: one ancient, one recent.
+            if i >= 3 {
+                for k in [0, live.len() - 5] {
+                    let (sk, pk) = live.remove(k);
+                    let (_, to) = wots::keygen(&std::array::from_fn(|n| [2, i, k as u8].get(n).copied().unwrap_or(0)));
+                    txs.push(spend_transaction(&sk, &pk, 50, &to));
+                }
+            }
+            let block = built_proved_and_mined(&mut a, &txs);
+            a.apply_block(&block).unwrap();
+            blocks.push(block);
+        }
+        let h = 8usize;
+        let base = &blocks[h];
+        let reader_a = StateReader::open(&storage_a).unwrap();
+        let point = reader_a.sync_point(base.header.hash()).unwrap().unwrap();
+        let unspent = download_state(&reader_a, base.header.hash(), &base.header);
+        assert!(!unspent.is_empty());
+
+        // A snapshot missing an output is refused.
+        let (_dc, _sc, mut c) = open();
+        assert!(matches!(c.import_snapshot(base, &point, &[], &unspent[1..]), Err(Error::StateRootMismatch)));
+
+        let (_db, storage_b, mut b) = open();
+        b.import_snapshot(base, &point, &[], &unspent).unwrap();
+        assert!(!crate::wallet::ChainView::has_full_history(&b.view().unwrap()));
+        for block in &blocks[h + 1..] {
+            assert_eq!(b.accept_block(block.clone()).unwrap(), AcceptOutcome::Applied);
+        }
+        let (ra, rb) = (storage_a.read_txn().unwrap(), storage_b.read_txn().unwrap());
+        assert_eq!(b.tip_hash(&rb).unwrap(), a.tip_hash(&ra).unwrap());
+        assert_eq!(b.state.root(&rb).unwrap(), a.state.root(&ra).unwrap());
+        assert_eq!(b.current_target(&rb).unwrap(), a.current_target(&ra).unwrap());
+        assert_eq!(b.chain_work(&rb, b.tip_hash(&rb).unwrap()).unwrap(), a.chain_work(&ra, a.tip_hash(&ra).unwrap()).unwrap());
+        assert_eq!(b.state.unspent_in(&rb, 0, 1 << 40).unwrap(), a.state.unspent_in(&ra, 0, 1 << 40).unwrap());
+        for (_, pk) in &live {
+            let c = commitment_of(pk, 50);
+            assert_eq!(b.utxo.get(&rb, c).unwrap(), a.utxo.get(&ra, c).unwrap());
+        }
+        drop((ra, rb));
+
+        // B serves the state as of H+1 just as A does.
+        let reader_b = StateReader::open(&storage_b).unwrap();
+        let next = &blocks[h + 1];
+        assert_eq!(download_state(&reader_b, next.header.hash(), &next.header), download_state(&reader_a, next.header.hash(), &next.header));
+        assert_eq!(reader_b.sync_point(next.header.hash()).unwrap(), reader_a.sync_point(next.header.hash()).unwrap());
+        // Nothing below the sync point: not served, not accepted.
+        assert_eq!(reader_b.piece(blocks[h - 1].header.hash(), 32, 0).unwrap(), None);
+        assert!(matches!(b.accept_block(blocks[h - 1].clone()), Err(Error::ReorgTooDeep)));
+        // A fresh chain only.
+        assert!(matches!(b.import_snapshot(base, &point, &[], &unspent), Err(Error::Snapshot(_))));
     }
 
     /// The key correctness property, same spirit as `state_tree`'s undo

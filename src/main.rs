@@ -15,6 +15,7 @@ mod fri;
 mod keychain;
 #[macro_use]
 mod log;
+mod fastsync;
 mod mempool;
 mod merkle;
 mod mnemonic;
@@ -32,9 +33,11 @@ mod prover;
 mod recovery;
 mod recursion;
 mod slate;
+mod snapshot;
 mod stark;
 mod state_circuit;
 mod state_tree;
+mod statesync;
 mod storage;
 mod symbolic;
 mod transaction;
@@ -67,6 +70,9 @@ use storage::Storage;
 /// stays fixed and easy, since tests built around it need to mine
 /// quickly -- see that constant's docs).
 const INITIAL_LEADING_ZERO_BITS: u32 = 23;
+/// The dev network's (`network`): easier, so proof of work adds little to
+/// the proving time that already bounds a block.
+const DEV_INITIAL_LEADING_ZERO_BITS: u32 = 20;
 
 /// Retargeting knobs for this driver's actual run -- independent of
 /// `chain::DifficultyConfig::for_tests`'s own numbers (see that
@@ -77,6 +83,28 @@ const INITIAL_LEADING_ZERO_BITS: u32 = 23;
 /// being independent numbers.
 const RETARGET_INTERVAL: u64 = 10;
 const TARGET_BLOCK_TIME_MS: u64 = 60_000;
+/// The dev network's. Below what proving takes (~80 s a block on dev), so
+/// retargeting eases proof of work as far as it goes and blocks come as
+/// fast as they're proven.
+const DEV_TARGET_BLOCK_TIME_MS: u64 = 10_000;
+
+/// This network's starting difficulty and block time. Consensus: the
+/// chain-proof circuit proves retargeting with these, so changing either
+/// means regenerating the network's chain-proof keys (`chain_keys` test)
+/// and starting from fresh data directories.
+fn leading_zero_bits() -> u32 {
+    match network::current() {
+        network::Network::Main => INITIAL_LEADING_ZERO_BITS,
+        network::Network::Dev => DEV_INITIAL_LEADING_ZERO_BITS,
+    }
+}
+
+fn target_block_time_ms() -> u64 {
+    match network::current() {
+        network::Network::Main => TARGET_BLOCK_TIME_MS,
+        network::Network::Dev => DEV_TARGET_BLOCK_TIME_MS,
+    }
+}
 const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 
 /// How many blocks a reorg is ever allowed to unwind in this driver's
@@ -103,6 +131,10 @@ const MAX_CHUNK_RETRIES: u32 = 5;
 const MAX_DOWNLOADS: usize = 4;
 /// How many transactions may be downloading at once.
 const MAX_TX_DOWNLOADS: usize = 32;
+/// Fast sync: state pieces downloading at once, across all peers.
+const MAX_PIECES_IN_FLIGHT: usize = 16;
+/// Fast sync: pieces a peer may fail before it's no longer asked.
+const MAX_PIECE_STRIKES: u32 = 3;
 /// How long a transaction id stays "seen" (not fetched again).
 const TX_SEEN_TTL_MS: u64 = 10 * 60_000;
 const PEER_HEIGHT_REFRESH_MS: u64 = 60_000;
@@ -122,9 +154,9 @@ const MINE_BATCH: u64 = 200_000;
 /// This network's retargeting configuration.
 fn difficulty_config() -> chain::DifficultyConfig {
     chain::DifficultyConfig {
-        initial_target: pow::max_hash_with_leading_zero_bits(INITIAL_LEADING_ZERO_BITS),
+        initial_target: pow::max_hash_with_leading_zero_bits(leading_zero_bits()),
         interval: RETARGET_INTERVAL,
-        target_block_time_ms: TARGET_BLOCK_TIME_MS,
+        target_block_time_ms: target_block_time_ms(),
         max_adjustment_factor: MAX_ADJUSTMENT_FACTOR,
     }
 }
@@ -219,11 +251,20 @@ struct Args {
     /// With `--recover`, also read the wallet's passphrase; when creating
     /// a new wallet, protect it with one (read twice).
     passphrase: bool,
+    /// Sync a new node block by block from genesis, not by fast sync.
+    full_sync: bool,
+    /// Fast sync starts this many blocks below the best peer's tip.
+    sync_depth: u64,
 }
+
+/// Fast sync's default `--sync-depth`: blocks replayed in full after the
+/// sync point, and how deep a fast-synced node can reorg at first.
+const DEFAULT_SYNC_DEPTH: u64 = 100;
 
 const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
          [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
-         [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]";
+         [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]
+         [--full-sync] [--sync-depth BLOCKS]";
 
 fn parse_args() -> Args {
     let mut data_dir = None;
@@ -239,6 +280,8 @@ fn parse_args() -> Args {
         wallet_dir: None,
         recover: false,
         passphrase: false,
+        full_sync: false,
+        sync_depth: DEFAULT_SYNC_DEPTH,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -284,6 +327,14 @@ fn parse_args() -> Args {
             "--wallet-dir" => args.wallet_dir = Some(value().into()),
             "--recover" => args.recover = true,
             "--passphrase" => args.passphrase = true,
+            "--full-sync" => args.full_sync = true,
+            "--sync-depth" => {
+                let v = value();
+                args.sync_depth = v.parse().ok().filter(|d| (1..=MAX_REORG_DEPTH / 2).contains(d)).unwrap_or_else(|| {
+                    eprintln!("invalid --sync-depth {v} (1 to {})\n{USAGE}", MAX_REORG_DEPTH / 2);
+                    std::process::exit(2);
+                });
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -372,6 +423,7 @@ fn random_key() -> [u8; 32] {
 type Network = (
     Receiver<(Block, SocketAddrV4)>,
     Receiver<(Vec<u8>, SocketAddrV4)>,
+    Receiver<statesync::Event>,
     Sender<Command>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
 );
@@ -409,7 +461,15 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Netw
         max_downloads: MAX_TX_DOWNLOADS,
         seen_ttl_ms: TX_SEEN_TTL_MS,
     });
-    let mut node = net::Node::new(discovery, transfer, txrelay, reader, socket, NETWORK_TICK_MS);
+    let statesync = statesync::StateSync::new(statesync::Config {
+        window: CHUNK_WINDOW,
+        chunk_timeout_ms: CHUNK_TIMEOUT_MS,
+        max_retries: MAX_CHUNK_RETRIES,
+        max_in_flight: MAX_PIECES_IN_FLIGHT,
+        max_strikes: MAX_PIECE_STRIKES,
+    });
+    let state_reader = chain::StateReader::open(storage).expect("failed to open state reader");
+    let mut node = net::Node::new(discovery, transfer, txrelay, statesync, reader, state_reader, socket, NETWORK_TICK_MS);
     // Debugging aid for now: log every datagram sent and received,
     // labeled with this node's port so several local nodes' logs are
     // easy to tell apart.
@@ -419,6 +479,7 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Netw
 
     let (blocks_tx, blocks_rx) = std::sync::mpsc::channel();
     let (txs_tx, txs_rx) = std::sync::mpsc::channel();
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel();
     let (commands_tx, commands_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         static NEVER_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -428,11 +489,14 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Netw
         let deliver_tx = |bytes, from| {
             let _ = txs_tx.send((bytes, from));
         };
-        if let Err(e) = node.run(now_millis, &NEVER_STOP, deliver, deliver_tx, &commands_rx) {
+        let deliver_sync = |event| {
+            let _ = sync_tx.send(event);
+        };
+        if let Err(e) = node.run(now_millis, &NEVER_STOP, deliver, deliver_tx, deliver_sync, &commands_rx) {
             error!("network stopped: {e:?}");
         }
     });
-    (blocks_rx, txs_rx, commands_tx, peer_height)
+    (blocks_rx, txs_rx, sync_rx, commands_tx, peer_height)
 }
 
 /// Tell the network to announce our current tip to every peer but
@@ -570,7 +634,7 @@ fn print_mining_stats(hashes: u64, elapsed: std::time::Duration, target: &[u8; 3
     info!(
         "  expected:    {} per block at this rate (target {})",
         format_duration(expected_hashes / rate),
-        format_duration(TARGET_BLOCK_TIME_MS as f64 / 1000.0)
+        format_duration(target_block_time_ms() as f64 / 1000.0)
     );
 }
 
@@ -657,6 +721,10 @@ fn main() {
     });
     // Every block after genesis carries its parent's chain proof.
     chain.require_chain_proofs(chain_step::consensus_verifier());
+    let fresh = {
+        let rtxn = storage.read_txn().expect("failed to open read transaction");
+        chain.height(&rtxn).expect("failed to read chain height").unwrap_or(0) == 0
+    };
 
     {
         let rtxn = storage.read_txn().expect("failed to open read transaction");
@@ -676,7 +744,8 @@ fn main() {
         info!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
     }
     let standalone = args.seeds.is_empty();
-    let (received, received_txs, commands, peer_height) = spawn_network(&storage, args.port, args.seeds);
+    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, args.seeds);
+    let fast_sync = (fresh && !args.full_sync).then(|| fastsync::FastSync::new(args.sync_depth, &commands));
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
     let peer_table = PeerTable::open(&storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
     let wallet_dir = args.wallet_dir.clone().unwrap_or_else(|| path.join("wallet"));
@@ -716,6 +785,8 @@ fn main() {
     node.chain_prover = std::sync::Arc::new(std::sync::Mutex::new(chain_step::ChainProver::new(difficulty_config(), prover::tree())));
     node.peer_height = peer_height;
     node.standalone = standalone;
+    node.fast_sync = fast_sync;
+    node.sync_events = Some(sync_events);
     node.run();
     std::process::exit(0);
 }

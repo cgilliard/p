@@ -118,6 +118,10 @@ pub struct Node {
     /// most once per `RECOVERY_CHECK`.
     recovering: bool,
     next_recovery_check: Instant,
+    /// Fast sync in progress (`fastsync`): blocks go to it, no mining.
+    pub fast_sync: Option<crate::fastsync::FastSync>,
+    /// Fast-sync events from the network.
+    pub sync_events: Option<Receiver<crate::statesync::Event>>,
 }
 
 /// How often a recovering wallet checks whether the chain has caught up.
@@ -160,6 +164,8 @@ impl Node {
             skip_mempool: false,
             recovering,
             next_recovery_check: Instant::now(),
+            fast_sync: None,
+            sync_events: None,
         }
     }
 
@@ -195,6 +201,7 @@ impl Node {
                     return;
                 }
             }
+            busy |= self.fast_sync_step();
             if self.process_received() {
                 self.on_tip_moved();
             }
@@ -257,14 +264,59 @@ impl Node {
         }
     }
 
+    // ---- fast sync -------------------------------------------------------
+
+    /// Move fast sync along, if it's running; whether anything happened.
+    fn fast_sync_step(&mut self) -> bool {
+        use crate::fastsync::Outcome;
+        let Some(fast_sync) = self.fast_sync.as_mut() else {
+            return false;
+        };
+        let mut busy = false;
+        let mut outcome = Outcome::Running;
+        if let Some(events) = &self.sync_events {
+            while let Ok(event) = events.try_recv() {
+                busy = true;
+                outcome = fast_sync.on_event(event, &mut self.chain, &self.commands);
+                if !matches!(outcome, Outcome::Running) {
+                    break;
+                }
+            }
+        }
+        if matches!(outcome, Outcome::Running) {
+            let best = match self.peer_height.load(Ordering::Relaxed) {
+                crate::net::NO_PEER_HEIGHT => None,
+                best => Some(best),
+            };
+            outcome = fast_sync.step(best, self.standalone, &self.commands);
+        }
+        match outcome {
+            Outcome::Running => busy,
+            Outcome::Done(next) => {
+                self.fast_sync = None;
+                let unknown = SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0);
+                crate::process_one(&mut self.chain, &self.reader, &self.commands, *next, unknown);
+                self.on_tip_moved();
+                true
+            }
+            Outcome::Abandoned => {
+                self.fast_sync = None;
+                true
+            }
+        }
+    }
+
     // ---- chain events ---------------------------------------------------
 
-    /// Hand every block the network has received so far to the chain.
-    /// Returns whether the tip moved.
+    /// Hand every block the network has received so far to the chain --
+    /// or, during a fast sync, to it. Returns whether the tip moved.
     fn process_received(&mut self) -> bool {
         let mut moved = false;
         while let Ok((block, from)) = self.received.try_recv() {
-            moved |= crate::process_one(&mut self.chain, &self.reader, &self.commands, block, from);
+            match self.fast_sync.as_mut() {
+                Some(fast_sync) => fast_sync.on_block(block, &self.commands),
+                None => moved |= crate::process_one(&mut self.chain, &self.reader, &self.commands, block, from),
+            }
         }
         moved
     }
@@ -393,8 +445,9 @@ impl Node {
     fn mine_step(&mut self) -> bool {
         match &mut self.miner {
             Miner::Idle => {
-                // A recovering wallet hands out no keys, rewards included.
-                if !self.mining || self.recovering {
+                // A recovering wallet hands out no keys, rewards included;
+                // a fast-syncing node has no tip to mine on yet.
+                if !self.mining || self.recovering || self.fast_sync.is_some() {
                     return false;
                 }
                 self.start_template();
@@ -704,6 +757,9 @@ impl Node {
                     "height:  {tip} ({tip_hash}…)\npeers:   {peers}\nmempool: {} transaction(s)\nmining:  {miner}",
                     self.mempool.len()
                 );
+                if let Some(fast_sync) = &self.fast_sync {
+                    out += &format!("\nsync:    fast sync -- {}", fast_sync.describe());
+                }
                 if self.recovering {
                     let best = match self.peer_height.load(Ordering::Relaxed) {
                         crate::net::NO_PEER_HEIGHT => "no peer has reported its height yet".to_string(),

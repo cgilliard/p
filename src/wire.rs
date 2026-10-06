@@ -18,6 +18,15 @@
 //! | 8    | `GET_TX`     | cookie u64 ‖ txid (32) ‖ first u32 ‖ count u16               |
 //! | 9    | `TX_CHUNK`   | txid (32) ‖ index u32 ‖ data (`CHUNK_LEN`, or less if last)  |
 //! | 10   | `GET_TX_INV` | cookie u64                                                  |
+//! | 11   | `GET_SYNC_POINT` | hash (32)                                               |
+//! | 12   | `SYNC_POINT` | hash (32) ‖ target (32) ‖ window_start u64 ‖ work (32)      |
+//! | 13   | `GET_PIECE`  | cookie u64 ‖ at (32) ‖ level u8 ‖ index u32 ‖ first u32 ‖ count u16 |
+//! | 14   | `PIECE_CHUNK`| at (32) ‖ level u8 ‖ index u32 ‖ size u32 ‖ chunk u32 ‖ data |
+//!
+//! The last four are fast sync's (`statesync`): a sync point's attested
+//! state, and pieces of the state tree as of it (`snapshot`), which travel
+//! like blocks, in `CHUNK_LEN` pieces -- a piece can be empty (size 0,
+//! one empty chunk).
 //!
 //! `GET_INV`'s field is the hash, or for a height, 24 zero bytes then
 //! the height -- one fixed size either way, so its `INV` reply (58
@@ -71,6 +80,10 @@ const TYPE_TX_INV: u8 = 7;
 const TYPE_GET_TX: u8 = 8;
 const TYPE_TX_CHUNK: u8 = 9;
 const TYPE_GET_TX_INV: u8 = 10;
+const TYPE_GET_SYNC_POINT: u8 = 11;
+const TYPE_SYNC_POINT: u8 = 12;
+const TYPE_GET_PIECE: u8 = 13;
+const TYPE_PIECE_CHUNK: u8 = 14;
 
 pub const HEADER_LEN: usize = MAGIC.len() + 2;
 const GET_HOSTS_MIN: usize = HEADER_LEN + 8 + 2;
@@ -81,6 +94,10 @@ const GET_CHUNKS_LEN: usize = HEADER_LEN + 8 + 32 + 4 + 2;
 const CHUNK_HEADER_LEN: usize = HEADER_LEN + 32 + 4;
 const TX_INV_ENTRY: usize = 32 + 4;
 const GET_TX_INV_LEN: usize = HEADER_LEN + 8;
+const GET_SYNC_POINT_LEN: usize = HEADER_LEN + 32;
+const SYNC_POINT_LEN: usize = HEADER_LEN + 32 + 32 + 8 + 32;
+const GET_PIECE_LEN: usize = HEADER_LEN + 8 + 32 + 1 + 4 + 4 + 2;
+const PIECE_CHUNK_HEADER_LEN: usize = HEADER_LEN + 32 + 1 + 4 + 4 + 4;
 
 /// The most transactions one `TX_INV` announces.
 pub const MAX_TX_INV: usize = (MAX_PACKET - HEADER_LEN - 1) / TX_INV_ENTRY;
@@ -90,6 +107,8 @@ pub const MAX_HOSTS_PER_PACKET: usize = (MAX_PACKET - HOSTS_MIN) / ADDR_LEN;
 
 const _: () = assert!(CHUNK_HEADER_LEN + CHUNK_LEN <= MAX_PACKET);
 const _: () = assert!(INV_LEN <= GET_INV_LEN * AMPLIFICATION_FACTOR);
+const _: () = assert!(SYNC_POINT_LEN <= GET_SYNC_POINT_LEN * AMPLIFICATION_FACTOR);
+const _: () = assert!(PIECE_CHUNK_HEADER_LEN + CHUNK_LEN <= MAX_PACKET);
 
 /// Which block a `GET_INV` asks about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +153,16 @@ pub enum Message {
     TxChunk { id: [u8; 32], index: u32, data: Vec<u8> },
     /// "Tell me every transaction you have" -- answered with `TxInv`s.
     GetTxInv { cookie: u64 },
+    /// "What does the chain proof of this block attest besides its
+    /// header?" See `statesync`.
+    GetSyncPoint { hash: [u8; 32] },
+    /// The answer to `GetSyncPoint`.
+    SyncPoint { hash: [u8; 32], point: crate::snapshot::SyncPoint },
+    /// "Send me chunks `first .. first + count` of piece `(level, index)`
+    /// of the state as of block `at`."
+    GetPiece { cookie: u64, at: [u8; 32], level: u8, index: u32, first: u32, count: u16 },
+    /// One chunk of a piece, which is `size` bytes in all.
+    PieceChunk { at: [u8; 32], level: u8, index: u32, size: u32, chunk: u32, data: Vec<u8> },
 }
 
 /// Size of a `HOSTS` packet carrying `count` addresses.
@@ -271,6 +300,49 @@ impl Message {
                 out.push(TYPE_GET_TX_INV);
                 out.extend_from_slice(&cookie.to_be_bytes());
             }
+            Message::GetSyncPoint { hash } => {
+                out.push(TYPE_GET_SYNC_POINT);
+                out.extend_from_slice(hash);
+            }
+            Message::SyncPoint { hash, point } => {
+                out.push(TYPE_SYNC_POINT);
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&point.target);
+                out.extend_from_slice(&point.window_start.to_be_bytes());
+                out.extend_from_slice(&point.work);
+            }
+            Message::GetPiece {
+                cookie,
+                at,
+                level,
+                index,
+                first,
+                count,
+            } => {
+                out.push(TYPE_GET_PIECE);
+                out.extend_from_slice(&cookie.to_be_bytes());
+                out.extend_from_slice(at);
+                out.push(*level);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&first.to_be_bytes());
+                out.extend_from_slice(&count.to_be_bytes());
+            }
+            Message::PieceChunk {
+                at,
+                level,
+                index,
+                size,
+                chunk,
+                data,
+            } => {
+                out.push(TYPE_PIECE_CHUNK);
+                out.extend_from_slice(at);
+                out.push(*level);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&size.to_be_bytes());
+                out.extend_from_slice(&chunk.to_be_bytes());
+                out.extend_from_slice(&data[..data.len().min(CHUNK_LEN)]);
+            }
         }
         out
     }
@@ -358,6 +430,31 @@ impl Message {
                 data: body[36..].to_vec(),
             }),
             TYPE_GET_TX_INV if bytes.len() == GET_TX_INV_LEN => Some(Message::GetTxInv { cookie: read_u64(body) }),
+            TYPE_GET_SYNC_POINT if bytes.len() == GET_SYNC_POINT_LEN => Some(Message::GetSyncPoint { hash: read_hash(body) }),
+            TYPE_SYNC_POINT if bytes.len() == SYNC_POINT_LEN => Some(Message::SyncPoint {
+                hash: read_hash(body),
+                point: crate::snapshot::SyncPoint {
+                    target: read_hash(&body[32..]),
+                    window_start: read_u64(&body[64..]),
+                    work: read_hash(&body[72..]),
+                },
+            }),
+            TYPE_GET_PIECE if bytes.len() == GET_PIECE_LEN => Some(Message::GetPiece {
+                cookie: read_u64(body),
+                at: read_hash(&body[8..]),
+                level: body[40],
+                index: read_u32(&body[41..]),
+                first: read_u32(&body[45..]),
+                count: read_u16(&body[49..]),
+            }),
+            TYPE_PIECE_CHUNK if (PIECE_CHUNK_HEADER_LEN..=PIECE_CHUNK_HEADER_LEN + CHUNK_LEN).contains(&bytes.len()) => Some(Message::PieceChunk {
+                at: read_hash(body),
+                level: body[32],
+                index: read_u32(&body[33..]),
+                size: read_u32(&body[37..]),
+                chunk: read_u32(&body[41..]),
+                data: body[45..].to_vec(),
+            }),
             _ => None,
         }
     }
@@ -394,6 +491,14 @@ impl Message {
             }
             Message::TxChunk { id, index, data } => format!("TX_CHUNK({} #{index}, {} bytes)", short(id), data.len()),
             Message::GetTxInv { .. } => "GET_TX_INV".to_string(),
+            Message::GetSyncPoint { hash } => format!("GET_SYNC_POINT({})", short(hash)),
+            Message::SyncPoint { hash, .. } => format!("SYNC_POINT({})", short(hash)),
+            Message::GetPiece {
+                at, level, index, first, count, ..
+            } => format!("GET_PIECE({} {level}/{index}, {first}..{})", short(at), *first as u64 + *count as u64),
+            Message::PieceChunk {
+                at, level, index, chunk, data, ..
+            } => format!("PIECE_CHUNK({} {level}/{index} #{chunk}, {} bytes)", short(at), data.len()),
         }
     }
 }
@@ -409,6 +514,39 @@ mod tests {
 
     fn all_kinds() -> Vec<Message> {
         vec![
+            Message::GetSyncPoint { hash: [3; 32] },
+            Message::SyncPoint {
+                hash: [4; 32],
+                point: crate::snapshot::SyncPoint {
+                    target: [5; 32],
+                    window_start: 77,
+                    work: [6; 32],
+                },
+            },
+            Message::GetPiece {
+                cookie: 9,
+                at: [8; 32],
+                level: 12,
+                index: 70_000,
+                first: 3,
+                count: 64,
+            },
+            Message::PieceChunk {
+                at: [8; 32],
+                level: 24,
+                index: 5,
+                size: 8192,
+                chunk: 7,
+                data: vec![1; CHUNK_LEN],
+            },
+            Message::PieceChunk {
+                at: [8; 32],
+                level: 12,
+                index: 6,
+                size: 0,
+                chunk: 0,
+                data: vec![],
+            },
             Message::GetHosts { nonce: 42, max: 17 },
             Message::Hosts {
                 nonce: 43,
@@ -492,7 +630,12 @@ mod tests {
             // ones reject a non-zero or misaligned one.
             let mut trailing = good.clone();
             trailing.push(1);
-            if !matches!(message, Message::Chunk { .. } | Message::TxChunk { .. }) {
+            let variable = match &message {
+                Message::Chunk { .. } | Message::TxChunk { .. } => true,
+                Message::PieceChunk { data, .. } => data.len() < CHUNK_LEN,
+                _ => false,
+            };
+            if !variable {
                 assert_eq!(Message::decode(&trailing), None, "{message:?}");
             }
         }
@@ -507,6 +650,7 @@ mod tests {
             let shortest_valid = match message {
                 Message::Chunk { .. } | Message::TxChunk { .. } => CHUNK_HEADER_LEN + 1,
                 Message::GetHosts { .. } => GET_HOSTS_MIN,
+                Message::PieceChunk { .. } => PIECE_CHUNK_HEADER_LEN,
                 _ => good.len(),
             };
             assert_eq!(Message::decode(&good[..shortest_valid - 1]), None, "{message:?}");

@@ -76,6 +76,18 @@ pub enum Command {
     /// This transaction left our mempool (mined, or no longer valid):
     /// stop holding it.
     ForgetTx { id: [u8; 32] },
+    /// Fast sync: stop (or resume) catching up block by block.
+    PauseBlockSync(bool),
+    /// Fast sync: fetch the active-chain block at this height from the
+    /// peer furthest ahead.
+    FetchHeight(u64),
+    /// Fast sync: ask every peer for this block's sync point.
+    RequestSyncPoint([u8; 32]),
+    /// Fast sync: download the state as of block `at` (a tree with `root`,
+    /// holding `count` outputs).
+    SyncState { at: [u8; 32], root: [u8; 32], count: u64 },
+    /// Fast sync: abandon the state download.
+    StopStateSync,
 }
 
 #[derive(Debug)]
@@ -105,9 +117,13 @@ pub struct Node<T: Transport> {
     pub discovery: Discovery,
     pub transfer: Transfer,
     pub txrelay: TxRelay,
+    pub statesync: crate::statesync::StateSync,
     /// Transactions downloaded, waiting for `take_transactions`.
     delivered_txs: Vec<(Vec<u8>, SocketAddrV4)>,
+    /// Fast-sync events, waiting for `take_sync_events`.
+    sync_events: Vec<crate::statesync::Event>,
     reader: BlockReader,
+    state_reader: crate::chain::StateReader,
     /// When set, print every datagram sent and received (except the
     /// individual `CHUNK`s of a block transfer, far too many to read) to
     /// stderr, prefixed with this label -- the node's own port, say. A
@@ -124,6 +140,7 @@ pub struct Node<T: Transport> {
 }
 
 impl<T: Transport> Node<T> {
+    #[allow(clippy::too_many_arguments)]
     /// `tick_interval_ms` is how often both protocols' `tick`s run -- it
     /// bounds how late a timeout or a due probe can be noticed, so keep
     /// it well under every timeout in their configs.
@@ -131,7 +148,9 @@ impl<T: Transport> Node<T> {
         discovery: Discovery,
         transfer: Transfer,
         txrelay: TxRelay,
+        statesync: crate::statesync::StateSync,
         reader: BlockReader,
+        state_reader: crate::chain::StateReader,
         transport: T,
         tick_interval_ms: u64,
     ) -> Self {
@@ -139,8 +158,11 @@ impl<T: Transport> Node<T> {
             discovery,
             transfer,
             txrelay,
+            statesync,
             delivered_txs: Vec::new(),
+            sync_events: Vec::new(),
             reader,
+            state_reader,
             log: None,
             peer_height: None,
             transport,
@@ -160,7 +182,7 @@ impl<T: Transport> Node<T> {
             let result = self.transport.send_to(&packet.bytes, packet.to);
             if let Some(label) = &self.log {
                 let message = Message::decode(&packet.bytes);
-                if matches!(message, Some(Message::Chunk { .. } | Message::TxChunk { .. })) {
+                if matches!(message, Some(Message::Chunk { .. } | Message::TxChunk { .. } | Message::PieceChunk { .. })) {
                     continue;
                 }
                 let what = message.map_or("unparseable packet".to_string(), |m| m.describe());
@@ -191,6 +213,20 @@ impl<T: Transport> Node<T> {
                 self.txrelay.remove(&id);
                 Vec::new()
             }
+            Command::PauseBlockSync(paused) => {
+                self.transfer.pause(paused);
+                Vec::new()
+            }
+            Command::FetchHeight(height) => self.transfer.fetch_height(height),
+            Command::RequestSyncPoint(hash) => self.statesync.request_point(hash, &self.discovery)?,
+            Command::SyncState { at, root, count } => {
+                self.statesync.start(at, root, count);
+                Vec::new()
+            }
+            Command::StopStateSync => {
+                self.statesync.stop();
+                Vec::new()
+            }
         };
         self.send_all(out);
         Ok(())
@@ -215,7 +251,7 @@ impl<T: Transport> Node<T> {
             };
             let message = Message::decode(&self.buf[..len]);
             if let Some(label) = &self.log
-                && !matches!(message, Some(Message::Chunk { .. } | Message::TxChunk { .. }))
+                && !matches!(message, Some(Message::Chunk { .. } | Message::TxChunk { .. } | Message::PieceChunk { .. }))
             {
                 let what = message.as_ref().map_or(format!("unparseable packet ({len} bytes)"), |m| m.describe());
                 debug!("[{label}] recv {what} from {from}");
@@ -228,6 +264,11 @@ impl<T: Transport> Node<T> {
                     Message::TxInv(_) | Message::GetTx { .. } | Message::TxChunk { .. } | Message::GetTxInv { .. } => {
                         let step = self.txrelay.handle(from, &message, &self.discovery, now_ms);
                         self.delivered_txs.extend(step.delivered);
+                        step.packets
+                    }
+                    Message::GetSyncPoint { .. } | Message::SyncPoint { .. } | Message::GetPiece { .. } | Message::PieceChunk { .. } => {
+                        let step = self.statesync.handle(from, &message, &self.discovery, &self.state_reader, now_ms);
+                        self.sync_events.extend(step.events);
                         step.packets
                     }
                     _ => {
@@ -250,6 +291,9 @@ impl<T: Transport> Node<T> {
             let tx_step = self.txrelay.tick(&self.discovery, now_ms)?;
             out.extend(tx_step.packets);
             self.delivered_txs.extend(tx_step.delivered);
+            let sync_step = self.statesync.tick(&self.discovery, now_ms);
+            out.extend(sync_step.packets);
+            self.sync_events.extend(sync_step.events);
             self.send_all(out);
             if let Some(shared) = &self.peer_height {
                 let best = self.transfer.best_peer_height().unwrap_or(NO_PEER_HEIGHT);
@@ -275,6 +319,11 @@ impl<T: Transport> Node<T> {
         std::mem::take(&mut self.delivered_txs)
     }
 
+    /// Fast-sync events since the last call.
+    pub fn take_sync_events(&mut self) -> Vec<crate::statesync::Event> {
+        std::mem::take(&mut self.sync_events)
+    }
+
     /// `poll` forever until `stop` is set, reading the time from `clock`:
     /// every finished download goes to `deliver`, and every `Command`
     /// waiting on `commands` is acted on between polls.
@@ -285,6 +334,7 @@ impl<T: Transport> Node<T> {
         stop: &std::sync::atomic::AtomicBool,
         mut deliver: impl FnMut(Block, SocketAddrV4),
         mut deliver_tx: impl FnMut(Vec<u8>, SocketAddrV4),
+        mut deliver_sync: impl FnMut(crate::statesync::Event),
         commands: &std::sync::mpsc::Receiver<Command>,
     ) -> Result<(), NodeError<T::Error>> {
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -296,6 +346,9 @@ impl<T: Transport> Node<T> {
             }
             for (bytes, from) in self.take_transactions() {
                 deliver_tx(bytes, from);
+            }
+            for event in self.take_sync_events() {
+                deliver_sync(event);
             }
         }
         Ok(())
@@ -351,6 +404,16 @@ mod tests {
         }
     }
 
+    fn test_statesync_config() -> crate::statesync::Config {
+        crate::statesync::Config {
+            window: 8,
+            chunk_timeout_ms: 200,
+            max_retries: 3,
+            max_in_flight: 8,
+            max_strikes: 3,
+        }
+    }
+
     struct TestNode {
         _dir: TempDir,
         storage: Storage,
@@ -383,7 +446,9 @@ mod tests {
             peer_height_refresh_ms: 60_000,
         });
         let reader = BlockReader::open(&storage).unwrap();
-        let node = Node::new(discovery, transfer, TxRelay::new(test_txrelay_config()), reader, socket, 10);
+        let state_reader = crate::chain::StateReader::open(&storage).unwrap();
+        let statesync = crate::statesync::StateSync::new(test_statesync_config());
+        let node = Node::new(discovery, transfer, TxRelay::new(test_txrelay_config()), statesync, reader, state_reader, socket, 10);
         TestNode {
             _dir: dir,
             storage,
@@ -566,6 +631,100 @@ mod tests {
         }
         assert!(c.node.take_transactions().is_empty());
         assert_eq!(a.node.take_transactions().len(), 0, "A doesn't fetch back its own transaction");
+    }
+
+
+    /// Fast sync's state download over real UDP: A and C hold the same
+    /// chain; B, knowing both, gets the sync point of a block a few back
+    /// and downloads the state as of it from both at once -- pieces
+    /// spanning several windows of chunks, and some fully spent history
+    /// skipped -- then starts its own chain there and catches up.
+    #[test]
+    fn a_fresh_node_downloads_the_state_from_two_peers() {
+        let (socket_a, addr_a) = bind();
+        let (socket_b, _addr_b) = bind();
+        let (socket_c, addr_c) = bind();
+        let mut a = test_node(vec![], socket_a, 1);
+        let mut c = test_node(vec![], socket_c, 3);
+        let mut b = test_node(vec![addr_a, addr_c], socket_b, 2);
+
+        let key = |i: u8, j: u8, k: u8| crate::wots::keygen(&std::array::from_fn(|n| [i, j, k].get(n).copied().unwrap_or(0)));
+        let mut blocks = Vec::new();
+        for height in 0..6u8 {
+            let mut transactions: Vec<Transaction> = (0..60u8)
+                .map(|i| {
+                    let (_sk, pk) = key(1, height, i);
+                    let mut tx = Transaction::new();
+                    tx.add_output(Output::new(&pk, 50)).unwrap();
+                    tx
+                })
+                .collect();
+            // Spend a few of the first block's outputs.
+            if height >= 2 {
+                for i in 0..3u8 {
+                    let (sk, pk) = key(1, 0, height * 3 + i);
+                    let (_, to) = key(2, height, i);
+                    let mut tx = Transaction::new();
+                    tx.add_input(&pk, 50).unwrap();
+                    tx.add_output(Output::new(&to, 50)).unwrap();
+                    assert!(tx.sign_input(&pk, &sk));
+                    transactions.push(tx);
+                }
+            }
+            let unproven = a.chain.build_block(&transactions).unwrap();
+            let target = unproven.target;
+            let mut block = unproven.finish(crate::prover::Proof::placeholder());
+            assert!(crate::block::mine_block(&mut block, &target, 100_000));
+            a.chain.apply_block(&block).unwrap();
+            c.chain.apply_block(&block).unwrap();
+            blocks.push(block);
+        }
+        let base = blocks[3].clone();
+        let at = base.header.hash();
+
+        // Until B knows both.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while b.node.discovery.cookie_from(addr_a).is_none() || b.node.discovery.cookie_from(addr_c).is_none() {
+            a.step();
+            b.step();
+            c.step();
+            assert!(Instant::now() < deadline, "B never connected");
+        }
+        b.node.command(Command::PauseBlockSync(true)).unwrap();
+        b.node.command(Command::RequestSyncPoint(at)).unwrap();
+        b.node
+            .command(Command::SyncState {
+                at,
+                root: base.header.state_root,
+                count: base.header.output_count,
+            })
+            .unwrap();
+        let (mut point, mut state, mut answers) = (None, None, 0);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while state.is_none() || answers < 2 {
+            a.node.poll(crate::block::now_millis()).unwrap();
+            c.node.poll(crate::block::now_millis()).unwrap();
+            assert!(b.node.poll(crate::block::now_millis()).unwrap().is_empty(), "paused: no blocks");
+            for event in b.node.take_sync_events() {
+                match event {
+                    crate::statesync::Event::Point { hash, point: p, .. } => {
+                        assert_eq!(hash, at);
+                        point = Some(p);
+                        answers += 1;
+                    }
+                    crate::statesync::Event::State(entries) => state = Some(entries),
+                }
+            }
+            assert!(Instant::now() < deadline, "the state download never finished");
+        }
+        let unspent = state.unwrap();
+        // Four blocks of 60 outputs; the spends since made as many as they spent.
+        assert_eq!((unspent.len(), base.header.output_count), (4 * 60, 4 * 60 + 6));
+        b.chain.import_snapshot(&base, &point.unwrap(), &[], &unspent).unwrap();
+        for block in &blocks[4..] {
+            b.chain.accept_block(block.clone()).unwrap();
+        }
+        assert_eq!(b.tip(), a.tip());
     }
 
 }

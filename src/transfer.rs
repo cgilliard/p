@@ -157,6 +157,11 @@ pub struct Transfer {
     /// Blocks downloaded and handed off, by when -- see
     /// `RECENTLY_DELIVERED_MS`.
     recently_delivered: HashMap<[u8; 32], u64>,
+    /// While a fast sync is under way: download no blocks but those asked
+    /// for by height (`fetch_height`) -- peers' heights are still tracked.
+    paused: bool,
+    /// Heights asked for with `fetch_height`, downloaded however far ahead.
+    wanted: std::collections::HashSet<u64>,
 }
 
 impl Transfer {
@@ -167,6 +172,35 @@ impl Transfer {
             peer_heights: HashMap::new(),
             last_catch_up: None,
             recently_delivered: HashMap::new(),
+            paused: false,
+            wanted: Default::default(),
+        }
+    }
+
+    /// Stop (or resume) catching up block by block -- see `paused`.
+    pub fn pause(&mut self, paused: bool) {
+        self.paused = paused;
+        if !paused {
+            self.wanted.clear();
+        }
+    }
+
+    /// Fetch the active-chain block at `height` from the peer furthest
+    /// ahead, however far ahead of our tip it is.
+    pub fn fetch_height(&mut self, height: u64) -> Vec<Outgoing> {
+        self.wanted.insert(height);
+        let best = self
+            .peer_heights
+            .iter()
+            .filter_map(|(peer, known)| Some((*peer, known.height?)))
+            .filter(|&(_, h)| h >= height)
+            .max_by_key(|&(_, h)| h);
+        match best {
+            Some((peer, _)) => vec![Outgoing {
+                to: peer,
+                bytes: Message::GetInv(InvQuery::ByHeight(height)).encode(),
+            }],
+            None => Vec::new(),
         }
     }
 
@@ -286,8 +320,12 @@ impl Transfer {
             return Ok(());
         }
 
+        let wanted = self.wanted.contains(&height);
+        if self.paused && !wanted {
+            return Ok(());
+        }
         let next = Self::next_height(reader)?;
-        if height > next {
+        if height > next && !wanted {
             // Too far ahead to connect: catch up from our own tip instead.
             step.packets.push(Outgoing {
                 to: from,
@@ -504,13 +542,13 @@ impl Transfer {
         let next = Self::next_height(reader)?;
         let query = Message::GetInv(InvQuery::ByHeight(next)).encode();
 
-        let ahead = self
+        let ahead = (!self.paused).then_some(()).and(self
             .peer_heights
             .iter()
             .filter_map(|(peer, known)| Some((*peer, known.height?)))
             .filter(|&(_, height)| height >= next)
             .max_by_key(|&(_, height)| height)
-            .map(|(peer, _)| peer);
+            .map(|(peer, _)| peer));
         if let Some(peer) = ahead {
             let asked_recently = self
                 .last_catch_up

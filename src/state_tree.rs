@@ -69,6 +69,9 @@ pub const SPENT: Octet = {
 
 const NODES_DB: &str = "state_tree";
 const META_DB: &str = "state_meta";
+/// Unspent outputs by position (u64 BE) -> commitment ‖ nonce: what a leaf
+/// hashes, kept so a peer can be sent a subtree's contents (`snapshot`).
+const LEAVES_DB: &str = "state_leaves";
 const COUNT_KEY: &[u8] = b"count";
 
 /// A node's capacity octet: its domain and the rate length.
@@ -123,6 +126,53 @@ pub fn empty_hashes() -> Vec<Octet> {
 }
 
 /// The root of an empty tree.
+/// The hash of an all-`SPENT` subtree of each height `0..=DEPTH`.
+pub fn spent_hashes() -> Vec<Octet> {
+    let mut hashes = vec![SPENT];
+    for level in 0..DEPTH {
+        let below = hashes[level];
+        hashes.push(node(level, &below, &below));
+    }
+    hashes
+}
+
+/// An unspent output: its position, commitment and recovery nonce.
+pub type Entry = (u64, [u8; 32], [u8; crate::recovery::NONCE_LEN]);
+
+/// The hash of subtree `(level, index)` of a tree holding `count` outputs,
+/// of which those in it still unspent are `unspent` (in position order, all
+/// inside the subtree): every other position below `count` is `SPENT`,
+/// every one from `count` on `EMPTY`.
+pub fn subtree_hash(level: usize, index: u64, count: u64, unspent: &[Entry], empty: &[Octet], spent: &[Octet]) -> Octet {
+    let (lo, hi) = (index << level, (index + 1) << level);
+    if lo >= count {
+        return empty[level];
+    }
+    if unspent.is_empty() && hi <= count {
+        return spent[level];
+    }
+    if level == 0 {
+        return match unspent {
+            [(_, commitment, nonce)] => leaf(commitment, nonce),
+            _ => SPENT,
+        };
+    }
+    let mid = lo + (1 << (level - 1));
+    let split = unspent.partition_point(|e| e.0 < mid);
+    let left = subtree_hash(level - 1, 2 * index, count, &unspent[..split], empty, spent);
+    let right = subtree_hash(level - 1, 2 * index + 1, count, &unspent[split..], empty, spent);
+    node(level - 1, &left, &right)
+}
+
+/// The tree as it was after some earlier block: `count` outputs, and the
+/// outputs unspent then but spent since (by position). Everything else
+/// below `count` is as it is now.
+#[derive(Clone, Debug, Default)]
+pub struct AsOf {
+    pub count: u64,
+    pub restored: std::collections::BTreeMap<u64, ([u8; 32], [u8; crate::recovery::NONCE_LEN])>,
+}
+
 pub fn empty_root() -> [u8; 32] {
     digest_to_bytes(empty_hashes()[DEPTH])
 }
@@ -173,7 +223,9 @@ fn key(height: usize, index: u64) -> [u8; 9] {
 pub struct StateTree {
     nodes: Database<Bytes, Bytes>,
     meta: Database<Bytes, Bytes>,
+    leaves: Database<Bytes, Bytes>,
     empty: Vec<Octet>,
+    spent: Vec<Octet>,
 }
 
 impl StateTree {
@@ -181,8 +233,110 @@ impl StateTree {
         Ok(StateTree {
             nodes: storage.database(NODES_DB)?,
             meta: storage.database(META_DB)?,
+            leaves: storage.database(LEAVES_DB)?,
             empty: empty_hashes(),
+            spent: spent_hashes(),
         })
+    }
+
+    fn put_leaf(&self, wtxn: &mut heed::RwTxn, position: u64, commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN]) -> Result<()> {
+        self.leaves.put(wtxn, &position.to_be_bytes(), &[&commitment[..], &nonce[..]].concat())?;
+        Ok(())
+    }
+
+    /// The unspent outputs at positions `lo..hi`, in order.
+    pub fn unspent_in(&self, txn: &heed::RoTxn, lo: u64, hi: u64) -> Result<Vec<Entry>> {
+        let (lo, hi) = (lo.to_be_bytes(), hi.to_be_bytes());
+        let range = (std::ops::Bound::Included(&lo[..]), std::ops::Bound::Excluded(&hi[..]));
+        let mut out = Vec::new();
+        for item in self.leaves.range(txn, &range)? {
+            let (key, value) = item?;
+            let position = u64::from_be_bytes(key.try_into().map_err(|_| Error::Corrupt("leaf key"))?);
+            if value.len() != 32 + crate::recovery::NONCE_LEN {
+                return Err(Error::Corrupt("leaf record"));
+            }
+            out.push((position, value[..32].try_into().unwrap(), value[32..].try_into().unwrap()));
+        }
+        Ok(out)
+    }
+
+    /// Node `(level, index)` as of `as_of` (see `AsOf`). Read from the
+    /// stored tree wherever nothing below it changed since.
+    pub fn node_as_of(&self, txn: &heed::RoTxn, as_of: &AsOf, level: usize, index: u64) -> Result<Octet> {
+        let (lo, hi) = (index << level, (index + 1) << level);
+        if lo >= as_of.count {
+            return Ok(self.empty[level]);
+        }
+        if hi <= as_of.count && as_of.restored.range(lo..hi).next().is_none() {
+            return self.get(txn, level, index);
+        }
+        if level == 0 {
+            return Ok(match as_of.restored.get(&lo) {
+                Some((commitment, nonce)) => leaf(commitment, nonce),
+                None => self.get(txn, 0, lo)?,
+            });
+        }
+        let left = self.node_as_of(txn, as_of, level - 1, 2 * index)?;
+        let right = self.node_as_of(txn, as_of, level - 1, 2 * index + 1)?;
+        Ok(node(level - 1, &left, &right))
+    }
+
+    /// The outputs at positions `lo..hi` unspent as of `as_of`, in order.
+    pub fn unspent_as_of(&self, txn: &heed::RoTxn, as_of: &AsOf, lo: u64, hi: u64) -> Result<Vec<Entry>> {
+        let hi = hi.min(as_of.count);
+        if lo >= hi {
+            return Ok(Vec::new());
+        }
+        let mut out = self.unspent_in(txn, lo, hi)?;
+        out.extend(as_of.restored.range(lo..hi).map(|(&p, &(c, n))| (p, c, n)));
+        out.sort_unstable_by_key(|e| e.0);
+        Ok(out)
+    }
+
+    /// Replace the whole tree with `count` outputs, of which `unspent` (in
+    /// position order) are unspent and the rest spent -- a snapshot
+    /// (`snapshot`). Its root. Fully spent subtrees are stored as their
+    /// root alone: nothing below one is ever read again (a path only
+    /// passes through subtrees holding an unspent output or the next
+    /// position, and reorgs never reach back past a snapshot).
+    pub fn import(&self, wtxn: &mut heed::RwTxn, count: u64, unspent: &[Entry]) -> Result<[u8; 32]> {
+        if count > 1 << DEPTH {
+            return Err(Error::Full);
+        }
+        let in_order = unspent.windows(2).all(|w| w[0].0 < w[1].0);
+        if !in_order || unspent.last().is_some_and(|e| e.0 >= count) {
+            return Err(Error::Corrupt("snapshot entries out of order or out of range"));
+        }
+        self.nodes.clear(wtxn)?;
+        self.leaves.clear(wtxn)?;
+        let root = self.build(wtxn, DEPTH, 0, count, unspent)?;
+        for (position, commitment, nonce) in unspent {
+            self.put_leaf(wtxn, *position, commitment, nonce)?;
+        }
+        self.set_count(wtxn, count)?;
+        Ok(digest_to_bytes(root))
+    }
+
+    fn build(&self, wtxn: &mut heed::RwTxn, level: usize, index: u64, count: u64, unspent: &[Entry]) -> Result<Octet> {
+        let (lo, hi) = (index << level, (index + 1) << level);
+        let hash = if lo >= count {
+            return Ok(self.empty[level]);
+        } else if unspent.is_empty() && hi <= count {
+            self.spent[level]
+        } else if level == 0 {
+            match unspent {
+                [(p, commitment, nonce)] if *p == lo => leaf(commitment, nonce),
+                _ => return Err(Error::Corrupt("snapshot entries out of order or out of range")),
+            }
+        } else {
+            let mid = lo + (1 << (level - 1));
+            let split = unspent.partition_point(|e| e.0 < mid);
+            let left = self.build(wtxn, level - 1, 2 * index, count, &unspent[..split])?;
+            let right = self.build(wtxn, level - 1, 2 * index + 1, count, &unspent[split..])?;
+            node(level - 1, &left, &right)
+        };
+        self.nodes.put(wtxn, &key(level, index), &digest_to_bytes(hash))?;
+        Ok(hash)
     }
 
     /// How many outputs the tree holds (the next position).
@@ -245,17 +399,20 @@ impl StateTree {
             return Err(Error::Full);
         }
         self.set(wtxn, position, leaf(commitment, nonce))?;
+        self.put_leaf(wtxn, position, commitment, nonce)?;
         self.set_count(wtxn, position + 1)?;
         Ok(position)
     }
 
     /// Mark the output at `position` spent.
     pub fn spend(&self, wtxn: &mut heed::RwTxn, position: u64) -> Result<()> {
+        self.leaves.delete(wtxn, &position.to_be_bytes())?;
         self.set(wtxn, position, SPENT)
     }
 
     /// Undo `spend`: the output at `position` is unspent again.
     pub fn unspend(&self, wtxn: &mut heed::RwTxn, position: u64, commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN]) -> Result<()> {
+        self.put_leaf(wtxn, position, commitment, nonce)?;
         self.set(wtxn, position, leaf(commitment, nonce))
     }
 
@@ -264,6 +421,7 @@ impl StateTree {
         let count = self.count(wtxn)?;
         let keep = count.checked_sub(n).ok_or(Error::Corrupt("truncating below zero"))?;
         for position in keep..count {
+            self.leaves.delete(wtxn, &position.to_be_bytes())?;
             self.set(wtxn, position, EMPTY)?;
         }
         self.set_count(wtxn, keep)
@@ -366,4 +524,83 @@ mod tests {
         let stored = tree.nodes.len(&wtxn).unwrap();
         assert!(stored < 2 * 1000 + DEPTH as u64 + 10, "{stored} nodes");
     }
+
+    /// `subtree_hash` and `import` agree with a tree built operation by
+    /// operation; the imported tree then keeps working (spends, appends)
+    /// exactly like the original.
+    #[test]
+    fn an_imported_snapshot_matches_and_keeps_working() {
+        let (_d1, storage, tree) = open("import-src");
+        let (_d2, storage2, imported) = open("import-dst");
+        let mut wtxn = storage.write_txn().unwrap();
+        for k in 0..300 {
+            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+        }
+        // Everything spent but a few, leaving fully spent regions.
+        let keep = [5u64, 6, 130, 257, 299];
+        for k in 0..300 {
+            if !keep.contains(&k) {
+                tree.spend(&mut wtxn, k).unwrap();
+            }
+        }
+        let unspent = tree.unspent_in(&wtxn, 0, 1 << 40).unwrap();
+        assert_eq!(unspent.iter().map(|e| e.0).collect::<Vec<_>>(), keep);
+        let (empty, spent) = (empty_hashes(), spent_hashes());
+        let root = tree.root(&wtxn).unwrap();
+        assert_eq!(digest_to_bytes(subtree_hash(DEPTH, 0, 300, &unspent, &empty, &spent)), root);
+        // A subtree on its own.
+        let in_first = tree.unspent_in(&wtxn, 0, 256).unwrap();
+        assert_eq!(subtree_hash(8, 0, 300, &in_first, &empty, &spent), tree.get(&wtxn, 8, 0).unwrap());
+
+        let mut wtxn2 = storage2.write_txn().unwrap();
+        assert_eq!(imported.import(&mut wtxn2, 300, &unspent).unwrap(), root);
+        assert_eq!(imported.count(&wtxn2).unwrap(), 300);
+        for &p in &keep {
+            assert_eq!(imported.path(&wtxn2, p).unwrap(), tree.path(&wtxn, p).unwrap());
+        }
+        // Both go on the same way.
+        for t in [(&tree, &mut wtxn), (&imported, &mut wtxn2)] {
+            t.0.spend(t.1, 130).unwrap();
+            t.0.push(t.1, &commitment(300), &nonce(300)).unwrap();
+            t.0.spend(t.1, 300).unwrap();
+            t.0.push(t.1, &commitment(301), &nonce(301)).unwrap();
+        }
+        assert_eq!(imported.root(&wtxn2).unwrap(), tree.root(&wtxn).unwrap());
+        assert_eq!(imported.unspent_in(&wtxn2, 0, 1000).unwrap(), tree.unspent_in(&wtxn, 0, 1000).unwrap());
+        // Out-of-range entries are refused.
+        assert!(imported.import(&mut wtxn2, 3, &[(3, commitment(1), nonce(1))]).is_err());
+    }
+
+    /// Views as of an earlier state, from the current tree plus what
+    /// changed since, match that earlier tree exactly.
+    #[test]
+    fn views_as_of_an_earlier_state() {
+        let (_d, storage, tree) = open("as-of");
+        let mut wtxn = storage.write_txn().unwrap();
+        for k in 0..100 {
+            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+        }
+        for k in [1, 2, 3, 50] {
+            tree.spend(&mut wtxn, k).unwrap();
+        }
+        let (root, unspent_then) = (tree.root(&wtxn).unwrap(), tree.unspent_in(&wtxn, 0, 100).unwrap());
+        let level8 = tree.get(&wtxn, 8, 0).unwrap();
+        // Later: spends of old outputs and new ones, and appends.
+        let mut as_of = AsOf { count: 100, ..AsOf::default() };
+        for k in [0, 4, 99] {
+            tree.spend(&mut wtxn, k).unwrap();
+            as_of.restored.insert(k, (commitment(k), nonce(k)));
+        }
+        for k in 100..140 {
+            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+        }
+        tree.spend(&mut wtxn, 120).unwrap();
+        assert_ne!(tree.root(&wtxn).unwrap(), root);
+        assert_eq!(digest_to_bytes(tree.node_as_of(&wtxn, &as_of, DEPTH, 0).unwrap()), root);
+        assert_eq!(tree.node_as_of(&wtxn, &as_of, 8, 0).unwrap(), level8);
+        assert_eq!(tree.unspent_as_of(&wtxn, &as_of, 0, 1000).unwrap(), unspent_then);
+        let middle: Vec<Entry> = unspent_then.iter().filter(|e| (40..60).contains(&e.0)).copied().collect();
+        assert_eq!(tree.unspent_as_of(&wtxn, &as_of, 40, 60).unwrap(), middle);
+    }
+
 }

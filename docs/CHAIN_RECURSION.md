@@ -204,16 +204,38 @@ also give non-membership for the duplicate check).
 
 ## Fast sync
 
-A new node:
+(Implemented: step 5d below.) Every node syncs this way -- there are no
+light clients: a fast-synced node validates everything a replaying node
+would, with the chain proof standing in for replaying history.
 
-1. Gets the tip header, its chain proof, and a **state snapshot** at the
-   tip from peers (choosing the tip with the most work, as attested).
-2. Verifies the chain proof (~10 ms) and the tip header natively.
-3. Verifies the snapshot against the proven roots (`pmmr_root`,
-   `bitmap_root`).
-4. Keeps the last `MAX_REORG_DEPTH` blocks' worth of data (headers,
-   bodies, undo) to handle reorgs -- fetched the usual way.
-5. Follows the chain normally from there.
+A new node, holding only the genesis block:
+
+1. **Picks the sync point** H = best peer height − `depth` (default 100,
+   `--sync-depth`). No headers are downloaded: the chain proof vouches
+   for every header up to H.
+2. **Fetches blocks H and H+1.** Block H+1 carries π_H, the chain proof
+   of H.
+3. **Gets H's sync point** -- the target, retarget window start and
+   cumulative work after H -- from any peer, and believes it once π_H
+   verifies against H's header and it (`Chain::check_sync_point`): every
+   block up to H valid, every state transition right, proof of work and
+   retargeting followed, that much work.
+4. **Downloads the state as of H** from every peer at once, piece by
+   piece, each checked on arrival (below).
+5. **Starts at H** (`Chain::import_snapshot`): the snapshot must hash to
+   H's state root with H's output count, with no two unspent outputs
+   alike -- which also checks the no-duplicate-output rule as of H.
+6. **Applies H+1 … tip in full**, as any node does -- block proofs, chain
+   proofs, every native rule. It's then a full node at the tip.
+
+No reorg reaches below H (`reorg_floor`), so `depth` is also how deep a
+fast-synced node can reorg at first; that grows as it runs.
+
+**Serving needs no stored snapshot.** A peer serves the state as of any
+active block from its reorg floor up: the current tree, with the outputs
+each later block spent put back (its undo data says which) and the
+outputs appended since cut off (`state_tree::AsOf`), computed when asked
+(`chain::StateReader`).
 
 ### The snapshot
 
@@ -230,16 +252,27 @@ No spent history, no internal hashes, no bitmap: it grows with the
 unspent set, not with history. Each leaf is `leaf(commitment, nonce)`, so
 the root authenticates the nonces as well as the commitments.
 
-**Parallel and trustless**, like a PMMR/bitmap sync:
+**Parallel and trustless** (`snapshot.rs`, `statesync.rs`): the tree is
+fetched as *pieces*, each a subtree whose hash is already known:
 
-1. Fetch the subtree roots at some height (say 16: 65,536 positions
-   each), hash them up, and check against the proven `state_root` --
-   which authenticates every subtree root at once.
-2. Fetch each subtree's unspent outputs from different peers in parallel.
-3. Rebuild each subtree on its own and compare with its authenticated
-   root. A mismatch identifies the peer that lied: ban it, refetch the
-   range elsewhere. A subtree whose root is the all-`SPENT` hash needs no
-   download at all, so mostly-spent history costs almost nothing.
+1. An inner piece (levels 32, 24, 16) is the hashes 8 levels down (4 for
+   the last: up to 256 hashes, 8 KB); they must hash up to the piece's
+   own hash, which authenticates them all.
+2. A leaf piece (level 12: 4,096 positions) is the subtree's unspent
+   outputs, up to ~200 KB; with the output count, they must hash to the
+   piece's hash.
+3. Pieces download from every peer in parallel (16 at a time). A piece
+   that doesn't match identifies the peer that lied: it's banned from
+   the sync and the piece fetched elsewhere. A subtree whose hash is the
+   all-`SPENT` (or all-`EMPTY`) one needs no download at all, so
+   mostly-spent history costs almost nothing.
+
+The state isn't append-only, unlike a PMMR's hashes: spending changes a
+leaf anywhere in history, so pieces are fetched *as of H*, not of a
+moving tip. (Grin's txhashset is pinned to a horizon header for the same
+reason: its leaf-set bitmap changes with every spend.) Fully spent
+subtrees never change again, and the imported tree stores them as their
+root alone.
 
 The worst a peer can do is withhold (retry elsewhere) or send a bad
 chunk (detected and attributed, as with a bad bitmap page).
@@ -249,7 +282,9 @@ wallet recovery can't see keys whose outputs were all spent -- which
 signed, and must never be handed out again. Such a node's chain view
 reports `has_full_history() == false`, and recovery then resumes keys
 `RECOVERY_INDEX_MARGIN_WITHOUT_HISTORY` (100,000) past the highest key it
-finds, instead of 1,000. (Done in `wallet.rs`; fast sync will set it.)
+finds, instead of 1,000. Imported outputs are recorded at H's height
+(their real heights aren't in the snapshot), which only matters for the
+coinbase maturity of outputs younger than H.
 
 ## Consensus changes (summary)
 
@@ -268,9 +303,14 @@ finds, instead of 1,000. (Done in `wallet.rs`; fast sync will set it.)
 - **State structure**: today's PMMR + bitmap re-hashed with elements, or
   a combined PMMR-with-spent-flags, or an indexed Merkle tree of
   unspent outputs? Decide by measuring rows per input and per output.
-- **Duplicate outputs**: prove non-membership, or make duplicates
-  impossible by construction (e.g. outputs keyed by position, or the
-  commitment folding in something unique per block)?
+- **Duplicate outputs** (settled for now): the no-duplicate-of-a-live-
+  output rule isn't in the chain proof (it needs non-membership). Every
+  node still enforces it: natively on every block it applies, and a
+  fast-synced node on its snapshot (two unspent outputs alike are
+  refused). All the proof leaves unchecked is a duplicate created *and
+  spent* before the sync point, which can't affect the state. Making
+  spends name a position (so duplicates are harmless) would put every
+  rule in the proof, if that's ever wanted.
 - **Block time** given the proving floor.
 - **Chain step for direct proofs**: wrap every direct proof (one wrap
   circuit per trace size), or require tree-form contents for every
@@ -278,9 +318,9 @@ finds, instead of 1,000. (Done in `wallet.rs`; fast sync will set it.)
 - **Cumulative work in-circuit**: 256-bit arithmetic is fine; is
   exactness needed, or is a coarser measure enough for fork choice?
 - **Old blocks**: a fast-synced node has no blocks below its snapshot,
-  so it can't serve them -- some nodes stay archival, or old blocks are
-  simply not needed (the tip's proof vouches for them). Its state needs
-  no history either way (see "The snapshot").
+  so it can't serve them. Since every node fast-syncs, old blocks are
+  only needed by `--full-sync` nodes, which need an archival peer.
+  (Archival nodes keep every active block today.)
 
 ## Spike results (2026-10-06, `state_circuit.rs`)
 
@@ -471,7 +511,31 @@ data.
      chain proofs accepts four real blocks -- the genesis proof, then step
      proofs -- and refuses a block carrying another block's chain proof.
      Chain proof 10-13 s, block proof ~62-67 s per block (dev, laptop).
-7. Next: fast sync (5d).
+7. **5d -- fast sync** (done; see "Fast sync" above):
+   - **State tree** (`state_tree.rs`): unspent outputs' leaves kept by
+     position (to serve); views as of an earlier block from the current
+     tree plus undo data (`AsOf`); `import` from a snapshot, fully spent
+     subtrees stored as their root alone.
+   - **Pieces** (`snapshot.rs`): what they are, how each is checked, and
+     the download plan.
+   - **Chain** (`chain.rs`): `StateReader` serves sync points and pieces;
+     `check_sync_point` and `import_snapshot` start a chain at H, with
+     the reorg floor at H and `has_full_history` false.
+   - **Network**: wire messages `GET_SYNC_POINT`/`SYNC_POINT` and
+     `GET_PIECE`/`PIECE_CHUNK` (version 8); `statesync.rs` serves and
+     downloads pieces from all peers, banning bad senders; `transfer`
+     pauses block-by-block sync and fetches blocks H and H+1 by height.
+   - **Node** (`fastsync.rs`): the steps above, on by default for a node
+     with nothing but genesis (`--full-sync` to replay instead,
+     `--sync-depth` for the depth); no mining until done.
+   - Tested: `state_tree` import and as-of views; `snapshot` piece
+     checks (tampering refused, fully spent pieces skipped);
+     `chain::fast_sync_from_a_state_snapshot` (import, catch up to the
+     same state, serve it on, refuse anything below H);
+     `net::a_fresh_node_downloads_the_state_from_two_peers` (UDP, two
+     peers at once); live on dev.
+8. Next: proving ahead (pipelining), and reconsidering the remaining
+   optimizations.
 7. (Earlier plan.) The chain-step circuit, completed: verify parent chain proof + contents proof +
    transition proof; parent header checks (PoW, link, timestamp,
    retarget, work); genesis base case. Measure the per-block floor.
