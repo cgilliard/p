@@ -5,6 +5,7 @@ mod block_air;
 mod bus;
 mod chain;
 mod circuit;
+mod cli;
 mod discovery;
 mod e2e;
 mod ext;
@@ -13,8 +14,10 @@ mod fri;
 mod keychain;
 #[macro_use]
 mod log;
+mod mempool;
 mod merkle;
 mod net;
+mod node;
 mod ntt;
 mod output;
 mod parallel;
@@ -32,20 +35,20 @@ mod symbolic;
 mod transaction;
 mod transfer;
 mod transcript;
+mod txrelay;
 mod utxo;
+mod wallet;
 mod wire;
 mod wots;
 
-use block::{Block, mine_block, now_millis};
+use block::{Block, now_millis};
 use chain::{AcceptOutcome, BlockReader, Chain};
 use discovery::Discovery;
 use net::Command;
 use std::net::SocketAddrV4;
 use std::sync::mpsc::{Receiver, Sender};
-use output::Output;
 use peers::PeerTable;
 use storage::Storage;
-use transaction::Transaction;
 
 /// How many leading zero bits this driver's starting PoW target has --
 /// the knob to turn if the first few blocks feel too fast or too slow.
@@ -93,6 +96,10 @@ const CHUNK_WINDOW: u16 = 32;
 const CHUNK_TIMEOUT_MS: u64 = 1_000;
 const MAX_CHUNK_RETRIES: u32 = 5;
 const MAX_DOWNLOADS: usize = 4;
+/// How many transactions may be downloading at once.
+const MAX_TX_DOWNLOADS: usize = 32;
+/// How long a transaction id stays "seen" (not fetched again).
+const TX_SEEN_TTL_MS: u64 = 10 * 60_000;
 const PEER_HEIGHT_REFRESH_MS: u64 = 60_000;
 
 /// How often the network thread runs both protocols' ticks.
@@ -169,10 +176,13 @@ struct Args {
     log_level: log::Level,
     /// Also log to standard output.
     log_stdout: bool,
+    /// The wallet's directory (default: `wallet` in the data directory).
+    wallet_dir: Option<std::path::PathBuf>,
 }
 
 const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
-         [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]";
+         [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
+         [--wallet-dir PATH]";
 
 fn parse_args() -> Args {
     let mut args = Args {
@@ -183,6 +193,7 @@ fn parse_args() -> Args {
         log_file: None,
         log_level: log::Level::Info,
         log_stdout: false,
+        wallet_dir: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -218,6 +229,7 @@ fn parse_args() -> Args {
                 });
             }
             "--log-stdout" => args.log_stdout = true,
+            "--wallet-dir" => args.wallet_dir = Some(value().into()),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -245,7 +257,16 @@ fn random_key() -> [u8; 32] {
 /// for the life of the process. Returns the channel finished downloads
 /// arrive on (each with the peer it came from) and the one to send it
 /// `Command`s on.
-fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> (Receiver<(Block, SocketAddrV4)>, Sender<Command>) {
+/// What the network thread hands the node: received blocks and
+/// transactions (encoded), each with the peer it came from, and the
+/// channel for its commands.
+type Network = (
+    Receiver<(Block, SocketAddrV4)>,
+    Receiver<(Vec<u8>, SocketAddrV4)>,
+    Sender<Command>,
+);
+
+fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Network {
     let socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
         die(&format!("failed to bind UDP port {port}: {e}"));
     });
@@ -272,24 +293,34 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> (Rec
         peer_height_refresh_ms: PEER_HEIGHT_REFRESH_MS,
     });
     let reader = BlockReader::open(storage).expect("failed to open block reader");
-    let mut node = net::Node::new(discovery, transfer, reader, socket, NETWORK_TICK_MS);
+    let txrelay = txrelay::TxRelay::new(txrelay::Config {
+        chunk_timeout_ms: CHUNK_TIMEOUT_MS,
+        max_retries: MAX_CHUNK_RETRIES,
+        max_downloads: MAX_TX_DOWNLOADS,
+        seen_ttl_ms: TX_SEEN_TTL_MS,
+    });
+    let mut node = net::Node::new(discovery, transfer, txrelay, reader, socket, NETWORK_TICK_MS);
     // Debugging aid for now: log every datagram sent and received,
     // labeled with this node's port so several local nodes' logs are
     // easy to tell apart.
     node.log = Some(format!(":{port}"));
 
     let (blocks_tx, blocks_rx) = std::sync::mpsc::channel();
+    let (txs_tx, txs_rx) = std::sync::mpsc::channel();
     let (commands_tx, commands_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         static NEVER_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let deliver = |block, from| {
             let _ = blocks_tx.send((block, from));
         };
-        if let Err(e) = node.run(now_millis, &NEVER_STOP, deliver, &commands_rx) {
+        let deliver_tx = |bytes, from| {
+            let _ = txs_tx.send((bytes, from));
+        };
+        if let Err(e) = node.run(now_millis, &NEVER_STOP, deliver, deliver_tx, &commands_rx) {
             error!("network stopped: {e:?}");
         }
     });
-    (blocks_rx, commands_tx)
+    (blocks_rx, txs_rx, commands_tx)
 }
 
 /// Tell the network to announce our current tip to every peer but
@@ -309,21 +340,6 @@ fn announce_tip(reader: &BlockReader, commands: &Sender<Command>, except: Option
         size,
         except,
     });
-}
-
-/// Hand every block the network has received so far to the chain (see
-/// `process_one`). Returns whether the tip moved.
-fn process_received(
-    chain: &mut Chain,
-    reader: &BlockReader,
-    received: &Receiver<(Block, SocketAddrV4)>,
-    commands: &Sender<Command>,
-) -> bool {
-    let mut tip_moved = false;
-    while let Ok((block, from)) = received.try_recv() {
-        tip_moved |= process_one(chain, reader, commands, block, from);
-    }
-    tip_moved
 }
 
 /// Hand one block received from `from` to the chain, announcing a new
@@ -516,7 +532,7 @@ fn main() {
     let genesis = genesis_block();
     assert_eq!(hex(&genesis.header.hash()), GENESIS_HASH, "genesis constants are inconsistent");
     info!("Genesis block: {GENESIS_HASH}");
-    let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
+    let chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
         let hint = if matches!(e, chain::Error::WrongGenesis) {
             " (its data is from a chain with a different genesis block -- delete it, or use another --data-dir)"
         } else {
@@ -542,105 +558,27 @@ fn main() {
         let seeds: Vec<String> = args.seeds.iter().map(|s| s.to_string()).collect();
         info!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
     }
-    let (received, commands) = spawn_network(&storage, args.port, args.seeds);
+    let (received, received_txs, commands) = spawn_network(&storage, args.port, args.seeds);
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
     let peer_table = PeerTable::open(&storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
+    let wallet_dir = args.wallet_dir.clone().unwrap_or_else(|| path.join("wallet"));
+    let wallet = wallet::Wallet::open(&wallet_dir)
+        .unwrap_or_else(|e| die(&format!("failed to open wallet at {}: {e}", wallet_dir.display())));
+    info!("Wallet: {}", wallet_dir.display());
 
-    if !args.mine {
-        info!("Following the network without mining -- press Ctrl+C to stop.");
-        loop {
-            // Block until something arrives, then handle it (and anything
-            // else already waiting).
-            let Ok((block, from)) = received.recv() else {
-                error!("network thread exited");
-                return;
-            };
-            process_one(&mut chain, &reader, &commands, block, from);
-            process_received(&mut chain, &reader, &received, &commands);
-        }
-    }
-
-    info!("Mining -- press Ctrl+C to stop.");
-
-    // Mixed into every reward key, so this node's keys differ from every
-    // other node's (and from its own in any earlier run) even at the
-    // same height.
-    let key_salt = random_key();
-
-    loop {
-        process_received(&mut chain, &reader, &received, &commands);
-
-        // A fresh miner address every block: a WOTS pubkey can only
-        // ever sign once, so the reward address must be new each time,
-        // not reused. Keyed off the upcoming height plus this run's
-        // random salt.
-        let next_height = {
-            let rtxn = storage.read_txn().expect("failed to open read transaction");
-            chain
-                .height(&rtxn)
-                .expect("failed to read chain height")
-                .map(|h| h + 1)
-                .unwrap_or(0)
-        };
-        let mut seed = key_salt;
-        seed[..8].copy_from_slice(&next_height.to_be_bytes());
-        let (_secret_key, public_key) = wots::keygen(&seed);
-
-        let mut reward_tx = Transaction::new();
-        reward_tx.add_output(Output::new(&public_key, prover::REWARD)).expect("fresh transaction never finalized");
-        let transactions = vec![reward_tx];
-
-        let unproven = chain.build_block(&transactions).expect("build_block failed");
-        let target = unproven.target;
-        let min_timestamp = unproven.min_timestamp;
-        // Direct for small blocks, a tree beyond (`prove_block_auto`).
-        let proof = prover::prove_block_auto(&unproven.inputs, &unproven.outputs, &transactions, random_key())
-            .expect("a block of this node's own valid, balanced transactions always proves");
-        let mut block = unproven.finish(proof);
-
-        let started = std::time::Instant::now();
-        let mut full_batches: u64 = 0;
-        let mined = loop {
-            if mine_block(&mut block, &target, MINE_BATCH) {
-                break true;
-            }
-            full_batches += 1;
-            if process_received(&mut chain, &reader, &received, &commands) {
-                break false; // the tip moved under us: this template is stale
-            }
-            // A fresh timestamp changes the preimage, opening up an
-            // entirely new nonce space for the next batch -- never earlier
-            // than the parent's allows, since timestamps must increase.
-            block.header.timestamp = now_millis().max(min_timestamp);
-        };
-        if !mined {
-            continue;
-        }
-
-        // `pow::mine` counts nonces up from 0, with the counter in the
-        // nonce's first 8 bytes (little-endian) -- so the winning nonce
-        // says exactly how many tries the final batch took.
-        let last_batch = u64::from_le_bytes(block.header.nonce[..8].try_into().unwrap()) + 1;
-        let hashes = full_batches * MINE_BATCH + last_batch;
-        let elapsed = started.elapsed();
-
-        match chain.accept_block(block.clone()) {
-            Ok(AcceptOutcome::Applied) => {
-                print_block(&block);
-                print_mining_stats(hashes, elapsed, &target);
-                let hosts = peer_table.all().expect("failed to read peer table");
-                let verified = hosts.iter().filter(|(_, record)| record.is_verified()).count();
-                info!("  peers:       {} known, {verified} verified", hosts.len());
-                announce_tip(&reader, &commands, None);
-            }
-            other => info!("mined block #{} was not applied: {other:?}", block.header.height),
-        }
-    }
+    // The node runs here; the command line reads the terminal on its own
+    // thread and sends it requests.
+    let (requests_tx, requests) = std::sync::mpsc::channel();
+    std::thread::spawn(move || cli::run(requests_tx));
+    let node = node::Node::new(chain, reader, received, received_txs, commands, peer_table, wallet, args.mine, requests);
+    node.run();
+    std::process::exit(0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::mine_block;
 
     fn hex32(bytes: &[u8; 32]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()

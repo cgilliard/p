@@ -672,6 +672,22 @@ fn is_connected(outcome: &AcceptOutcome) -> bool {
 /// A full node's chain state: the real `Pmmr`, `Bitmap`, and `UtxoIndex`,
 /// plus the metadata none of those three know about on their own -- which
 /// header is the current tip, and at what height.
+/// The active chain at one moment, for the wallet (`Chain::view`).
+pub struct ChainState<'a> {
+    chain: &'a Chain,
+    txn: heed::RoTxn<'a>,
+}
+
+impl crate::wallet::ChainView for ChainState<'_> {
+    fn tip_height(&self) -> u64 {
+        self.chain.height(&self.txn).ok().flatten().unwrap_or(0)
+    }
+
+    fn is_unspent(&self, commitment: &[u8; 32]) -> bool {
+        self.chain.is_unspent(&self.txn, commitment).unwrap_or(false)
+    }
+}
+
 pub struct Chain {
     storage: Storage,
     pmmr: Pmmr,
@@ -982,6 +998,20 @@ impl Chain {
     /// applied (there is no height to report yet).
     pub fn height(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
         Ok(self.tip_header(txn)?.map(|h| h.height))
+    }
+
+    /// Whether `commitment` is an unspent output of the active chain.
+    pub fn is_unspent(&self, txn: &heed::RoTxn, commitment: &[u8; 32]) -> Result<bool> {
+        Ok(self.utxo.get(txn, *commitment)?.is_some())
+    }
+
+    /// A read-only view of the active chain as it is now (see
+    /// `wallet::ChainView`).
+    pub fn view(&self) -> Result<ChainState<'_>> {
+        Ok(ChainState {
+            chain: self,
+            txn: self.storage.read_txn()?,
+        })
     }
 
     /// The `(prev_hash, height)` the next block must declare to extend

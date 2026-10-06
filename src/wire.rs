@@ -14,6 +14,10 @@
 //! | 4    | `GET_INV`    | kind u8 (0 = by height, 1 = by hash) ‖ 32-byte field          |
 //! | 5    | `GET_CHUNKS` | cookie u64 ‖ hash (32) ‖ first u32 ‖ count u16               |
 //! | 6    | `CHUNK`      | hash (32) ‖ index u32 ‖ data (`CHUNK_LEN`, or less if last)  |
+//! | 7    | `TX_INV`     | count u8 ‖ count × (txid (32) ‖ size u32)                   |
+//! | 8    | `GET_TX`     | cookie u64 ‖ txid (32) ‖ first u32 ‖ count u16               |
+//! | 9    | `TX_CHUNK`   | txid (32) ‖ index u32 ‖ data (`CHUNK_LEN`, or less if last)  |
+//! | 10   | `GET_TX_INV` | cookie u64                                                  |
 //!
 //! `GET_INV`'s field is the hash, or for a height, 24 zero bytes then
 //! the height -- one fixed size either way, so its `INV` reply (58
@@ -22,6 +26,7 @@
 //! Every packet is at most `MAX_PACKET` bytes, so none ever needs IP
 //! fragmentation -- minimal (bare-metal) stacks often can't reassemble.
 //! A block bigger than one packet travels as `CHUNK`s; see `transfer`.
+//! Transactions travel the same way, as `TX_CHUNK`s; see `txrelay`.
 
 #![allow(dead_code)]
 
@@ -29,7 +34,7 @@ use crate::peers::{self, ADDR_LEN};
 use std::net::SocketAddrV4;
 
 pub const MAGIC: [u8; 4] = *b"TBRN";
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 
 /// Largest packet this protocol ever sends or accepts -- comfortably
 /// under the 1280-byte IPv6 minimum MTU (and every realistic IPv4 path
@@ -51,6 +56,10 @@ const TYPE_INV: u8 = 3;
 const TYPE_GET_INV: u8 = 4;
 const TYPE_GET_CHUNKS: u8 = 5;
 const TYPE_CHUNK: u8 = 6;
+const TYPE_TX_INV: u8 = 7;
+const TYPE_GET_TX: u8 = 8;
+const TYPE_TX_CHUNK: u8 = 9;
+const TYPE_GET_TX_INV: u8 = 10;
 
 pub const HEADER_LEN: usize = MAGIC.len() + 2;
 const GET_HOSTS_MIN: usize = HEADER_LEN + 8 + 2;
@@ -59,6 +68,11 @@ const INV_LEN: usize = HEADER_LEN + 32 + 8 + 4 + 8;
 const GET_INV_LEN: usize = HEADER_LEN + 1 + 32;
 const GET_CHUNKS_LEN: usize = HEADER_LEN + 8 + 32 + 4 + 2;
 const CHUNK_HEADER_LEN: usize = HEADER_LEN + 32 + 4;
+const TX_INV_ENTRY: usize = 32 + 4;
+const GET_TX_INV_LEN: usize = HEADER_LEN + 8;
+
+/// The most transactions one `TX_INV` announces.
+pub const MAX_TX_INV: usize = (MAX_PACKET - HEADER_LEN - 1) / TX_INV_ENTRY;
 
 /// The most addresses a single `HOSTS` packet can carry.
 pub const MAX_HOSTS_PER_PACKET: usize = (MAX_PACKET - HOSTS_MIN) / ADDR_LEN;
@@ -100,6 +114,15 @@ pub enum Message {
     GetChunks { cookie: u64, hash: [u8; 32], first: u32, count: u16 },
     /// One piece of a block's encoding, at byte offset `index * CHUNK_LEN`.
     Chunk { hash: [u8; 32], index: u32, data: Vec<u8> },
+    /// "I have these transactions" (id, encoded size), at most
+    /// `MAX_TX_INV`. See `txrelay`.
+    TxInv(Vec<([u8; 32], u32)>),
+    /// "Send me chunks `first .. first + count` of this transaction."
+    GetTx { cookie: u64, id: [u8; 32], first: u32, count: u16 },
+    /// One piece of a transaction's encoding.
+    TxChunk { id: [u8; 32], index: u32, data: Vec<u8> },
+    /// "Tell me every transaction you have" -- answered with `TxInv`s.
+    GetTxInv { cookie: u64 },
 }
 
 /// Size of a `HOSTS` packet carrying `count` addresses.
@@ -211,6 +234,32 @@ impl Message {
                 out.extend_from_slice(&index.to_be_bytes());
                 out.extend_from_slice(&data[..data.len().min(CHUNK_LEN)]);
             }
+            Message::TxInv(entries) => {
+                out.push(TYPE_TX_INV);
+                let entries = &entries[..entries.len().min(MAX_TX_INV)];
+                out.push(entries.len() as u8);
+                for (id, size) in entries {
+                    out.extend_from_slice(id);
+                    out.extend_from_slice(&size.to_be_bytes());
+                }
+            }
+            Message::GetTx { cookie, id, first, count } => {
+                out.push(TYPE_GET_TX);
+                out.extend_from_slice(&cookie.to_be_bytes());
+                out.extend_from_slice(id);
+                out.extend_from_slice(&first.to_be_bytes());
+                out.extend_from_slice(&count.to_be_bytes());
+            }
+            Message::TxChunk { id, index, data } => {
+                out.push(TYPE_TX_CHUNK);
+                out.extend_from_slice(id);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&data[..data.len().min(CHUNK_LEN)]);
+            }
+            Message::GetTxInv { cookie } => {
+                out.push(TYPE_GET_TX_INV);
+                out.extend_from_slice(&cookie.to_be_bytes());
+            }
         }
         out
     }
@@ -276,6 +325,28 @@ impl Message {
                 index: read_u32(&body[32..]),
                 data: body[36..].to_vec(),
             }),
+            TYPE_TX_INV if !body.is_empty() => {
+                let count = body[0] as usize;
+                let entries = &body[1..];
+                if count == 0 || count > MAX_TX_INV || entries.len() != count * TX_INV_ENTRY {
+                    return None;
+                }
+                Some(Message::TxInv(
+                    entries.chunks_exact(TX_INV_ENTRY).map(|e| (read_hash(e), read_u32(&e[32..]))).collect(),
+                ))
+            }
+            TYPE_GET_TX if bytes.len() == GET_CHUNKS_LEN => Some(Message::GetTx {
+                cookie: read_u64(body),
+                id: read_hash(&body[8..]),
+                first: read_u32(&body[40..]),
+                count: read_u16(&body[44..]),
+            }),
+            TYPE_TX_CHUNK if bytes.len() > CHUNK_HEADER_LEN => Some(Message::TxChunk {
+                id: read_hash(body),
+                index: read_u32(&body[32..]),
+                data: body[36..].to_vec(),
+            }),
+            TYPE_GET_TX_INV if bytes.len() == GET_TX_INV_LEN => Some(Message::GetTxInv { cookie: read_u64(body) }),
             _ => None,
         }
     }
@@ -303,6 +374,15 @@ impl Message {
                 format!("GET_CHUNKS({}, {first}..{})", short(hash), *first as u64 + *count as u64)
             }
             Message::Chunk { hash, index, data } => format!("CHUNK({} #{index}, {} bytes)", short(hash), data.len()),
+            Message::TxInv(entries) => {
+                let ids: Vec<String> = entries.iter().map(|(id, size)| format!("{} ({size} bytes)", short(id))).collect();
+                format!("TX_INV([{}])", ids.join(", "))
+            }
+            Message::GetTx { id, first, count, .. } => {
+                format!("GET_TX({}, {first}..{})", short(id), *first as u64 + *count as u64)
+            }
+            Message::TxChunk { id, index, data } => format!("TX_CHUNK({} #{index}, {} bytes)", short(id), data.len()),
+            Message::GetTxInv { .. } => "GET_TX_INV".to_string(),
         }
     }
 }
@@ -348,7 +428,30 @@ mod tests {
                 index: 4,
                 data: vec![2; 17],
             },
+            Message::TxInv(vec![([5; 32], 4_321)]),
+            Message::TxInv((0..MAX_TX_INV as u8).map(|i| ([i; 32], i as u32 + 1)).collect()),
+            Message::GetTx {
+                cookie: 9,
+                id: [6; 32],
+                first: 0,
+                count: 42,
+            },
+            Message::TxChunk {
+                id: [6; 32],
+                index: 41,
+                data: vec![3; 300],
+            },
+            Message::GetTxInv { cookie: 11 },
         ]
+    }
+
+    #[test]
+    fn tx_inv_counts_must_match() {
+        let mut bytes = Message::TxInv(vec![([5; 32], 1), ([6; 32], 2)]).encode();
+        bytes[HEADER_LEN] = 3; // claims three entries, carries two
+        assert_eq!(Message::decode(&bytes), None);
+        bytes[HEADER_LEN] = 0;
+        assert_eq!(Message::decode(&bytes), None);
     }
 
     #[test]
@@ -378,7 +481,7 @@ mod tests {
             // ones reject a non-zero or misaligned one.
             let mut trailing = good.clone();
             trailing.push(1);
-            if !matches!(message, Message::Chunk { .. }) {
+            if !matches!(message, Message::Chunk { .. } | Message::TxChunk { .. }) {
                 assert_eq!(Message::decode(&trailing), None, "{message:?}");
             }
         }
@@ -391,7 +494,7 @@ mod tests {
             // A `CHUNK` stays valid down to one data byte, a `GET_HOSTS`
             // down to its unpadded length; anything shorter isn't.
             let shortest_valid = match message {
-                Message::Chunk { .. } => CHUNK_HEADER_LEN + 1,
+                Message::Chunk { .. } | Message::TxChunk { .. } => CHUNK_HEADER_LEN + 1,
                 Message::GetHosts { .. } => GET_HOSTS_MIN,
                 _ => good.len(),
             };

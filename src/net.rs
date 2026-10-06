@@ -20,6 +20,7 @@ use crate::block::Block;
 use crate::chain::BlockReader;
 use crate::discovery::{Discovery, Outgoing};
 use crate::transfer::{self, Transfer};
+use crate::txrelay::TxRelay;
 use crate::wire::{MAX_PACKET, Message};
 use std::net::{SocketAddr, SocketAddrV4};
 
@@ -69,6 +70,12 @@ pub enum Command {
     /// We need this block -- an orphan's missing parent -- and `from` is
     /// likely to have it.
     RequestBlock { hash: [u8; 32], from: SocketAddrV4 },
+    /// Our mempool accepted this transaction (encoded): hold it, and
+    /// announce it to every peer but `except` (whoever sent it to us).
+    AnnounceTx { bytes: Vec<u8>, except: Option<SocketAddrV4> },
+    /// This transaction left our mempool (mined, or no longer valid):
+    /// stop holding it.
+    ForgetTx { id: [u8; 32] },
 }
 
 #[derive(Debug)]
@@ -90,10 +97,13 @@ impl<E> From<transfer::Error> for NodeError<E> {
     }
 }
 
-/// `discovery` and `transfer`, driven over one `Transport`.
+/// `discovery`, `transfer` and `txrelay`, driven over one `Transport`.
 pub struct Node<T: Transport> {
     pub discovery: Discovery,
     pub transfer: Transfer,
+    pub txrelay: TxRelay,
+    /// Transactions downloaded, waiting for `take_transactions`.
+    delivered_txs: Vec<(Vec<u8>, SocketAddrV4)>,
     reader: BlockReader,
     /// When set, print every datagram sent and received (except the
     /// individual `CHUNK`s of a block transfer, far too many to read) to
@@ -110,10 +120,19 @@ impl<T: Transport> Node<T> {
     /// `tick_interval_ms` is how often both protocols' `tick`s run -- it
     /// bounds how late a timeout or a due probe can be noticed, so keep
     /// it well under every timeout in their configs.
-    pub fn new(discovery: Discovery, transfer: Transfer, reader: BlockReader, transport: T, tick_interval_ms: u64) -> Self {
+    pub fn new(
+        discovery: Discovery,
+        transfer: Transfer,
+        txrelay: TxRelay,
+        reader: BlockReader,
+        transport: T,
+        tick_interval_ms: u64,
+    ) -> Self {
         Node {
             discovery,
             transfer,
+            txrelay,
+            delivered_txs: Vec::new(),
             reader,
             log: None,
             transport,
@@ -133,7 +152,7 @@ impl<T: Transport> Node<T> {
             let result = self.transport.send_to(&packet.bytes, packet.to);
             if let Some(label) = &self.log {
                 let message = Message::decode(&packet.bytes);
-                if matches!(message, Some(Message::Chunk { .. })) {
+                if matches!(message, Some(Message::Chunk { .. } | Message::TxChunk { .. })) {
                     continue;
                 }
                 let what = message.map_or("unparseable packet".to_string(), |m| m.describe());
@@ -157,6 +176,13 @@ impl<T: Transport> Node<T> {
                 self.transfer.announce(hash, height, size, except, &self.discovery)?
             }
             Command::RequestBlock { hash, from } => self.transfer.request_block(hash, from),
+            Command::AnnounceTx { bytes, except } => {
+                self.txrelay.add(bytes, except, &self.discovery, crate::block::now_millis())?
+            }
+            Command::ForgetTx { id } => {
+                self.txrelay.remove(&id);
+                Vec::new()
+            }
         };
         self.send_all(out);
         Ok(())
@@ -181,7 +207,7 @@ impl<T: Transport> Node<T> {
             };
             let message = Message::decode(&self.buf[..len]);
             if let Some(label) = &self.log
-                && !matches!(message, Some(Message::Chunk { .. }))
+                && !matches!(message, Some(Message::Chunk { .. } | Message::TxChunk { .. }))
             {
                 let what = message.as_ref().map_or(format!("unparseable packet ({len} bytes)"), |m| m.describe());
                 debug!("[{label}] recv {what} from {from}");
@@ -190,6 +216,11 @@ impl<T: Transport> Node<T> {
                 let out = match message {
                     Message::GetHosts { .. } | Message::Hosts { .. } => {
                         self.discovery.handle_message(from, &message, len, now_ms)?
+                    }
+                    Message::TxInv(_) | Message::GetTx { .. } | Message::TxChunk { .. } | Message::GetTxInv { .. } => {
+                        let step = self.txrelay.handle(from, &message, &self.discovery, now_ms);
+                        self.delivered_txs.extend(step.delivered);
+                        step.packets
                     }
                     _ => {
                         let step = self
@@ -208,6 +239,9 @@ impl<T: Transport> Node<T> {
             let step = self.transfer.tick(&self.discovery, &self.reader, now_ms)?;
             out.extend(step.packets);
             delivered.extend(step.delivered);
+            let tx_step = self.txrelay.tick(&self.discovery, now_ms)?;
+            out.extend(tx_step.packets);
+            self.delivered_txs.extend(tx_step.delivered);
             self.send_all(out);
             self.next_tick_ms = Some(now_ms + self.tick_interval_ms);
         }
@@ -216,18 +250,29 @@ impl<T: Transport> Node<T> {
             for (block, from) in &delivered {
                 info!("[{label}] downloaded block #{} from {from}", block.header.height);
             }
+            for (bytes, from) in &self.delivered_txs {
+                debug!("[{label}] downloaded a transaction ({} bytes) from {from}", bytes.len());
+            }
         }
         Ok(delivered)
+    }
+
+    /// Transactions downloaded since the last call (encoded, each with the
+    /// peer it came from), for the mempool to check.
+    pub fn take_transactions(&mut self) -> Vec<(Vec<u8>, SocketAddrV4)> {
+        std::mem::take(&mut self.delivered_txs)
     }
 
     /// `poll` forever until `stop` is set, reading the time from `clock`:
     /// every finished download goes to `deliver`, and every `Command`
     /// waiting on `commands` is acted on between polls.
+    /// Blocks go to `deliver`, transactions to `deliver_tx`.
     pub fn run(
         &mut self,
         clock: impl Fn() -> u64,
         stop: &std::sync::atomic::AtomicBool,
         mut deliver: impl FnMut(Block, SocketAddrV4),
+        mut deliver_tx: impl FnMut(Vec<u8>, SocketAddrV4),
         commands: &std::sync::mpsc::Receiver<Command>,
     ) -> Result<(), NodeError<T::Error>> {
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -236,6 +281,9 @@ impl<T: Transport> Node<T> {
             }
             for (block, from) in self.poll(clock())? {
                 deliver(block, from);
+            }
+            for (bytes, from) in self.take_transactions() {
+                deliver_tx(bytes, from);
             }
         }
         Ok(())
@@ -282,6 +330,15 @@ mod tests {
         (socket, local)
     }
 
+    fn test_txrelay_config() -> crate::txrelay::Config {
+        crate::txrelay::Config {
+            chunk_timeout_ms: 200,
+            max_retries: 5,
+            max_downloads: 16,
+            seen_ttl_ms: 60_000,
+        }
+    }
+
     struct TestNode {
         _dir: TempDir,
         storage: Storage,
@@ -314,7 +371,7 @@ mod tests {
             peer_height_refresh_ms: 60_000,
         });
         let reader = BlockReader::open(&storage).unwrap();
-        let node = Node::new(discovery, transfer, reader, socket, 10);
+        let node = Node::new(discovery, transfer, TxRelay::new(test_txrelay_config()), reader, socket, 10);
         TestNode {
             _dir: dir,
             storage,
@@ -428,4 +485,75 @@ mod tests {
             assert!(Instant::now() < deadline, "B never caught up to A");
         }
     }
+
+    /// A real signed transaction (one input: about 4 KB, several chunks).
+    fn signed_transaction() -> Vec<u8> {
+        let keys = crate::keychain::Keychain::test("net relay");
+        let (sk, pk) = keys.derive(crate::keychain::KeyId::new(0, 0));
+        let mut tx = Transaction::new();
+        tx.add_input(&pk, 100).unwrap();
+        tx.add_output(keys.output(crate::keychain::KeyId::new(0, 1), 90)).unwrap();
+        assert!(tx.sign_input(&pk, &sk));
+        tx.to_bytes()
+    }
+
+    /// A transaction announced by A reaches B, which relays it on (as the
+    /// node does once its mempool accepts it); C, joining later and
+    /// knowing only B, gets it from B's mempool sync.
+    #[test]
+    fn transactions_relay_and_reach_a_late_joiner() {
+        let (socket_a, addr_a) = bind();
+        let (socket_b, addr_b) = bind();
+        let (socket_c, _addr_c) = bind();
+        let mut a = test_node(vec![], socket_a, 1);
+        let mut b = test_node(vec![addr_a], socket_b, 2);
+        let bytes = signed_transaction();
+        assert!(bytes.len() > 4 * crate::wire::CHUNK_LEN);
+
+        // Until A and B know each other, then A announces.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.node.discovery.cookie_from(addr_b).is_none() || b.node.discovery.cookie_from(addr_a).is_none() {
+            a.step();
+            b.step();
+            assert!(Instant::now() < deadline, "A and B never connected");
+        }
+        a.node.command(Command::AnnounceTx { bytes: bytes.clone(), except: None }).unwrap();
+
+        // B receives it whole, and relays it (as an accepting mempool would).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let from = loop {
+            a.step();
+            b.step();
+            if let Some((got, from)) = b.node.take_transactions().pop() {
+                assert_eq!(got, bytes);
+                break from;
+            }
+            assert!(Instant::now() < deadline, "B never received the transaction");
+        };
+        assert_eq!(from, addr_a);
+        b.node.command(Command::AnnounceTx { bytes: bytes.clone(), except: Some(from) }).unwrap();
+        assert_eq!(b.node.txrelay.held(), 1);
+
+        // C joins knowing only B, and is offered B's transactions.
+        let mut c = test_node(vec![addr_b], socket_c, 3);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            a.step();
+            b.step();
+            c.step();
+            if let Some((got, from)) = c.node.take_transactions().pop() {
+                assert_eq!((got, from), (bytes.clone(), addr_b));
+                break;
+            }
+            assert!(Instant::now() < deadline, "C never received the transaction");
+        }
+        // Once received, it isn't fetched again.
+        for _ in 0..200 {
+            b.step();
+            c.step();
+        }
+        assert!(c.node.take_transactions().is_empty());
+        assert_eq!(a.node.take_transactions().len(), 0, "A doesn't fetch back its own transaction");
+    }
+
 }
