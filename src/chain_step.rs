@@ -462,7 +462,7 @@ mod tests {
     #[test]
     #[ignore]
     fn chain_step_rows() {
-        let tree = crate::prover::TREE;
+        let tree = crate::prover::tree();
         let g = genesis_header();
         let g_tip = Tip::of(&g, TARGET);
         let genesis = genesis_key(&g_tip, &tree).unwrap();
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     #[ignore]
     fn chain_step_costs() {
-        let tree = crate::prover::TREE;
+        let tree = crate::prover::tree();
         let g = genesis_header();
         let g_tip = Tip::of(&g, TARGET);
         let time = std::time::Instant::now;

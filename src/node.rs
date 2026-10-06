@@ -535,7 +535,7 @@ impl Node {
                     "spendable: {}\nimmature:  {}  (mining rewards need {} confirmations)\npending:   {}\nlocked:    {}\n{held}total:     {}",
                     format_amount(b.spendable),
                     format_amount(b.immature),
-                    wallet::COINBASE_MATURITY,
+                    wallet::coinbase_maturity(),
                     format_amount(b.pending),
                     format_amount(b.locked),
                     format_amount(b.total())

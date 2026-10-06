@@ -108,6 +108,51 @@ pub const CHUNK_SHAPE: ChunkShape = ChunkShape {
 /// is the transactions).
 pub const CHUNK_PARAMS: Params = PARAMS;
 
+/// The dev network's parameters (`network`): blowup 4, 8 queries, no
+/// grinding -- about 16 bits of soundness. **Not secure**; for testing
+/// only, where they make proving several times faster.
+pub const DEV_PARAMS: Params = Params {
+    log_blowup: 2,
+    num_queries: 8,
+    grinding_bits: 0,
+    hiding: true,
+};
+
+/// The dev network's tree proofs: the same lightening, and half the rows
+/// (fewer queries make the verifier circuits small enough).
+pub const DEV_TREE: TreeParams = TreeParams {
+    trace_len: 1 << 17,
+    params: Params {
+        log_blowup: 2,
+        num_queries: 8,
+        grinding_bits: 0,
+        hiding: false,
+    },
+};
+
+/// The chunk proofs' parameters on this node's network.
+pub fn chunk_params() -> Params {
+    match crate::network::current() {
+        crate::network::Network::Main => CHUNK_PARAMS,
+        crate::network::Network::Dev => DEV_PARAMS,
+    }
+}
+
+/// The tree proofs' size and parameters on this node's network.
+pub fn tree() -> TreeParams {
+    match crate::network::current() {
+        crate::network::Network::Main => TREE,
+        crate::network::Network::Dev => DEV_TREE,
+    }
+}
+
+/// `log2` of tree proofs' low-degree extension: the trace, times the
+/// composition factor (4), times the blowup.
+fn tree_log_lde() -> usize {
+    let t = tree();
+    t.trace_len.trailing_zeros() as usize + 2 + t.params.log_blowup
+}
+
 /// Every tree proof's size and parameters: the same soundness as `PARAMS`,
 /// without zero-knowledge blinding -- a tree proof's witness is other
 /// proofs, ultimately zero-knowledge chunk proofs (see `stark::Params::
@@ -122,9 +167,6 @@ pub const TREE: TreeParams = TreeParams {
     },
 };
 
-/// `log2` of tree proofs' low-degree extension (`2^18` rows, composition
-/// factor 4, blowup 16).
-const TREE_LOG_LDE: usize = 24;
 
 /// The verifying keys: the wrap and aggregation circuits' preprocessed
 /// caps, as hex. Derived from the circuits (see the `tree_keys` test,
@@ -141,13 +183,21 @@ fn cap_to_hex(cap: &[[u8; 32]]) -> String {
     cap.iter().flatten().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The consensus verifying key for tree proofs.
+/// The dev network's verifying keys (`tree_keys` with `NETWORK=dev`).
+const DEV_WRAP_CAP: &str = "cc5a4f67868db3106fbbdb12bbba21134d972141214c922ba8c4e6141aed205d3ba5f715ccd06b6238d0a763dbf5ee571f1e6802edc23008fdab704c03cc086323ecd537cc80610813f144026da7a343591e180b23a6f93349cae16fbe08a85ef59d530e9fa472710623b067fe68d103437afa61b5c43c3ac2ca4c316674450a271bf70bbbfa541cb132c852afcf2c63ffec2249e51639521924b90884c02a5065c0cc6460ddbd589f3aad511d599d17040b8a08ec0a636f97824a1ff815c7187d504f5e3f824f7723295342d967bf26ac0e561bda4dbd53a21d9d7408776776240bc06a2c515566ea7eb77460bb592d3359f70ae10be809ee53802bbe417d05c0515d65c734c0276a1df72b7bae6c591d63a53129370d017eb3a468f214495801246b4579452a68983496547bf00d4ef553106874521f3510bd6c1584b895663214e62e4105e61d0980b675a155914012eded1f47652919b31218630cdb8e37cde1241096d89456269e6b3ded7b7f1a22f9bd089c74280711568747435e04413c1f1f37317f6c16553dec254f87b350b8012e6f7b576556a0ee6e43b7910c47b9d8e45a82def732f9601a606307455da76324546932f832b88ba20839271d6c5a720605274e436c17aa624745185e4d96dcd74bb9adb864924da676797ab57582738d527703864e81c1751563a41056fa2d913bc4c6750a4cfdb261bb7f880b8e1a8f0b06fe86404dccef1eb2ac5164aa79115485a54a08cc3c17760662dd07feb2a977b74f69222b352277091eb85d32215f70868b5f24a9b71710f5deba2b8413bd660f4458549267075cc9ac3b512e60a538a391890247c76d253382702febb8272992edaa0d62ba1520510d9e63329acd1e3e419c50986e052fb64de566baef411e63a4386643c0dd341d71440a50c61e043ff5fa28e3356a77b0d747618873df771ab3f20cec14fc44336474740366bd03a5fa5f68590b613bb03a92775d878361f4d30c66916a341868535f317199ce276b430d3d93b7d92828cdff5f2af090020f43db52ad8f62718466063ca8b78e2514986e0d94f0d96d54c48249e7d1472e79ff5f08fa201f1260782d348dca76469ffcf239ec346a15f32648468b6df033f30012323581b74915432f66accaa159651992327daa4024467bbd1f2358480da377c907c985e0055c224d723b8657116b8d66621154131505cd2502a1ac7526edd7853ccd4b8a0d03fed85802b029645ef0522cae27da138423073acd7f233c11b97c4c7126d818d9d3cb180120743dcab1743747be7b42067e1e3e1a6c4e0e6eef3826693d9474544e6026c773a14445caa4124e1e72485b74b80185cba271530d4c2228be48165f150c0c57269b17816c9f2aafd165593facaf4aa8b62c059bb9144e72267c5b8b9d401dbecb9c39e37019264bbb20501dea5a47";
+const DEV_AGGREGATE_CAP: &str = "60cf2341168c566b039bfe469168ac4a4069d6446df10e0ffe1d27590fffbf6ccb72904222b17c776e7e756a933cc51989e8024d2dcb6119966b8b23ed7f1146237e88756c602b7652349107c5a6e8570ad99d143a442a66f9413d293cfa451ee558462b0a46467153777f42145d585c33a4d655bfe0f864d2bc3632a65eaa185473c8536300a32d94171a09737f9f43081a223ba7d9243947264e4e6009b127dbfa2d0cf152d55def59f43016d1626df690833d24020c1dcd91c969efd1e84067c2176751832f105ca7551007b8576dbaf6dd449206641fd4321f0803473c1692df832ff5435f15b415606e945eb842461de3176a22336e9403f8246205ef3c54a968332f37805d298c2321289a5c677c533b4ee6397726f847381106e3880031d93d3506d3cc67fe679409d3193f76ec9114526f9ede237c1e0c4bc11f297015cbd94f90198a5cc8273b33ee15584849899f37500ba95c8cf8b540b670a93a3489cc52eaa6896948aad83560472444eb8d732e0c64c61cd8025c062c777768e897e46e07aecf6fba0445449a119f772e1633651e817050af2d762fff06c4376e60573e580241444572ed73e6866b5eae8a5d216478c43ba65ee2548b71e4597eae465e7617a3052468cc5a77a8d96e9ba910662f1fdc4f789071629480213a09353a23bc9d5a4d05126152310fa60e71cbeb543bed9962fad287313d5e6f2d73434d6ca6bcb660f483df47322ef12782bf80585257f663db35d05420f55e0c822f273cf0303f0447ea6162ed357e078f9980299cdd1f6dabe0f2402b829d45398cbf54049a1b223c397d5259fdd5212b2b466289a2373f5903645dfca5c12301ed1a37f7bd4e744fb7463f5f0d917561696c27ec8a8e60c919b75cf5541e1f9216ab28050f2d250567aa3061b54633c8602f4d1a01921a70e05821df14e14837e7da684ae5202ba45aa020d5e7d82d5d886811adbb7365a6b2616fdf8ab64c9329244b4127f256791323506fc5950e86c02d670bf51356a9c8e45a8ff60a38c465a829624e78571cd69330fc5f7f6d886d811f17b3d15ef890b421f2d41607dfd87e021278cc077eae78258a888c6bb716e10b3d970a0964ff112b09375f62ab9d8a4fe234544d0f6f625cb7eb303d63409f0c816bfe3c094d530294c0693750f5863a907b4a68ac77932abd86c5644860521e70dda1238f2a225e27fcdf6262c66f397362b209d9512f564a70f1382f67220db872e50ebd3973109ea25f34c10d9700157a777473ba670198c5720928352b0d89ca9f0eac7f3f709f1aab6406cddc0614171202fe5d12189d35b423a9dd3e0e3048220238d6ce0872f64e2a1d5d8b75f6e62868473c9544e438522efce93d15f0c3ae10c56d64472a0d126d1b2d3a53cb82f6184f031e129f176d12df0d8c0257901d605e96106611756619";
+
+/// This network's verifying key for tree proofs.
 pub fn tree_verifying_key() -> VerifyingKey {
+    let (wrap, aggregate) = match crate::network::current() {
+        crate::network::Network::Main => (WRAP_CAP, AGGREGATE_CAP),
+        crate::network::Network::Dev => (DEV_WRAP_CAP, DEV_AGGREGATE_CAP),
+    };
     VerifyingKey {
-        wrap_cap: cap_from_hex(WRAP_CAP),
-        aggregate_cap: cap_from_hex(AGGREGATE_CAP),
-        log_lde: TREE_LOG_LDE,
-        tree: TREE,
+        wrap_cap: cap_from_hex(wrap),
+        aggregate_cap: cap_from_hex(aggregate),
+        log_lde: tree_log_lde(),
+        tree: tree(),
     }
 }
 
@@ -433,28 +483,28 @@ pub fn prove_block(
 
     let mut chunks = Vec::with_capacity(witnesses.len());
     for (k, w) in witnesses.into_iter().enumerate() {
-        let proof = stark::prove(&w.air, &w.trace, &CHUNK_PARAMS, derive(k as u16)).ok()?;
+        let proof = stark::prove(&w.air, &w.trace, &chunk_params(), derive(k as u16)).ok()?;
         chunks.push((w.air, proof));
     }
 
     let mut keys = TREE_KEYS.lock().unwrap();
     if keys.is_none() {
         let (air, proof) = &chunks[0];
-        let wrap = aggregate::wrap_key(air, proof, &plan.transitions[0], &CHUNK_PARAMS, &TREE).ok()?;
+        let wrap = aggregate::wrap_key(air, proof, &plan.transitions[0], &chunk_params(), &tree()).ok()?;
         *keys = Some(TreeKeys { wrap, aggregate: None });
     }
     let keys = keys.as_mut().unwrap();
     let mut wraps = Vec::with_capacity(chunks.len());
     for (k, ((air, proof), transition)) in chunks.iter().zip(&plan.transitions).enumerate() {
-        wraps.push(aggregate::wrap(&keys.wrap, air, proof, transition, &CHUNK_PARAMS, &TREE, derive(0x8000 | k as u16)).ok()?);
+        wraps.push(aggregate::wrap(&keys.wrap, air, proof, transition, &chunk_params(), &tree(), derive(0x8000 | k as u16)).ok()?);
     }
     let root = if wraps.len() == 1 {
         wraps.pop().unwrap()
     } else {
         if keys.aggregate.is_none() {
-            keys.aggregate = Some(aggregate::aggregate_key([&wraps[0], &wraps[1]], &keys.wrap, &TREE).ok()?);
+            keys.aggregate = Some(aggregate::aggregate_key([&wraps[0], &wraps[1]], &keys.wrap, &tree()).ok()?);
         }
-        aggregate::aggregate_all(keys.aggregate.as_ref().unwrap(), &keys.wrap, wraps, &TREE, derive(0xffff)).ok()?
+        aggregate::aggregate_all(keys.aggregate.as_ref().unwrap(), &keys.wrap, wraps, &tree(), derive(0xffff)).ok()?
     };
 
     let mut bytes = vec![KIND_TREE];
@@ -667,15 +717,18 @@ mod tests {
         let (wrap, aggregate) = {
             let keys = TREE_KEYS.lock().unwrap();
             let keys = keys.as_ref().unwrap();
-            assert_eq!(keys.wrap.preprocessed.log_lde, TREE_LOG_LDE);
+            assert_eq!(keys.wrap.preprocessed.log_lde, tree_log_lde());
             (
                 cap_to_hex(&keys.wrap.preprocessed.cap),
                 cap_to_hex(&keys.aggregate.as_ref().unwrap().preprocessed.cap),
             )
         };
-        if wrap != WRAP_CAP || aggregate != AGGREGATE_CAP {
-            println!("const WRAP_CAP: &str = \"{wrap}\";");
-            println!("const AGGREGATE_CAP: &str = \"{aggregate}\";");
+        let dev = crate::network::current() == crate::network::Network::Dev;
+        let (current_wrap, current_aggregate) = if dev { (DEV_WRAP_CAP, DEV_AGGREGATE_CAP) } else { (WRAP_CAP, AGGREGATE_CAP) };
+        if wrap != current_wrap || aggregate != current_aggregate {
+            let prefix = if dev { "DEV_" } else { "" };
+            println!("const {prefix}WRAP_CAP: &str = \"{wrap}\";");
+            println!("const {prefix}AGGREGATE_CAP: &str = \"{aggregate}\";");
             panic!("the verifying-key constants are stale: update them to the above");
         }
         let proof = proof.expect("a tree proof that verifies");
@@ -717,10 +770,11 @@ mod tests {
         let created: u64 = txs.iter().flat_map(|t| &t.outputs).map(|o| o.amount).sum();
         let chunk = block_air::build_chunk(&txs, (created - spent, 0), CHUNK_SHAPE).unwrap();
         let start = std::time::Instant::now();
-        let proof = stark::prove(&chunk.air, &chunk.trace, &CHUNK_PARAMS, [1; 32]).unwrap();
+        let proof = stark::prove(&chunk.air, &chunk.trace, &chunk_params(), [1; 32]).unwrap();
         println!("chunk proof: {:.2?}", start.elapsed());
-        let rows = aggregate::wrap_rows(&chunk.air, &proof, &b.plan.transitions[k], &CHUNK_PARAMS).unwrap();
-        println!("wrap circuit: {rows} rows of {} ({:.0}%)", TREE.trace_len, 100.0 * rows as f64 / TREE.trace_len as f64);
+        let rows = aggregate::wrap_rows(&chunk.air, &proof, &b.plan.transitions[k], &chunk_params()).unwrap();
+        let t = tree();
+        println!("wrap circuit: {rows} rows of {} ({:.0}%)", t.trace_len, 100.0 * rows as f64 / t.trace_len as f64);
     }
 
     /// Not a correctness test: proving costs. `COST=chunk`: one chunk
@@ -739,7 +793,7 @@ mod tests {
             "chunk" => {
                 let chunk = block_air::build_chunk(&b.txs, (REWARD, 0), CHUNK_SHAPE).unwrap();
                 let start = time();
-                let proof = stark::prove(&chunk.air, &chunk.trace, &CHUNK_PARAMS, [1; 32]).unwrap();
+                let proof = stark::prove(&chunk.air, &chunk.trace, &chunk_params(), [1; 32]).unwrap();
                 println!(
                     "chunk: {} rows; prove {:.2?}; {:.1} KB",
                     chunk.air.trace_len(),

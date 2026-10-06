@@ -34,6 +34,17 @@ use crate::peers::{self, ADDR_LEN};
 use std::net::SocketAddrV4;
 
 pub const MAGIC: [u8; 4] = *b"TBRN";
+/// The dev network's magic (`network`): a dev node and a main node never
+/// even parse each other's packets.
+pub const DEV_MAGIC: [u8; 4] = *b"TBRD";
+
+/// This node's network's magic.
+pub fn magic() -> [u8; 4] {
+    match crate::network::current() {
+        crate::network::Network::Main => MAGIC,
+        crate::network::Network::Dev => DEV_MAGIC,
+    }
+}
 pub const VERSION: u8 = 7;
 
 /// Largest packet this protocol ever sends or accepts -- comfortably
@@ -170,7 +181,7 @@ fn read_u64(bytes: &[u8]) -> u64 {
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(MAX_PACKET);
-        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&magic());
         out.push(VERSION);
         match self {
             Message::GetHosts { nonce, max } => {
@@ -269,7 +280,7 @@ impl Message {
         if bytes.len() < HEADER_LEN || bytes.len() > MAX_PACKET {
             return None;
         }
-        if bytes[..4] != MAGIC || bytes[4] != VERSION {
+        if bytes[..4] != magic() || bytes[4] != VERSION {
             return None;
         }
         let body = &bytes[HEADER_LEN..];

@@ -64,6 +64,17 @@ pub const MAX_INPUTS: usize = crate::prover::CHUNK_SHAPE.inputs;
 /// consensus.
 pub const COINBASE_MATURITY: u64 = 10;
 
+/// The dev network's maturity (`network`): short, so testing doesn't wait.
+pub const DEV_COINBASE_MATURITY: u64 = 3;
+
+/// The confirmations a mining reward needs on this node's network.
+pub fn coinbase_maturity() -> u64 {
+    match crate::network::current() {
+        crate::network::Network::Main => COINBASE_MATURITY,
+        crate::network::Network::Dev => DEV_COINBASE_MATURITY,
+    }
+}
+
 const SEED_KEY: &[u8] = b"seed";
 const NEXT_INDEX_KEY: &[u8] = b"next_index";
 /// Present while a wallet restored from its backup words hasn't yet
@@ -93,6 +104,17 @@ pub const RECOVERY_INDEX_MARGIN_WITHOUT_HISTORY: u32 = 100_000;
 /// signing a *different* spend of it would reveal a second one-time
 /// signature, and with it the key.
 pub const RECOVERY_HOLD_BLOCKS: u64 = 10;
+
+/// The dev network's hold (`network`), matching its short maturity.
+pub const DEV_RECOVERY_HOLD_BLOCKS: u64 = 3;
+
+/// The recovery hold on this node's network.
+pub fn recovery_hold_blocks() -> u64 {
+    match crate::network::current() {
+        crate::network::Network::Main => RECOVERY_HOLD_BLOCKS,
+        crate::network::Network::Dev => DEV_RECOVERY_HOLD_BLOCKS,
+    }
+}
 
 /// What the chain can tell the wallet.
 pub trait ChainView {
@@ -275,7 +297,7 @@ impl OwnedOutput {
                     return Status::Held { confirmations, until };
                 }
                 let reward_like = matches!(self.origin, Origin::Mined | Origin::Recovered);
-                let mature = !reward_like || confirmations >= COINBASE_MATURITY;
+                let mature = !reward_like || confirmations >= coinbase_maturity();
                 Status::Confirmed { confirmations, mature }
             }
         }
@@ -577,7 +599,7 @@ impl Wallet {
         if !scanned {
             return Err(Error::Corrupt("couldn't scan the chain's outputs"));
         }
-        let spendable_from = tip + RECOVERY_HOLD_BLOCKS;
+        let spendable_from = tip + recovery_hold_blocks();
         let mut report = Recovered { spendable_from, ..Default::default() };
         let mut wtxn = self.storage.write_txn()?;
         let mut max_index = None;

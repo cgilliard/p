@@ -404,6 +404,16 @@ data.
    - Cost: every block now pays a chunk proof (~140 s on the laptop)
      plus a wrap (~60 s) even when empty -- ~3.3 min; each further chunk
      of 8 inputs adds a chunk, a wrap and an aggregation.
+   - **Dev network** (`network.rs`, `--network dev`), for testing at
+     this cost: light, insecure proof parameters (blowup 4, 8 queries,
+     no grinding) and half-size tree proofs (2^17 rows; the wrap is
+     127,114 rows, 97%), with its own verifying keys, genesis, wire magic
+     (`TBRD`, so dev and main nodes never talk), default data
+     directory (`~/.tabernacle/dev`), and shorter wallet waits: rewards
+     mature after 3 confirmations and recovered outputs are held 3 blocks
+     (main: 10 each). Measured: a two-chunk block in
+     140 s (main: 505 s), 47 KB proof, verified in 3.2 ms, 2.1 GB peak;
+     live, two nodes produced a block every ~70 s (main: ~3.3 min+).
 5. The chain-step circuit, completed: verify parent chain proof + contents proof +
    transition proof; parent header checks (PoW, link, timestamp,
    retarget, work); genesis base case. Measure the per-block floor.

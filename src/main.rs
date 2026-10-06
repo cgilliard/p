@@ -18,6 +18,7 @@ mod mempool;
 mod merkle;
 mod mnemonic;
 mod net;
+mod network;
 mod node;
 mod ntt;
 mod output;
@@ -132,11 +133,37 @@ fn difficulty_config() -> chain::DifficultyConfig {
 /// block, and accepts no other at height 0 (see `Chain::open`). Its body
 /// is empty, so its state root is an empty state tree's; its
 /// timestamp is the floor every later block's must climb from.
-const GENESIS_TIMESTAMP_MS: u64 = 1_791_270_256_362;
+///
+/// Each network (`network`) has its own; they differ only in timestamp
+/// and nonce (the body, and so the state root, is empty in both).
 const GENESIS_STATE_ROOT: &str = "5be6bc002e4d0a70dcdf897284a01d5577381315464b6506f65ce56f7d5bc035";
 const GENESIS_BODY_HASH: &str = "78e5073d3554582a18816b49397ac631b629d019a062cf257ef467124ec2c16f";
-const GENESIS_NONCE: &str = "343f010000000000000000000000000000000000000000000000000000000000";
-const GENESIS_HASH: &str = "0000016cc4e2345bda9ec954d1365025ee280457e4f8197162bbaf2884398d3d";
+
+/// A network's genesis: timestamp, nonce, and the resulting hash.
+struct Genesis {
+    timestamp_ms: u64,
+    nonce: &'static str,
+    hash: &'static str,
+}
+
+const MAIN_GENESIS: Genesis = Genesis {
+    timestamp_ms: 1_791_270_256_362,
+    nonce: "343f010000000000000000000000000000000000000000000000000000000000",
+    hash: "0000016cc4e2345bda9ec954d1365025ee280457e4f8197162bbaf2884398d3d",
+};
+
+const DEV_GENESIS: Genesis = Genesis {
+    timestamp_ms: 1_791_303_237_548,
+    nonce: "cadb000000000000000000000000000000000000000000000000000000000000",
+    hash: "000000223942ad0a83176867852fe1324fa8e36bb2133161c90d854771ca1000",
+};
+
+fn genesis() -> &'static Genesis {
+    match network::current() {
+        network::Network::Main => &MAIN_GENESIS,
+        network::Network::Dev => &DEV_GENESIS,
+    }
+}
 
 fn from_hex32(hex: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -154,22 +181,28 @@ fn genesis_block() -> Block {
             output_count: 0,
             body_hash: from_hex32(GENESIS_BODY_HASH),
             height: 0,
-            timestamp: GENESIS_TIMESTAMP_MS,
-            nonce: from_hex32(GENESIS_NONCE),
+            timestamp: genesis().timestamp_ms,
+            nonce: from_hex32(genesis().nonce),
         },
         body: block::BlockBody::new(),
     }
 }
 
-fn default_data_dir() -> std::path::PathBuf {
+fn default_data_dir(network: network::Network) -> std::path::PathBuf {
     let home = std::env::var("HOME").expect("HOME environment variable must be set");
-    std::path::PathBuf::from(home).join(".tabernacle").join("lmdb")
+    let name = match network {
+        network::Network::Main => "lmdb",
+        network::Network::Dev => "dev",
+    };
+    std::path::PathBuf::from(home).join(".tabernacle").join(name)
 }
 
 /// Command-line options. Hand-parsed -- there are only a few, and this
 /// crate takes on no dependencies it doesn't need.
 struct Args {
     data_dir: std::path::PathBuf,
+    /// `main`, or `dev` (light, insecure proofs for testing).
+    network: network::Network,
     port: u16,
     seeds: Vec<SocketAddrV4>,
     mine: bool,
@@ -189,11 +222,13 @@ struct Args {
 
 const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
          [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
-         [--wallet-dir PATH] [--recover] [--passphrase]";
+         [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]";
 
 fn parse_args() -> Args {
+    let mut data_dir = None;
     let mut args = Args {
-        data_dir: default_data_dir(),
+        data_dir: std::path::PathBuf::new(),
+        network: network::Network::Main,
         port: DEFAULT_PORT,
         seeds: Vec::new(),
         mine: true,
@@ -213,7 +248,14 @@ fn parse_args() -> Args {
             })
         };
         match flag.as_str() {
-            "--data-dir" => args.data_dir = value().into(),
+            "--data-dir" => data_dir = Some(value().into()),
+            "--network" => {
+                let v = value();
+                args.network = network::Network::parse(&v).unwrap_or_else(|| {
+                    eprintln!("invalid network (expected main or dev): {v}\n{USAGE}");
+                    std::process::exit(2);
+                });
+            }
             "--port" => {
                 let v = value();
                 args.port = v.parse().unwrap_or_else(|_| {
@@ -251,6 +293,9 @@ fn parse_args() -> Args {
             }
         }
     }
+    // Everything that differs between networks reads it from here on.
+    network::set(args.network);
+    args.data_dir = data_dir.unwrap_or_else(|| default_data_dir(args.network));
     args
 }
 
@@ -595,9 +640,12 @@ fn main() {
     }
 
     let storage = Storage::open(&path).expect("failed to open storage");
+    if args.network != network::Network::Main {
+        info!("Network: {} (light, insecure proofs -- for testing only)", args.network.name());
+    }
     let genesis = genesis_block();
-    assert_eq!(hex(&genesis.header.hash()), GENESIS_HASH, "genesis constants are inconsistent");
-    info!("Genesis block: {GENESIS_HASH}");
+    assert_eq!(hex(&genesis.header.hash()), self::genesis().hash, "genesis constants are inconsistent");
+    info!("Genesis block: {}", self::genesis().hash);
     let chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
         let hint = if matches!(e, chain::Error::WrongGenesis) {
             " (its data is from a chain with a different genesis block -- delete it, or use another --data-dir)"
@@ -687,7 +735,7 @@ mod tests {
     #[test]
     fn the_genesis_block_is_valid_and_matches_its_recorded_hash() {
         let genesis = genesis_block();
-        assert_eq!(hex32(&genesis.header.hash()), GENESIS_HASH);
+        assert_eq!(hex32(&genesis.header.hash()), self::genesis().hash);
         // Structure only: genesis is exempt from the proof check (see
         // `Chain`'s `block_is_valid`) -- its empty body claims no reward.
         assert!(genesis.validate_structure(&difficulty_config().initial_target));
