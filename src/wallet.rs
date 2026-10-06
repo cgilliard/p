@@ -47,6 +47,7 @@ use heed::types::Bytes;
 
 use crate::keychain::{KeyId, Keychain};
 use crate::output::Output;
+use crate::recovery::{self, NONCE_LEN, ViewKey};
 use crate::slate::{self, Slate};
 use crate::storage::Storage;
 use crate::transaction::Transaction;
@@ -65,6 +66,26 @@ pub const COINBASE_MATURITY: u64 = 10;
 
 const SEED_KEY: &[u8] = b"seed";
 const NEXT_INDEX_KEY: &[u8] = b"next_index";
+/// Present while a wallet restored from its backup words hasn't yet
+/// scanned a fully synced chain (`restore`, `finish_recovery`).
+const RECOVERING_KEY: &[u8] = b"recovering";
+/// The backup words' entropy (the seed is derived from it and, if set, a
+/// passphrase -- `mnemonic::seed_from`), and whether a passphrase was.
+/// Absent in wallets made before passphrases: their seed is the entropy.
+const ENTROPY_KEY: &[u8] = b"backup_entropy";
+const PASSPHRASE_KEY: &[u8] = b"backup_passphrase";
+
+/// After recovery, keys are handed out from this far past the highest
+/// index found on chain -- covering keys the lost wallet handed out that
+/// never confirmed (unanswered slates, rewards for blocks others won).
+pub const RECOVERY_INDEX_MARGIN: u32 = 1000;
+
+/// A recovered output can't be spent until this many blocks after
+/// recovery: if the lost wallet had signed a spend of it that's still in
+/// flight, that spend gets time to show up (`observe_spend`) or confirm --
+/// signing a *different* spend of it would reveal a second one-time
+/// signature, and with it the key.
+pub const RECOVERY_HOLD_BLOCKS: u64 = 10;
 
 /// What the chain can tell the wallet.
 pub trait ChainView {
@@ -72,6 +93,32 @@ pub trait ChainView {
     fn tip_height(&self) -> u64;
     /// Whether `commitment` is an unspent output of the active chain.
     fn is_unspent(&self, commitment: &[u8; 32]) -> bool;
+    /// The height of the block that created `commitment` on the active
+    /// chain, and its recovery nonce -- if known (`None` falls back to
+    /// "seen now", and skips the nonce check).
+    fn output_record(&self, _commitment: &[u8; 32]) -> Option<(u64, [u8; NONCE_LEN])> {
+        None
+    }
+    /// Call `f(commitment, height, nonce, unspent)` for every output the
+    /// active chain has created -- what recovery scans. Returns whether
+    /// the whole scan succeeded. (A view that can't offer this fails.)
+    fn for_each_output(&self, _f: &mut dyn FnMut([u8; 32], u64, [u8; NONCE_LEN], bool)) -> bool {
+        false
+    }
+}
+
+/// What `finish_recovery` found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recovered {
+    /// Our outputs found on chain, spent or not.
+    pub outputs: usize,
+    /// How many of them are unspent, and their total.
+    pub unspent: usize,
+    pub amount: u64,
+    /// Where key handout resumes.
+    pub next_index: u32,
+    /// Recovered outputs are spendable from this height.
+    pub spendable_from: u64,
 }
 
 #[derive(Debug)]
@@ -87,6 +134,11 @@ pub enum Error {
     WrongSlateState(&'static str),
     /// The slate was already finalized with a different response.
     AlreadyFinalized,
+    /// `restore` into a directory that already holds a wallet.
+    Exists,
+    /// Restored from backup words, and still waiting for a synced chain
+    /// to scan (`finish_recovery`): no keys are handed out until then.
+    Recovering,
 }
 
 impl From<crate::storage::Error> for Error {
@@ -124,6 +176,8 @@ impl std::fmt::Display for Error {
             Error::UnknownSlate => write!(f, "this wallet has no record of that slate"),
             Error::WrongSlateState(what) => write!(f, "{what}"),
             Error::AlreadyFinalized => write!(f, "that slate was already finalized with a different response"),
+            Error::Exists => write!(f, "a wallet already exists there -- restore into a new directory"),
+            Error::Recovering => write!(f, "the wallet is still being recovered (waiting for the chain to sync)"),
         }
     }
 }
@@ -138,6 +192,9 @@ pub enum Origin {
     Mined = 0,
     Change = 1,
     Received = 2,
+    /// Found on chain by recovery: we can't tell whether it was a mining
+    /// reward, so it's given a reward's maturity.
+    Recovered = 3,
 }
 
 /// The wallet's own intent for an output.
@@ -148,6 +205,9 @@ pub enum Lock {
     Locked([u8; 16]),
     /// An input of this slate's signed transaction (permanent).
     Signed([u8; 16]),
+    /// Recovered: not spendable until the chain reaches this height
+    /// (`RECOVERY_HOLD_BLOCKS`); otherwise like `Free`.
+    Held(u64),
 }
 
 /// An output the wallet owns (or expects to).
@@ -158,13 +218,13 @@ pub struct OwnedOutput {
     pub amount: u64,
     pub origin: Origin,
     pub lock: Lock,
-    /// The chain height at which `refresh` first saw it unspent, while
-    /// it's on chain. Confirmations count from here: a wallet refreshed
-    /// after every block (as a node does) counts exactly; one that was
-    /// offline counts fewer, which only errs on the safe side (rewards
-    /// mature later, never earlier).
+    /// The height of the block that created it, while it's on chain
+    /// (from the chain's output index; a chain view without one gives
+    /// the height `refresh` first saw it at). Confirmations count from
+    /// here.
     pub seen_height: Option<u64>,
-    /// Gone from the chain after we signed it away (`refresh`).
+    /// Spent on chain -- by a transaction we signed, or (for an output
+    /// the chain knows it created) by anyone (`refresh`).
     pub spent: bool,
 }
 
@@ -180,18 +240,29 @@ pub enum Status {
     /// Signed away, not yet confirmed.
     Spending,
     Spent,
+    /// Recovered and on chain, but not spendable before height `until`
+    /// (`RECOVERY_HOLD_BLOCKS`).
+    Held { confirmations: u64, until: u64 },
 }
 
 impl OwnedOutput {
     pub fn status(&self, tip_height: u64) -> Status {
         match (self.lock, self.seen_height, self.spent) {
-            (Lock::Signed(_), _, true) => Status::Spent,
+            (_, _, true) => Status::Spent,
             (Lock::Signed(_), _, false) => Status::Spending,
             (Lock::Locked(_), _, _) => Status::Locked,
-            (Lock::Free, None, _) => Status::Pending,
-            (Lock::Free, Some(h), _) => {
+            (Lock::Free | Lock::Held(_), None, _) => Status::Pending,
+            (Lock::Free | Lock::Held(_), Some(h), _) => {
                 let confirmations = tip_height.saturating_sub(h) + 1;
-                let mature = self.origin != Origin::Mined || confirmations >= COINBASE_MATURITY;
+                // The hold (from recovery, at a height no earlier than the
+                // output's) always outlasts maturity, so it's what to show.
+                if let Lock::Held(until) = self.lock
+                    && tip_height < until
+                {
+                    return Status::Held { confirmations, until };
+                }
+                let reward_like = matches!(self.origin, Origin::Mined | Origin::Recovered);
+                let mature = !reward_like || confirmations >= COINBASE_MATURITY;
                 Status::Confirmed { confirmations, mature }
             }
         }
@@ -211,6 +282,11 @@ impl OwnedOutput {
                 out.push(2);
                 out.extend(id);
             }
+            Lock::Held(until) => {
+                out.push(3);
+                out.extend(until.to_le_bytes());
+                out.extend([0u8; 8]);
+            }
         }
         out.extend(self.seen_height.map_or(u64::MAX, |h| h).to_le_bytes());
         out.push(self.spent as u8);
@@ -225,6 +301,7 @@ impl OwnedOutput {
             0 => Origin::Mined,
             1 => Origin::Change,
             2 => Origin::Received,
+            3 => Origin::Recovered,
             _ => return None,
         };
         let id: [u8; 16] = bytes[18..34].try_into().unwrap();
@@ -232,6 +309,7 @@ impl OwnedOutput {
             0 => Lock::Free,
             1 => Lock::Locked(id),
             2 => Lock::Signed(id),
+            3 => Lock::Held(u64::from_le_bytes(id[..8].try_into().unwrap())),
             _ => return None,
         };
         let seen = u64::from_le_bytes(bytes[34..42].try_into().unwrap());
@@ -327,6 +405,15 @@ pub struct Balance {
     pub pending: u64,
     /// In unfinished slates, or signed away and awaiting confirmation.
     pub locked: u64,
+    /// Recovered, held until `held_until` (`RECOVERY_HOLD_BLOCKS`).
+    pub held: u64,
+    pub held_until: u64,
+}
+
+impl Balance {
+    pub fn total(&self) -> u64 {
+        self.spendable + self.immature + self.pending + self.locked + self.held
+    }
 }
 
 pub struct Wallet {
@@ -337,23 +424,38 @@ pub struct Wallet {
     slates: Database<Bytes, Bytes>,
     /// Signed transactions that aren't slates (`self_transfer`), by id.
     transactions: Database<Bytes, Bytes>,
+    /// Seals every output we create with a recovery nonce (`recovery`).
+    view_key: ViewKey,
 }
 
 impl Wallet {
     /// Open the wallet in `dir`, creating it -- with a new random seed --
     /// if it doesn't exist. The directory is made private to the user.
     pub fn open(dir: &Path) -> Result<Wallet> {
-        Self::open_inner(dir, None)
+        Self::open_inner(dir, None, None)
+    }
+
+    /// Create a new wallet in `dir` (which must not hold one) with fresh
+    /// backup words and a passphrase: restoring it takes both.
+    pub fn create_with_passphrase(dir: &Path, passphrase: &str) -> Result<Wallet> {
+        if dir.join("data.mdb").exists() {
+            return Err(Error::Exists);
+        }
+        let entropy = crate::keychain::random_bytes();
+        let keychain = Keychain::from_seed(crate::mnemonic::seed_from(&entropy, passphrase));
+        Self::open_inner(dir, Some(keychain), Some((entropy, !passphrase.is_empty())))
     }
 
     /// Open the wallet in `dir`, creating it from `keychain`'s seed if it
     /// doesn't exist (restore, or tests). An existing wallet must have the
     /// same seed.
     pub fn open_with(dir: &Path, keychain: Keychain) -> Result<Wallet> {
-        Self::open_inner(dir, Some(keychain))
+        Self::open_inner(dir, Some(keychain), None)
     }
 
-    fn open_inner(dir: &Path, keychain: Option<Keychain>) -> Result<Wallet> {
+    /// `backup`, for a wallet created here: its words' entropy, and whether
+    /// a passphrase was used (`None`: the seed is the entropy).
+    fn open_inner(dir: &Path, keychain: Option<Keychain>, backup: Option<([u8; 32], bool)>) -> Result<Wallet> {
         std::fs::create_dir_all(dir).map_err(crate::storage::Error::Io)?;
         #[cfg(unix)]
         {
@@ -377,11 +479,15 @@ impl Wallet {
             None => {
                 let keychain = keychain.unwrap_or_else(Keychain::random);
                 meta.put(&mut wtxn, SEED_KEY, keychain.seed())?;
+                let (entropy, passphrase) = backup.unwrap_or((*keychain.seed(), false));
+                meta.put(&mut wtxn, ENTROPY_KEY, &entropy)?;
+                meta.put(&mut wtxn, PASSPHRASE_KEY, &[passphrase as u8])?;
                 keychain
             }
         };
         wtxn.commit()?;
         Ok(Wallet {
+            view_key: keychain.view_key(),
             storage,
             keychain,
             meta,
@@ -395,9 +501,173 @@ impl Wallet {
         &self.keychain
     }
 
+    /// The 24 backup words, and whether restoring also takes a passphrase.
+    pub fn backup_words(&self) -> Result<(String, bool)> {
+        let rtxn = self.storage.read_txn()?;
+        let Some(entropy) = self.meta.get(&rtxn, ENTROPY_KEY)? else {
+            return Ok((self.keychain.phrase(), false));
+        };
+        let entropy: [u8; 32] = entropy.try_into().map_err(|_| Error::Corrupt("backup entropy"))?;
+        let passphrase = self.meta.get(&rtxn, PASSPHRASE_KEY)?.is_some_and(|b| b == [1]);
+        Ok((crate::mnemonic::to_phrase(&entropy), passphrase))
+    }
+
+    // ---- recovery (`docs/RECOVERY.md`) -----------------------------------
+
+    /// Restore a wallet from its seed (the backup words) into `dir`, which
+    /// must not already hold one. It starts **recovering**: it knows
+    /// nothing yet and hands out no keys -- no mining, sending or
+    /// receiving -- until `finish_recovery` has scanned a fully synced
+    /// chain, since any key it handed out before then might be one the
+    /// lost wallet already used.
+    pub fn restore(dir: &Path, keychain: Keychain) -> Result<Wallet> {
+        Self::restore_inner(dir, keychain, None)
+    }
+
+    /// `restore` from the backup words and passphrase (`""` for none).
+    pub fn restore_from_words(dir: &Path, phrase: &str, passphrase: &str) -> Result<Wallet> {
+        let entropy = crate::mnemonic::from_phrase(phrase).map_err(|_| Error::WrongSlateState("those aren't valid backup words"))?;
+        let keychain = Keychain::from_seed(crate::mnemonic::seed_from(&entropy, passphrase));
+        Self::restore_inner(dir, keychain, Some((entropy, !passphrase.is_empty())))
+    }
+
+    fn restore_inner(dir: &Path, keychain: Keychain, backup: Option<([u8; 32], bool)>) -> Result<Wallet> {
+        if dir.join("data.mdb").exists() {
+            return Err(Error::Exists);
+        }
+        let wallet = Self::open_inner(dir, Some(keychain), backup)?;
+        let mut wtxn = wallet.storage.write_txn()?;
+        wallet.meta.put(&mut wtxn, RECOVERING_KEY, &[1])?;
+        wtxn.commit()?;
+        Ok(wallet)
+    }
+
+    pub fn is_recovering(&self) -> Result<bool> {
+        let rtxn = self.storage.read_txn()?;
+        Ok(self.meta.get(&rtxn, RECOVERING_KEY)?.is_some())
+    }
+
+    /// Finish a `restore`, once `chain` is synced with the network: find
+    /// every output of ours it ever created (each one's recovery nonce
+    /// names its key and amount; `recovery::identify` confirms), record
+    /// them, and resume key handout past every index ever used (plus
+    /// `RECOVERY_INDEX_MARGIN`). Unspent ones are held for
+    /// `RECOVERY_HOLD_BLOCKS`.
+    pub fn finish_recovery(&self, chain: &impl ChainView) -> Result<Recovered> {
+        let tip = chain.tip_height();
+        let mut found = Vec::new();
+        let scanned = chain.for_each_output(&mut |commitment, height, nonce, unspent| {
+            if let Some((key, amount)) = recovery::identify(&self.keychain, &self.view_key, ACCOUNT, &commitment, &nonce) {
+                found.push((commitment, key, amount, height, unspent));
+            }
+        });
+        if !scanned {
+            return Err(Error::Corrupt("couldn't scan the chain's outputs"));
+        }
+        let spendable_from = tip + RECOVERY_HOLD_BLOCKS;
+        let mut report = Recovered { spendable_from, ..Default::default() };
+        let mut wtxn = self.storage.write_txn()?;
+        let mut max_index = None;
+        for (commitment, key, amount, height, unspent) in found {
+            max_index = max_index.max(Some(key.index));
+            report.outputs += 1;
+            if unspent {
+                report.unspent += 1;
+                report.amount += amount;
+            }
+            // Don't overwrite what we already know (a repeated call).
+            if self.get_output(&wtxn, &commitment)?.is_some() {
+                continue;
+            }
+            self.put_output(
+                &mut wtxn,
+                &OwnedOutput {
+                    commitment,
+                    key,
+                    amount,
+                    origin: Origin::Recovered,
+                    lock: if unspent { Lock::Held(spendable_from) } else { Lock::Free },
+                    seen_height: Some(height),
+                    spent: !unspent,
+                },
+            )?;
+        }
+        let resume = max_index
+            .map_or(0, |m| m.saturating_add(1))
+            .saturating_add(RECOVERY_INDEX_MARGIN);
+        let current = match self.meta.get(&wtxn, NEXT_INDEX_KEY)? {
+            Some(b) => u32::from_le_bytes(b.try_into().map_err(|_| Error::Corrupt("next index"))?),
+            None => 0,
+        };
+        report.next_index = resume.max(current);
+        self.meta.put(&mut wtxn, NEXT_INDEX_KEY, &report.next_index.to_le_bytes())?;
+        self.meta.delete(&mut wtxn, RECOVERING_KEY)?;
+        wtxn.commit()?;
+        Ok(report)
+    }
+
+    /// Note a transaction someone (a peer, a copy of this wallet, or this
+    /// wallet before it was lost and restored) has signed, if it spends
+    /// any output of ours we haven't signed: mark those as signed away,
+    /// and keep the transaction (resubmitted at startup like our own) --
+    /// so we never sign a different spend of them. Any of its outputs
+    /// sealed to us (its change, say) are recorded as expected, so they're
+    /// ours once it confirms. Returns whether it spent outputs of ours.
+    pub fn observe_spend(&self, tx: &Transaction) -> Result<bool> {
+        let id = tx.id();
+        let lock: [u8; 16] = id[..16].try_into().unwrap();
+        let mut wtxn = self.storage.write_txn()?;
+        let mut ours = false;
+        for input in &tx.inputs {
+            let commitment = Output::new(&input.pubkey, input.amount).commitment();
+            if let Some(mut o) = self.get_output(&wtxn, &commitment)?
+                && !matches!(o.lock, Lock::Signed(_))
+            {
+                o.lock = Lock::Signed(lock);
+                self.put_output(&mut wtxn, &o)?;
+                ours = true;
+            }
+        }
+        if ours {
+            self.transactions.put(&mut wtxn, &id, &tx.to_bytes())?;
+            for output in &tx.outputs {
+                let commitment = output.commitment();
+                let Some((key, amount)) = recovery::identify(&self.keychain, &self.view_key, ACCOUNT, &commitment, &output.nonce) else {
+                    continue;
+                };
+                if self.get_output(&wtxn, &commitment)?.is_none() {
+                    let expected = OwnedOutput {
+                        commitment,
+                        key,
+                        amount,
+                        origin: Origin::Recovered,
+                        lock: Lock::Free,
+                        seen_height: None,
+                        spent: false,
+                    };
+                    self.put_output(&mut wtxn, &expected)?;
+                }
+            }
+            wtxn.commit()?;
+        }
+        Ok(ours)
+    }
+
+    /// The output paying `amount` to our key `key`, sealed with its
+    /// recovery nonce -- how every output this wallet creates is made, so
+    /// the seed alone can find it again (`docs/RECOVERY.md`).
+    fn sealed_output(&self, key: KeyId, amount: u64) -> Output {
+        let output = self.keychain.output(key, amount);
+        let nonce = recovery::seal(&self.view_key, &output.commitment(), key.index, amount);
+        output.with_nonce(nonce)
+    }
+
     /// Hand out the next unused key, recording that in `wtxn` -- committed
     /// together with whatever uses it, so a key is never handed out twice.
     fn next_key(&self, wtxn: &mut heed::RwTxn) -> Result<KeyId> {
+        if self.meta.get(wtxn, RECOVERING_KEY)?.is_some() {
+            return Err(Error::Recovering);
+        }
         let next = match self.meta.get(wtxn, NEXT_INDEX_KEY)? {
             Some(b) => u32::from_le_bytes(b.try_into().map_err(|_| Error::Corrupt("next index"))?),
             None => 0,
@@ -462,7 +732,15 @@ impl Wallet {
 
     /// Bring every output's chain status up to date (see the module docs).
     /// Call after every change to the chain.
-    pub fn refresh(&self, chain: &impl ChainView) -> Result<()> {
+    ///
+    /// Returns the commitments of outputs that just confirmed **without a
+    /// valid recovery nonce**. Once signed, a nonce can't be altered (the
+    /// signature and the block's proof cover it), but the sender of a
+    /// slate payment signs it, and could have changed ours first. The
+    /// funds are fine, but the seed alone can't find that output again:
+    /// the wallet file is its only record until it's spent.
+    pub fn refresh(&self, chain: &impl ChainView) -> Result<Vec<[u8; 32]>> {
+        let mut unrecoverable = Vec::new();
         let tip = chain.tip_height();
         let mut wtxn = self.storage.write_txn()?;
         let records: Vec<OwnedOutput> = {
@@ -480,8 +758,21 @@ impl Wallet {
             if chain.is_unspent(&record.commitment) {
                 record.spent = false;
                 if record.seen_height.is_none() {
-                    record.seen_height = Some(tip);
+                    let on_chain = chain.output_record(&record.commitment);
+                    record.seen_height = Some(on_chain.map_or(tip, |(height, _)| height));
+                    if let Some((_, nonce)) = on_chain {
+                        let found = recovery::identify(&self.keychain, &self.view_key, record.key.account, &record.commitment, &nonce);
+                        if found != Some((record.key, record.amount)) {
+                            unrecoverable.push(record.commitment);
+                        }
+                    }
                 }
+            } else if let Some((height, _)) = chain.output_record(&record.commitment) {
+                // On chain once, gone from the unspent set: spent -- by us,
+                // or by a copy of this wallet, or a spend signed before a
+                // restore.
+                record.spent = true;
+                record.seen_height = Some(height);
             } else if signed {
                 record.spent = true;
             } else {
@@ -492,7 +783,7 @@ impl Wallet {
             }
         }
         wtxn.commit()?;
-        Ok(())
+        Ok(unrecoverable)
     }
 
     pub fn balance(&self, tip_height: u64) -> Result<Balance> {
@@ -507,6 +798,10 @@ impl Wallet {
                 Status::Pending => b.pending += o.amount,
                 Status::Locked | Status::Spending => b.locked += o.amount,
                 Status::Spent => {}
+                Status::Held { until, .. } => {
+                    b.held += o.amount;
+                    b.held_until = b.held_until.max(until);
+                }
             }
         }
         Ok(b)
@@ -520,7 +815,7 @@ impl Wallet {
         let mut wtxn = self.storage.write_txn()?;
         let record = self.expect_output(&mut wtxn, amount, Origin::Mined)?;
         wtxn.commit()?;
-        Ok((record.key, self.keychain.output(record.key, amount)))
+        Ok((record.key, self.sealed_output(record.key, amount)))
     }
 
     /// Drop an expected output that will never appear (a block template
@@ -613,7 +908,7 @@ impl Wallet {
             tx.add_input(&self.keychain.public_key(o.key), o.amount).map_err(|_| Error::Corrupt("transaction"))?;
         }
         for o in &outputs {
-            tx.add_output(self.keychain.output(o.key, o.amount)).map_err(|_| Error::Corrupt("transaction"))?;
+            tx.add_output(self.sealed_output(o.key, o.amount)).map_err(|_| Error::Corrupt("transaction"))?;
         }
         for o in &chosen {
             let (sk, pk) = self.keychain.derive(o.key);
@@ -654,7 +949,7 @@ impl Wallet {
             None
         };
         let inputs = chosen.iter().map(|o| (self.keychain.public_key(o.key), o.amount)).collect();
-        let change_outputs = change.iter().map(|c| self.keychain.output(c.key, c.amount)).collect();
+        let change_outputs = change.iter().map(|c| self.sealed_output(c.key, c.amount)).collect();
         let slate = Slate::send(amount, fee, inputs, change_outputs)?;
         for mut o in chosen {
             o.lock = Lock::Locked(slate.id);
@@ -684,7 +979,7 @@ impl Wallet {
         }
         let mut wtxn = self.storage.write_txn()?;
         let record = self.expect_output(&mut wtxn, s1.amount, Origin::Received)?;
-        let s2 = s1.receive(self.keychain.output(record.key, s1.amount))?;
+        let s2 = s1.receive(self.sealed_output(record.key, s1.amount))?;
         self.put_slate(
             &mut wtxn,
             &SlateRecord {
@@ -838,12 +1133,18 @@ mod tests {
         }
     }
 
-    /// A stand-in chain: a set of unspent commitments and a height.
+    /// A stand-in chain: a set of unspent commitments, a height, and
+    /// (for outputs mined from real `Output`s) each one's height and
+    /// nonce, as the real chain's output index keeps them.
     #[derive(Default)]
     struct FakeChain {
         unspent: RefCell<HashSet<[u8; 32]>>,
         height: RefCell<u64>,
+        records: RefCell<std::collections::HashMap<[u8; 32], OnChain>>,
     }
+
+    /// An output's height and nonce, as `ChainView::output_record` gives.
+    type OnChain = (u64, [u8; NONCE_LEN]);
 
     impl FakeChain {
         /// A block: spends `inputs`, creates `outputs`.
@@ -858,8 +1159,17 @@ mod tests {
 
         fn mine_tx(&self, tx: &Transaction) {
             let inputs: Vec<_> = tx.inputs.iter().map(|i| Output::new(&i.pubkey, i.amount).commitment()).collect();
-            let outputs: Vec<_> = tx.outputs.iter().map(|o| o.commitment()).collect();
-            self.mine(&inputs, &outputs);
+            self.mine_outputs(&inputs, &tx.outputs);
+        }
+
+        /// A block creating these outputs, recording their nonces.
+        fn mine_outputs(&self, inputs: &[[u8; 32]], outputs: &[Output]) {
+            let commitments: Vec<_> = outputs.iter().map(|o| o.commitment()).collect();
+            self.mine(inputs, &commitments);
+            let height = *self.height.borrow();
+            for o in outputs {
+                self.records.borrow_mut().insert(o.commitment(), (height, o.nonce));
+            }
         }
 
         fn empty_blocks(&self, n: u64) {
@@ -874,6 +1184,15 @@ mod tests {
         fn is_unspent(&self, commitment: &[u8; 32]) -> bool {
             self.unspent.borrow().contains(commitment)
         }
+        fn output_record(&self, commitment: &[u8; 32]) -> Option<(u64, [u8; NONCE_LEN])> {
+            self.records.borrow().get(commitment).copied()
+        }
+        fn for_each_output(&self, f: &mut dyn FnMut([u8; 32], u64, [u8; NONCE_LEN], bool)) -> bool {
+            for (c, &(height, nonce)) in self.records.borrow().iter() {
+                f(*c, height, nonce, self.is_unspent(c));
+            }
+            true
+        }
     }
 
     fn open(dir: &TempDir, label: &str) -> Wallet {
@@ -885,8 +1204,8 @@ mod tests {
         let w = open(dir, label);
         for &r in rewards {
             let (_, output) = w.reward_output(r).unwrap();
-            chain.mine(&[], &[output.commitment()]);
-            w.refresh(chain).unwrap(); // as a node does after every block
+            chain.mine_outputs(&[], &[output]);
+            assert!(w.refresh(chain).unwrap().is_empty()); // as a node does after every block
         }
         chain.empty_blocks(COINBASE_MATURITY);
         w.refresh(chain).unwrap();
@@ -957,6 +1276,7 @@ mod tests {
                 immature: 0,
                 pending: REWARD / 2 - fee,
                 locked: 2 * REWARD,
+                ..Default::default()
             }
         );
 
@@ -1057,11 +1377,15 @@ mod tests {
         let chain = FakeChain::default();
         let alice = funded(&da, "alice6", &chain, &[REWARD]);
         let commitment = alice.outputs().unwrap()[0].commitment;
+        // Its block is unwound: gone from the unspent set and the output
+        // index both.
         chain.unspent.borrow_mut().remove(&commitment);
+        let record = chain.records.borrow_mut().remove(&commitment).unwrap();
         alice.refresh(&chain).unwrap();
         assert_eq!(alice.balance(chain.tip_height()).unwrap(), Balance::default());
         assert_eq!(alice.outputs().unwrap()[0].status(chain.tip_height()), Status::Pending);
         chain.unspent.borrow_mut().insert(commitment);
+        chain.records.borrow_mut().insert(commitment, record);
         alice.refresh(&chain).unwrap();
         chain.empty_blocks(COINBASE_MATURITY);
         alice.refresh(&chain).unwrap();
@@ -1093,6 +1417,233 @@ mod tests {
         assert!(alice.self_transfer(Some(&small[..1]), &[1], 0, tip).is_err(), "already signed away");
         assert!(alice.self_transfer(Some(&[[9; 32]]), &[1], 0, tip).is_err());
         assert!(matches!(alice.self_transfer(None, &[REWARD * 2], 0, tip), Err(Error::InsufficientFunds { .. })));
+    }
+
+    /// Every kind of output the wallet creates -- reward, change,
+    /// received payment, self-transfer -- carries a nonce its owner's
+    /// seed can read back; and refresh accepts them all.
+    #[test]
+    fn every_output_the_wallet_makes_is_recoverable() {
+        let (da, db) = (TempDir::new("seal-a"), TempDir::new("seal-b"));
+        let chain = FakeChain::default();
+        let alice = funded(&da, "seal alice", &chain, &[REWARD, REWARD]);
+        let bob = open(&db, "seal bob");
+        let tip = chain.tip_height();
+        let s1 = alice.send(REWARD / 2, 100, tip).unwrap();
+        let s2 = bob.receive(&s1).unwrap();
+        let payment = alice.finalize(&s2).unwrap();
+        let split = alice.self_transfer(None, &[1_000, 2_000], 50, tip).unwrap();
+        for tx in [&payment, &split] {
+            chain.mine_tx(tx);
+            assert!(alice.refresh(&chain).unwrap().is_empty());
+            assert!(bob.refresh(&chain).unwrap().is_empty());
+        }
+        let readable = |w: &Wallet, o: &OwnedOutput| {
+            let (_, nonce) = chain.output_record(&o.commitment).unwrap();
+            let k = Keychain::from_seed(*w.keychain().seed());
+            recovery::identify(&k, &k.view_key(), o.key.account, &o.commitment, &nonce) == Some((o.key, o.amount))
+        };
+        let mut checked = 0;
+        for (w, outputs) in [(&alice, alice.outputs().unwrap()), (&bob, bob.outputs().unwrap())] {
+            for o in outputs.iter().filter(|o| chain.output_record(&o.commitment).is_some()) {
+                assert!(readable(w, o), "{:?} output", o.origin);
+                checked += 1;
+            }
+        }
+        // Two rewards; payment: Bob's output, Alice's change; split: two
+        // pieces and change.
+        assert_eq!(checked, 7);
+        assert!(bob.outputs().unwrap().iter().any(|o| o.origin == Origin::Received && readable(&bob, o)));
+    }
+
+    /// A nonce altered on the way to the chain is reported when its
+    /// output confirms (once), and the output still counts as ours.
+    #[test]
+    fn an_altered_nonce_is_reported_at_confirmation() {
+        let da = TempDir::new("tamper");
+        let chain = FakeChain::default();
+        let alice = funded(&da, "tamper alice", &chain, &[REWARD]);
+        let tip = chain.tip_height();
+        let mut tx = alice.self_transfer(None, &[1_000], 10, tip).unwrap();
+        // A relay flips a bit in one output's nonce (nothing signs it).
+        tx.outputs[0].nonce[0] ^= 1;
+        let altered = tx.outputs[0].commitment();
+        chain.mine_tx(&tx);
+        assert_eq!(alice.refresh(&chain).unwrap(), vec![altered]);
+        assert!(alice.refresh(&chain).unwrap().is_empty(), "reported once");
+        assert_eq!(alice.balance(chain.tip_height()).unwrap().pending, 0);
+    }
+
+    /// Confirmations count from the block that created the output, even
+    /// when the wallet first looks much later.
+    #[test]
+    fn confirmations_count_from_the_including_block() {
+        let da = TempDir::new("height");
+        let chain = FakeChain::default();
+        let alice = open(&da, "height alice");
+        let (_, reward) = alice.reward_output(REWARD).unwrap();
+        chain.mine_outputs(&[], &[reward]);
+        let mined_at = chain.tip_height();
+        chain.empty_blocks(COINBASE_MATURITY); // the wallet was offline
+        alice.refresh(&chain).unwrap();
+        let o = alice.outputs().unwrap()[0];
+        assert_eq!(o.seen_height, Some(mined_at));
+        assert_eq!(alice.balance(chain.tip_height()).unwrap().spendable, REWARD, "already mature");
+    }
+
+    /// The unspent outputs a wallet holds, as (commitment, amount).
+    fn unspent_set(w: &Wallet) -> Vec<([u8; 32], u64)> {
+        let mut v: Vec<_> = w.outputs().unwrap().iter().filter(|o| o.seen_height.is_some() && !o.spent).map(|o| (o.commitment, o.amount)).collect();
+        v.sort();
+        v
+    }
+
+    /// The acceptance test in miniature: a wallet that mined, paid,
+    /// received, split and made change is lost; one restored from its
+    /// seed alone ends up with exactly the same unspent outputs, knows
+    /// which ones were spent, never reuses a key, and can spend after
+    /// the hold.
+    #[test]
+    fn a_wallet_restored_from_its_seed_finds_everything() {
+        let (da, db, dr) = (TempDir::new("lost"), TempDir::new("payer"), TempDir::new("restored"));
+        let chain = FakeChain::default();
+        let lost = funded(&da, "recover me", &chain, &[REWARD, REWARD, REWARD]);
+        let bob = funded(&db, "recover bob", &chain, &[REWARD]);
+        let tip = chain.tip_height();
+        // Pay Bob (spends a reward, makes change); receive from Bob;
+        // split a reward.
+        let s1 = lost.send(REWARD / 3, 100, tip).unwrap();
+        chain.mine_tx(&lost.finalize(&bob.receive(&s1).unwrap()).unwrap());
+        let s1 = bob.send(REWARD / 5, 100, chain.tip_height()).unwrap();
+        chain.mine_tx(&bob.finalize(&lost.receive(&s1).unwrap()).unwrap());
+        lost.refresh(&chain).unwrap();
+        chain.mine_tx(&lost.self_transfer(None, &[7_000, 8_000], 10, chain.tip_height()).unwrap());
+        lost.refresh(&chain).unwrap();
+        chain.empty_blocks(COINBASE_MATURITY);
+        lost.refresh(&chain).unwrap();
+        let used = lost.outputs().unwrap().iter().map(|o| o.key.index).max().unwrap();
+        let before = lost.balance(chain.tip_height()).unwrap();
+        let expected = unspent_set(&lost);
+        assert!(expected.len() >= 5);
+        let seed = *lost.keychain().seed();
+        drop(lost);
+
+        // Restore from the words alone.
+        let words = Keychain::from_seed(seed).phrase();
+        let restored = Wallet::restore(&dr.0, Keychain::from_phrase(&words).unwrap()).unwrap();
+        assert!(restored.is_recovering().unwrap());
+        assert!(matches!(restored.reward_output(1), Err(Error::Recovering)), "no keys before the scan");
+        let report = restored.finish_recovery(&chain).unwrap();
+        assert!(!restored.is_recovering().unwrap());
+        assert_eq!((report.unspent, report.amount), (expected.len(), expected.iter().map(|e| e.1).sum()));
+        assert!(report.outputs > report.unspent, "spent outputs are found too");
+        assert!(report.next_index > used + RECOVERY_INDEX_MARGIN);
+        assert_eq!(unspent_set(&restored), expected);
+
+        // Held at first; spendable after the hold, with the same total.
+        let tip = chain.tip_height();
+        let held = restored.balance(tip).unwrap();
+        assert_eq!((held.spendable, held.immature), (0, 0));
+        assert_eq!((held.held, held.held_until), (before.spendable + before.immature, report.spendable_from));
+        assert!(restored.outputs().unwrap().iter().filter(|o| !o.spent).all(|o| matches!(o.status(tip), Status::Held { until, .. } if until == report.spendable_from)));
+        assert!(restored.send(1, 0, tip).is_err());
+        chain.empty_blocks(RECOVERY_HOLD_BLOCKS);
+        restored.refresh(&chain).unwrap();
+        let after = restored.balance(chain.tip_height()).unwrap();
+        assert_eq!(after.spendable, before.spendable + before.immature);
+        // And it works: a new key well past every old one.
+        let (key, _) = restored.reward_output(1).unwrap();
+        assert_eq!(key.index, report.next_index);
+        let tx = restored.self_transfer(None, &[1_000], 10, chain.tip_height()).unwrap();
+        chain.mine_tx(&tx);
+        assert!(restored.refresh(&chain).unwrap().is_empty());
+    }
+
+    /// A spend the lost wallet signed but that hadn't confirmed: once the
+    /// restored wallet sees it (in the mempool), it never signs that
+    /// output again, and resubmits the spend itself.
+    #[test]
+    fn a_restored_wallet_respects_a_spend_still_in_flight() {
+        let (da, dr) = (TempDir::new("inflight"), TempDir::new("inflight-restored"));
+        let chain = FakeChain::default();
+        let lost = funded(&da, "inflight", &chain, &[REWARD]);
+        let in_flight = lost.self_transfer(None, &[1_000], 10, chain.tip_height()).unwrap();
+        let seed = *lost.keychain().seed();
+        drop(lost);
+
+        let restored = Wallet::restore(&dr.0, Keychain::from_seed(seed)).unwrap();
+        restored.finish_recovery(&chain).unwrap();
+        assert!(restored.observe_spend(&in_flight).unwrap());
+        assert!(!restored.observe_spend(&in_flight).unwrap(), "already noted");
+        let resubmit: Vec<_> = restored.unconfirmed_transactions().unwrap().iter().map(Transaction::id).collect();
+        assert_eq!(resubmit, vec![in_flight.id()]);
+        chain.empty_blocks(RECOVERY_HOLD_BLOCKS);
+        restored.refresh(&chain).unwrap();
+        assert!(restored.self_transfer(None, &[1], 0, chain.tip_height()).is_err(), "never signed twice");
+        // It confirms: the recovered input reads as spent, and the
+        // spend's outputs -- sealed to our seed -- are ours.
+        chain.mine_tx(&in_flight);
+        restored.refresh(&chain).unwrap();
+        let outputs = restored.outputs().unwrap();
+        let (spent, unspent): (Vec<&OwnedOutput>, Vec<&OwnedOutput>) = outputs.iter().partition(|o| o.spent);
+        assert_eq!(spent.len(), 1);
+        let mut found: Vec<_> = unspent.iter().map(|o| o.commitment).collect();
+        let mut made: Vec<_> = in_flight.outputs.iter().map(|o| o.commitment()).collect();
+        found.sort();
+        made.sort();
+        assert_eq!(found, made);
+        assert!(unspent.iter().all(|o| o.seen_height.is_some()));
+    }
+
+    /// A passphrase wallet: its words alone restore a different (empty)
+    /// wallet; words and passphrase restore it.
+    #[test]
+    fn a_passphrase_wallet_needs_words_and_passphrase() {
+        let (d, wrong, right) = (TempDir::new("pp"), TempDir::new("pp-wrong"), TempDir::new("pp-right"));
+        let chain = FakeChain::default();
+        let w = Wallet::create_with_passphrase(&d.0, "hunter2 is not a good one").unwrap();
+        let (words, passphrase) = w.backup_words().unwrap();
+        assert!(passphrase);
+        assert_ne!(Keychain::from_phrase(&words).unwrap().seed(), w.keychain().seed(), "the words alone aren't the seed");
+        let (_, reward) = w.reward_output(REWARD).unwrap();
+        chain.mine_outputs(&[], &[reward]);
+        drop(w);
+
+        let without = Wallet::restore_from_words(&wrong.0, &words, "").unwrap();
+        assert_eq!(without.finish_recovery(&chain).unwrap().outputs, 0);
+        let with = Wallet::restore_from_words(&right.0, &words, "hunter2 is not a good one").unwrap();
+        assert_eq!(with.finish_recovery(&chain).unwrap().amount, REWARD);
+        assert_eq!(with.backup_words().unwrap(), (words, true));
+        // A wallet without one: the words are the seed, as always.
+        let plain = open(&TempDir::new("pp-plain"), "plain");
+        let (plain_words, pp) = plain.backup_words().unwrap();
+        assert!(!pp);
+        assert_eq!(Keychain::from_phrase(&plain_words).unwrap().seed(), plain.keychain().seed());
+    }
+
+    #[test]
+    fn restore_refuses_an_existing_wallet() {
+        let d = TempDir::new("exists");
+        drop(open(&d, "exists"));
+        assert!(matches!(Wallet::restore(&d.0, Keychain::test("exists")), Err(Error::Exists)));
+    }
+
+    /// An output spent by someone else holding our keys (a copy of the
+    /// wallet) reads as spent, not as vanished.
+    #[test]
+    fn an_output_spent_elsewhere_reads_as_spent() {
+        let (da, db) = (TempDir::new("copy-a"), TempDir::new("copy-b"));
+        let chain = FakeChain::default();
+        let a = funded(&da, "copied", &chain, &[REWARD]);
+        let b = Wallet::restore(&db.0, Keychain::from_seed(*a.keychain().seed())).unwrap();
+        b.finish_recovery(&chain).unwrap();
+        chain.empty_blocks(RECOVERY_HOLD_BLOCKS);
+        b.refresh(&chain).unwrap();
+        chain.mine_tx(&b.self_transfer(None, &[1_000], 10, chain.tip_height()).unwrap());
+        a.refresh(&chain).unwrap();
+        let reward = a.outputs().unwrap().into_iter().find(|o| o.origin == Origin::Mined).unwrap();
+        assert_eq!(reward.status(chain.tip_height()), Status::Spent);
+        assert_eq!(a.balance(chain.tip_height()).unwrap().spendable, 0);
     }
 
     #[test]

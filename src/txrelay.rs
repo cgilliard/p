@@ -37,7 +37,7 @@ use crate::transfer::MAX_SERVE_WINDOW;
 use crate::wire::{self, CHUNK_LEN, MAX_TX_INV, Message};
 
 /// The largest transaction relayed: enough for a full chunk's worth of
-/// inputs (10 × ~4.2 KB) and outputs (256 × 40 B), and no more than one
+/// inputs (10 × ~4.2 KB) and outputs (256 × 56 B), and no more than one
 /// `GET_TX` can fetch.
 pub const MAX_TX_BYTES: usize = MAX_SERVE_WINDOW as usize * CHUNK_LEN;
 

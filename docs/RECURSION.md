@@ -364,3 +364,35 @@ plaintext amounts; proving keys are derived from the first tree block it
 proves and kept; and it checks the result against the consensus key
 before publishing, falling back to a direct proof if anything fails
 (including a transaction too big for one chunk).
+
+## Privacy enhancements (optional, not required)
+
+Neither of these is needed for soundness or for the protocol to work;
+they would only reduce what a tree-proven block reveals to observers.
+Both change consensus (the proof format or the tree's parameters), so
+they're cheapest to decide before the format is frozen.
+
+What a block reveals today: inputs and outputs are bare commitments,
+`H(pubkey_hash, amount)` under fresh one-time keys, so amounts and
+recipients stay hidden from everyone but the transacting parties and the
+miner. A **direct** proof also hides transaction boundaries -- the body
+is one sorted list of inputs and one of outputs, so each block is in
+effect a CoinJoin of everything in it. Private submission (a user sending
+a transaction to one miner instead of the public mempool) is a matter of
+miner software, not consensus, and needs nothing here.
+
+1. **Hide chunk grouping in tree proofs.** A tree proof publishes each
+   commitment's chunk index, and a chunk holds whole transactions, so it
+   reveals which commitments travel together (and the chunks' net
+   amounts). Options: commit to the assignment inside the proof instead
+   of publishing it; or have the aggregation circuit prove the chunks'
+   commitment sets together form the block's sorted lists, so no
+   per-chunk structure is public. Until then a miner can soften it within
+   today's rules: use a direct proof when the block fits, or pack several
+   transactions into each chunk, so the grouping only says "same chunk".
+2. **Make the tree's outer layers zero-knowledge.** `TREE` uses `hiding:
+   false` (half the LDE, smaller and faster). Its witnesses are the chunk
+   proofs, which *are* hiding, so the leak is probably harmless -- but
+   that's an argument still to be made. Either make it (what a
+   non-hiding wrap of a zero-knowledge proof can reveal) or switch the
+   tree to hiding, at roughly twice the outer layers' LDE cost.

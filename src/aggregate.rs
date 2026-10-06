@@ -248,6 +248,12 @@ fn wrap_circuit(chunk: &BlockAir, proof: &Proof, params: &Params, tree: &TreePar
     let last = b.lane(lo1, 3);
     b.assert_zero(last);
     b.assert_zero(hi1);
+    // The rest of the tuple (it's as long as the widest one) is zeros.
+    for &octet in &net[2..] {
+        let (lo, hi) = b.halves(octet);
+        b.assert_zero(lo);
+        b.assert_zero(hi);
+    }
     let limbs: Vec<EVar> = [(lo0, 3), (hi0, 0), (hi0, 1), (hi0, 2), (hi0, 3), (lo1, 0), (lo1, 1), (lo1, 2)]
         .into_iter()
         .map(|(cell, l)| b.lane(cell, l))
@@ -558,6 +564,7 @@ mod tests {
             c.air.num_blocks(),
             c.air.public_inputs().to_vec(),
             c.air.public_outputs().to_vec(),
+            c.air.public_nonces().to_vec(),
             (7, 7),
             Some((SHAPE.inputs, SHAPE.outputs)),
         );
@@ -566,6 +573,7 @@ mod tests {
             c.air.num_blocks(),
             c.air.public_inputs().to_vec(),
             vec![c.air.public_outputs()[0]],
+            vec![c.air.public_nonces()[0]],
             c.air.net(),
             Some((SHAPE.inputs, SHAPE.outputs)),
         );

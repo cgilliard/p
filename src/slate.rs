@@ -45,7 +45,7 @@ use crate::transaction::Transaction;
 use crate::wots::{self, PublicKey, SecretKey};
 
 const MAGIC: &[u8; 4] = b"TSLT";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const BEGIN: &str = "-----BEGIN TABERNACLE SLATE-----";
 const END: &str = "-----END TABERNACLE SLATE-----";
 

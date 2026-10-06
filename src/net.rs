@@ -97,6 +97,9 @@ impl<E> From<transfer::Error> for NodeError<E> {
     }
 }
 
+/// `Node::peer_height`'s value before any peer has reported its tip.
+pub const NO_PEER_HEIGHT: u64 = u64::MAX;
+
 /// `discovery`, `transfer` and `txrelay`, driven over one `Transport`.
 pub struct Node<T: Transport> {
     pub discovery: Discovery,
@@ -110,6 +113,10 @@ pub struct Node<T: Transport> {
     /// stderr, prefixed with this label -- the node's own port, say. A
     /// debugging aid, off by default.
     pub log: Option<String>,
+    /// When set, kept up to date with the highest tip any peer has
+    /// reported (`NO_PEER_HEIGHT` until one has) -- how the node, on
+    /// another thread, tells whether it has caught up.
+    pub peer_height: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     transport: T,
     tick_interval_ms: u64,
     next_tick_ms: Option<u64>,
@@ -135,6 +142,7 @@ impl<T: Transport> Node<T> {
             delivered_txs: Vec::new(),
             reader,
             log: None,
+            peer_height: None,
             transport,
             tick_interval_ms,
             next_tick_ms: None,
@@ -243,6 +251,10 @@ impl<T: Transport> Node<T> {
             out.extend(tx_step.packets);
             self.delivered_txs.extend(tx_step.delivered);
             self.send_all(out);
+            if let Some(shared) = &self.peer_height {
+                let best = self.transfer.best_peer_height().unwrap_or(NO_PEER_HEIGHT);
+                shared.store(best, std::sync::atomic::Ordering::Relaxed);
+            }
             self.next_tick_ms = Some(now_ms + self.tick_interval_ms);
         }
 

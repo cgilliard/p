@@ -27,7 +27,7 @@ const HELP: &str = "commands:
   slates                         payments in progress
   status                         chain height, peers, mempool, mining
   mine on|off                    start or stop mining
-  seed                           show the wallet's seed (keep it secret!)
+  seed                           show the wallet's 24 backup words (keep them secret!)
   help                           this
   quit                           stop the node";
 

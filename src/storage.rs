@@ -32,7 +32,7 @@ pub const DEFAULT_MAP_SIZE: usize = 1 << 30;
 /// `block_heights`, and `active_heights` (by `Chain`), and `peers` (by
 /// `PeerTable`) -- 14 of 16, leaving a little headroom before this needs
 /// revisiting again.
-const MAX_DBS: u32 = 16;
+const MAX_DBS: u32 = 32;
 
 #[derive(Debug)]
 pub enum Error {

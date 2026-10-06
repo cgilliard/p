@@ -80,6 +80,7 @@
 
 #![allow(dead_code)]
 
+use crate::recovery::NONCE_LEN;
 use crate::bitmap::Bitmap;
 use crate::block::{Block, BlockBody, BlockHeader, HEADER_LEN, UnprovenBlock, now_millis};
 use crate::pmmr::Pmmr;
@@ -226,6 +227,13 @@ const BLOCK_HEIGHTS_DB: &str = "block_heights";
 /// (sync), and what `prune` uses to tell active-chain blocks (kept
 /// forever) from side-branch ones (dropped once out of reach).
 const ACTIVE_HEIGHTS_DB: &str = "active_heights";
+
+/// Every output the active chain has created, spent or not: commitment
+/// -> its block's height (u64 BE) ‖ its recovery nonce. Written when a
+/// block applies, removed only when that block is unwound -- spending
+/// doesn't touch it. What a wallet checks its outputs' nonces against,
+/// and what recovery scans (`docs/RECOVERY.md`).
+const OUTPUT_INDEX_DB: &str = "output_index";
 
 /// How many blocks the orphan pool holds before evicting the oldest --
 /// a bound on how much memory a peer can make this node spend on
@@ -678,6 +686,27 @@ pub struct ChainState<'a> {
     txn: heed::RoTxn<'a>,
 }
 
+/// An output the active chain created: where, and its recovery nonce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputRecord {
+    pub commitment: [u8; 32],
+    pub height: u64,
+    pub nonce: [u8; NONCE_LEN],
+}
+
+impl OutputRecord {
+    fn decode(commitment: [u8; 32], bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 8 + NONCE_LEN {
+            return Err(Error::Corrupt("output index entry was the wrong size"));
+        }
+        Ok(OutputRecord {
+            commitment,
+            height: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+            nonce: bytes[8..].try_into().unwrap(),
+        })
+    }
+}
+
 impl crate::wallet::ChainView for ChainState<'_> {
     fn tip_height(&self) -> u64 {
         self.chain.height(&self.txn).ok().flatten().unwrap_or(0)
@@ -685,6 +714,17 @@ impl crate::wallet::ChainView for ChainState<'_> {
 
     fn is_unspent(&self, commitment: &[u8; 32]) -> bool {
         self.chain.is_unspent(&self.txn, commitment).unwrap_or(false)
+    }
+
+    fn output_record(&self, commitment: &[u8; 32]) -> Option<(u64, [u8; NONCE_LEN])> {
+        let record = self.chain.output_record(&self.txn, commitment).ok()??;
+        Some((record.height, record.nonce))
+    }
+
+    fn for_each_output(&self, f: &mut dyn FnMut([u8; 32], u64, [u8; NONCE_LEN], bool)) -> bool {
+        self.chain
+            .for_each_output(&self.txn, |r, unspent| f(r.commitment, r.height, r.nonce, unspent))
+            .is_ok()
     }
 }
 
@@ -701,6 +741,7 @@ pub struct Chain {
     block_retarget: Database<Bytes, Bytes>,
     block_heights: Database<Bytes, Bytes>,
     active_heights: Database<Bytes, Bytes>,
+    output_index: Database<Bytes, Bytes>,
     /// The one block allowed to have no parent, if this chain has a
     /// fixed one -- see `Chain::open`.
     genesis_hash: Option<[u8; 32]>,
@@ -766,6 +807,7 @@ impl Chain {
         let block_retarget = storage.database(BLOCK_RETARGET_DB)?;
         let block_heights = storage.database(BLOCK_HEIGHTS_DB)?;
         let active_heights = storage.database(ACTIVE_HEIGHTS_DB)?;
+        let output_index = storage.database(OUTPUT_INDEX_DB)?;
         let mut chain = Chain {
             storage: storage.clone(),
             pmmr,
@@ -779,6 +821,7 @@ impl Chain {
             block_retarget,
             block_heights,
             active_heights,
+            output_index,
             genesis_hash: genesis.map(|g| g.header.hash()),
             check_proofs: true,
             difficulty,
@@ -1005,6 +1048,28 @@ impl Chain {
         Ok(self.utxo.get(txn, *commitment)?.is_some())
     }
 
+    /// The height and recovery nonce of an output the active chain
+    /// created (spent or not), if it did.
+    pub fn output_record(&self, txn: &heed::RoTxn, commitment: &[u8; 32]) -> Result<Option<OutputRecord>> {
+        match self.output_index.get(txn, commitment)? {
+            Some(bytes) => Ok(Some(OutputRecord::decode(*commitment, bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Call `f` with every output the active chain has created, spent or
+    /// not (in commitment order), and whether it's still unspent -- what
+    /// wallet recovery scans. One pass, one read transaction.
+    pub fn for_each_output(&self, txn: &heed::RoTxn, mut f: impl FnMut(&OutputRecord, bool)) -> Result<()> {
+        for item in self.output_index.iter(txn)? {
+            let (key, bytes) = item?;
+            let commitment: [u8; 32] = key.try_into().map_err(|_| Error::Corrupt("output index key was not 32 bytes"))?;
+            let record = OutputRecord::decode(commitment, bytes)?;
+            f(&record, self.is_unspent(txn, &commitment)?);
+        }
+        Ok(())
+    }
+
     /// A read-only view of the active chain as it is now (see
     /// `wallet::ChainView`).
     pub fn view(&self) -> Result<ChainState<'_>> {
@@ -1169,6 +1234,10 @@ impl Chain {
         let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
 
         let (pmmr_root, bitmap_root, spent_inputs) = self.resolve_and_apply(wtxn, &block.body)?;
+        for (commitment, nonce) in block.body.outputs.iter().zip(&block.body.nonces) {
+            let record = [&block.header.height.to_be_bytes()[..], nonce].concat();
+            self.output_index.put(wtxn, commitment, &record)?;
+        }
         if pmmr_root != block.header.pmmr_root {
             return Err(Error::PmmrRootMismatch);
         }
@@ -1234,6 +1303,7 @@ impl Chain {
         // from the live set again.
         for commitment in &block.body.outputs {
             self.utxo.remove(wtxn, *commitment)?;
+            self.output_index.delete(wtxn, commitment)?;
         }
         // Reverse the PMMR append -- this block pushed exactly
         // `body.outputs.len()` leaves, contiguously, and nothing else
@@ -1574,6 +1644,7 @@ impl Chain {
             bitmap_root,
             inputs: body.inputs,
             outputs: body.outputs,
+            nonces: body.nonces,
         })
     }
 }
@@ -1782,6 +1853,46 @@ mod tests {
         assert!(!chain.bitmap.get(&rtxn, position_a).unwrap());
         // pk_b's output (created by the now-undone block) is gone.
         assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
+    }
+
+    /// The output index records every output with its height and nonce;
+    /// spending leaves the record (recovery needs spent outputs too);
+    /// unwinding the block that created an output removes it.
+    #[test]
+    fn the_output_index_follows_the_active_chain() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let mut reward = Transaction::new();
+        reward.add_output(Output::new(&pk_a, 50).with_nonce([7; NONCE_LEN])).unwrap();
+        let block0 = built_proved_and_mined(&mut chain, &[reward]);
+        assert_eq!(block0.body.nonces, vec![[7; NONCE_LEN]]);
+        chain.apply_block(&block0).unwrap();
+
+        let (_sk_b, pk_b) = keypair(2);
+        let mut spend = Transaction::new();
+        spend.add_input(&pk_a, 50).unwrap();
+        spend.add_output(Output::new(&pk_b, 50).with_nonce([9; NONCE_LEN])).unwrap();
+        assert!(spend.sign_input(&pk_a, &sk_a));
+        let block1 = built_proved_and_mined(&mut chain, &[spend]);
+        chain.apply_block(&block1).unwrap();
+
+        let (a, b) = (commitment_of(&pk_a, 50), commitment_of(&pk_b, 50));
+        let rtxn = storage.read_txn().unwrap();
+        let record = |c| chain.output_record(&rtxn, &c).unwrap();
+        assert_eq!(record(a), Some(OutputRecord { commitment: a, height: 0, nonce: [7; NONCE_LEN] }), "spent, still recorded");
+        assert_eq!(record(b), Some(OutputRecord { commitment: b, height: 1, nonce: [9; NONCE_LEN] }));
+        let mut seen = Vec::new();
+        chain.for_each_output(&rtxn, |r, unspent| seen.push((r.commitment, unspent))).unwrap();
+        seen.sort();
+        let mut expected = vec![(a, false), (b, true)];
+        expected.sort();
+        assert_eq!(seen, expected);
+        drop(rtxn);
+
+        unwind_committed(&storage, &mut chain);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.output_record(&rtxn, &b).unwrap(), None, "its block was unwound");
+        assert!(chain.output_record(&rtxn, &a).unwrap().is_some());
     }
 
     /// Unwinding a block that completed a retarget window must restore

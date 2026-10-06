@@ -35,16 +35,23 @@
 //! - `CIN` / `COUT`: an input's / output's commitment
 //!   `hash_elements(DOMAIN_COMMITMENT, pubkey_hash ‖ amount limbs)`. An
 //!   input's key hash comes directly from the `PK` sponge just before it;
-//!   an output's is free. Limbs are range-checked to 16 bits, and added
+//!   an output's is free, and so is its recovery nonce (`NONCE`, eight
+//!   16-bit limbs), which travels with its commitment everywhere below. Limbs are range-checked to 16 bits, and added
 //!   to (inputs) or subtracted from (outputs) a running total -- kept
 //!   normalized as it goes: four range-checked 16-bit limbs plus a small
 //!   signed top limb, with carries of -1, 0, or +1 between them, so it
 //!   can never wrap around the field however many commitments there are.
-//!   Each sends its commitment both to the public side of the bus and to
-//!   its transaction's message.
-//! - `MSG`: one block of a transaction's signing-message sponge, absorbing
-//!   the input count and then every commitment received from the bus; the
-//!   last sends the message once per input of the transaction.
+//!   Each sends its commitment (an output's with its nonce, in the same
+//!   tuple) both to the public side of the bus and to its transaction's
+//!   message.
+//! - `MSG`: one block of a transaction's signing-message sponge: the first
+//!   absorbs the input count, each later one exactly one item received
+//!   from the bus -- an input's commitment (and zeros) or an output's
+//!   commitment and nonce, whole, so a nonce can't be moved to another
+//!   output. The last sends the message once per input of the
+//!   transaction. Since the signatures cover the message, and the public
+//!   side covers the nonces the block publishes, those are exactly the
+//!   ones the outputs' owners signed.
 //! - `PAD`: unused filler (the first block is always one).
 //! - `BAL`: the last block, checking the running total plus `a` minus `b`
 //!   comes out to exactly zero, carry by carry. `a` and `b` (as 16-bit
@@ -144,7 +151,9 @@ const CRY3: usize = 210;
 /// Range checks of the running total's limbs after each update.
 const BIT2: usize = 211;
 const LACC2: usize = 215;
-pub const WIDTH: usize = 219;
+/// An output's recovery nonce, as eight 16-bit limbs (`COUT`).
+const NONCE: usize = 219;
+pub const WIDTH: usize = 227;
 
 /// The column holding carry `k` out of limb `k` of the running total.
 fn carry_column(k: usize) -> usize {
@@ -153,7 +162,7 @@ fn carry_column(k: usize) -> usize {
 
 /// Columns constant within a block.
 fn constant_columns() -> impl Iterator<Item = usize> {
-    (K_CHAIN..LIMB + AMOUNT_LIMBS).chain(CRY..CRY + 3).chain([CRY3])
+    (K_CHAIN..LIMB + AMOUNT_LIMBS).chain(CRY..CRY + 3).chain([CRY3]).chain(NONCE..NONCE + 8)
 }
 
 // ---- Periodic columns (after the chip's own) ----------------------------
@@ -186,7 +195,9 @@ const TAG_PIN: u32 = 5;
 const TAG_POUT: u32 = 6;
 /// The public amounts `a`, `b`: `[TAG_NET, 0, 0, a limbs, b limbs]`.
 pub const TAG_NET: u32 = 7;
-const TUPLE_LEN: usize = 11;
+/// `[tag, a, b]` and 16 values: an output's commitment and nonce, the
+/// widest thing sent.
+const TUPLE_LEN: usize = 19;
 const BUS: Bus = Bus {
     slots: 9,
     aux_offset: 0,
@@ -222,6 +233,8 @@ pub struct BlockAir {
     num_blocks: usize,
     inputs: Vec<[BabyBear; 8]>,
     outputs: Vec<[BabyBear; 8]>,
+    /// Each output's recovery nonce limbs, in `outputs`' order.
+    nonces: Vec<[BabyBear; 8]>,
     net: (u64, u64),
     /// Public commitment slots, `(inputs, outputs)`: the lists padded to
     /// these lengths with unused entries (multiplicity 0), so every chunk
@@ -241,13 +254,19 @@ pub struct ChunkShape {
 
 impl BlockAir {
     /// A whole block's statement: `a = reward`, `b = 0`.
-    pub fn new(num_blocks: usize, inputs: Vec<[BabyBear; 8]>, outputs: Vec<[BabyBear; 8]>, reward: u64) -> Self {
-        Self::with_net(num_blocks, inputs, outputs, (reward, 0))
+    pub fn new(num_blocks: usize, inputs: Vec<[BabyBear; 8]>, outputs: Vec<[BabyBear; 8]>, nonces: Vec<[BabyBear; 8]>, reward: u64) -> Self {
+        Self::with_net(num_blocks, inputs, outputs, nonces, (reward, 0))
     }
 
     /// `sum(inputs) + a == sum(outputs) + b`, `net = (a, b)`.
-    pub fn with_net(num_blocks: usize, inputs: Vec<[BabyBear; 8]>, outputs: Vec<[BabyBear; 8]>, net: (u64, u64)) -> Self {
-        Self::chunk(num_blocks, inputs, outputs, net, None)
+    pub fn with_net(
+        num_blocks: usize,
+        inputs: Vec<[BabyBear; 8]>,
+        outputs: Vec<[BabyBear; 8]>,
+        nonces: Vec<[BabyBear; 8]>,
+        net: (u64, u64),
+    ) -> Self {
+        Self::chunk(num_blocks, inputs, outputs, nonces, net, None)
     }
 
     /// A chunk's statement, its commitment lists padded to `capacity`.
@@ -255,17 +274,20 @@ impl BlockAir {
         num_blocks: usize,
         inputs: Vec<[BabyBear; 8]>,
         outputs: Vec<[BabyBear; 8]>,
+        nonces: Vec<[BabyBear; 8]>,
         net: (u64, u64),
         capacity: Option<(usize, usize)>,
     ) -> Self {
         if let Some((i, o)) = capacity {
             assert!(inputs.len() <= i && outputs.len() <= o, "more commitments than slots");
         }
+        assert_eq!(nonces.len(), outputs.len(), "one nonce per output");
         let mut air = BlockAir {
             chip: Poseidon2Chip::<24>::new(),
             num_blocks,
             inputs,
             outputs,
+            nonces,
             net,
             capacity,
             num_constraints: 0,
@@ -285,6 +307,10 @@ impl BlockAir {
 
     pub fn public_outputs(&self) -> &[[BabyBear; 8]] {
         &self.outputs
+    }
+
+    pub fn public_nonces(&self) -> &[[BabyBear; 8]] {
+        &self.nonces
     }
 
     pub fn net(&self) -> (u64, u64) {
@@ -395,15 +421,13 @@ impl BlockAir {
             out.push(px * n[K_CIN] * (n[STATE + i] - c[CARRY + i]));
         }
 
-        // MSG: the input count first, unused halves empty.
+        // MSG: the input count first (and nothing else), then one item
+        // per block.
         out.push(km * c[FIRST] * (c[IN] - c[PREV] - c[NIN]));
-        for i in 1..8 {
+        for i in 1..16 {
             out.push(km * c[FIRST] * (c[IN + i] - c[PREV + i]));
         }
-        for i in 0..8 {
-            out.push(km * (one - c[FIRST]) * (one - c[ALO]) * (c[IN + i] - c[PREV + i]));
-            out.push(km * (one - c[AHI]) * (c[IN + 8 + i] - c[PREV + 8 + i]));
-        }
+        out.push(km * (one - c[FIRST]) * (one - c[ALO]));
 
         // DIG: input structure, canonical 3-bit decomposition, target sum.
         let kd = c[K_DIG];
@@ -517,6 +541,9 @@ impl BlockAir {
         let range = |start: usize, len: usize| -> Vec<F> { (start..start + len).map(|i| c[i]).collect() };
         let absorbed = |half: usize| -> Vec<F> { (0..8).map(|i| c[IN + 8 * half + i] - c[PREV + 8 * half + i]).collect() };
         let carry8 = range(CARRY, 8);
+        // An output's commitment and nonce, as sent together.
+        let committed: Vec<F> = range(CARRY, 8).into_iter().chain(range(NONCE, 8)).collect();
+        let item: Vec<F> = absorbed(0).into_iter().chain(absorbed(1)).collect();
         let compress_out: Vec<F> = (0..8).map(|i| c[CARRY + i] + c[IN + i]).collect();
         let (kc, kp, kd, kin, kout, km) = (c[K_CHAIN], c[K_PK], c[K_DIG], c[K_CIN], c[K_COUT], c[K_MSG]);
         let digit = |e: usize| c[B0 + e] + c[B1 + e] + c[B1 + e] + k(4) * c[B2 + e];
@@ -537,20 +564,19 @@ impl BlockAir {
                 (kc, tuple(TAG_CH, c[UID], c[C], &[c[S]])),
                 (kp, pk_half(0, FLO, two_c - one)),
                 (kd, tuple(TAG_MSG, c[TX], F::ZERO, &range(IN + 6, 8))),
-                (km, tuple(TAG_ITEM, c[TX], c[RLO], &absorbed(0))),
+                (km, tuple(TAG_ITEM, c[TX], c[RLO], &item)),
                 (kin, tuple(TAG_PIN, F::ZERO, F::ZERO, &carry8)),
-                (kout, tuple(TAG_POUT, F::ZERO, F::ZERO, &carry8)),
+                (kout, tuple(TAG_POUT, F::ZERO, F::ZERO, &committed)),
             ]),
         });
         // Slot 1.
         slots.push(Interaction {
-            multiplicity: kc * pout * c[END] - kp * p0 * (one - c[LAST]) - km * p0 * c[AHI] + (kin + kout) * pout,
+            multiplicity: kc * pout * c[END] - kp * p0 * (one - c[LAST]) + (kin + kout) * pout,
             values: mix(&[
                 (kc, tuple(TAG_TOP, c[UID], c[C], &compress_out)),
                 (kp, pk_half(1, FHI, two_c)),
-                (km, tuple(TAG_ITEM, c[TX], c[RHI], &absorbed(1))),
                 (kin, tuple(TAG_ITEM, c[TX], one, &carry8)),
-                (kout, tuple(TAG_ITEM, c[TX], F::ZERO, &carry8)),
+                (kout, tuple(TAG_ITEM, c[TX], F::ZERO, &committed)),
             ]),
         });
         // Slot 2: a message, once per input; or digit lane 0; or the
@@ -578,9 +604,10 @@ impl BlockAir {
     }
 
     fn public_tuples(&self) -> Vec<(BabyBear, Vec<BabyBear>)> {
-        let entry = |tag: u32, commitment: &[BabyBear; 8]| {
+        let entry = |tag: u32, commitment: &[BabyBear; 8], nonce: Option<&[BabyBear; 8]>| {
             let mut t = vec![bb(tag), BabyBear::ZERO, BabyBear::ZERO];
             t.extend_from_slice(commitment);
+            t.extend_from_slice(nonce.unwrap_or(&[BabyBear::ZERO; 8]));
             (BabyBear::ONE, t)
         };
         let mut amounts = vec![bb(TAG_NET), BabyBear::ZERO, BabyBear::ZERO];
@@ -593,9 +620,9 @@ impl BlockAir {
             (BabyBear::ZERO, t)
         };
         std::iter::once((BabyBear::ONE, amounts))
-            .chain(self.inputs.iter().map(|c| entry(TAG_PIN, c)))
+            .chain(self.inputs.iter().map(|c| entry(TAG_PIN, c, None)))
             .chain((self.inputs.len()..in_slots).map(|_| unused(TAG_PIN)))
-            .chain(self.outputs.iter().map(|c| entry(TAG_POUT, c)))
+            .chain(self.outputs.iter().zip(&self.nonces).map(|(c, n)| entry(TAG_POUT, c, Some(n))))
             .chain((self.outputs.len()..out_slots).map(|_| unused(TAG_POUT)))
             .collect()
     }
@@ -705,6 +732,7 @@ struct Spec {
     prev: [BabyBear; 24],
     limbs: [BabyBear; AMOUNT_LIMBS],
     carries: [i64; AMOUNT_LIMBS],
+    nonce: [BabyBear; 8],
 }
 
 impl Spec {
@@ -716,6 +744,7 @@ impl Spec {
             prev: [BabyBear::ZERO; 24],
             limbs: [BabyBear::ZERO; AMOUNT_LIMBS],
             carries: [0; AMOUNT_LIMBS],
+            nonce: [BabyBear::ZERO; 8],
         }
     }
 
@@ -791,7 +820,9 @@ fn build_shaped(
         }
         let tx_id = bb(t as u32);
         let message = tx.signing_message();
-        let mut items: Vec<([BabyBear; 8], bool)> = Vec::new();
+        // Each signed item: a commitment, the rest of its block (an
+        // output's nonce; zeros for an input), and whether it's an input.
+        let mut items: Vec<([BabyBear; 8], [BabyBear; 8], bool)> = Vec::new();
 
         for input in &tx.inputs {
             uid += 1;
@@ -887,47 +918,43 @@ fn build_shaped(
             let commitment = commit_spec(&mut specs, K_CIN, pkh, input.amount, tx_id, perm);
             specs.last_mut().unwrap().carries = total.add(input.amount, 1);
             public_inputs.push(commitment);
-            items.push((commitment, true));
+            items.push((commitment, [BabyBear::ZERO; 8], true));
         }
 
         for output in &tx.outputs {
             let pkh = digest_from_bytes(&output.pubkey_hash);
             let commitment = commit_spec(&mut specs, K_COUT, pkh, output.amount, tx_id, perm);
-            specs.last_mut().unwrap().carries = total.add(output.amount, -1);
-            public_outputs.push(commitment);
-            items.push((commitment, false));
+            let nonce = crate::output::nonce_limbs(&output.nonce);
+            let spec = specs.last_mut().unwrap();
+            spec.carries = total.add(output.amount, -1);
+            spec.nonce = nonce;
+            public_outputs.push((commitment, nonce));
+            items.push((commitment, nonce, false));
         }
 
-        // Signing message: the input count, then every commitment.
+        // Signing message: the input count, then one item per block.
         let n_in = bb(tx.inputs.len() as u32);
-        let mut halves: Vec<Option<([BabyBear; 8], bool)>> = vec![None];
-        halves.extend(items.iter().map(|&i| Some(i)));
-        let num_blocks = halves.len().div_ceil(2);
-        let mut sponge = iv(DOMAIN_SIGNING, 8 * halves.len() as u32);
+        let num_blocks = 1 + items.len();
+        let mut sponge = iv(DOMAIN_SIGNING, 16 * num_blocks as u32);
         for b in 0..num_blocks {
             let prev = sponge;
-            let half = |h: usize| halves.get(2 * b + h).copied().flatten();
-            if b == 0 {
-                sponge[0] = sponge[0] + n_in;
-            }
-            for h in 0..2 {
-                if let Some((commitment, _)) = half(h) {
+            let item = b.checked_sub(1).map(|i| items[i]);
+            match item {
+                None => sponge[0] = sponge[0] + n_in,
+                Some((commitment, rest, _)) => {
                     for i in 0..8 {
-                        sponge[8 * h + i] = sponge[8 * h + i] + commitment[i];
+                        sponge[i] = sponge[i] + commitment[i];
+                        sponge[8 + i] = sponge[8 + i] + rest[i];
                     }
                 }
             }
-            let role = |h: usize| bb(half(h).is_some_and(|(_, is_input)| is_input) as u32);
-            let active = |h: usize| bb(half(h).is_some() as u32);
             let mut spec = Spec::new(K_MSG, sponge)
                 .set(TX, tx_id)
                 .set(NIN, n_in)
                 .set(FIRST, bb((b == 0) as u32))
                 .set(LAST, bb((b == num_blocks - 1) as u32))
-                .set(RLO, role(0))
-                .set(RHI, role(1))
-                .set(ALO, active(0))
-                .set(AHI, active(1));
+                .set(RLO, bb(item.is_some_and(|(_, _, is_input)| is_input) as u32))
+                .set(ALO, bb(item.is_some() as u32));
             spec.prev = prev;
             specs.push(spec);
             sponge = perm.permute(sponge);
@@ -959,14 +986,15 @@ fn build_shaped(
 
     // The same order a `BlockBody` publishes them in.
     public_inputs.sort_by_key(|c| digest_to_bytes(*c));
-    public_outputs.sort_by_key(|c| digest_to_bytes(*c));
+    public_outputs.sort_by_key(|(c, _)| digest_to_bytes(*c));
     if let Some(shape) = shape
         && (public_inputs.len() > shape.inputs || public_outputs.len() > shape.outputs)
     {
         return Err(WitnessError::TooLarge);
     }
     let capacity = shape.map(|s| (s.inputs, s.outputs));
-    let air = BlockAir::chunk(num_blocks, public_inputs, public_outputs, net, capacity);
+    let (public_outputs, public_nonces) = public_outputs.into_iter().unzip();
+    let air = BlockAir::chunk(num_blocks, public_inputs, public_outputs, public_nonces, net, capacity);
     let mut trace = fill(&air, &specs);
     let bal_row = (num_blocks - 1) * ROWS;
     for (j, limb) in amount_limbs(net.1).into_iter().enumerate() {
@@ -1088,6 +1116,9 @@ fn fill(air: &BlockAir, specs: &[Spec]) -> Vec<Vec<BabyBear>> {
         }
         for j in 0..AMOUNT_LIMBS {
             header.push((carry_column(j), from_signed(spec.carries[j])));
+        }
+        for i in 0..8 {
+            header.push((NONCE + i, spec.nonce[i]));
         }
 
         let is_commit = spec.kind == K_CIN || spec.kind == K_COUT;
@@ -1296,12 +1327,23 @@ mod tests {
     #[test]
     fn a_different_public_statement_is_refused() {
         let witness = spend_block();
+        let (inputs, nonces) = (witness.air.inputs.clone(), witness.air.nonces.clone());
         let mut outputs = witness.air.outputs.clone();
         outputs.push([bb(1); 8]);
-        let air = BlockAir::new(witness.air.num_blocks, witness.air.inputs.clone(), outputs, REWARD);
+        let mut more_nonces = nonces.clone();
+        more_nonces.push([bb(0); 8]);
+        let air = BlockAir::new(witness.air.num_blocks, inputs.clone(), outputs, more_nonces, REWARD);
         assert!(stark::check(&air, &witness.trace, &challenges()).is_err());
-        let air = BlockAir::new(witness.air.num_blocks, vec![], witness.air.outputs.clone(), REWARD);
+        let air = BlockAir::new(witness.air.num_blocks, vec![], witness.air.outputs.clone(), nonces.clone(), REWARD);
         assert!(stark::check(&air, &witness.trace, &challenges()).is_err());
+        // A different nonce for an output than the one signed.
+        let mut altered = nonces.clone();
+        altered[0][3] = altered[0][3] + BabyBear::ONE;
+        let air = BlockAir::new(witness.air.num_blocks, inputs.clone(), witness.air.outputs.clone(), altered, REWARD);
+        assert!(stark::check(&air, &witness.trace, &challenges()).is_err());
+        // The honest statement passes.
+        let air = BlockAir::new(witness.air.num_blocks, inputs, witness.air.outputs.clone(), nonces, REWARD);
+        assert!(stark::check(&air, &witness.trace, &challenges()).is_ok());
     }
 
     #[test]

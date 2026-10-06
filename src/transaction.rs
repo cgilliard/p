@@ -227,30 +227,32 @@ impl Transaction {
     }
 
     /// The single message every signer signs: a hash over the complete
-    /// current transaction -- the number of inputs, then every input's
-    /// commitment in canonical (pubkey-sorted) order, then every output's
-    /// commitment, also in canonical order. Identical for every signer at
-    /// any given moment; changes the instant the input or output set
-    /// changes at all (see the module docs). The input count is padded to
-    /// 8 elements so every commitment lands on exactly half of one of the
-    /// sponge's 16-element blocks, which is what lets a block's proof
-    /// absorb each one as a single unit.
+    /// current transaction, laid out in whole 16-element sponge blocks --
+    /// first the number of inputs (and padding), then one block per input
+    /// (its commitment, then zeros), then one per output (its commitment,
+    /// then its recovery nonce as eight 16-bit limbs). Inputs and outputs
+    /// each in canonical order. Identical for every signer at any given
+    /// moment; changes the instant anything about the transaction does.
     ///
     /// Over commitments rather than raw (pubkey, amount) pairs: each
     /// commitment binds its owner and amount just as firmly (it's a
-    /// collision-resistant hash of them), and hashing eight field elements
+    /// collision-resistant hash of them), and hashing a few field elements
     /// per entry -- instead of a whole public key, byte by byte -- is what
-    /// a block's proof can afford to recompute. The input count keeps the
-    /// boundary between inputs and outputs unambiguous.
+    /// a block's proof can afford to recompute. One item per block is
+    /// what lets the proof receive each output's commitment and nonce
+    /// together, so they can't be paired up differently. The input count
+    /// keeps the boundary between inputs and outputs unambiguous.
     pub fn signing_message(&self) -> [BabyBear; 8] {
-        let mut elements = vec![BabyBear::ZERO; 8];
+        let mut elements = vec![BabyBear::ZERO; 16];
         elements[0] = BabyBear::new(self.inputs.len() as u32);
         for input in &self.inputs {
             let commitment = Output::new(&input.pubkey, input.amount).commitment();
             elements.extend(digest_from_bytes(&commitment));
+            elements.extend([BabyBear::ZERO; 8]);
         }
         for output in &self.outputs {
             elements.extend(digest_from_bytes(&output.commitment()));
+            elements.extend(crate::output::nonce_limbs(&output.nonce));
         }
         hash_elements(DOMAIN_SIGNING, &elements)
     }
@@ -322,7 +324,7 @@ impl Default for Transaction {
 }
 
 /// The encoding's version byte.
-const ENCODING_VERSION: u8 = 1;
+const ENCODING_VERSION: u8 = 3;
 
 impl Transaction {
     /// Byte encoding -- what's stored, written into files, and relayed:

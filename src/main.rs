@@ -16,6 +16,7 @@ mod keychain;
 mod log;
 mod mempool;
 mod merkle;
+mod mnemonic;
 mod net;
 mod node;
 mod ntt;
@@ -27,6 +28,7 @@ mod poseidon2;
 mod poseidon2_air;
 mod pow;
 mod prover;
+mod recovery;
 mod recursion;
 mod slate;
 mod stark;
@@ -129,12 +131,12 @@ fn difficulty_config() -> chain::DifficultyConfig {
 /// block, and accepts no other at height 0 (see `Chain::open`). Its body
 /// is empty, so the roots are those of an empty PMMR and bitmap; its
 /// timestamp is the floor every later block's must climb from.
-const GENESIS_TIMESTAMP_MS: u64 = 1_791_152_721_925;
+const GENESIS_TIMESTAMP_MS: u64 = 1_791_260_315_834;
 const GENESIS_PMMR_ROOT: &str = "136a8c43079d821b5d16f870ba686501fb73124c7f2f684f6bd00f741cbd0675";
 const GENESIS_BITMAP_ROOT: &str = "a800d34b66c57962f6aab87343c0064fdd5e933c7168454d5eb8b760affab20f";
-const GENESIS_BODY_HASH: &str = "9fc4302cb42e2d003c16622e59bafe2f8a23d667ba38930fc90d9767519cac06";
-const GENESIS_NONCE: &str = "bc8e000000000000000000000000000000000000000000000000000000000000";
-const GENESIS_HASH: &str = "00000146ddd8d725363a0e45d40e7a3017b20276d7a50c4777ab2b6b11e93f05";
+const GENESIS_BODY_HASH: &str = "78e5073d3554582a18816b49397ac631b629d019a062cf257ef467124ec2c16f";
+const GENESIS_NONCE: &str = "68e5020000000000000000000000000000000000000000000000000000000000";
+const GENESIS_HASH: &str = "000001172b14381562be5e4caf32f07457253912ebbdd96f7e36c4027520943f";
 
 fn from_hex32(hex: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -178,11 +180,16 @@ struct Args {
     log_stdout: bool,
     /// The wallet's directory (default: `wallet` in the data directory).
     wallet_dir: Option<std::path::PathBuf>,
+    /// Restore the wallet from its 24 backup words, read from stdin.
+    recover: bool,
+    /// With `--recover`, also read the wallet's passphrase; when creating
+    /// a new wallet, protect it with one (read twice).
+    passphrase: bool,
 }
 
 const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
          [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
-         [--wallet-dir PATH]";
+         [--wallet-dir PATH] [--recover] [--passphrase]";
 
 fn parse_args() -> Args {
     let mut args = Args {
@@ -194,6 +201,8 @@ fn parse_args() -> Args {
         log_level: log::Level::Info,
         log_stdout: false,
         wallet_dir: None,
+        recover: false,
+        passphrase: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -230,6 +239,8 @@ fn parse_args() -> Args {
             }
             "--log-stdout" => args.log_stdout = true,
             "--wallet-dir" => args.wallet_dir = Some(value().into()),
+            "--recover" => args.recover = true,
+            "--passphrase" => args.passphrase = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -241,6 +252,58 @@ fn parse_args() -> Args {
         }
     }
     args
+}
+
+/// The 24 backup words, typed (or piped) on stdin -- never taken as an
+/// argument, so they don't end up in the shell's history or the process
+/// list. Asks again on a mistake; exits if stdin closes.
+fn read_backup_words() -> String {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        eprintln!("Enter the wallet's 24 backup words (on one or more lines):");
+        let mut words = Vec::new();
+        while words.len() < mnemonic::WORDS {
+            match lines.next() {
+                Some(Ok(line)) => words.extend(line.split_whitespace().map(str::to_string)),
+                _ => die("no backup words given"),
+            }
+        }
+        match mnemonic::from_phrase(&words.join(" ")) {
+            Ok(_) => return words.join(" "),
+            Err(e) => eprintln!("Those words don't restore a wallet: {e}. Try again."),
+        }
+    }
+}
+
+/// A new wallet's backup words, shown once on the terminal (never
+/// logged: a log file is no place for them). `seed` shows them again.
+fn print_new_wallet_words(wallet: &wallet::Wallet) {
+    let (words, passphrase) = match wallet.backup_words() {
+        Ok(backup) => backup,
+        Err(e) => return eprintln!("failed to read the new wallet's backup words: {e}"),
+    };
+    println!("A new wallet was created. Its 24 backup words -- write them down, in order, and keep");
+    println!("them secret; they're the only way to restore it, and anyone with them can spend it:");
+    println!();
+    println!("{}", mnemonic::display(&words));
+    println!();
+    if passphrase {
+        println!("Restoring it also takes the passphrase you just chose.");
+    }
+    println!("(`seed` shows them again.)");
+}
+
+/// One line from stdin, after a prompt (without its line ending). Not
+/// hidden as it's typed -- there's no terminal handling here.
+fn read_line(prompt: &str) -> String {
+    use std::io::BufRead;
+    eprintln!("{prompt}");
+    match std::io::stdin().lock().lines().next() {
+        Some(Ok(line)) => line,
+        _ => die("stdin closed"),
+    }
 }
 
 /// 32 fresh random bytes from the OS.
@@ -264,6 +327,7 @@ type Network = (
     Receiver<(Block, SocketAddrV4)>,
     Receiver<(Vec<u8>, SocketAddrV4)>,
     Sender<Command>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
 );
 
 fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Network {
@@ -304,6 +368,8 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Netw
     // labeled with this node's port so several local nodes' logs are
     // easy to tell apart.
     node.log = Some(format!(":{port}"));
+    let peer_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(net::NO_PEER_HEIGHT));
+    node.peer_height = Some(peer_height.clone());
 
     let (blocks_tx, blocks_rx) = std::sync::mpsc::channel();
     let (txs_tx, txs_rx) = std::sync::mpsc::channel();
@@ -320,7 +386,7 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Netw
             error!("network stopped: {e:?}");
         }
     });
-    (blocks_rx, txs_rx, commands_tx)
+    (blocks_rx, txs_rx, commands_tx, peer_height)
 }
 
 /// Tell the network to announce our current tip to every peer but
@@ -558,19 +624,46 @@ fn main() {
         let seeds: Vec<String> = args.seeds.iter().map(|s| s.to_string()).collect();
         info!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
     }
-    let (received, received_txs, commands) = spawn_network(&storage, args.port, args.seeds);
+    let standalone = args.seeds.is_empty();
+    let (received, received_txs, commands, peer_height) = spawn_network(&storage, args.port, args.seeds);
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
     let peer_table = PeerTable::open(&storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
     let wallet_dir = args.wallet_dir.clone().unwrap_or_else(|| path.join("wallet"));
-    let wallet = wallet::Wallet::open(&wallet_dir)
-        .unwrap_or_else(|e| die(&format!("failed to open wallet at {}: {e}", wallet_dir.display())));
+    // A wallet made just now (not restored) shows its backup words once.
+    let created = !args.recover && !wallet_dir.join("data.mdb").exists();
+    let wallet = if args.recover {
+        let words = read_backup_words();
+        let passphrase = if args.passphrase { read_line("The wallet's passphrase:") } else { String::new() };
+        let wallet = wallet::Wallet::restore_from_words(&wallet_dir, &words, &passphrase)
+            .unwrap_or_else(|e| die(&format!("failed to restore the wallet at {}: {e}", wallet_dir.display())));
+        println!("Restoring the wallet: it will scan the chain once this node has caught up with its peers (`status` shows progress).");
+        wallet
+    } else if args.passphrase {
+        if wallet_dir.join("data.mdb").exists() {
+            die("--passphrase: the wallet already exists (a passphrase is set when a wallet is created, or with --recover)");
+        }
+        let passphrase = read_line("A passphrase for the new wallet (it will be needed, with the backup words, to restore it):");
+        if passphrase.is_empty() || read_line("The passphrase again:") != passphrase {
+            die("the passphrases were empty or didn't match");
+        }
+        wallet::Wallet::create_with_passphrase(&wallet_dir, &passphrase)
+            .unwrap_or_else(|e| die(&format!("failed to create the wallet at {}: {e}", wallet_dir.display())))
+    } else {
+        wallet::Wallet::open(&wallet_dir).unwrap_or_else(|e| die(&format!("failed to open wallet at {}: {e}", wallet_dir.display())))
+    };
     info!("Wallet: {}", wallet_dir.display());
+    if created {
+        info!("wallet: created a new wallet (its backup words were shown on the terminal, not logged)");
+        print_new_wallet_words(&wallet);
+    }
 
     // The node runs here; the command line reads the terminal on its own
     // thread and sends it requests.
     let (requests_tx, requests) = std::sync::mpsc::channel();
     std::thread::spawn(move || cli::run(requests_tx));
-    let node = node::Node::new(chain, reader, received, received_txs, commands, peer_table, wallet, args.mine, requests);
+    let mut node = node::Node::new(chain, reader, received, received_txs, commands, peer_table, wallet, args.mine, requests);
+    node.peer_height = peer_height;
+    node.standalone = standalone;
     node.run();
     std::process::exit(0);
 }

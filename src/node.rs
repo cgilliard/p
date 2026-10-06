@@ -19,6 +19,8 @@
 
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -90,12 +92,26 @@ pub struct Node {
     pub mempool: Mempool,
     pub mining: bool,
     pub requests: Receiver<(Request, Sender<Reply>)>,
+    /// The highest tip any peer has reported (`net::NO_PEER_HEIGHT`
+    /// until one has), kept current by the network thread.
+    pub peer_height: Arc<AtomicU64>,
+    /// No seeds were given: this node may be the network's first, so
+    /// with no peer heights known it counts as caught up.
+    pub standalone: bool,
     miner: Miner,
     last_balance: Option<wallet::Balance>,
     /// Build the next template without mempool transactions (after one
     /// with them failed to build or prove).
     skip_mempool: bool,
+    /// The wallet is restored from backup words and waits for the chain
+    /// to catch up before scanning it (`try_finish_recovery`); checked at
+    /// most once per `RECOVERY_CHECK`.
+    recovering: bool,
+    next_recovery_check: Instant,
 }
+
+/// How often a recovering wallet checks whether the chain has caught up.
+const RECOVERY_CHECK: Duration = Duration::from_secs(1);
 
 impl Node {
     #[allow(clippy::too_many_arguments)]
@@ -110,6 +126,7 @@ impl Node {
         mining: bool,
         requests: Receiver<(Request, Sender<Reply>)>,
     ) -> Self {
+        let recovering = wallet.is_recovering().unwrap_or(false);
         Node {
             chain,
             reader,
@@ -121,9 +138,13 @@ impl Node {
             mempool: Mempool::new(),
             mining,
             requests,
+            peer_height: Arc::new(AtomicU64::new(crate::net::NO_PEER_HEIGHT)),
+            standalone: false,
             miner: Miner::Idle,
             last_balance: None,
             skip_mempool: false,
+            recovering,
+            next_recovery_check: Instant::now(),
         }
     }
 
@@ -144,8 +165,11 @@ impl Node {
             Err(e) => error!("wallet: {e}"),
         }
         info!("{}", if self.mining { "Mining." } else { "Not mining." });
+        if self.recovering {
+            info!("wallet: restored from backup words -- waiting for the chain to catch up with peers before scanning it");
+        }
         loop {
-            let mut busy = false;
+            let mut busy = self.try_finish_recovery();
             while let Ok((request, reply)) = self.requests.try_recv() {
                 busy = true;
                 let quit = matches!(request, Request::Quit);
@@ -163,6 +187,57 @@ impl Node {
             busy |= self.mine_step();
             if !busy {
                 std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    // ---- recovery ---------------------------------------------------------
+
+    /// Whether the chain has caught up with every peer that's told us its
+    /// tip (or, with none and no seeds, whether we stand alone).
+    fn caught_up(&self) -> bool {
+        match self.peer_height.load(Ordering::Relaxed) {
+            crate::net::NO_PEER_HEIGHT => self.standalone,
+            best => self.tip_height() >= best,
+        }
+    }
+
+    /// For a restored wallet: once the chain has caught up, scan it for
+    /// our outputs (`Wallet::finish_recovery`). Returns whether it did.
+    fn try_finish_recovery(&mut self) -> bool {
+        if !self.recovering || Instant::now() < self.next_recovery_check {
+            return false;
+        }
+        self.next_recovery_check = Instant::now() + RECOVERY_CHECK;
+        if !self.caught_up() {
+            return false;
+        }
+        let result = match self.chain.view() {
+            Ok(view) => self.wallet.finish_recovery(&view),
+            Err(e) => {
+                error!("wallet: failed to read the chain: {e}");
+                return false;
+            }
+        };
+        match result {
+            Ok(r) => {
+                self.recovering = false;
+                info!(
+                    "wallet: recovered {} output(s) at height {} -- {} unspent, {} in all; spendable from height {} (a hold in case a spend was in flight); new keys from index {}",
+                    r.outputs,
+                    self.tip_height(),
+                    r.unspent,
+                    format_amount(r.amount),
+                    r.spendable_from,
+                    r.next_index
+                );
+                self.last_balance = None;
+                self.refresh_wallet();
+                true
+            }
+            Err(e) => {
+                error!("wallet: recovery failed: {e}");
+                false
             }
         }
     }
@@ -227,13 +302,27 @@ impl Node {
             Ok(view) => view,
             Err(e) => return error!("wallet: failed to read the chain: {e}"),
         };
-        if let Err(e) = self.wallet.refresh(&view) {
-            return error!("wallet: refresh failed: {e}");
+        match self.wallet.refresh(&view) {
+            Ok(unrecoverable) => {
+                for commitment in unrecoverable {
+                    warn!(
+                        "wallet: output {} confirmed, but its recovery nonce was altered on the way -- \
+                         the backup words can't restore it; keep this wallet's files until it's spent",
+                        crate::hex(&commitment[..8])
+                    );
+                }
+            }
+            Err(e) => return error!("wallet: refresh failed: {e}"),
         }
         match self.wallet.balance(view.tip_height()) {
             Ok(b) if self.last_balance != Some(b) => {
+                let held = if b.held > 0 {
+                    format!(", held {} (recovered, until height {})", format_amount(b.held), b.held_until)
+                } else {
+                    String::new()
+                };
                 info!(
-                    "wallet: spendable {}, immature {}, pending {}, locked {}",
+                    "wallet: spendable {}, immature {}, pending {}, locked {}{held}",
                     format_amount(b.spendable),
                     format_amount(b.immature),
                     format_amount(b.pending),
@@ -255,8 +344,18 @@ impl Node {
     /// relay it to every peer but `from`, the one that sent it.
     fn submit_from(&mut self, tx: Transaction, from: Option<SocketAddrV4>) -> Result<[u8; 32], Rejection> {
         let bytes = tx.to_bytes();
+        let tx_copy = tx.clone();
         let view = self.chain.view().map_err(|_| Rejection::Invalid("the chain is unreadable"))?;
         let id = self.mempool.admit(tx, &view)?;
+        drop(view);
+        // A spend of one of our outputs we didn't sign here (a restored
+        // wallet's in-flight spend, or a copy of this wallet): never sign
+        // that output again.
+        match self.wallet.observe_spend(&tx_copy) {
+            Ok(true) => warn!("wallet: transaction {} spends outputs of ours signed elsewhere; marked as spent", crate::hex(&id[..8])),
+            Ok(false) => {}
+            Err(e) => error!("wallet: {e}"),
+        }
         let source = from.map_or("this wallet".to_string(), |f| f.to_string());
         info!("mempool: accepted {} from {source}; {} waiting", crate::hex(&id[..8]), self.mempool.len());
         let _ = self.commands.send(Command::AnnounceTx { bytes, except: from });
@@ -279,7 +378,8 @@ impl Node {
     fn mine_step(&mut self) -> bool {
         match &mut self.miner {
             Miner::Idle => {
-                if !self.mining {
+                // A recovering wallet hands out no keys, rewards included.
+                if !self.mining || self.recovering {
                     return false;
                 }
                 self.start_template();
@@ -422,14 +522,23 @@ impl Node {
         match request {
             Request::Balance => {
                 let b = self.wallet.balance(tip).map_err(|e| e.to_string())?;
+                let held = if b.held > 0 {
+                    format!(
+                        "held:      {}  (recovered; spendable from height {}, in case the lost wallet's last spend is still in flight)\n",
+                        format_amount(b.held),
+                        b.held_until
+                    )
+                } else {
+                    String::new()
+                };
                 Ok(format!(
-                    "spendable: {}\nimmature:  {}  (mining rewards need {} confirmations)\npending:   {}\nlocked:    {}\ntotal:     {}",
+                    "spendable: {}\nimmature:  {}  (mining rewards need {} confirmations)\npending:   {}\nlocked:    {}\n{held}total:     {}",
                     format_amount(b.spendable),
                     format_amount(b.immature),
                     wallet::COINBASE_MATURITY,
                     format_amount(b.pending),
                     format_amount(b.locked),
-                    format_amount(b.spendable + b.immature + b.pending + b.locked)
+                    format_amount(b.total())
                 ))
             }
             Request::Outputs => {
@@ -454,6 +563,7 @@ impl Node {
                             wallet::Status::Locked => "locked".into(),
                             wallet::Status::Spending => "spending".into(),
                             wallet::Status::Spent => "spent".into(),
+                            wallet::Status::Held { confirmations, until } => format!("{confirmations} conf, held to {until}"),
                         };
                         format!("{:>22}  {:<20} {:?} {}", format_amount(o.amount), status, o.origin, crate::hex(&o.commitment[..8]))
                     })
@@ -526,10 +636,18 @@ impl Node {
                     (Miner::Proving { started, .. }, true) => format!("proving ({:.0?})", started.elapsed()),
                     (Miner::Mining { started, .. }, true) => format!("mining ({:.0?})", started.elapsed()),
                 };
-                Ok(format!(
+                let mut out = format!(
                     "height:  {tip} ({tip_hash}…)\npeers:   {peers}\nmempool: {} transaction(s)\nmining:  {miner}",
                     self.mempool.len()
-                ))
+                );
+                if self.recovering {
+                    let best = match self.peer_height.load(Ordering::Relaxed) {
+                        crate::net::NO_PEER_HEIGHT => "no peer has reported its height yet".to_string(),
+                        best => format!("peers are at height {best}"),
+                    };
+                    out += &format!("\nwallet:  recovering -- scans the chain once it has caught up ({best})");
+                }
+                Ok(out)
             }
             Request::Mine(on) => {
                 self.mining = on;
@@ -539,10 +657,18 @@ impl Node {
                 info!("mining {}", if on { "on" } else { "off" });
                 Ok(format!("mining {}", if on { "on" } else { "off" }))
             }
-            Request::Seed => Ok(format!(
-                "{}\nAnyone with this seed can spend everything in this wallet. Keep it secret.",
-                self.wallet.keychain().seed_hex()
-            )),
+            Request::Seed => {
+                let (words, passphrase) = self.wallet.backup_words().map_err(|e| e.to_string())?;
+                let reminder = if passphrase {
+                    "\nThis wallet also has a passphrase: restoring it takes the words AND the passphrase.\nWithout the passphrase the words restore an empty wallet."
+                } else {
+                    ""
+                };
+                Ok(format!(
+                    "{}\nThese 24 words are this wallet's backup: write them down, in order, and keep them\nsecret -- anyone who has them can spend everything in it.{reminder}",
+                    crate::mnemonic::display(&words)
+                ))
+            }
             Request::Quit => Ok("bye".into()),
         }
     }

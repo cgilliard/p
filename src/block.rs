@@ -52,6 +52,7 @@ use crate::output::Output;
 use crate::poseidon2::hash_bytes_32;
 use crate::pow;
 use crate::prover::Proof;
+use crate::recovery::NONCE_LEN;
 use crate::transaction::Transaction;
 
 /// Errors from decoding a `BlockBody`/`Block` from bytes. Encoding never
@@ -231,14 +232,27 @@ fn insert_sorted(list: &mut Vec<[u8; 32]>, value: [u8; 32]) {
 pub struct BlockBody {
     pub inputs: Vec<[u8; 32]>,
     pub outputs: Vec<[u8; 32]>,
+    /// Each output's recovery nonce (`recovery`), in `outputs`' order:
+    /// `nonces[i]` belongs to `outputs[i]`. Not covered by the proof --
+    /// the owner checks it -- but covered by `body_hash`, so by the
+    /// header's proof of work. `Block::validate` requires exactly one
+    /// per output.
+    pub nonces: Vec<[u8; NONCE_LEN]>,
     pub proof: Proof,
 }
+
+/// Which body layout `body_hash` commits to -- 2 since outputs carry
+/// recovery nonces. Part of the hashed bytes, so a chain stored under an
+/// older layout (whose genesis hashes differently) is refused at startup
+/// rather than misread.
+const BODY_VERSION: u8 = 2;
 
 impl BlockBody {
     pub fn new() -> Self {
         BlockBody {
             inputs: Vec::new(),
             outputs: Vec::new(),
+            nonces: Vec::new(),
             proof: Proof::default(),
         }
     }
@@ -260,7 +274,7 @@ impl BlockBody {
             self.push_input(commitment);
         }
         for output in &tx.outputs {
-            self.push_output(output.commitment());
+            self.push_output(output.commitment(), output.nonce);
         }
         true
     }
@@ -291,9 +305,11 @@ impl BlockBody {
     }
 
     /// Insert `commitment`, keeping `outputs` sorted ascending -- same
-    /// reasoning as `push_input`.
-    fn push_output(&mut self, commitment: [u8; 32]) {
-        insert_sorted(&mut self.outputs, commitment);
+    /// reasoning as `push_input` -- and its nonce at the same position.
+    fn push_output(&mut self, commitment: [u8; 32], nonce: [u8; NONCE_LEN]) {
+        let pos = self.outputs.partition_point(|existing| *existing < commitment);
+        self.outputs.insert(pos, commitment);
+        self.nonces.insert(pos, nonce);
     }
 
     /// Hash of the complete body: every input commitment in sorted
@@ -301,13 +317,24 @@ impl BlockBody {
     /// proof's own commitment -- one hash covering everything below the
     /// header, proof included (see the struct docs). What the header's
     /// `body_hash` commits to.
+    ///
+    /// Exactly: `BODY_VERSION`, then each list (inputs, outputs, nonces)
+    /// prefixed by its length as a u32, then the proof's commitment. The
+    /// lengths make the boundaries unambiguous.
     pub fn body_hash(&self) -> [u8; 32] {
-        let mut bytes = Vec::with_capacity((self.inputs.len() + self.outputs.len()) * 32 + 32);
+        let mut bytes = Vec::with_capacity(13 + (self.inputs.len() + self.outputs.len()) * 32 + self.nonces.len() * NONCE_LEN + 32);
+        bytes.push(BODY_VERSION);
+        bytes.extend_from_slice(&(self.inputs.len() as u32).to_be_bytes());
         for commitment in &self.inputs {
             bytes.extend_from_slice(commitment);
         }
+        bytes.extend_from_slice(&(self.outputs.len() as u32).to_be_bytes());
         for commitment in &self.outputs {
             bytes.extend_from_slice(commitment);
+        }
+        bytes.extend_from_slice(&(self.nonces.len() as u32).to_be_bytes());
+        for nonce in &self.nonces {
+            bytes.extend_from_slice(nonce);
         }
         bytes.extend_from_slice(&self.proof.commitment_hash());
         hash_bytes_32(&bytes)
@@ -317,17 +344,18 @@ impl BlockBody {
     /// `outputs` -- see `prover`'s docs. By far the most expensive check
     /// a block gets.
     pub fn proof_is_valid(&self) -> bool {
-        self.proof.verify(&self.inputs, &self.outputs)
+        self.proof.verify(&self.inputs, &self.outputs, &self.nonces)
     }
 
     /// `to_bytes().len()`, without building the bytes.
     pub fn encoded_len(&self) -> usize {
-        4 + 32 * self.inputs.len() + 4 + 32 * self.outputs.len() + 4 + self.proof.len()
+        4 + 32 * self.inputs.len() + 4 + 32 * self.outputs.len() + 4 + NONCE_LEN * self.nonces.len() + 4 + self.proof.len()
     }
 
     /// Serialize: a 4-byte big-endian input count, that many 32-byte
     /// commitments, a 4-byte big-endian output count, that many 32-byte
-    /// commitments, then a 4-byte big-endian proof length and the proof's
+    /// commitments, a 4-byte big-endian nonce count, that many 16-byte
+    /// nonces, then a 4-byte big-endian proof length and the proof's
     /// bytes. Always produces canonically-ordered bytes, since `inputs`/
     /// `outputs` are only ever populated in that order in the first place
     /// (`push_input`/`push_output`).
@@ -340,6 +368,10 @@ impl BlockBody {
         out.extend_from_slice(&(self.outputs.len() as u32).to_be_bytes());
         for commitment in &self.outputs {
             out.extend_from_slice(commitment);
+        }
+        out.extend_from_slice(&(self.nonces.len() as u32).to_be_bytes());
+        for nonce in &self.nonces {
+            out.extend_from_slice(nonce);
         }
         out.extend_from_slice(&(self.proof.len() as u32).to_be_bytes());
         out.extend_from_slice(self.proof.as_bytes());
@@ -361,16 +393,16 @@ impl BlockBody {
             Ok(u32::from_be_bytes(slice.try_into().unwrap()))
         }
 
-        fn read_commitments(bytes: &[u8], offset: &mut usize, count: u32) -> Result<Vec<[u8; 32]>> {
+        fn read_records<const N: usize>(bytes: &[u8], offset: &mut usize, count: u32) -> Result<Vec<[u8; N]>> {
             // Never reserve more than the bytes actually present could
             // fill: `count` comes off the wire, and a lie there (four
             // billion, say) must fail as `Truncated`, not as an
             // allocation of hundreds of gigabytes.
-            let room = bytes.len().saturating_sub(*offset) / 32;
+            let room = bytes.len().saturating_sub(*offset) / N;
             let mut out = Vec::with_capacity((count as usize).min(room));
             for _ in 0..count {
-                let slice = bytes.get(*offset..*offset + 32).ok_or(Error::Truncated)?;
-                *offset += 32;
+                let slice = bytes.get(*offset..*offset + N).ok_or(Error::Truncated)?;
+                *offset += N;
                 out.push(slice.try_into().unwrap());
             }
             Ok(out)
@@ -378,9 +410,11 @@ impl BlockBody {
 
         let mut offset = 0;
         let input_count = read_u32(bytes, &mut offset)?;
-        let inputs = read_commitments(bytes, &mut offset, input_count)?;
+        let inputs = read_records(bytes, &mut offset, input_count)?;
         let output_count = read_u32(bytes, &mut offset)?;
-        let outputs = read_commitments(bytes, &mut offset, output_count)?;
+        let outputs = read_records(bytes, &mut offset, output_count)?;
+        let nonce_count = read_u32(bytes, &mut offset)?;
+        let nonces = read_records(bytes, &mut offset, nonce_count)?;
         let proof_len = read_u32(bytes, &mut offset)? as usize;
         let proof = bytes.get(offset..offset.saturating_add(proof_len)).ok_or(Error::Truncated)?;
         offset += proof_len;
@@ -392,6 +426,7 @@ impl BlockBody {
         Ok(BlockBody {
             inputs,
             outputs,
+            nonces,
             proof: Proof::from_bytes(proof.to_vec()),
         })
     }
@@ -454,6 +489,7 @@ pub struct UnprovenBlock {
     pub bitmap_root: [u8; 32],
     pub inputs: Vec<[u8; 32]>,
     pub outputs: Vec<[u8; 32]>,
+    pub nonces: Vec<[u8; NONCE_LEN]>,
 }
 
 impl UnprovenBlock {
@@ -473,6 +509,7 @@ impl UnprovenBlock {
         let body = BlockBody {
             inputs: self.inputs,
             outputs: self.outputs,
+            nonces: self.nonces,
             proof,
         };
         let header = BlockHeader {
@@ -553,6 +590,9 @@ impl Block {
             return false;
         }
         if !self.body.is_canonically_ordered() {
+            return false;
+        }
+        if self.body.nonces.len() != self.body.outputs.len() {
             return false;
         }
         if self.body.spends_its_own_output() {
@@ -1033,6 +1073,7 @@ mod tests {
             })
             .collect();
         BlockBody {
+            nonces: vec![[0; NONCE_LEN]; n],
             outputs,
             ..Default::default()
         }
@@ -1051,6 +1092,31 @@ mod tests {
         Block { header, body }
     }
 
+    /// Nonces round-trip with their outputs, count toward `body_hash`,
+    /// and a body without exactly one per output is invalid.
+    #[test]
+    fn nonces_are_encoded_hashed_and_required() {
+        let mut body = body_with_outputs(3);
+        body.nonces = vec![[1; NONCE_LEN], [2; NONCE_LEN], [3; NONCE_LEN]];
+        assert_eq!(BlockBody::from_bytes(&body.to_bytes()).unwrap(), body);
+        let mut other = body.clone();
+        other.nonces[1] = [4; NONCE_LEN];
+        assert_ne!(other.body_hash(), body.body_hash(), "nonces are committed to");
+        assert!(mined_block(body.clone()).validate_structure(&INITIAL_MAX_HASH));
+        body.nonces.pop();
+        assert!(!mined_block(body).validate_structure(&INITIAL_MAX_HASH));
+    }
+
+    /// Inputs and outputs can't trade places without changing the hash
+    /// (the list lengths are hashed too).
+    #[test]
+    fn body_hash_separates_inputs_from_outputs() {
+        let c = [5u8; 32];
+        let as_input = BlockBody { inputs: vec![c], ..Default::default() };
+        let as_output = BlockBody { outputs: vec![c], ..Default::default() };
+        assert_ne!(as_input.body_hash(), as_output.body_hash());
+    }
+
     #[test]
     fn encoded_len_matches_to_bytes() {
         for n in [0, 1, 7] {
@@ -1059,11 +1125,12 @@ mod tests {
         }
     }
 
-    /// Exactly at `MAX_BLOCK_BYTES` is fine; one commitment more isn't.
-    /// (Counts and proof length take 12 bytes; this proof is empty.)
+    /// Exactly at `MAX_BLOCK_BYTES` is fine; one output more isn't.
+    /// (Counts and proof length take 16 bytes; this proof is empty; each
+    /// output is a commitment and a nonce.)
     #[test]
     fn validate_enforces_the_block_size_limit() {
-        let fits = (MAX_BLOCK_BYTES - HEADER_LEN - 12) / 32;
+        let fits = (MAX_BLOCK_BYTES - HEADER_LEN - 16) / (32 + NONCE_LEN);
         let at_limit = mined_block(body_with_outputs(fits));
         assert!(at_limit.encoded_len() <= MAX_BLOCK_BYTES);
         assert!(at_limit.validate_structure(&INITIAL_MAX_HASH));

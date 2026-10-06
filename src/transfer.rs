@@ -170,6 +170,11 @@ impl Transfer {
         }
     }
 
+    /// The highest tip any peer has told us about, if any has.
+    pub fn best_peer_height(&self) -> Option<u64> {
+        self.peer_heights.values().filter_map(|p| p.height).max()
+    }
+
     pub fn downloading(&self) -> usize {
         self.downloads.len()
     }

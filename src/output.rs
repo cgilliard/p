@@ -20,12 +20,14 @@
 #![allow(dead_code)]
 
 use crate::poseidon2::{BabyBear, DOMAIN_COMMITMENT, digest_from_bytes, digest_to_bytes, hash_elements};
+use crate::recovery::NONCE_LEN;
 use crate::wots::PublicKey;
 
 /// 8 BabyBear field elements, 4 bytes each.
 const PUBKEY_HASH_LEN: usize = 32;
-/// `PUBKEY_HASH_LEN` bytes of hash, plus 8 bytes of little-endian amount.
-pub const OUTPUT_LEN: usize = PUBKEY_HASH_LEN + 8;
+/// `PUBKEY_HASH_LEN` bytes of hash, 8 bytes of little-endian amount, and
+/// the recovery nonce.
+pub const OUTPUT_LEN: usize = PUBKEY_HASH_LEN + 8 + NONCE_LEN;
 
 /// Bits per amount limb in a commitment -- see `Output::commitment`.
 pub const AMOUNT_LIMB_BITS: u32 = 16;
@@ -64,19 +66,40 @@ pub fn parse_amount(text: &str) -> Option<u64> {
     whole.parse::<u64>().ok()?.checked_mul(UNITS_PER_COIN)?.checked_add(units)
 }
 
+/// A recovery nonce as eight 16-bit limbs (little-endian pairs of
+/// bytes): how the signing message and the block circuit carry it. Every
+/// 16-byte nonce has exactly one encoding, and each limb is far below P.
+pub fn nonce_limbs(nonce: &[u8; NONCE_LEN]) -> [BabyBear; 8] {
+    std::array::from_fn(|i| BabyBear::new(u16::from_le_bytes([nonce[2 * i], nonce[2 * i + 1]]) as u32))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Output {
     /// Poseidon2 hash of the owning public key.
     pub pubkey_hash: [u8; PUBKEY_HASH_LEN],
     pub amount: u64,
+    /// The owner's recovery nonce (`recovery`): its key index and amount,
+    /// readable only with the owner's view key. Published with the
+    /// commitment but not part of it; the transaction's signature covers
+    /// it, and a block's proof ties the published nonces to the signed
+    /// ones -- so nobody can alter it once it's signed.
+    pub nonce: [u8; NONCE_LEN],
 }
 
 impl Output {
+    /// An output with an all-zero nonce: fine for computing commitments
+    /// (an input's, say); an output actually created needs a real one
+    /// (`with_nonce`).
     pub fn new(pk: &PublicKey, amount: u64) -> Self {
         Output {
             pubkey_hash: digest_to_bytes(pk.hash()),
             amount,
+            nonce: [0; NONCE_LEN],
         }
+    }
+
+    pub fn with_nonce(self, nonce: [u8; NONCE_LEN]) -> Self {
+        Output { nonce, ..self }
     }
 
     /// The commitment published for this output (and, when it's spent,
@@ -96,10 +119,12 @@ impl Output {
         digest_to_bytes(hash_elements(DOMAIN_COMMITMENT, &elements))
     }
 
+    /// `pubkey_hash ‖ amount (u64 LE) ‖ nonce`.
     pub fn to_bytes(&self) -> [u8; OUTPUT_LEN] {
         let mut out = [0u8; OUTPUT_LEN];
         out[..PUBKEY_HASH_LEN].copy_from_slice(&self.pubkey_hash);
-        out[PUBKEY_HASH_LEN..].copy_from_slice(&self.amount.to_le_bytes());
+        out[PUBKEY_HASH_LEN..PUBKEY_HASH_LEN + 8].copy_from_slice(&self.amount.to_le_bytes());
+        out[PUBKEY_HASH_LEN + 8..].copy_from_slice(&self.nonce);
         out
     }
 
@@ -114,8 +139,9 @@ impl Output {
         let bytes: [u8; OUTPUT_LEN] = bytes.try_into().ok()?;
         let mut pubkey_hash = [0u8; PUBKEY_HASH_LEN];
         pubkey_hash.copy_from_slice(&bytes[..PUBKEY_HASH_LEN]);
-        let amount = u64::from_le_bytes(bytes[PUBKEY_HASH_LEN..].try_into().unwrap());
-        Some(Output { pubkey_hash, amount })
+        let amount = u64::from_le_bytes(bytes[PUBKEY_HASH_LEN..PUBKEY_HASH_LEN + 8].try_into().unwrap());
+        let nonce = bytes[PUBKEY_HASH_LEN + 8..].try_into().unwrap();
+        Some(Output { pubkey_hash, amount, nonce })
     }
 }
 

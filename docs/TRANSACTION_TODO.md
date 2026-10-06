@@ -81,7 +81,7 @@ the chain too, so make that explicit:
 - [x] `quit` stops the node (LMDB commits are already durable, so
       Ctrl+C is safe too).
 
-## Phase 1 -- keychain (`keychain.rs`: done, except mnemonic)
+## Phase 1 -- keychain (`keychain.rs`, `mnemonic.rs`: done)
 
 - [x] `Keychain::random()` (production), `from_seed` / `from_seed_hex`
       (restore), `Keychain::test(label)` (reproducible, per-test keys);
@@ -90,8 +90,9 @@ the chain too, so make that explicit:
       zeroed on drop.
 - [x] **Seed**: 32 random bytes (from the OS), created on first run
       (`Wallet::open`); restore with `Wallet::open_with`.
-- [ ] **Mnemonic**: show the seed as BIP39 English (24 words, with a
-      checksum) for backup, and restore from one.
+- [x] **Mnemonic**: the seed as 24 BIP39 English words (`mnemonic.rs`);
+      `seed` shows them; `--recover` restores a wallet from them alone
+      (every output carries a recovery nonce -- see `docs/RECOVERY.md`).
 - [x] **Derivation**: `key_seed = hash_bytes_32("tabernacle-keychain-v1" ‖
       seed ‖ account ‖ index)`, then `wots::keygen(key_seed)`. Keys are
       never stored, only the seed and the next unused index; any key can

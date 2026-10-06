@@ -150,8 +150,10 @@ mod tests {
             let mut txs = vec![reward_tx];
             txs.extend(others);
             mine_and_apply(chain, &txs).unwrap();
-            alice.refresh(&chain.view().unwrap()).unwrap();
-            bob.refresh(&chain.view().unwrap()).unwrap();
+            // Every output both wallets made reached the chain with its
+            // recovery nonce intact.
+            assert!(alice.refresh(&chain.view().unwrap()).unwrap().is_empty());
+            assert!(bob.refresh(&chain.view().unwrap()).unwrap().is_empty());
         };
         for _ in 0..=COINBASE_MATURITY {
             mine(&mut chain, vec![], 0);
@@ -238,7 +240,7 @@ mod tests {
             let height = block.header.height;
             assert_eq!(chain.accept_block(block).unwrap(), chain::AcceptOutcome::Applied, "block {height}");
             let view = chain.view().unwrap();
-            wallet.refresh(&view).unwrap();
+            assert!(wallet.refresh(&view).unwrap().is_empty(), "every nonce arrived intact");
             assert!(mempool.revalidate(&view).len() == count && mempool.is_empty(), "every transaction was mined");
             println!(
                 "height {height:2}: {count} transaction(s), {inputs:2} inputs -- {} proof, {:.1} KB, proved in {proving:.1?}",
@@ -291,6 +293,147 @@ mod tests {
         assert_eq!(b.pending + b.locked, 0, "{b:?}");
         assert_eq!(b.spendable + b.immature, 20 * REWARD, "{b:?}");
         assert!(wallet.unconfirmed_transactions().unwrap().is_empty());
+    }
+
+
+    /// Mine one block with real proofs, as the node's miner does: a
+    /// template from `mempool`, the reward (with fees) to `miner`, proven
+    /// (direct or tree), mined, and applied to a chain that checks every
+    /// proof; then every wallet refreshes (and must find every nonce
+    /// intact) and the mempool drops what was mined.
+    fn mine_real(chain: &mut Chain, mempool: &mut crate::mempool::Mempool, miner: &crate::wallet::Wallet, wallets: &[&crate::wallet::Wallet]) {
+        let (txs, fees) = mempool.select(1 << 20);
+        let (_, reward) = miner.reward_output(prover::REWARD + fees).unwrap();
+        let mut reward_tx = Transaction::new();
+        reward_tx.add_output(reward).unwrap();
+        let transactions: Vec<Transaction> = std::iter::once(reward_tx).chain(txs).collect();
+        let unproven = chain.build_block(&transactions).unwrap();
+        let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
+        let proof = prover::prove_block_auto(&unproven.inputs, &unproven.outputs, &transactions, [7; 32]).unwrap();
+        let mut block = unproven.finish(proof);
+        block.header.timestamp = block.header.timestamp.max(min_timestamp);
+        assert!(mine_block(&mut block, &target, u64::MAX));
+        assert_eq!(chain.accept_block(block).unwrap(), chain::AcceptOutcome::Applied);
+        let view = chain.view().unwrap();
+        for w in wallets.iter().chain([&miner]) {
+            assert!(w.refresh(&view).unwrap().is_empty(), "a nonce arrived altered");
+        }
+        mempool.revalidate(&view);
+    }
+
+    /// Admit `tx` to the mempool, and let every wallet see it -- as the
+    /// node does (`Wallet::observe_spend`).
+    fn submit_real(chain: &Chain, mempool: &mut crate::mempool::Mempool, tx: &Transaction, wallets: &[&crate::wallet::Wallet]) {
+        mempool.admit(tx.clone(), &chain.view().unwrap()).unwrap();
+        for w in wallets {
+            w.observe_spend(tx).unwrap();
+        }
+    }
+
+    /// `docs/RECOVERY.md`'s acceptance test, with real proofs on a chain
+    /// that checks every one. Alice mines, pays Bob, is paid by Bob, splits
+    /// coins, and has one more spend signed and waiting in the mempool when
+    /// her wallet is lost. A wallet restored from her **24 words alone**
+    /// finds exactly her unspent outputs, respects the spend in flight
+    /// (and gets its change once it confirms), never reuses a key, and --
+    /// after the hold -- pays Bob.
+    ///
+    /// Slow (a few minutes of proving); run with
+    /// `cargo test --release -- --ignored --nocapture a_wallet_restored_from_its_words`.
+    #[test]
+    #[ignore]
+    fn a_wallet_restored_from_its_words_alone_with_real_proofs() {
+        use crate::keychain::Keychain;
+        use crate::mempool::Mempool;
+        use crate::wallet::{ChainView, RECOVERY_HOLD_BLOCKS, RECOVERY_INDEX_MARGIN, Status, Wallet};
+        const FEE: u64 = 100_000;
+        let unspent_of = |w: &Wallet| {
+            let mut v: Vec<([u8; 32], u64)> = w.outputs().unwrap().iter().filter(|o| o.seen_height.is_some() && !o.spent).map(|o| (o.commitment, o.amount)).collect();
+            v.sort();
+            v
+        };
+
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0.join("chain")).unwrap();
+        let mut chain = Chain::open(&storage, chain::DifficultyConfig::for_tests(), 5, None).unwrap();
+        let mut mempool = Mempool::new();
+        let alice = Wallet::open_with(&dir.0.join("alice"), Keychain::random()).unwrap();
+        let bob = Wallet::open_with(&dir.0.join("bob"), Keychain::random()).unwrap();
+        let tip = |chain: &Chain| chain.view().unwrap().tip_height();
+
+        // Alice mines 11 blocks: her first reward matures.
+        for _ in 0..11 {
+            mine_real(&mut chain, &mut mempool, &alice, &[&bob]);
+        }
+        // She pays Bob 0.3; Bob pays her back 0.1; she splits a coin.
+        let s1 = alice.send(300_000_000, FEE, tip(&chain)).unwrap();
+        let pay = alice.finalize(&bob.receive(&s1).unwrap()).unwrap();
+        submit_real(&chain, &mut mempool, &pay, &[&alice, &bob]);
+        mine_real(&mut chain, &mut mempool, &alice, &[&bob]);
+        let s1 = bob.send(100_000_000, FEE, tip(&chain)).unwrap();
+        let back = bob.finalize(&alice.receive(&s1).unwrap()).unwrap();
+        submit_real(&chain, &mut mempool, &back, &[&alice, &bob]);
+        mine_real(&mut chain, &mut mempool, &alice, &[&bob]);
+        let split = alice.self_transfer(None, &[50_000_000, 70_000_000], FEE, tip(&chain)).unwrap();
+        submit_real(&chain, &mut mempool, &split, &[&alice, &bob]);
+        mine_real(&mut chain, &mut mempool, &alice, &[&bob]);
+        // One more spend, signed and in the mempool -- then the wallet is lost.
+        let in_flight = alice.self_transfer(None, &[110_000_000], FEE, tip(&chain)).unwrap();
+        submit_real(&chain, &mut mempool, &in_flight, &[&alice, &bob]);
+
+        let on_chain = unspent_of(&alice);
+        assert!(on_chain.len() >= 12, "{} unspent", on_chain.len());
+        let used = alice.outputs().unwrap().iter().map(|o| o.key.index).max().unwrap();
+        let words = alice.keychain().phrase();
+        let in_flight_inputs: Vec<[u8; 32]> = in_flight.inputs.iter().map(|i| Output::new(&i.pubkey, i.amount).commitment()).collect();
+        let mut after_in_flight: Vec<([u8; 32], u64)> = on_chain.iter().filter(|(c, _)| !in_flight_inputs.contains(c)).copied().collect();
+        after_in_flight.extend(in_flight.outputs.iter().map(|o| (o.commitment(), o.amount)));
+        after_in_flight.sort();
+        drop(alice);
+        std::fs::remove_dir_all(dir.0.join("alice")).unwrap();
+        println!("lost at height {}: {} unspent outputs, keys used up to {used}", tip(&chain), on_chain.len());
+
+        // Restored from the words alone.
+        let restored = Wallet::restore(&dir.0.join("restored"), Keychain::from_phrase(&words).unwrap()).unwrap();
+        let report = restored.finish_recovery(&chain.view().unwrap()).unwrap();
+        println!("{report:?}");
+        assert_eq!(unspent_of(&restored), on_chain, "exactly her unspent outputs");
+        assert_eq!((report.unspent, report.amount), (on_chain.len(), on_chain.iter().map(|o| o.1).sum()));
+        // Past every key she ever handed out -- including ones never on
+        // chain (the in-flight spend's outputs), which the margin covers.
+        assert!(report.next_index > used, "{} <= {used}", report.next_index);
+        assert!(report.next_index >= RECOVERY_INDEX_MARGIN);
+        let now = tip(&chain);
+        assert!(restored.outputs().unwrap().iter().filter(|o| !o.spent).all(|o| matches!(o.status(now), Status::Held { .. })));
+
+        // The node sees the spend in its mempool: never signed again, and
+        // resubmitted by the restored wallet.
+        assert!(restored.observe_spend(&in_flight).unwrap());
+        assert_eq!(restored.unconfirmed_transactions().unwrap().len(), 1);
+        assert!(restored.self_transfer(Some(&in_flight_inputs), &[1], 0, now + RECOVERY_HOLD_BLOCKS).is_err());
+
+        // Bob mines through the hold; the spend in flight confirms in the
+        // first block, and its change is the restored wallet's.
+        for _ in 0..RECOVERY_HOLD_BLOCKS {
+            mine_real(&mut chain, &mut mempool, &bob, &[&restored]);
+        }
+        assert!(mempool.is_empty());
+        assert_eq!(unspent_of(&restored), after_in_flight, "the in-flight spend's outputs are found");
+        let b = restored.balance(tip(&chain)).unwrap();
+        assert_eq!((b.held, b.locked, b.pending), (0, 0, 0), "{b:?}");
+        assert_eq!(b.spendable, after_in_flight.iter().map(|o| o.1).sum::<u64>());
+
+        // And it pays Bob, with new keys only.
+        let bob_before = bob.balance(tip(&chain)).unwrap();
+        let s1 = restored.send(200_000_000, FEE, tip(&chain)).unwrap();
+        let pay = restored.finalize(&bob.receive(&s1).unwrap()).unwrap();
+        submit_real(&chain, &mut mempool, &pay, &[&restored, &bob]);
+        mine_real(&mut chain, &mut mempool, &bob, &[&restored]);
+        let bob_after = bob.balance(tip(&chain)).unwrap();
+        assert_eq!(bob_after.spendable + bob_after.immature, bob_before.spendable + bob_before.immature + 200_000_000 + prover::REWARD + FEE);
+        let new_keys: Vec<u32> = restored.outputs().unwrap().iter().filter(|o| o.origin != crate::wallet::Origin::Recovered).map(|o| o.key.index).collect();
+        assert!(!new_keys.is_empty() && new_keys.iter().all(|&k| k >= report.next_index), "{new_keys:?}");
+        println!("restored wallet paid Bob at height {}; new keys from {}", tip(&chain), report.next_index);
     }
 
 }

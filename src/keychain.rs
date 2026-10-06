@@ -20,7 +20,8 @@
 //! already signed).
 //!
 //! `Keychain::random` is for real wallets (OS randomness); `Keychain::
-//! from_seed` restores one; tests use `Keychain::test`, a fixed seed per
+//! from_phrase` restores one from its 24 backup words (`mnemonic`), and
+//! `from_seed` from the raw seed; tests use `Keychain::test`, a fixed seed per
 //! label, so each test's keys are reproducible and distinct from other
 //! tests'.
 
@@ -31,6 +32,7 @@ use crate::poseidon2::hash_bytes_32;
 use crate::wots::{self, PublicKey, SecretKey};
 
 const DOMAIN: &[u8] = b"tabernacle-keychain-v1";
+const VIEW_DOMAIN: &[u8] = b"tabernacle-view-v1";
 
 /// Which key: an account (a separate sequence of keys, e.g. for different
 /// purposes) and an index within it.
@@ -108,6 +110,29 @@ impl Keychain {
 
     pub fn seed_hex(&self) -> String {
         self.seed.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The seed as 24 backup words (`mnemonic`). Anyone holding them can
+    /// spend everything.
+    pub fn phrase(&self) -> String {
+        crate::mnemonic::to_phrase(&self.seed)
+    }
+
+    /// The view key (`recovery`): reads this wallet's outputs' recovery
+    /// nonces, can't spend.
+    ///
+    /// ```text
+    /// view_key = hash_bytes_32("tabernacle-view-v1" ‖ seed)
+    /// ```
+    pub fn view_key(&self) -> crate::recovery::ViewKey {
+        crate::recovery::ViewKey(hash_bytes_32(&[VIEW_DOMAIN, &self.seed].concat()))
+    }
+
+    /// A keychain from its 24 backup words.
+    pub fn from_phrase(phrase: &str) -> Result<Self, crate::mnemonic::Error> {
+        Ok(Keychain {
+            seed: crate::mnemonic::from_phrase(phrase)?,
+        })
     }
 
     /// A keychain from a 64-character hex seed.
@@ -207,4 +232,15 @@ mod tests {
         assert_eq!(id.to_string(), "3/3735928559");
         assert!(KeyId::from_bytes(&[0; 7]).is_none());
     }
+
+    #[test]
+    fn backup_words_restore_the_same_keys() {
+        let original = Keychain::random();
+        let restored = Keychain::from_phrase(&original.phrase()).unwrap();
+        assert_eq!(restored.seed(), original.seed());
+        let id = KeyId::new(0, 7);
+        assert_eq!(restored.output(id, 5).commitment(), original.output(id, 5).commitment());
+        assert!(Keychain::from_phrase("abandon abandon").is_err());
+    }
+
 }
