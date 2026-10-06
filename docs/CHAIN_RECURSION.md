@@ -534,7 +534,16 @@ data.
      same state, serve it on, refuse anything below H);
      `net::a_fresh_node_downloads_the_state_from_two_peers` (UDP, two
      peers at once); live on dev.
-8. Next: proving ahead (pipelining), and reconsidering the remaining
+8. **Storage** (done): a node stores a state-tree node only if its
+   subtree holds two or more unspent outputs (and never below level 4);
+   the rest is recomputed from the leaf records. The UTXO index and the
+   output index share one record per output. Measured
+   (`chain::snapshot_storage_cost`, 1M unspent outputs): **~200 B per
+   unspent output on disk after a fast sync** (161 B at 50% of outputs
+   unspent, 201 B at 10%, 208 B at 1%), down from 0.67-1.7 KB; the
+   download is ~53 B. Data in the old layout is refused (storage
+   version 2).
+9. Next: proving ahead (pipelining), and reconsidering the remaining
    optimizations.
 7. (Earlier plan.) The chain-step circuit, completed: verify parent chain proof + contents proof +
    transition proof; parent header checks (PoW, link, timestamp,

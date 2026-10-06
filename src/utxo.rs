@@ -1,5 +1,7 @@
 //! A UTXO index: a reverse lookup from an output's commitment hash to its
-//! position in the state tree (`state_tree`). This is the piece `chain`
+//! position in the state tree (`state_tree`). Stored in the same record per
+//! output as the output index (`OUTPUTS_DB`) -- one entry per output, not
+//! two. This is the piece `chain`
 //! validation needs to turn a spend into "where in the state tree is the
 //! real output it's spending" -- without it, there's no way to check a spend against real
 //! chain state at all.
@@ -75,16 +77,13 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn encode_pos(pos: u64) -> [u8; 8] {
-    pos.to_be_bytes()
-}
-
-fn decode_pos(bytes: &[u8]) -> Result<u64> {
-    bytes
-        .try_into()
-        .map(u64::from_be_bytes)
-        .map_err(|_| Error::Corrupt("position value was not 8 bytes"))
-}
+/// The database: one record per output the active chain created (see
+/// `chain`'s output index, which reads the same records): its block's
+/// height (u64 BE) ‖ recovery nonce ‖ position (u64 BE) ‖ unspent (0/1).
+pub const OUTPUTS_DB: &str = "outputs";
+const POSITION: std::ops::Range<usize> = 24..32;
+const UNSPENT: usize = 32;
+pub const RECORD_LEN: usize = 33;
 
 pub struct UtxoIndex {
     storage: Storage,
@@ -92,45 +91,75 @@ pub struct UtxoIndex {
 }
 
 impl UtxoIndex {
-    /// Open this index's table within the given storage context, creating
-    /// it if it doesn't already exist.
     pub fn open(storage: &Storage) -> Result<Self> {
-        let entries = storage.database("utxo_index")?;
+        let entries = storage.database(OUTPUTS_DB)?;
         Ok(UtxoIndex {
             storage: storage.clone(),
             entries,
         })
     }
 
-    /// Record that the output hashing to `commitment` lives at `position`,
-    /// through `wtxn`. A plain, unconditional write -- overwrites whatever
-    /// was there before for that key, with no check of whether that's
-    /// safe. See the module docs: that check belongs to the caller.
-    /// Nothing is committed here -- that's the caller's job, once every
-    /// other store it's updating in the same transaction has also
-    /// succeeded.
-    pub fn insert(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash, position: u64) -> Result<()> {
-        self.entries
-            .put(wtxn, &commitment, &encode_pos(position))?;
-        Ok(())
-    }
-
-    /// The position of the unspent output hashing to `commitment`, or
-    /// `None` if there's no such entry -- either it never existed, or it
-    /// was already spent (see `remove`). Reads through `txn` -- a plain
-    /// `RoTxn`, or the same `RwTxn` an in-progress `insert`/`remove` is
-    /// using.
-    pub fn get(&self, txn: &heed::RoTxn, commitment: Hash) -> Result<Option<u64>> {
-        match self.entries.get(txn, &commitment)? {
-            Some(bytes) => Ok(Some(decode_pos(bytes)?)),
+    fn record(&self, txn: &heed::RoTxn, commitment: &Hash) -> Result<Option<[u8; RECORD_LEN]>> {
+        match self.entries.get(txn, commitment)? {
+            Some(bytes) => Ok(Some(bytes.try_into().map_err(|_| Error::Corrupt("output record was the wrong size"))?)),
             None => Ok(None),
         }
     }
 
-    /// Remove the entry for `commitment`, e.g. once it's been spent.
-    /// Harmless no-op if there wasn't one. Nothing is committed here --
-    /// see `insert`.
+    /// `commitment` is unspent, at `position` (its record's height and
+    /// nonce are kept, or zero until `set_origin`). Nothing is committed
+    /// here -- that's the caller's transaction.
+    pub fn insert(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash, position: u64) -> Result<()> {
+        let mut record = self.record(wtxn, &commitment)?.unwrap_or([0; RECORD_LEN]);
+        record[POSITION].copy_from_slice(&position.to_be_bytes());
+        record[UNSPENT] = 1;
+        self.entries.put(wtxn, &commitment, &record)?;
+        Ok(())
+    }
+
+    /// A new unspent output's whole record at once (a snapshot import).
+    pub fn create(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash, position: u64, height: u64, nonce: &[u8; 16]) -> Result<()> {
+        let mut record = [0; RECORD_LEN];
+        record[..8].copy_from_slice(&height.to_be_bytes());
+        record[8..24].copy_from_slice(nonce);
+        record[POSITION].copy_from_slice(&position.to_be_bytes());
+        record[UNSPENT] = 1;
+        self.entries.put(wtxn, &commitment, &record)?;
+        Ok(())
+    }
+
+    /// Record the block height and recovery nonce `commitment` was created
+    /// with.
+    pub fn set_origin(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash, height: u64, nonce: &[u8; 16]) -> Result<()> {
+        let mut record = self.record(wtxn, &commitment)?.unwrap_or([0; RECORD_LEN]);
+        record[..8].copy_from_slice(&height.to_be_bytes());
+        record[8..24].copy_from_slice(nonce);
+        self.entries.put(wtxn, &commitment, &record)?;
+        Ok(())
+    }
+
+    /// The position of `commitment` if it's an unspent output. Reads
+    /// through `txn` -- a plain `RoTxn`, or the same `RwTxn` an in-progress
+    /// `insert`/`remove` is using.
+    pub fn get(&self, txn: &heed::RoTxn, commitment: Hash) -> Result<Option<u64>> {
+        Ok(self
+            .record(txn, &commitment)?
+            .filter(|r| r[UNSPENT] == 1)
+            .map(|r| u64::from_be_bytes(r[POSITION].try_into().unwrap())))
+    }
+
+    /// `commitment` is spent: no longer found by `get` (its record stays,
+    /// for recovery, until `forget`). Harmless if it isn't there.
     pub fn remove(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash) -> Result<()> {
+        if let Some(mut record) = self.record(wtxn, &commitment)? {
+            record[UNSPENT] = 0;
+            self.entries.put(wtxn, &commitment, &record)?;
+        }
+        Ok(())
+    }
+
+    /// Drop `commitment`'s record entirely (its creating block unwound).
+    pub fn forget(&mut self, wtxn: &mut heed::RwTxn, commitment: Hash) -> Result<()> {
         self.entries.delete(wtxn, &commitment)?;
         Ok(())
     }

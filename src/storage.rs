@@ -13,9 +13,12 @@ use heed::{Database, Env, EnvOpenOptions};
 use std::path::Path;
 
 /// Default LMDB map size: 1 GiB of reserved address space (not disk usage --
-/// LMDB only consumes what's actually written). Plenty for development;
-/// bump this (or reopen with a larger value) before storing more than that.
+/// LMDB only consumes what's actually written). Enough for tests and the
+/// wallet; a node's chain opens with `NODE_MAP_SIZE`.
 pub const DEFAULT_MAP_SIZE: usize = 1 << 30;
+
+/// A node's chain store: 1 TiB of address space, the most it can hold.
+pub const NODE_MAP_SIZE: usize = 1 << 40;
 
 /// Upper bound on how many named databases this environment can ever hold;
 /// LMDB requires declaring this upfront. Currently used: `state_tree` and

@@ -35,11 +35,15 @@
 //!
 //! # Storage
 //!
-//! Sparse, in LMDB: a node is stored only if it differs from the hash of
-//! an all-`EMPTY` subtree of its height (`empty`), so storage grows with
-//! the outputs actually created (about two nodes per leaf), not with the
-//! 2^32 positions. Like the other stores, every method works through the
-//! caller's transaction and keeps no state of its own.
+//! Sparse, in LMDB, and only what can't be cheaply recomputed: each
+//! unspent output's record by position (`LEAVES_DB`), and a node only if
+//! its subtree holds **two or more** unspent outputs (and it's at level
+//! `STORED_FROM` or above). Every other node follows from the leaf
+//! records and the count -- one unspent output at most, everything else
+//! spent or empty -- in at most a few dozen hashes (`get`). So storage
+//! grows with the unspent outputs, not with every output ever created:
+//! spent history costs nothing. Like the other stores, every method works
+//! through the caller's transaction and keeps no state of its own.
 
 #![allow(dead_code)]
 
@@ -228,6 +232,10 @@ pub struct StateTree {
     spent: Vec<Octet>,
 }
 
+/// Nodes below this level are never stored: computed from the leaf
+/// records (at most 2^`STORED_FROM` leaves) whenever needed.
+pub const STORED_FROM: usize = 4;
+
 impl StateTree {
     pub fn open(storage: &Storage) -> Result<Self> {
         Ok(StateTree {
@@ -244,12 +252,16 @@ impl StateTree {
         Ok(())
     }
 
-    /// The unspent outputs at positions `lo..hi`, in order.
-    pub fn unspent_in(&self, txn: &heed::RoTxn, lo: u64, hi: u64) -> Result<Vec<Entry>> {
+    /// The unspent outputs at positions `lo..hi`, in order -- at most
+    /// `limit` of them.
+    fn unspent_limited(&self, txn: &heed::RoTxn, lo: u64, hi: u64, limit: usize) -> Result<Vec<Entry>> {
         let (lo, hi) = (lo.to_be_bytes(), hi.to_be_bytes());
         let range = (std::ops::Bound::Included(&lo[..]), std::ops::Bound::Excluded(&hi[..]));
         let mut out = Vec::new();
         for item in self.leaves.range(txn, &range)? {
+            if out.len() >= limit {
+                break;
+            }
             let (key, value) = item?;
             let position = u64::from_be_bytes(key.try_into().map_err(|_| Error::Corrupt("leaf key"))?);
             if value.len() != 32 + crate::recovery::NONCE_LEN {
@@ -260,8 +272,13 @@ impl StateTree {
         Ok(out)
     }
 
+    /// The unspent outputs at positions `lo..hi`, in order.
+    pub fn unspent_in(&self, txn: &heed::RoTxn, lo: u64, hi: u64) -> Result<Vec<Entry>> {
+        self.unspent_limited(txn, lo, hi, usize::MAX)
+    }
+
     /// Node `(level, index)` as of `as_of` (see `AsOf`). Read from the
-    /// stored tree wherever nothing below it changed since.
+    /// tree as it is wherever nothing below it changed since.
     pub fn node_as_of(&self, txn: &heed::RoTxn, as_of: &AsOf, level: usize, index: u64) -> Result<Octet> {
         let (lo, hi) = (index << level, (index + 1) << level);
         if lo >= as_of.count {
@@ -295,10 +312,8 @@ impl StateTree {
 
     /// Replace the whole tree with `count` outputs, of which `unspent` (in
     /// position order) are unspent and the rest spent -- a snapshot
-    /// (`snapshot`). Its root. Fully spent subtrees are stored as their
-    /// root alone: nothing below one is ever read again (a path only
-    /// passes through subtrees holding an unspent output or the next
-    /// position, and reorgs never reach back past a snapshot).
+    /// (`snapshot`). Its root. Nodes are written in key order, so pages
+    /// fill.
     pub fn import(&self, wtxn: &mut heed::RwTxn, count: u64, unspent: &[Entry]) -> Result<[u8; 32]> {
         if count > 1 << DEPTH {
             return Err(Error::Full);
@@ -309,7 +324,12 @@ impl StateTree {
         }
         self.nodes.clear(wtxn)?;
         self.leaves.clear(wtxn)?;
-        let root = self.build(wtxn, DEPTH, 0, count, unspent)?;
+        let mut stored = Vec::new();
+        let root = self.build(DEPTH, 0, count, unspent, &mut stored);
+        stored.sort_unstable_by_key(|(k, _)| *k);
+        for (k, hash) in stored {
+            self.nodes.put(wtxn, &k, &digest_to_bytes(hash))?;
+        }
         for (position, commitment, nonce) in unspent {
             self.put_leaf(wtxn, *position, commitment, nonce)?;
         }
@@ -317,26 +337,18 @@ impl StateTree {
         Ok(digest_to_bytes(root))
     }
 
-    fn build(&self, wtxn: &mut heed::RwTxn, level: usize, index: u64, count: u64, unspent: &[Entry]) -> Result<Octet> {
-        let (lo, hi) = (index << level, (index + 1) << level);
-        let hash = if lo >= count {
-            return Ok(self.empty[level]);
-        } else if unspent.is_empty() && hi <= count {
-            self.spent[level]
-        } else if level == 0 {
-            match unspent {
-                [(p, commitment, nonce)] if *p == lo => leaf(commitment, nonce),
-                _ => return Err(Error::Corrupt("snapshot entries out of order or out of range")),
-            }
-        } else {
-            let mid = lo + (1 << (level - 1));
-            let split = unspent.partition_point(|e| e.0 < mid);
-            let left = self.build(wtxn, level - 1, 2 * index, count, &unspent[..split])?;
-            let right = self.build(wtxn, level - 1, 2 * index + 1, count, &unspent[split..])?;
-            node(level - 1, &left, &right)
-        };
-        self.nodes.put(wtxn, &key(level, index), &digest_to_bytes(hash))?;
-        Ok(hash)
+    /// `subtree_hash`, collecting the nodes `update` would store.
+    fn build(&self, level: usize, index: u64, count: u64, unspent: &[Entry], stored: &mut Vec<([u8; 9], Octet)>) -> Octet {
+        if unspent.len() < 2 || level < STORED_FROM {
+            return subtree_hash(level, index, count, unspent, &self.empty, &self.spent);
+        }
+        let mid = (index << level) + (1 << (level - 1));
+        let split = unspent.partition_point(|e| e.0 < mid);
+        let left = self.build(level - 1, 2 * index, count, &unspent[..split], stored);
+        let right = self.build(level - 1, 2 * index + 1, count, &unspent[split..], stored);
+        let hash = node(level - 1, &left, &right);
+        stored.push((key(level, index), hash));
+        hash
     }
 
     /// How many outputs the tree holds (the next position).
@@ -347,11 +359,27 @@ impl StateTree {
         }
     }
 
-    fn get(&self, txn: &heed::RoTxn, height: usize, index: u64) -> Result<Octet> {
-        match self.nodes.get(txn, &key(height, index))? {
-            Some(b) => Ok(digest_from_bytes(b.try_into().map_err(|_| Error::Corrupt("node"))?)),
-            None => Ok(self.empty[height]),
+    /// Node `(level, index)`: stored if its subtree holds two or more
+    /// unspent outputs (and it's at `STORED_FROM` or above), otherwise
+    /// computed from the leaf records -- at most one unspent output then
+    /// (or a handful, below `STORED_FROM`), everything else spent or empty.
+    fn get(&self, txn: &heed::RoTxn, level: usize, index: u64) -> Result<Octet> {
+        if level >= STORED_FROM
+            && let Some(b) = self.nodes.get(txn, &key(level, index))?
+        {
+            return Ok(digest_from_bytes(b.try_into().map_err(|_| Error::Corrupt("node"))?));
         }
+        let (lo, hi) = (index << level, (index + 1) << level);
+        let count = self.count(txn)?;
+        if lo >= count {
+            return Ok(self.empty[level]);
+        }
+        let limit = if level >= STORED_FROM { 2 } else { usize::MAX };
+        let unspent = self.unspent_limited(txn, lo, hi, limit)?;
+        if level >= STORED_FROM && unspent.len() > 1 {
+            return Err(Error::Corrupt("a node that should be stored isn't"));
+        }
+        Ok(subtree_hash(level, index, count, &unspent, &self.empty, &self.spent))
     }
 
     pub fn root(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
@@ -368,21 +396,21 @@ impl StateTree {
         (0..DEPTH).map(|h| self.get(txn, h, (position >> h) ^ 1)).collect()
     }
 
-    /// Set leaf `position`, updating its path to the root.
-    fn set(&self, wtxn: &mut heed::RwTxn, position: u64, leaf: Octet) -> Result<()> {
-        let mut hash = leaf;
-        for h in 0..=DEPTH {
+    /// After a change at `position` (its leaf record, or the count): bring
+    /// the stored nodes above it up to date -- each stored exactly if its
+    /// subtree holds two or more unspent outputs.
+    fn update(&self, wtxn: &mut heed::RwTxn, position: u64) -> Result<()> {
+        for h in STORED_FROM..=DEPTH {
             let index = position >> h;
-            if hash == self.empty[h] {
-                self.nodes.delete(wtxn, &key(h, index))?;
+            let k = key(h, index);
+            let (lo, hi) = (index << h, (index + 1) << h);
+            if self.unspent_limited(wtxn, lo, hi, 2)?.len() >= 2 {
+                let left = self.get(wtxn, h - 1, 2 * index)?;
+                let right = self.get(wtxn, h - 1, 2 * index + 1)?;
+                self.nodes.put(wtxn, &k, &digest_to_bytes(node(h - 1, &left, &right)))?;
             } else {
-                self.nodes.put(wtxn, &key(h, index), &digest_to_bytes(hash))?;
+                self.nodes.delete(wtxn, &k)?;
             }
-            if h == DEPTH {
-                break;
-            }
-            let sibling = self.get(wtxn, h, index ^ 1)?;
-            hash = if index & 1 == 0 { node(h, &hash, &sibling) } else { node(h, &sibling, &hash) };
         }
         Ok(())
     }
@@ -398,22 +426,22 @@ impl StateTree {
         if position >= 1 << DEPTH {
             return Err(Error::Full);
         }
-        self.set(wtxn, position, leaf(commitment, nonce))?;
         self.put_leaf(wtxn, position, commitment, nonce)?;
         self.set_count(wtxn, position + 1)?;
+        self.update(wtxn, position)?;
         Ok(position)
     }
 
     /// Mark the output at `position` spent.
     pub fn spend(&self, wtxn: &mut heed::RwTxn, position: u64) -> Result<()> {
         self.leaves.delete(wtxn, &position.to_be_bytes())?;
-        self.set(wtxn, position, SPENT)
+        self.update(wtxn, position)
     }
 
     /// Undo `spend`: the output at `position` is unspent again.
     pub fn unspend(&self, wtxn: &mut heed::RwTxn, position: u64, commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN]) -> Result<()> {
         self.put_leaf(wtxn, position, commitment, nonce)?;
-        self.set(wtxn, position, leaf(commitment, nonce))
+        self.update(wtxn, position)
     }
 
     /// Undo the last `n` appends.
@@ -422,9 +450,17 @@ impl StateTree {
         let keep = count.checked_sub(n).ok_or(Error::Corrupt("truncating below zero"))?;
         for position in keep..count {
             self.leaves.delete(wtxn, &position.to_be_bytes())?;
-            self.set(wtxn, position, EMPTY)?;
         }
-        self.set_count(wtxn, keep)
+        self.set_count(wtxn, keep)?;
+        // Every stored node over a removed position: one update per
+        // smallest stored subtree touched covers them all.
+        let step = 1u64 << STORED_FROM;
+        let mut position = keep;
+        while position < count {
+            self.update(wtxn, position)?;
+            position = (position / step + 1) * step;
+        }
+        Ok(())
     }
 }
 
@@ -601,6 +637,64 @@ mod tests {
         assert_eq!(tree.unspent_as_of(&wtxn, &as_of, 0, 1000).unwrap(), unspent_then);
         let middle: Vec<Entry> = unspent_then.iter().filter(|e| (40..60).contains(&e.0)).copied().collect();
         assert_eq!(tree.unspent_as_of(&wtxn, &as_of, 40, 60).unwrap(), middle);
+    }
+
+
+    /// Random pushes, spends, unspends and truncates: after each, the root
+    /// and paths match a tree rebuilt from scratch with every node
+    /// computed, and exactly the nodes an import of the same state would
+    /// store are stored.
+    #[test]
+    fn stored_nodes_stay_exactly_those_needed() {
+        let (_d, storage, tree) = open("random-ops");
+        let (_d2, storage2, fresh) = open("random-ops-import");
+        let (empty, spent) = (empty_hashes(), spent_hashes());
+        let mut wtxn = storage.write_txn().unwrap();
+        let mut seed = 12345u64;
+        let mut random = move |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut next = 0u64;
+        for step in 0..600 {
+            let count = tree.count(&wtxn).unwrap();
+            match random(10) {
+                0..=4 => {
+                    tree.push(&mut wtxn, &commitment(next), &nonce(next)).unwrap();
+                    next += 1;
+                }
+                5..=7 if count > 0 => {
+                    let p = random(count);
+                    tree.spend(&mut wtxn, p).unwrap();
+                }
+                8 if count > 0 => {
+                    // Unspend whatever is at a spent position (as a reorg
+                    // would, with its original output).
+                    let p = random(count);
+                    if tree.unspent_in(&wtxn, p, p + 1).unwrap().is_empty() {
+                        let k = p; // commitment(k) was pushed at p only if never truncated; any value does here
+                        tree.unspend(&mut wtxn, p, &commitment(k + 1_000_000), &nonce(k)).unwrap();
+                    }
+                }
+                _ if count > 0 => tree.truncate(&mut wtxn, random(count.min(40)) + 1).unwrap(),
+                _ => {}
+            }
+            let count = tree.count(&wtxn).unwrap();
+            let unspent = tree.unspent_in(&wtxn, 0, u64::MAX).unwrap();
+            let root = subtree_hash(DEPTH, 0, count, &unspent, &empty, &spent);
+            assert_eq!(tree.root(&wtxn).unwrap(), digest_to_bytes(root), "step {step}");
+            if step % 50 == 0 {
+                let mut w2 = storage2.write_txn().unwrap();
+                assert_eq!(fresh.import(&mut w2, count, &unspent).unwrap(), digest_to_bytes(root));
+                let stored: Vec<Vec<u8>> = tree.nodes.iter(&wtxn).unwrap().map(|e| e.unwrap().0.to_vec()).collect();
+                let wanted: Vec<Vec<u8>> = fresh.nodes.iter(&w2).unwrap().map(|e| e.unwrap().0.to_vec()).collect();
+                assert_eq!(stored, wanted, "step {step}");
+                for p in [0, count / 2, count.saturating_sub(1), count] {
+                    assert_eq!(tree.path(&wtxn, p).unwrap(), fresh.path(&w2, p).unwrap());
+                }
+                w2.commit().unwrap();
+            }
+        }
     }
 
 }

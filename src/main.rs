@@ -704,7 +704,7 @@ fn main() {
         info!("Found an existing chain at {} -- loading it.", path.display());
     }
 
-    let storage = Storage::open(&path).expect("failed to open storage");
+    let storage = Storage::open_with_map_size(&path, storage::NODE_MAP_SIZE).expect("failed to open storage");
     if args.network != network::Network::Main {
         info!("Network: {} (light, insecure proofs -- for testing only)", args.network.name());
     }
@@ -712,10 +712,10 @@ fn main() {
     assert_eq!(hex(&genesis.header.hash()), self::genesis().hash, "genesis constants are inconsistent");
     info!("Genesis block: {}", self::genesis().hash);
     let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap_or_else(|e| {
-        let hint = if matches!(e, chain::Error::WrongGenesis) {
-            " (its data is from a chain with a different genesis block -- delete it, or use another --data-dir)"
-        } else {
-            ""
+        let hint = match e {
+            chain::Error::WrongGenesis => " (its data is from a chain with a different genesis block -- delete it, or use another --data-dir)",
+            chain::Error::OldStorage => " (delete it, or use another --data-dir)",
+            _ => "",
         };
         die(&format!("failed to open chain at {}: {e}{hint}", path.display()));
     });

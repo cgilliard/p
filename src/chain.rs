@@ -179,6 +179,12 @@ const WINDOW_START_TIMESTAMP_KEY: &[u8] = b"window_start_timestamp";
 /// genesis block, so no reorg reaches below it (`reorg_floor`).
 const SYNC_BASE_KEY: &[u8] = b"sync_base";
 
+/// `chain_meta` key: the layout version of everything stored (u32 BE).
+/// Data written in another layout is refused (`Error::OldStorage`), not
+/// misread.
+const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
+const STORAGE_VERSION: u32 = 2;
+
 /// Database name: every applied block, in full (`Block::to_bytes`),
 /// keyed by its own header hash. The one place this module keeps
 /// actual block data around after applying it -- needed so a reorg
@@ -237,7 +243,7 @@ const ACTIVE_HEIGHTS_DB: &str = "active_heights";
 /// block applies, removed only when that block is unwound -- spending
 /// doesn't touch it. What a wallet checks its outputs' nonces against,
 /// and what recovery scans (`docs/RECOVERY.md`).
-const OUTPUT_INDEX_DB: &str = "output_index";
+const OUTPUT_INDEX_DB: &str = crate::utxo::OUTPUTS_DB;
 
 /// How many blocks the orphan pool holds before evicting the oldest --
 /// a bound on how much memory a peer can make this node spend on
@@ -274,6 +280,8 @@ pub enum Error {
     DuplicateOutput([u8; 32]),
     /// A fast sync's snapshot was refused: why.
     Snapshot(&'static str),
+    /// The stored data is in another layout (an older version's).
+    OldStorage,
     /// Applying the body produced a state root different from the one the
     /// header claims.
     StateRootMismatch,
@@ -378,6 +386,7 @@ impl std::fmt::Display for Error {
             Error::UnresolvedInput(c) => write!(f, "input {} does not resolve to a live unspent output", hex(c)),
             Error::DuplicateOutput(c) => write!(f, "output {} collides with a still-live output", hex(c)),
             Error::Snapshot(why) => write!(f, "snapshot refused: {why}"),
+            Error::OldStorage => write!(f, "the stored chain is from an incompatible version of this software"),
             Error::StateRootMismatch => write!(f, "header's state_root does not match the result of applying the body"),
             Error::OutputCountMismatch => write!(f, "header's output_count does not match the result of applying the body"),
             Error::InvalidTransaction(i) => write!(f, "transaction at index {i} failed verify()"),
@@ -710,13 +719,13 @@ pub struct OutputRecord {
 
 impl OutputRecord {
     fn decode(commitment: [u8; 32], bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 8 + NONCE_LEN {
+        if bytes.len() != crate::utxo::RECORD_LEN {
             return Err(Error::Corrupt("output index entry was the wrong size"));
         }
         Ok(OutputRecord {
             commitment,
             height: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
-            nonce: bytes[8..].try_into().unwrap(),
+            nonce: bytes[8..8 + NONCE_LEN].try_into().unwrap(),
         })
     }
 }
@@ -997,6 +1006,18 @@ impl Chain {
             max_orphans: MAX_ORPHANS,
         };
 
+        {
+            let mut wtxn = storage.write_txn()?;
+            match chain.meta.get(&wtxn, STORAGE_VERSION_KEY)? {
+                Some(v) if v == STORAGE_VERSION.to_be_bytes() => {}
+                Some(_) => return Err(Error::OldStorage),
+                None if chain.meta.get(&wtxn, TIP_HEADER_KEY)?.is_some() => return Err(Error::OldStorage),
+                None => {
+                    chain.meta.put(&mut wtxn, STORAGE_VERSION_KEY, &STORAGE_VERSION.to_be_bytes())?;
+                    wtxn.commit()?;
+                }
+            }
+        }
         if let Some(genesis) = genesis {
             let rtxn = storage.read_txn()?;
             let first = chain.active_heights.get(&rtxn, &0u64.to_be_bytes())?.map(|h| h.to_vec());
@@ -1287,12 +1308,16 @@ impl Chain {
         if root != header.state_root {
             return Err(Error::StateRootMismatch);
         }
-        for (position, commitment, nonce) in unspent {
-            if self.utxo.get(&wtxn, *commitment)?.is_some() {
-                return Err(Error::DuplicateOutput(*commitment));
+        // In commitment order, so the records' pages fill.
+        let mut by_commitment: Vec<&crate::state_tree::Entry> = unspent.iter().collect();
+        by_commitment.sort_unstable_by_key(|e| e.1);
+        for pair in by_commitment.windows(2) {
+            if pair[0].1 == pair[1].1 {
+                return Err(Error::DuplicateOutput(pair[0].1));
             }
-            self.utxo.insert(&mut wtxn, *commitment, *position)?;
-            self.output_index.put(&mut wtxn, commitment, &[&header.height.to_be_bytes()[..], nonce].concat())?;
+        }
+        for (position, commitment, nonce) in by_commitment {
+            self.utxo.create(&mut wtxn, *commitment, *position, header.height, nonce)?;
         }
         self.meta.put(&mut wtxn, TIP_HEADER_KEY, &header.to_bytes())?;
         self.meta.put(&mut wtxn, CURRENT_TARGET_KEY, &point.target)?;
@@ -1626,8 +1651,7 @@ impl Chain {
         let chunks = Self::chunks_of(&block.body);
         let (state_root, output_count, spent_inputs, _) = self.resolve_and_apply(wtxn, &block.body, &chunks, false)?;
         for (commitment, nonce) in block.body.outputs.iter().zip(&block.body.nonces) {
-            let record = [&block.header.height.to_be_bytes()[..], nonce].concat();
-            self.output_index.put(wtxn, commitment, &record)?;
+            self.utxo.set_origin(wtxn, *commitment, block.header.height, nonce)?;
         }
         if state_root != block.header.state_root {
             return Err(Error::StateRootMismatch);
@@ -1698,8 +1722,7 @@ impl Chain {
         // Reverse the outputs: each one this block created disappears
         // from the live set again.
         for commitment in &block.body.outputs {
-            self.utxo.remove(wtxn, *commitment)?;
-            self.output_index.delete(wtxn, commitment)?;
+            self.utxo.forget(wtxn, *commitment)?;
         }
         // Reverse the appends -- this block appended exactly
         // `body.outputs.len()` outputs, the last ones, and nothing else
@@ -2263,6 +2286,82 @@ mod tests {
         assert!(matches!(b.accept_block(blocks[h - 1].clone()), Err(Error::ReorgTooDeep)));
         // A fresh chain only.
         assert!(matches!(b.import_snapshot(base, &point, &[], &unspent), Err(Error::Snapshot(_))));
+    }
+
+    /// What a fast-synced state costs on disk, per unspent output: a
+    /// synthetic state of `UNSPENT` unspent outputs (default 1M) scattered
+    /// among `OUTPUTS` ever created (default 10×), imported as a fast sync
+    /// does, then every database's pages counted.
+    /// `cargo test --release -- --ignored --nocapture snapshot_storage_cost`.
+    #[test]
+    #[ignore]
+    fn snapshot_storage_cost() {
+        let var = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let unspent_count = var("UNSPENT", 1_000_000);
+        let outputs = var("OUTPUTS", 10 * unspent_count);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let stride = outputs / unspent_count;
+        let unspent: Vec<crate::state_tree::Entry> = (0..unspent_count)
+            .map(|i| {
+                let position = i * stride + random() % stride;
+                let mut commitment = [0u8; 32];
+                for c in commitment.chunks_mut(8) {
+                    c.copy_from_slice(&random().to_le_bytes());
+                }
+                let nonce: [u8; 16] = [random().to_le_bytes(), random().to_le_bytes()].concat().try_into().unwrap();
+                (position, commitment, nonce)
+            })
+            .collect();
+        let (empty, spent) = (crate::state_tree::empty_hashes(), crate::state_tree::spent_hashes());
+        let root = crate::poseidon2::digest_to_bytes(crate::state_tree::subtree_hash(crate::state_tree::DEPTH, 0, outputs, &unspent, &empty, &spent));
+        let body = BlockBody {
+            inputs: vec![],
+            outputs: vec![],
+            nonces: vec![],
+            proof: prover::Proof::placeholder(),
+            chain_proof: vec![],
+        };
+        let header = BlockHeader {
+            prev_hash: [1; 32],
+            state_root: root,
+            body_hash: body.body_hash(),
+            output_count: outputs,
+            height: 1,
+            timestamp: 1,
+            nonce: [0; 32],
+        };
+        let base = Block { header, body };
+        let point = crate::snapshot::SyncPoint {
+            target: [0xff; 32],
+            window_start: 0,
+            work: [0; 32],
+        };
+        let dir = std::env::temp_dir().join(format!("storage-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open_with_map_size(&dir, 1 << 40).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5, None).unwrap();
+        let start = std::time::Instant::now();
+        chain.import_snapshot(&base, &point, &[], &unspent).unwrap();
+        println!("{unspent_count} unspent of {outputs} outputs: imported in {:.1?}", start.elapsed());
+        let rtxn = storage.read_txn().unwrap();
+        let mut total = 0;
+        for name in ["state_tree", "state_leaves", "outputs", "state_meta", "chain_meta", "blocks"] {
+            let Ok(db) = storage.database(name) else { continue };
+            let stat = db.stat(&rtxn).unwrap();
+            let bytes = (stat.branch_pages + stat.leaf_pages + stat.overflow_pages) * stat.page_size as usize;
+            total += bytes;
+            println!("  {name:<14} {:>12} entries {:>14} bytes  {:>7.1} B per unspent output", stat.entries, bytes, bytes as f64 / unspent_count as f64);
+        }
+        println!("  total {total} bytes: {:.1} B per unspent output", total as f64 / unspent_count as f64);
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The key correctness property, same spirit as `state_tree`'s undo
