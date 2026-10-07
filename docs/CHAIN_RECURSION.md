@@ -543,7 +543,14 @@ data.
    unspent, 201 B at 10%, 208 B at 1%), down from 0.67-1.7 KB; the
    download is ~53 B. Data in the old layout is refused (storage
    version 2).
-9. Next: proving ahead (pipelining), and reconsidering the remaining
+9. **128-bit main** (done): blowup 16, 26 queries, 24 grinding bits --
+   128 bits conjectured, ~64 against Grover. Each query costs ~5.9k rows
+   per verified proof, so a circuit verifying two proofs needs ~345k
+   rows: every tree proof is 2^19. Measured on a 12-thread laptop:
+   one-chunk block proof ~296 s (157 s of it the chunk), 161.9 KB,
+   verify 10.3 ms, peak 7.8 GB; chain step 344,911 rows (66%), proof
+   148.6 s, 161 KB, verify 10.2 ms, peak 9.9 GB. Dev is unchanged.
+10. Next: proving ahead (pipelining), and reconsidering the remaining
    optimizations.
 7. (Earlier plan.) The chain-step circuit, completed: verify parent chain proof + contents proof +
    transition proof; parent header checks (PoW, link, timestamp,

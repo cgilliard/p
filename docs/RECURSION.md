@@ -144,8 +144,9 @@ returns here, applied to the chunk layer.
   blowup (2–4), dense layout. Their proof size matters only through
   aggregation cost.
 - **Aggregation proofs (inner):** moderate parameters.
-- **Root proof:** blowup 16, 20 queries, 20-bit grinding — the current
-  `prover::PARAMS` — for the smallest published proof and fastest check.
+- **Root proof:** blowup 16, 26 queries, 24-bit grinding (128 bits
+  conjectured, ~64 against Grover) — the current `prover::PARAMS` — for
+  the smallest published proof and fastest check at that security.
 
 The verifier of a block checks only the root.
 
@@ -315,9 +316,11 @@ Considered and set aside, with reasons:
 - *4-ary aggregation*: halves tree depth, but each node verifies twice
   as many children (twice the work), so latency per block is about the
   same unless nodes are themselves split across machines.
-- *Cheaper tree parameters* (lower blowup, more queries): more queries
-  make the verifier circuit bigger than 2^18; blowup 16 / 20 queries is
-  the sweet spot for tree layers.
+- *Cheaper tree parameters* (lower blowup, more queries): each query
+  costs ~5.9k rows per verified proof (measured, `recursion::
+  print_profile`), so more queries grow every verifier circuit; blowup 16
+  is the sweet spot for tree layers. At 26 queries a circuit verifying
+  two proofs needs ~330k rows, hence 2^19 tree proofs.
 
 ## Open questions
 
@@ -351,7 +354,7 @@ the body's commitment lists:
 
 Consensus constants (`prover`): `CHUNK_SHAPE` (4096 blocks = 2^17 rows,
 10 inputs, 256 outputs), `CHUNK_PARAMS` (= `PARAMS`, hiding), `TREE`
-(2^18 rows; blowup 16, 20 queries, 20-bit grinding, *not* hiding), and
+(2^19 rows; blowup 16, 26 queries, 24-bit grinding, *not* hiding), and
 the wrap and aggregation circuits' preprocessed caps (`WRAP_CAP`,
 `AGGREGATE_CAP`), derived from the circuits by the `tree_keys` test --
 which must be re-run, and the constants updated, after any change to the

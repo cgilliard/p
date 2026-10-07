@@ -354,6 +354,51 @@ fn ext_element(b: &mut Builder, leaf: &[OVar], k: usize) -> EVar {
     if k.is_multiple_of(2) { lo } else { hi }
 }
 
+// Circuit rows by part of the verifier, for measuring (`print_profile`):
+// test builds only.
+#[cfg(test)]
+thread_local! {
+    pub static PROFILE: std::cell::RefCell<Vec<(&'static str, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Charge the rows added since `*since` to `label` (test builds only).
+#[cfg_attr(not(test), allow(unused_variables))]
+fn charge(b: &Builder, label: &'static str, since: &mut usize) {
+    #[cfg(test)]
+    {
+        let now = b.rows_used();
+        PROFILE.with(|p| {
+            let mut p = p.borrow_mut();
+            match p.iter_mut().find(|(l, _)| *l == label) {
+                Some(entry) => entry.1 += now - *since,
+                None => p.push((label, now - *since)),
+            }
+        });
+        *since = now;
+    }
+}
+
+#[cfg(test)]
+pub fn clear_profile() {
+    PROFILE.with(|p| p.borrow_mut().clear());
+}
+
+/// Print what `charge` recorded since the last call -- for a circuit of
+/// `total` rows verifying `proofs` proofs of `queries` queries each -- and
+/// clear it.
+#[cfg(test)]
+pub fn print_profile(total: usize, proofs: usize, queries: usize) {
+    let profile = PROFILE.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    let verifier: usize = profile.iter().map(|(_, r)| r).sum();
+    let per_query: usize = profile.iter().filter(|(l, _)| l.starts_with("query")).map(|(_, r)| r).sum();
+    println!("  {total} rows: {verifier} verifying {proofs} proof(s), {} other", total - verifier);
+    for (label, rows) in &profile {
+        println!("    {label:<28} {rows:>8}  ({:.1}%)", 100.0 * *rows as f64 / total as f64);
+    }
+    let one = per_query as f64 / (proofs * queries) as f64;
+    println!("  per query per proof: {one:.0} rows; +1 query everywhere = +{:.0} rows", one * proofs as f64);
+}
+
 /// Add to `b` a circuit verifying `proof` for `air` under `params`. The
 /// proof must verify natively (checked first: `None` otherwise) -- a
 /// prover can't produce this circuit's witness for a bad proof, and this
@@ -365,6 +410,7 @@ fn ext_element(b: &mut Builder, leaf: &[OVar], k: usize) -> EVar {
 /// something, ...). Unbound, it proves only "some statement of this shape
 /// has a valid proof".
 pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: &Params) -> Option<Statement> {
+    let mut since = b.rows_used();
     if !stark::verify(air, proof, params) {
         return None;
     }
@@ -607,10 +653,12 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
         let path = tree_log.saturating_sub(cap_bits);
         (path, bits.slice(b, path, tree_log))
     };
+    charge(b, "before the queries", &mut since);
     for (q, query) in proof.fri.query_proofs.iter().enumerate() {
         let sample = t.challenge_ext(b, fri::QUERY_INDEX_LABEL);
         let bits = Bits::of(b, sample);
         let low_bits = &bits.bits[..leaves_log];
+        charge(b, "query: index", &mut since);
 
         // First layer: the DEEP combination at x and -x, from the STARK
         // openings at `low`.
@@ -618,6 +666,7 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
         let (path, cap_index) = path_and_cap(b, &bits, leaves_log);
         let trace_leaf = witness_leaf(b, &openings.trace.leaf);
         merkle_check(b, &trace_leaf, openings.trace.leaf.len(), &openings.trace, &low_bits[..path], trace_cap, cap_index);
+        charge(b, "query: trace opening", &mut since);
         let fixed_leaf = match (&openings.preprocessed, preprocessed_cap) {
             (Some(o), Some(table)) => {
                 let leaf = witness_leaf(b, &o.leaf);
@@ -626,8 +675,10 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
             }
             _ => Vec::new(),
         };
+        charge(b, "query: preprocessed opening", &mut since);
         let aux_leaf = witness_leaf(b, &openings.aux.leaf);
         merkle_check(b, &aux_leaf, openings.aux.leaf.len(), &openings.aux, &low_bits[..path], aux_cap, cap_index);
+        charge(b, "query: aux opening", &mut since);
         let composition_leaf = witness_leaf(b, &openings.composition.leaf);
         merkle_check(
             b,
@@ -638,6 +689,7 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
             composition_cap,
             cap_index,
         );
+        charge(b, "query: composition opening", &mut since);
 
         let x = power_from_bits(b, COSET_SHIFT, lde_generator, low_bits);
         let neg_x = b.scale(x, -BabyBear::ONE);
@@ -676,6 +728,7 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
         }
         let x_inv = b.inverse(x);
         let mut value = fold_pair(b, sides[0], sides[1], x_inv, beta0);
+        charge(b, "query: DEEP combination", &mut since);
 
         // Committed rounds.
         let mut log = log_size - 1;
@@ -688,6 +741,7 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
             let leaf: Vec<OVar> = (0..values.len() / 2).map(|k| b.pack(table.ext(2 * k), table.ext(2 * k + 1))).collect();
             let (path, cap_index) = path_and_cap(b, &bits, group_log);
             merkle_check(b, &leaf, opening.leaf.len(), opening, &bits.bits[..path], round_caps[r], cap_index);
+            charge(b, "query: FRI round openings", &mut since);
             let slot = bits.slice(b, group_log, log);
             b.lookup_ext(value, table, slot);
 
@@ -720,8 +774,10 @@ pub fn verify<A: RecursiveAir>(b: &mut Builder, air: &A, proof: &Proof, params: 
                 layer_shift = layer_shift * layer_shift;
             }
             log -= arity;
+            charge(b, "query: FRI folding", &mut since);
         }
         b.assert_eq(value, final_value);
+        charge(b, "query: FRI folding", &mut since);
     }
     Some(Statement {
         octets: statement,

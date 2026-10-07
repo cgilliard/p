@@ -924,7 +924,7 @@ mod tests {
         // HIDING=0 profiles a tree layer without zero-knowledge blinding.
         let hiding = std::env::var("HIDING").map_or(true, |v| v != "0");
         let tree = TreeParams {
-            trace_len: 1 << 18,
+            trace_len: crate::prover::TREE.trace_len,
             params: Params { hiding, ..consensus },
         };
         println!("tree parameters: {:?}", tree.params);
