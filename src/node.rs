@@ -58,8 +58,20 @@ pub enum Request {
 /// What to print back: the text, or an error message.
 pub type Reply = Result<String, String>;
 
-/// A chain proof, and the block it attests.
-type CachedChainProof = ([u8; 32], Vec<u8>);
+/// A chain proof being made in the background: `None` while it's being
+/// proven, then `Some(proof)` -- `Some(None)` if proving failed. Waited on
+/// (the condvar) by whatever needs it.
+type ChainProofSlot = Arc<(std::sync::Mutex<Option<Option<Vec<u8>>>>, std::sync::Condvar)>;
+
+/// Wait for a chain proof job to finish; its proof, if it made one.
+fn wait_for(slot: &ChainProofSlot) -> Option<Vec<u8>> {
+    let (lock, ready) = &**slot;
+    let mut state = lock.lock().unwrap();
+    while state.is_none() {
+        state = ready.wait(state).unwrap();
+    }
+    state.clone().unwrap()
+}
 
 enum Miner {
     Idle,
@@ -105,9 +117,10 @@ pub struct Node {
     /// Makes the chain proofs this node's blocks carry (`chain_step`):
     /// shared with the proving thread, which derives its keys once.
     pub chain_prover: Arc<std::sync::Mutex<crate::chain_step::ChainProver>>,
-    /// The last chain proof made, by the block it attests -- a template
-    /// rebuilt on the same tip reuses it.
-    chain_proof: Arc<std::sync::Mutex<Option<CachedChainProof>>>,
+    /// Proving ahead: the chain proof of the tip, started the moment the
+    /// tip moves (`prove_tip`) and made alongside the block proof -- by
+    /// the block it attests. Every template on that tip reuses it.
+    chain_job: Option<([u8; 32], ChainProofSlot)>,
     miner: Miner,
     last_balance: Option<wallet::Balance>,
     /// Build the next template without mempool transactions (after one
@@ -158,7 +171,7 @@ impl Node {
                 crate::chain::DifficultyConfig::for_tests(),
                 prover::tree(),
             ))),
-            chain_proof: Arc::new(std::sync::Mutex::new(None)),
+            chain_job: None,
             miner: Miner::Idle,
             last_balance: None,
             skip_mempool: false,
@@ -352,6 +365,7 @@ impl Node {
                 let _ = self.commands.send(Command::ForgetTx { id });
             }
         }
+        self.prove_tip();
         let tip = self.reader.tip().ok().flatten().map(|(_, hash)| hash);
         let stale = match &self.miner {
             Miner::Proving { unproven, .. } => Some(unproven.prev_hash) != tip,
@@ -514,6 +528,58 @@ impl Node {
     }
 
     /// Build a block template and start proving it on a worker thread.
+    /// Proving ahead: make sure the chain proof of the current tip is made
+    /// or being made, in the background, if this node mines -- started
+    /// the moment the tip moves, so it's done (or nearly) by the time the
+    /// next block's own proof is. The tip and its job.
+    fn prove_tip(&mut self) -> Option<([u8; 32], ChainProofSlot)> {
+        if !self.mining || self.recovering || self.fast_sync.is_some() {
+            return None;
+        }
+        let tip = self.reader.tip().ok().flatten()?.1;
+        if let Some((hash, slot)) = &self.chain_job
+            && *hash == tip
+            && !matches!(*slot.0.lock().unwrap(), Some(None))
+        {
+            return Some((tip, slot.clone())); // being made, or made: reused
+        }
+        let inputs = match self.chain.chain_proof_inputs(tip) {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                error!("can't gather the tip's chain proof inputs: {e}");
+                return None;
+            }
+        };
+        let second = self.reader.active_hash_at(1).ok().flatten().and_then(|h| self.chain.chain_proof_inputs(h).ok());
+        let slot: ChainProofSlot = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let (job, chain_prover) = (slot.clone(), self.chain_prover.clone());
+        std::thread::spawn(move || {
+            // One at a time: a job for an earlier tip still running finishes
+            // first (the prover's lock), rather than both at once.
+            let mut chain_prover = chain_prover.lock().unwrap();
+            let start = Instant::now();
+            let made = match chain_prover.prove(&inputs, || second, crate::random_key()) {
+                Ok(proof) if crate::chain_step::consensus_verifier().verify(&inputs.tip, &proof) => {
+                    debug!("chain proof of block #{}: {:.2?}", inputs.tip.height, start.elapsed());
+                    Some(proof)
+                }
+                Ok(_) => {
+                    error!("the chain proof doesn't verify against this network's keys -- are the chain-proof constants stale?");
+                    None
+                }
+                Err(e) => {
+                    error!("proving the tip's chain proof failed: {e:?}");
+                    None
+                }
+            };
+            let (lock, ready) = &*job;
+            *lock.lock().unwrap() = Some(made);
+            ready.notify_all();
+        });
+        self.chain_job = Some((tip, slot.clone()));
+        Some((tip, slot))
+    }
+
     fn start_template(&mut self) {
         let (txs, fees) = if std::mem::take(&mut self.skip_mempool) {
             (Vec::new(), 0)
@@ -550,59 +616,26 @@ impl Node {
             );
         }
         let (inputs, outputs, nonces, plan) = (unproven.inputs.clone(), unproven.outputs.clone(), unproven.nonces.clone(), unproven.plan.clone());
-        // The parent's chain proof: made before (this tip's), or to make --
-        // with what it needs from the chain gathered here.
-        let parent = unproven.prev_hash;
-        let cached = self.chain_proof.lock().unwrap().as_ref().filter(|(h, _)| *h == parent).map(|(_, p)| p.clone());
-        let to_prove = match cached {
-            Some(_) => None,
-            None => match self.chain.chain_proof_inputs(parent) {
-                Ok(inputs) => {
-                    let second = self
-                        .reader
-                        .active_hash_at(1)
-                        .ok()
-                        .flatten()
-                        .and_then(|h| self.chain.chain_proof_inputs(h).ok());
-                    Some((inputs, second))
-                }
-                Err(e) => {
-                    error!("can't gather the parent's chain proof inputs: {e}");
-                    self.abandon_template();
-                    return;
-                }
-            },
+        // The parent's chain proof is (normally) already being made; the
+        // block proof runs alongside it, and mining waits for both.
+        let Some(slot) = self.prove_tip().filter(|(hash, _)| *hash == unproven.prev_hash).map(|(_, slot)| slot) else {
+            self.abandon_template();
+            return;
         };
-        let (chain_prover, chain_proof_cache) = (self.chain_prover.clone(), self.chain_proof.clone());
         let (send, result) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let chain_proof = match (cached, to_prove) {
-                (Some(proof), _) => Some(proof),
-                (None, Some((parent_inputs, second))) => {
-                    let start = Instant::now();
-                    let made = chain_prover.lock().unwrap().prove(&parent_inputs, || second, crate::random_key());
-                    match made {
-                        Ok(proof) if crate::chain_step::consensus_verifier().verify(&parent_inputs.tip, &proof) => {
-                            debug!("chain proof of block #{}: {:.2?}", parent_inputs.tip.height, start.elapsed());
-                            *chain_proof_cache.lock().unwrap() = Some((parent, proof.clone()));
-                            Some(proof)
-                        }
-                        Ok(_) => {
-                            error!("the chain proof doesn't verify against this network's keys -- are the chain-proof constants stale?");
-                            None
-                        }
-                        Err(e) => {
-                            error!("proving the parent's chain proof failed: {e:?}");
-                            None
-                        }
-                    }
+            let start = Instant::now();
+            let block = prover::prove_block(&inputs, &outputs, &nonces, &transactions, &plan, crate::random_key());
+            debug!("block proof: {:.2?}", start.elapsed());
+            let both = block.and_then(|proof| {
+                let waited = Instant::now();
+                let chain_proof = wait_for(&slot)?;
+                if waited.elapsed() > Duration::from_millis(500) {
+                    debug!("waited {:.2?} for the parent's chain proof", waited.elapsed());
                 }
-                (None, None) => None,
-            };
-            let block = chain_proof.and_then(|chain_proof| {
-                prover::prove_block(&inputs, &outputs, &nonces, &transactions, &plan, crate::random_key()).map(|p| (p, chain_proof))
+                Some((proof, chain_proof))
             });
-            let _ = send.send(block);
+            let _ = send.send(both);
         });
         self.miner = Miner::Proving {
             unproven,
