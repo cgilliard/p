@@ -215,11 +215,12 @@ A new node, holding only the genesis block:
    for every header up to H.
 2. **Fetches blocks H and H+1.** Block H+1 carries π_H, the chain proof
    of H.
-3. **Gets H's sync point** -- the target, retarget window start and
-   cumulative work after H -- from any peer, and believes it once π_H
-   verifies against H's header and it (`Chain::check_sync_point`): every
-   block up to H valid, every state transition right, proof of work and
-   retargeting followed, that much work.
+3. **Gets H's sync point** -- the target, retarget anchor (the first
+   block's timestamp) and cumulative work after H -- from any peer, and
+   believes it once π_H verifies against H's header and it
+   (`Chain::check_sync_point`): every block up to H valid, every state
+   transition right, proof of work and retargeting followed, that much
+   work.
 4. **Downloads the state as of H** from every peer at once, piece by
    piece, each checked on arrival (below).
 5. **Starts at H** (`Chain::import_snapshot`): the snapshot must hash to
@@ -553,13 +554,25 @@ data.
    one-chunk block proof ~296 s (157 s of it the chunk), 161.9 KB,
    verify 10.3 ms, peak 7.8 GB; chain step 344,911 rows (66%), proof
    148.6 s, 161 KB, verify 10.2 ms, peak 9.9 GB. Dev is unchanged.
-10. **Ten-minute blocks, the reward schedule, the aux hash** (done,
-   2026-10-07):
-   - **Main's target block time is ten minutes, retargeting every 2016
-     blocks** (Bitcoin's window: two weeks at the target pace; dev's
-     unchanged: 10 blocks). The clamped window time then exceeds both 2^32 and p, so
-     the retarget gadget clamps limb by limb and takes times as six
-     bytes.
+10. **Ten-minute blocks, ASERT, the reward schedule, the aux hash**
+   (done, 2026-10-07):
+   - **Main's target block time is ten minutes** (dev's unchanged).
+   - **Retargeting is ASERT** (Bitcoin Cash's aserti3-2d, replacing
+     Bitcoin's window rule; `chain::asert`): every block's target is the
+     first block's, times `2^(behind / half_life)`, `behind` being how
+     far the block's timestamp is past the schedule (the first block's
+     timestamp plus a target block time per block since), with
+     aserti3-2d's integer arithmetic (a cubic for the fractional power)
+     and clamped to `[1, 2^256 - 1]`. Half-life: two days on main (288
+     blocks), ten minutes on dev. It adjusts every block, and needs no
+     window: the retarget state is just the first block's timestamp,
+     carried in the chain proof where the window start was. The gadget
+     (`chain_rules::retarget`) offsets `behind` by a multiple of the
+     half-life to keep it non-negative, checks the division and the
+     cubic in bytes, and shifts by a small multiplier plus a 7-stage
+     byte barrel shifter; it's tested against the native rule at every
+     clamp and shift boundary. Dev's chain step is 82,225 rows (63% of
+     2^17).
    - **The reward follows a schedule** (`prover::Schedule`): on main
      1,000,000,000 a block for seven years (`7 × 144 × 365` blocks),
      then 7,000,000 for a thousand -- each era issuing 367,920,000,000,000

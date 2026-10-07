@@ -1,6 +1,6 @@
 //! The chain's numeric consensus rules as circuit gadgets, for chain
-//! proofs (`chain_step`): **retargeting** (`retarget`, the same rule as
-//! `chain::next_retarget`) and **cumulative work** (`add_work`, as
+//! proofs (`chain_step`): **retargeting** (`retarget`, ASERT, the same
+//! rule as `chain::next_retarget`) and **cumulative work** (`add_work`, as
 //! `pow::work_for_target`, summed).
 //!
 //! Both are 256-bit arithmetic. Numbers are little-endian **bytes**, each
@@ -140,109 +140,178 @@ pub fn less_than(b: &mut Builder, x: &[EVar], y: &[EVar]) -> EVar {
     subtract(b, x, y, 8).1
 }
 
-/// A number's 16-bit limbs (little-endian), as constants.
-fn const_limbs16(b: &mut Builder, v: u64) -> Vec<EVar> {
-    (0..4).map(|j| b.const_base(BabyBear::new(((v >> (16 * j)) & 0xffff) as u32))).collect()
-}
-
-fn le_bytes(v: u64, n: usize) -> Vec<u8> {
+/// `v`'s low `n` little-endian bytes.
+fn le_bytes128(v: u128, n: usize) -> Vec<u8> {
     v.to_le_bytes()[..n].to_vec()
 }
 
-/// Bytes of a time span (milliseconds) in the retarget gadget: three
-/// 16-bit limbs, room for main's clamp (`600 s × 2015 × 4` ≈ 2^32.2).
-const TIME_BYTES: usize = 6;
-
-/// The retarget rule (`chain::next_retarget`) for a block at `height`
-/// with timestamp `ts` (four 16-bit limbs, range-checked), given the
-/// `target` (32 little-endian bytes) and window start `window_start`
-/// (four 16-bit limbs) in effect before it: the target and window start
-/// in effect after it.
-pub fn retarget(
-    b: &mut Builder,
-    config: &DifficultyConfig,
-    height: EVar,
-    ts: &[EVar; 4],
-    target: &[EVar],
-    window_start: &[EVar; 4],
-) -> (Vec<EVar>, [EVar; 4]) {
-    let interval = config.interval;
-    let expected = config.target_block_time_ms * (interval - 1);
-    let (lo, hi) = (expected / config.max_adjustment_factor, expected * config.max_adjustment_factor);
-    // Clamped times are `TIME_BYTES` bytes in the gadget.
-    assert!(hi < 1 << (8 * TIME_BYTES) && interval >= 2 && interval < 1 << 30, "the retarget parameters must fit the gadget");
-
-    // height = q·interval + r, 0 <= r < interval.
-    let h = value(b, height);
-    let (q, r) = (witness(b, h / interval), witness(b, h % interval));
-    let r_bits = 64 - (interval - 1).leading_zeros() as usize;
-    bits_of(b, q, 31);
-    bits_of(b, r, r_bits);
-    let last = b.const_base(BabyBear::new((interval - 1) as u32));
-    let room = b.sub(last, r);
-    bits_of(b, room, r_bits);
+/// Four 16-bit limbs (range-checked) as eight bytes: witnesses, composing
+/// to the limbs.
+fn limb_bytes(b: &mut Builder, limbs: &[EVar; 4]) -> Vec<EVar> {
     let z = BabyBear::ZERO;
-    let composed = b.arith(z, Some(q), None, BabyBear::new(interval as u32), z, Some(r), BabyBear::ONE, [z; 4]);
-    b.assert_eq(composed, height);
-    let starts = is_zero(b, r);
-    let at_last = b.sub(r, last);
-    let ends = is_zero(b, at_last);
-
-    // The window start: this block's timestamp at a window's first block.
-    let window: [EVar; 4] = std::array::from_fn(|j| select(b, starts, window_start[j], ts[j]));
-
-    // Elapsed, saturating at zero, clamped to [lo, hi].
-    let (elapsed, backwards) = subtract(b, ts, &window, 16);
-    let hi_limbs = const_limbs16(b, hi);
-    let lo_limbs = const_limbs16(b, lo);
-    let (_, below_hi) = subtract(b, &elapsed, &hi_limbs, 16);
-    let (_, below_lo) = subtract(b, &elapsed, &lo_limbs, 16);
-    // Limb by limb (the clamp may not fit one element).
-    let clamped: Vec<EVar> = (0..4)
-        .map(|j| {
-            let inner = select(b, below_lo, elapsed[j], lo_limbs[j]);
-            let mid = select(b, below_hi, hi_limbs[j], inner);
-            select(b, backwards, mid, lo_limbs[j])
-        })
-        .collect();
-
-    // target · clamped / expected, or all ones if the product overflows.
-    let c = (0..4).map(|j| value(b, clamped[j]) << (16 * j)).sum::<u64>();
-    let c_bytes = witness_bytes(b, &le_bytes(c, TIME_BYTES));
-    for (j, &limb) in clamped.iter().enumerate() {
-        if 2 * j < TIME_BYTES {
-            let composed = b.arith(z, Some(c_bytes[2 * j + 1]), None, BabyBear::new(256), z, Some(c_bytes[2 * j]), BabyBear::ONE, [z; 4]);
-            b.assert_eq(composed, limb);
-        } else {
-            b.assert_zero(limb);
-        }
+    let mut bytes = Vec::with_capacity(8);
+    for &limb in limbs {
+        let v = value(b, limb);
+        let (lo, hi) = (witness_byte(b, v & 0xff), witness_byte(b, v >> 8));
+        let composed = b.arith(z, Some(hi), None, BabyBear::new(256), z, Some(lo), BabyBear::ONE, [z; 4]);
+        b.assert_eq(composed, limb);
+        bytes.extend([lo, hi]);
     }
-    let t_bytes = bytes_of(b, target);
-    let product = mul_small(&t_bytes, c);
-    let p = witness_bytes(b, &product);
-    assert_product(b, target, &c_bytes, &[], 0, &p);
-    let (quotient, remainder) = div_small(&product, expected);
-    let q_bytes = witness_bytes(b, &quotient);
-    let r_bytes = witness_bytes(b, &le_bytes(remainder, TIME_BYTES));
-    let d_bytes = const_bytes(b, &le_bytes(expected, TIME_BYTES));
-    let mut p_out = p.clone();
-    while p_out.len() < q_bytes.len() + d_bytes.len() - 1 {
-        p_out.push(b.zero());
+    bytes
+}
+
+/// The retarget rule (`chain::next_retarget`: ASERT, `chain::asert`) for
+/// a block after the first, at the height whose bits are `height_bits`
+/// (31, lowest first, canonical) with timestamp `ts` (four 16-bit limbs,
+/// range-checked), the first block's timestamp being `anchor` (four
+/// 16-bit limbs): the target in effect after it, 32 little-endian bytes.
+///
+/// `behind` (`asert`'s) is made non-negative by adding `C = half_life ·
+/// 2^k`, at least any `height · target_block_time` (the timestamp is past
+/// the anchor's): that adds exactly `2^(k+16)` to `e`, so `2^k` to the
+/// whole halvings and nothing to the fraction. Then the fraction's
+/// factor (the cubic, in bytes), `initial_target · factor`, and the
+/// shift by `halvings - 16` bits: a shift by up to 7 bits (a small
+/// multiplier) and then a barrel shift by whole bytes, with everything
+/// below the result's bytes dropped (rounding down) and anything above
+/// them overflow. Shifts out of the barrel's range are the clamps.
+pub fn retarget(b: &mut Builder, config: &DifficultyConfig, height_bits: &[EVar], ts: &[EVar; 4], anchor: &[EVar; 4]) -> Vec<EVar> {
+    use crate::state_circuit::from_bits;
+    let (z, o) = (BabyBear::ZERO, BabyBear::ONE);
+    let (block_time, half_life) = (config.target_block_time_ms, config.half_life_ms);
+    assert!(height_bits.len() == 31 && block_time < 1 << 32 && (1..1 << 32).contains(&half_life), "the retarget parameters must fit the gadget");
+    let mut k = 9;
+    while (half_life as u128) << k < (block_time as u128) << 31 {
+        k += 1;
     }
-    assert_product(b, &q_bytes, &d_bytes, &[&r_bytes], 0, &p_out);
-    let smaller = less_than(b, &r_bytes, &d_bytes);
+    let offset = (half_life as u128) << k;
     let one = b.one();
+    let zero = b.zero();
+    let limbs_value = |b: &Builder, l: &[EVar; 4]| (0..4).map(|j| value(b, l[j]) << (16 * j)).sum::<u64>();
+    let (t, a) = (limbs_value(b, ts), limbs_value(b, anchor));
+    let h = (0..31).map(|i| value(b, height_bits[i]) << i).sum::<u64>();
+
+    // n = t + C - anchor - height · block_time, in 10 bytes.
+    let ts_bytes = limb_bytes(b, ts);
+    let anchor_bytes = limb_bytes(b, anchor);
+    let h_bytes: Vec<EVar> = height_bits.chunks(8).map(|c| from_bits(b, c)).collect();
+    let sum = t as u128 + offset;
+    let sum_cells = witness_bytes(b, &le_bytes128(sum, 10));
+    let offset_cells = const_bytes(b, &le_bytes128(offset, 10));
+    assert_product(b, &ts_bytes, &[one], &[&offset_cells], 0, &sum_cells);
+    let n = sum.checked_sub(a as u128 + block_time as u128 * h as u128).expect("a timestamp before the schedule's start");
+    let n_cells = witness_bytes(b, &le_bytes128(n, 10));
+    let block_time_cells = const_bytes(b, &le_bytes128(block_time as u128, 4));
+    assert_product(b, &h_bytes, &block_time_cells, &[&n_cells, &anchor_bytes], 0, &sum_cells);
+
+    // n · 2^16 = e · half_life + r, r < half_life.
+    let (e, r) = ((n << 16) / half_life as u128, (n << 16) % half_life as u128);
+    let e_cells = witness_bytes(b, &le_bytes128(e, 12));
+    let r_cells = witness_bytes(b, &le_bytes128(r, 4));
+    let half_life_cells = const_bytes(b, &le_bytes128(half_life as u128, 4));
+    let mut shifted = vec![zero, zero];
+    shifted.extend(&n_cells);
+    shifted.resize(15, zero);
+    assert_product(b, &e_cells, &half_life_cells, &[&r_cells], 0, &shifted);
+    let smaller = less_than(b, &r_cells, &half_life_cells);
     b.assert_eq(smaller, one);
-    let high = p[33..].iter().fold(p[32], |acc, &x| b.add(acc, x));
+
+    // factor = 2^16 + (c1·f + c2·f² + c3·f³ + 2^47) >> 48.
+    let f = (e & 0xffff) as u128;
+    let f_cells = &e_cells[..2];
+    let f2 = witness_bytes(b, &le_bytes128(f * f, 4));
+    assert_product(b, f_cells, f_cells, &[], 0, &f2);
+    let f3 = witness_bytes(b, &le_bytes128(f * f * f, 6));
+    assert_product(b, &f2, f_cells, &[], 0, &f3);
+    let [c1, c2, c3] = crate::chain::ASERT_POLY.map(|c| c as u128);
+    let mut terms = Vec::new();
+    for (c, c_len, (power, value)) in [(c1, 6, (f_cells, f)), (c2, 4, (&f2[..], f * f)), (c3, 2, (&f3[..], f * f * f))] {
+        assert!(c < 1 << (8 * c_len));
+        let c_cells = const_bytes(b, &le_bytes128(c, c_len));
+        let term = witness_bytes(b, &le_bytes128(c * value, 9));
+        assert_product(b, power, &c_cells, &[], 0, &term);
+        terms.push(term);
+    }
+    let poly = c1 * f + c2 * f * f + c3 * f * f * f + (1 << 47);
+    let poly_cells = witness_bytes(b, &le_bytes128(poly, 9));
+    let half = const_bytes(b, &le_bytes128(1 << 47, 6));
+    assert_product(b, &terms[0], &[one], &[&terms[1], &terms[2], &half], 0, &poly_cells);
+    let factor = (1 << 16) + (poly >> 48);
+    let factor_cells = witness_bytes(b, &le_bytes128(factor, 3));
+    let base_factor = const_bytes(b, &le_bytes128(1 << 16, 3));
+    assert_product(b, &poly_cells[6..], &[one], &[&base_factor], 0, &factor_cells);
+
+    // x = initial_target · factor, 35 bytes.
+    let target_le: Vec<u8> = config.initial_target.iter().rev().copied().collect();
+    let target_cells = const_bytes(b, &target_le);
+    let x = mul_small(&target_le, factor as u64);
+    let x_cells = witness_bytes(b, &x[..35]);
+    assert_product(b, &target_cells, &factor_cells, &[], 0, &x_cells);
+
+    // The shift: u = halvings - 16 + 296 = (e >> 16) - (2^k - 280), from
+    // 0 to 1023 within range; below, the result rounds to 0 (so 1), and
+    // above, it overflows.
+    let base = (1u128 << k) - 280;
+    let halvings = &e_cells[2..];
+    let (base_cells, top_cells) = (const_bytes(b, &le_bytes128(base, 10)), const_bytes(b, &le_bytes128(base + 1024, 10)));
+    let (u_cells, under) = subtract(b, halvings, &base_cells, 8);
+    let below_top = less_than(b, halvings, &top_cells);
+    let mut u_bits = bits_of(b, u_cells[0], 8);
+    u_bits.extend(bits_of(b, u_cells[1], 8));
+    // Up to 7 bits: x · 2^(u mod 8), 36 bytes.
+    let mut m = one;
+    for (i, &bit) in u_bits[..3].iter().enumerate() {
+        let factor = b.arith(z, Some(bit), None, BabyBear::new((1 << (1 << i)) - 1), z, Some(one), o, [z; 4]);
+        m = b.mul(m, factor);
+    }
+    let y_bytes = mul_small(&x[..35], 1 << (value(b, u_bits[0]) + 2 * value(b, u_bits[1]) + 4 * value(b, u_bits[2])));
+    let y_cells = witness_bytes(b, &y_bytes[..36]);
+    assert_product(b, &x_cells, &[m], &[], 0, &y_cells);
+    // Then by u >> 3 whole bytes: 7 stages of 1, 2, ... 64 bytes (`None`
+    // is a known zero).
+    const LEN: usize = 36 + 127;
+    let mut cells: Vec<Option<EVar>> = y_cells.iter().map(|&c| Some(c)).chain(std::iter::repeat(None)).take(LEN).collect();
+    for (i, &bit) in u_bits[3..10].iter().enumerate() {
+        let by = 1 << i;
+        cells = (0..LEN)
+            .map(|j| {
+                let from = if j >= by { cells[j - by] } else { None };
+                match (cells[j], from) {
+                    (None, None) => None,
+                    (Some(stay), None) => {
+                        let moved = b.mul(bit, stay);
+                        Some(b.sub(stay, moved))
+                    }
+                    (None, Some(from)) => Some(b.mul(bit, from)),
+                    (Some(stay), Some(from)) => Some(select(b, bit, stay, from)),
+                }
+            })
+            .collect();
+    }
+    // Bytes 37.. 69 are the result; any above, overflow.
+    let mut high = zero;
+    for &cell in cells[69..].iter().flatten() {
+        high = b.add(high, cell);
+    }
     let fits = is_zero(b, high);
+    let result: Vec<EVar> = cells[37..69].iter().map(|c| c.unwrap_or(zero)).collect();
+    let mut low = zero;
+    for &cell in &result {
+        low = b.add(low, cell);
+    }
+    let vanished = is_zero(b, low);
+    let not_under = b.sub(one, under);
+    let ok = b.mul(not_under, below_top);
+    let ok = b.mul(ok, fits);
     let all_ones = b.const_base(BabyBear::new(255));
-    let next: Vec<EVar> = (0..32)
+    (0..32)
         .map(|k| {
-            let scaled = select(b, fits, all_ones, q_bytes[k]);
-            select(b, ends, target[k], scaled)
+            let least = if k == 0 { one } else { zero };
+            let r = select(b, vanished, result[k], least);
+            let r = select(b, ok, all_ones, r);
+            select(b, under, r, least)
         })
-        .collect();
-    (next, window)
+        .collect()
 }
 
 /// `work + work_for_target(target)`, all 32 little-endian bytes: the
@@ -305,9 +374,9 @@ pub fn add_work(b: &mut Builder, target: &[EVar], work: &[EVar]) -> Vec<EVar> {
     sum_cells
 }
 
-/// `value · m` for little-endian bytes: 35 bytes.
+/// `value · m` for little-endian bytes, 8 bytes longer.
 fn mul_small(value: &[u8], m: u64) -> Vec<u8> {
-    let mut out = vec![0u8; value.len() + TIME_BYTES];
+    let mut out = vec![0u8; value.len() + 8];
     let mut carry: u128 = 0;
     for (k, slot) in out.iter_mut().enumerate() {
         let v = value.get(k).copied().unwrap_or(0) as u128 * m as u128 + carry;
@@ -315,18 +384,6 @@ fn mul_small(value: &[u8], m: u64) -> Vec<u8> {
         carry = v >> 8;
     }
     out
-}
-
-/// `value / d` and `value % d` for little-endian bytes.
-fn div_small(value: &[u8], d: u64) -> (Vec<u8>, u64) {
-    let mut q = vec![0u8; value.len()];
-    let mut rem: u128 = 0;
-    for k in (0..value.len()).rev() {
-        let cur = (rem << 8) | value[k] as u128;
-        q[k] = (cur / d as u128) as u8;
-        rem = cur % d as u128;
-    }
-    (q, rem as u64)
 }
 
 #[cfg(test)]
@@ -366,52 +423,81 @@ mod tests {
         (0..4).map(|j| value(b, l[j]) << (16 * j)).sum()
     }
 
-    /// The circuit's retarget agrees with the node's, across window
-    /// positions and fast, slow, clamped, backwards and overflowing
-    /// windows.
-    #[test]
-    fn retargeting_in_the_circuit_matches_the_chain() {
-        // Dev's ten-block windows, and main's 2016 ten-minute blocks (whose
-        // clamp needs more than 32 bits); the cases' heights are in units
-        // of ten-block windows, scaled to the interval.
-        for (interval, target_block_time_ms) in [(10, 60_000), (10, 600_000), (2016, 600_000)] {
+    /// The circuit's retarget agrees with the node's (`chain::asert`):
+    /// on schedule, behind and ahead by whole and fractional half-lives,
+    /// at the edges of the shifts it computes and past them (clamped to
+    /// all ones, or to 1).
+    fn retargeting_matches(target_block_time_ms: u64, half_life_ms: u64, initial_target: [u8; 32]) {
         let config = DifficultyConfig {
             pow: crate::pow::Params::TEST,
-            initial_target: [0; 32],
-            interval,
+            initial_target,
             target_block_time_ms,
-            max_adjustment_factor: 4,
+            half_life_ms,
             schedule: crate::prover::DEV_SCHEDULE,
         };
-        let easy = crate::block::INITIAL_MAX_HASH;
-        let hard = crate::pow::max_hash_with_leading_zero_bits(40);
-        let cases: [([u8; 32], u64, u64, u64); 9] = [
-            (easy, 5, 1_000_000, 900_000),           // mid-window: nothing changes
-            (easy, 10, 2_000_000, 900_000),          // a window starts
-            (hard, 19, 1_100_000, 1_000_000),        // fast window: clamped harder
-            (hard, 19, 3_000_000, 1_000_000),        // slow: easier, within the clamp
-            (hard, 19, 900_000_000, 1_000_000),      // very slow: clamped easier
-            (hard, 19, 500_000, 1_000_000),          // timestamps went backwards
-            ([0xff; 32], 9, 900_000_000, 0),         // overflow: all ones
-            (easy, 9, 1_000_000_000_000, 999_999_999_000), // big timestamps
-            (hard, 0, 7, 0),                          // the first block
-        ];
-        let scale_time = target_block_time_ms * (interval - 1) / (60_000 * 9);
-        for (target, height, ts, ws) in cases {
-            // The same position in the window, and the same pace.
-            let height = height / 10 * interval + if height % 10 == 9 { interval - 1 } else { height % 10 };
-            let (ts, ws) = (ts * scale_time, ws * scale_time);
-            let (expected_target, expected_ws) = crate::chain::next_retarget(&config, (target, ws), height, ts);
+        let anchor = 1_791_000_000_000u64;
+        let (t, hl) = (target_block_time_ms as i128, half_life_ms as i128);
+        // (height, how far behind schedule) -- in half-lives, scaled by
+        // 1/12.
+        let mut cases: Vec<(u64, i128)> = vec![(1, 0), (5, 12), (5, -12), (100, 4), (100, -7), (100, 17), (1 << 20, 30), (crate::poseidon2::P as u64 - 1, 0)];
+        for halvings in [-298, -296, -290, -281, -280, -3, -1, 1, 3, 8, 16, 19, 20, 21, 22, 23, 24, 200, 233, 254, 256, 727, 728] {
+            cases.push((1 << 25, 12 * halvings));
+        }
+        for (height, twelfths) in cases {
+            let behind = twelfths * hl / 12;
+            let Ok(ts) = u64::try_from(anchor as i128 + t * height as i128 + behind) else { continue };
+            if ts <= anchor {
+                continue;
+            }
+            let expected = crate::chain::asert(&config, anchor, height, ts);
             let mut b = Builder::new();
             let h = witness(&mut b, height);
+            let height_bits = crate::state_circuit::canonical_bits(&mut b, h);
             let ts_cells = limbs(&mut b, ts);
-            let ws_cells = limbs(&mut b, ws);
-            let t = witness_bytes(&mut b, &le(target));
-            let (next, window) = retarget(&mut b, &config, h, &ts_cells, &t, &ws_cells);
-            assert_eq!(bytes_of(&b, &next), le(expected_target), "height {height}, ts {ts}, ws {ws}");
-            assert_eq!(limbs_value(&b, &window), expected_ws);
+            let anchor_cells = limbs(&mut b, anchor);
+            let next = retarget(&mut b, &config, &height_bits, &ts_cells, &anchor_cells);
+            assert_eq!(bytes_of(&b, &next), le(expected), "height {height}, {twelfths}/12 half-lives behind");
             check(b);
         }
+    }
+
+    #[test]
+    fn retargeting_in_the_circuit_matches_the_chain_on_main() {
+        retargeting_matches(600_000, 2 * 24 * 3_600_000, crate::pow::max_hash_with_leading_zero_bits(23));
+    }
+
+    #[test]
+    fn retargeting_in_the_circuit_matches_the_chain_on_dev() {
+        retargeting_matches(10_000, 600_000, crate::pow::max_hash_with_leading_zero_bits(20));
+    }
+
+    #[test]
+    fn retargeting_in_the_circuit_matches_the_chain_in_tests() {
+        retargeting_matches(10, 100, crate::block::INITIAL_MAX_HASH);
+    }
+
+    /// Anchor targets that overflow at once, and that round to nothing.
+    #[test]
+    fn retargeting_in_the_circuit_matches_the_chain_at_extreme_targets() {
+        let mut tiny = [0u8; 32];
+        tiny[31] = 3;
+        retargeting_matches(600_000, 2 * 24 * 3_600_000, tiny);
+        retargeting_matches(600_000, 2 * 24 * 3_600_000, [0xff; 32]);
+    }
+
+    /// A far future timestamp: the most behind schedule a chain can be.
+    #[test]
+    fn retargeting_in_the_circuit_takes_any_timestamp() {
+        let config = DifficultyConfig::for_tests();
+        for ts in [u64::MAX, u64::MAX / 3] {
+            let mut b = Builder::new();
+            let h = witness(&mut b, 7);
+            let height_bits = crate::state_circuit::canonical_bits(&mut b, h);
+            let ts_cells = limbs(&mut b, ts);
+            let anchor_cells = limbs(&mut b, 1);
+            let next = retarget(&mut b, &config, &height_bits, &ts_cells, &anchor_cells);
+            assert_eq!(bytes_of(&b, &next), le(crate::chain::asert(&config, 1, 7, ts)));
+            check(b);
         }
     }
 

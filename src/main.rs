@@ -65,10 +65,10 @@ use storage::Storage;
 /// dial in by hand -- see `pow::max_hash_with_leading_zero_bits`'s
 /// docs -- so this is in bits, not bytes: 16 was too fast, 24 too
 /// slow, 20 closer but still a bit fast. Only an informed guess, not a
-/// calibration: `Chain`'s retargeting corrects for however wrong it
-/// actually is after the first retarget window regardless (on main,
-/// 2016 blocks -- a few hours or weeks, depending on how wrong it is),
-/// and this number is independent of `block::INITIAL_MAX_HASH` (which
+/// calibration: `Chain`'s retargeting (ASERT) corrects for however
+/// wrong it actually is as blocks come -- each half-life the chain runs
+/// behind (ahead of) schedule halves (doubles) the difficulty -- and
+/// this number is independent of `block::INITIAL_MAX_HASH` (which
 /// stays fixed and easy, since tests built around it need to mine
 /// quickly -- see that constant's docs).
 ///
@@ -80,17 +80,16 @@ const INITIAL_LEADING_ZERO_BITS: u32 = 23;
 /// the proving time that already bounds a block.
 const DEV_INITIAL_LEADING_ZERO_BITS: u32 = 20;
 
-/// Retargeting knobs for this driver's actual run -- independent of
-/// `chain::DifficultyConfig::for_tests`'s own numbers (see that
-/// method's docs for why they're deliberately never the same values):
-/// the tests use 10-block windows of 10 ms blocks, to run fast.
+/// Retargeting knobs for this driver's actual run (ASERT,
+/// `chain::asert`) -- independent of `chain::DifficultyConfig::
+/// for_tests`'s own numbers (see that method's docs for why they're
+/// deliberately never the same values): the tests use 10 ms blocks.
 ///
-/// Main: Bitcoin's 2016-block window (two weeks at the target pace),
-/// each retarget moving difficulty at most
-/// `MAX_ADJUSTMENT_FACTOR`x either way.
-const RETARGET_INTERVAL: u64 = 2016;
-/// Dev: 10-block windows, so difficulty follows proving time quickly.
-const DEV_RETARGET_INTERVAL: u64 = 10;
+/// Main: a two-day half-life (288 blocks), Bitcoin Cash's.
+const HALF_LIFE_MS: u64 = 2 * 24 * 60 * 60 * 1000;
+/// Dev: ten minutes, so difficulty follows proving time within a few
+/// blocks.
+const DEV_HALF_LIFE_MS: u64 = 10 * 60 * 1000;
 /// Main: ten minutes, which the reward schedule's eras are counted in
 /// (`prover::MAIN_SCHEDULE`).
 const TARGET_BLOCK_TIME_MS: u64 = 600_000;
@@ -99,7 +98,7 @@ const TARGET_BLOCK_TIME_MS: u64 = 600_000;
 /// fast as they're proven.
 const DEV_TARGET_BLOCK_TIME_MS: u64 = 10_000;
 
-/// This network's starting difficulty, block time and retarget window.
+/// This network's starting difficulty, block time and half-life.
 /// Consensus: the chain-proof circuit proves retargeting with these, so
 /// changing any means regenerating the network's chain-proof keys (`chain_keys` test)
 /// and starting from fresh data directories.
@@ -117,13 +116,12 @@ fn target_block_time_ms() -> u64 {
     }
 }
 
-fn retarget_interval() -> u64 {
+fn half_life_ms() -> u64 {
     match network::current() {
-        network::Network::Main => RETARGET_INTERVAL,
-        network::Network::Dev => DEV_RETARGET_INTERVAL,
+        network::Network::Main => HALF_LIFE_MS,
+        network::Network::Dev => DEV_HALF_LIFE_MS,
     }
 }
-const MAX_ADJUSTMENT_FACTOR: u64 = 4;
 
 /// How many blocks a reorg is ever allowed to unwind in this driver's
 /// actual run -- independent of the test suite's own (much smaller)
@@ -177,9 +175,8 @@ fn difficulty_config() -> chain::DifficultyConfig {
             network::Network::Dev => pow::Params::DEV,
         },
         initial_target: pow::max_hash_with_leading_zero_bits(leading_zero_bits()),
-        interval: retarget_interval(),
         target_block_time_ms: target_block_time_ms(),
-        max_adjustment_factor: MAX_ADJUSTMENT_FACTOR,
+        half_life_ms: half_life_ms(),
         schedule: prover::schedule(),
     }
 }

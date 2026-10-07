@@ -43,7 +43,7 @@ pub const MAX_PIECE_BYTES: usize = (1 << LEAF_LEVEL) * ENTRY_LEN;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyncPoint {
     pub target: [u8; 32],
-    pub window_start: u64,
+    pub anchor_timestamp: u64,
     pub work: [u8; 32],
 }
 

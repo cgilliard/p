@@ -14,9 +14,10 @@
 //!
 //! Timestamps must **strictly increase**: every block's `timestamp` is
 //! later than its parent's (`Error::TimestampNotAfterParent`). Checked
-//! here, in plaintext, by every full node -- it's cheap, and it's what
-//! stops a miner backdating the first block of a retarget window to
-//! fake a slow window and drag difficulty down (the "timewarp" attack).
+//! here, in plaintext, by every full node -- it's cheap, and it keeps
+//! the chain's clock monotonic, so the retarget rule's measure of how
+//! far behind schedule the chain is can only be pushed one way (forward,
+//! and only as far as `MAX_FUTURE_DRIFT_MS` allows).
 //! A light client relying on the recursive proof instead will need the
 //! proof to attest the same rule; that's the proof's job on top of this,
 //! not instead of it.
@@ -59,19 +60,19 @@
 //! target as an explicit parameter rather than assuming a constant
 //! (see `block`'s docs). `Chain` tracks two more small pieces of side
 //! state for this, on top of the tip header: the currently-active
-//! target (`current_target`), and the timestamp of whichever block
-//! started the retarget window currently in progress
-//! (`window_start_timestamp`).
+//! target (`current_target`), and the timestamp of the chain's first
+//! block (`anchor_timestamp`), which the rule measures from.
 //!
-//! The rule is Bitcoin's own: every `DifficultyConfig::interval`
-//! blocks, compare how long that window actually took (real elapsed
-//! time, from `timestamp`s already in the applied headers) against
-//! how long it was supposed to take, clamp that ratio to
-//! `[1/max_adjustment_factor, max_adjustment_factor]` (so one bad
-//! window can't swing the target wildly), and scale the target by it
-//! (`pow::scale` -- genuine proportional 256-bit arithmetic, not a
-//! bit-shift). All four knobs -- the starting target, the window
-//! size, the target block time, and the clamp -- are bundled into one
+//! The rule is **ASERT** (absolutely scheduled exponentially rising
+//! targets; Bitcoin Cash's aserti3-2d, `asert`): every block's target is
+//! the first block's, scaled by `2^(behind / half_life)`, where `behind`
+//! is how far the block's timestamp is past the schedule -- the first
+//! block's timestamp plus `target_block_time_ms` per block since. Each
+//! half-life behind schedule halves the difficulty; each one ahead
+//! doubles it. It adjusts every block, depends on nothing but the first
+//! block and the latest one (no window), and a skewed timestamp moves it
+//! only until the next honest one. All the knobs -- the starting target,
+//! the target block time, and the half-life -- are bundled into one
 //! `DifficultyConfig` the caller supplies to `Chain::open`, precisely
 //! because the right values for a test (fast, cheap to mine, so the
 //! suite stays quick) and for an actual run (slower, closer to a real
@@ -105,6 +106,10 @@ pub const GENESIS_PARENT_HASH: [u8; 32] = [0u8; 32];
 /// chain validity eventually gets folded into a recursive proof.
 const MAX_FUTURE_DRIFT_MS: u64 = 2 * 60 * 60 * 1000;
 
+/// How much easier than the current target an orphan's proof of work may
+/// be and still be pooled (`Chain::orphan_target`).
+const ORPHAN_TARGET_RELAX: u64 = 4;
+
 /// The tip's full header, the one thing `Chain` persists in its own
 /// `chain_meta` database beyond what `state`/`utxo` already
 /// track. Everything else `Chain` needs to know about the tip --
@@ -125,26 +130,19 @@ pub struct DifficultyConfig {
     /// The proof-of-work function's parameters (`pow::Params`): the
     /// dataset's size, an item's cost, and reads per attempt.
     pub pow: crate::pow::Params,
-    /// The PoW target a brand new chain starts at, before the first
-    /// retarget happens. Only matters for a genuinely new chain -- if
-    /// this one's already been applied to before, whatever's actually
-    /// stored in `chain_meta` wins, same as every other piece of
-    /// retargeting state.
+    /// The PoW target the chain's first block sets for the second: the
+    /// target of a chain exactly on schedule (`asert`'s anchor).
     pub initial_target: [u8; 32],
-    /// Blocks between difficulty adjustments.
-    pub interval: u64,
-    /// The real time a window of `interval` blocks is supposed to
-    /// take, in **milliseconds**, if mining is keeping pace with the
-    /// target. Milliseconds rather than seconds specifically so a test
-    /// can set this small (tens of milliseconds) and use genuinely
-    /// real elapsed time -- actually sleeping between mined blocks --
-    /// without the test suite paying for it in wall-clock seconds; see
-    /// `for_tests`.
+    /// The real time a block is supposed to take, in **milliseconds**,
+    /// if mining is keeping pace with the target. Milliseconds rather
+    /// than seconds specifically so a test can set this small (tens of
+    /// milliseconds) and use genuinely real elapsed time -- actually
+    /// sleeping between mined blocks -- without the test suite paying
+    /// for it in wall-clock seconds; see `for_tests`.
     pub target_block_time_ms: u64,
-    /// How far the actual/expected elapsed-time ratio is allowed to
-    /// swing before being clamped, each retarget -- `4` means at most
-    /// 4x harder or 4x easier per window. Bitcoin's own value.
-    pub max_adjustment_factor: u64,
+    /// How far behind (ahead of) schedule halves (doubles) the
+    /// difficulty, in milliseconds (`asert`).
+    pub half_life_ms: u64,
     /// The block reward by height, and the height the chain ends at
     /// (`prover::Schedule`).
     pub schedule: crate::prover::Schedule,
@@ -153,34 +151,28 @@ pub struct DifficultyConfig {
 impl DifficultyConfig {
     /// Fast, cheap-to-mine defaults for tests: `block::INITIAL_MAX_HASH`
     /// (the easy target everything else in this crate's test suite is
-    /// already built around), a short window, and a millisecond-scale
-    /// target block time -- a full retarget window is nominally just
-    /// `10 * 9 = 90` milliseconds, fast enough that a test exercising
-    /// genuinely real elapsed time (not hand-set `timestamp`s) stays
-    /// fast too.
+    /// already built around), a millisecond-scale target block time, and
+    /// a half-life of ten such blocks -- fast enough that a test
+    /// exercising genuinely real elapsed time (not hand-set
+    /// `timestamp`s) stays fast too.
     pub fn for_tests() -> Self {
         DifficultyConfig {
             pow: crate::pow::Params::TEST,
             initial_target: crate::block::INITIAL_MAX_HASH,
-            interval: 10,
             target_block_time_ms: 10,
-            max_adjustment_factor: 4,
+            half_life_ms: 100,
             schedule: crate::prover::DEV_SCHEDULE,
         }
     }
 }
 
 /// The currently-active PoW target, the other piece of state `Chain`
-/// persists in `chain_meta` beyond the tip header -- `Chain`'s own
-/// `initial_target` until the first retarget happens.
+/// persists in `chain_meta` beyond the tip header.
 const CURRENT_TARGET_KEY: &[u8] = b"current_target";
 
-/// The timestamp of the first block in the retarget window currently in
-/// progress -- what the next retarget's elapsed-time measurement is
-/// taken from. Updated every time a block lands on a window boundary
-/// (`height % RETARGET_INTERVAL == 0`), including height `0`, which is
-/// what seeds this without needing a separate genesis special-case.
-const WINDOW_START_TIMESTAMP_KEY: &[u8] = b"window_start_timestamp";
+/// The timestamp of the chain's first block -- what `asert` measures the
+/// schedule from. Set by the block at height `0`, and never again.
+const ANCHOR_TIMESTAMP_KEY: &[u8] = b"anchor_timestamp";
 
 /// `chain_meta` key: the height of the block a fast sync started this
 /// chain at (u64 BE), if one did -- nothing below it is stored but the
@@ -320,7 +312,7 @@ pub enum Error {
     /// `INVALID_BLOCKS_DB`.
     KnownInvalidBlock,
     /// An orphan's proof of work doesn't even meet the active chain's
-    /// current target relaxed by `max_adjustment_factor` -- see
+    /// current target relaxed by `ORPHAN_TARGET_RELAX` -- see
     /// `Chain::orphan_target`. Not a verdict on the block (its real
     /// target is unknowable without its parent), just a refusal to
     /// spend pool space on it; it can always be sent again once its
@@ -443,21 +435,20 @@ fn hex(bytes: &[u8; 32]) -> String {
 }
 
 /// Difficulty retargeting's state as of right after some block: the
-/// target the *next* block must meet, and the timestamp the retarget
-/// window in progress started at. What `chain_meta`'s
-/// `CURRENT_TARGET_KEY`/`WINDOW_START_TIMESTAMP_KEY` hold for the
+/// target the *next* block must meet, and the first block's timestamp. What `chain_meta`'s
+/// `CURRENT_TARGET_KEY`/`ANCHOR_TIMESTAMP_KEY` hold for the
 /// active tip, and what `BLOCK_RETARGET_DB` holds for every stored block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RetargetState {
     target: [u8; 32],
-    window_start_timestamp: u64,
+    anchor_timestamp: u64,
 }
 
 impl RetargetState {
     fn to_bytes(self) -> [u8; 40] {
         let mut out = [0u8; 40];
         out[..32].copy_from_slice(&self.target);
-        out[32..].copy_from_slice(&self.window_start_timestamp.to_be_bytes());
+        out[32..].copy_from_slice(&self.anchor_timestamp.to_be_bytes());
         out
     }
 
@@ -467,51 +458,88 @@ impl RetargetState {
         }
         Ok(RetargetState {
             target: bytes[..32].try_into().unwrap(),
-            window_start_timestamp: u64::from_be_bytes(bytes[32..].try_into().unwrap()),
+            anchor_timestamp: u64::from_be_bytes(bytes[32..].try_into().unwrap()),
         })
     }
 
     /// The state right after `header` lands on top of `self` -- the
     /// retargeting rule itself, as a pure function of nothing but the
     /// previous state and the new header, so it can be run for any
-    /// branch, not just the active one. Two things can happen, and at
-    /// most one ever does for a given block (see the module docs): if
-    /// `header` opens a new window, its timestamp becomes the new
-    /// `window_start_timestamp`; if it closes one, the window's actual
-    /// elapsed time, clamped to within `max_adjustment_factor` of what
-    /// was expected, becomes the ratio `target` is scaled by (Bitcoin's
-    /// own rule -- see the module docs).
+    /// branch, not just the active one (`next_retarget`).
     fn after(self, config: &DifficultyConfig, header: &BlockHeader) -> Self {
-        let (target, window_start_timestamp) = next_retarget(config, (self.target, self.window_start_timestamp), header.height, header.timestamp);
-        RetargetState { target, window_start_timestamp }
+        let (target, anchor_timestamp) = next_retarget(config, (self.target, self.anchor_timestamp), header.height, header.timestamp);
+        RetargetState { target, anchor_timestamp }
     }
 }
 
-/// The retarget rule, on its own: the `(target, window start)` in effect
-/// after a block at `height` with `timestamp`, given those before it. A
-/// window starts at every multiple of `config.interval`; at a window's
-/// last block the target scales by its elapsed over expected time,
-/// clamped to within `max_adjustment_factor` (`pow::scale`). Shared with
-/// the chain-proof circuit (`chain_step`), which proves the same rule.
-pub(crate) fn next_retarget(config: &DifficultyConfig, (target, window_start): ([u8; 32], u64), height: u64, timestamp: u64) -> ([u8; 32], u64) {
-    let interval = config.interval;
-    let window_start = if height.is_multiple_of(interval) { timestamp } else { window_start };
-    let mut target = target;
-    if (height + 1).is_multiple_of(interval) {
-        let elapsed = timestamp.saturating_sub(window_start);
-        let expected = config.target_block_time_ms * (interval - 1);
-        let factor = config.max_adjustment_factor;
-        let clamped_elapsed = elapsed.clamp(expected / factor, expected * factor);
-        target = pow::scale(target, clamped_elapsed, expected);
+/// The retarget rule, on its own: the `(target, anchor timestamp)` in
+/// effect after a block at `height` with `timestamp`, given the anchor
+/// timestamp before it. The block at height `0` sets the anchor to its
+/// own timestamp; every block's next target is `asert`'s. (The target
+/// before doesn't matter: ASERT is absolute.) Shared with the
+/// chain-proof circuit (`chain_rules::retarget`), which proves the same
+/// rule.
+pub(crate) fn next_retarget(config: &DifficultyConfig, (_target, anchor): ([u8; 32], u64), height: u64, timestamp: u64) -> ([u8; 32], u64) {
+    let anchor = if height == 0 { timestamp } else { anchor };
+    (asert(config, anchor, height, timestamp), anchor)
+}
+
+/// aserti3-2d's cubic approximation: for `0 <= f < 2^16`,
+/// `2^16 · 2^(f / 2^16) ≈ 2^16 + (c1·f + c2·f² + c3·f³ + 2^47) >> 48`.
+pub(crate) const ASERT_POLY: [u64; 3] = [195_766_423_245_049, 971_821_376, 5_127];
+
+/// The target after a block at `height` with `timestamp`, the chain's
+/// first block having had `anchor` (ASERT, with aserti3-2d's integer
+/// arithmetic): `behind = timestamp - anchor - height · target_block_time`,
+/// `e = ⌊behind · 2^16 / half_life⌋` -- whole halvings `⌊e / 2^16⌋` and a
+/// fraction `e mod 2^16` -- and the target is `initial_target ·
+/// factor(fraction) · 2^(halvings - 16)`, rounded down, then clamped to
+/// `[1, 2^256 - 1]`. On schedule (`behind = 0`) it's `initial_target`
+/// exactly.
+pub(crate) fn asert(config: &DifficultyConfig, anchor: u64, height: u64, timestamp: u64) -> [u8; 32] {
+    let behind = timestamp as i128 - anchor as i128 - config.target_block_time_ms as i128 * height as i128;
+    let e = (behind << 16).div_euclid(config.half_life_ms as i128);
+    let (halvings, f) = (e >> 16, (e & 0xffff) as u128);
+    let [c1, c2, c3] = ASERT_POLY.map(|c| c as u128);
+    let factor = (1 << 16) + ((c1 * f + c2 * f * f + c3 * f * f * f + (1 << 47)) >> 48);
+    // initial_target · factor, little-endian: below 2^273, 35 bytes.
+    let mut x = [0u8; 35];
+    let mut carry = 0u128;
+    for (k, slot) in x.iter_mut().enumerate() {
+        let v = config.initial_target.get(31usize.wrapping_sub(k)).map_or(0, |&b| b as u128) * factor + carry;
+        *slot = v as u8;
+        carry = v >> 8;
     }
-    (target, window_start)
+    const ONE: [u8; 32] = {
+        let mut t = [0u8; 32];
+        t[31] = 1;
+        t
+    };
+    // · 2^shift, rounded down.
+    let shift = halvings - 16;
+    if shift >= 256 {
+        return [0xff; 32];
+    }
+    if shift <= -(8 * 35) {
+        return ONE;
+    }
+    let bit = |i: i128| -> u8 { if (0..8 * 35).contains(&i) { (x[(i / 8) as usize] >> (i % 8)) & 1 } else { 0 } };
+    // Any bit at 256 or above overflows.
+    if (256 - shift..8 * 35).any(|i| bit(i) == 1) {
+        return [0xff; 32];
+    }
+    let mut out = [0u8; 32];
+    for k in 0..256 {
+        out[31 - k as usize / 8] |= bit(k - shift) << (k % 8);
+    }
+    if out == [0; 32] { ONE } else { out }
 }
 
 /// Everything `Chain::unwind_tip` needs to reverse exactly what
 /// `apply_block` did for one block, snapshotted *before* that block's
 /// own mutations ran. None of this is recoverable any other way once
 /// those mutations have happened: the tip header and retargeting
-/// state (`current_target`/`window_start_timestamp`) get overwritten
+/// state (`current_target`/`anchor_timestamp`) get overwritten
 /// in place, not appended, and a spent input's original position
 /// is deleted from `utxo` the moment it's spent -- the one instant
 /// `resolve_and_apply` has it in hand is the only chance to record it.
@@ -523,7 +551,7 @@ struct UndoData {
     /// applied (there was no tip at all yet).
     prev_tip_header: Option<BlockHeader>,
     prev_current_target: [u8; 32],
-    prev_window_start_timestamp: u64,
+    prev_anchor_timestamp: u64,
     /// `(commitment, position)` for every input this block spent.
     spent_inputs: Vec<([u8; 32], u64)>,
 }
@@ -539,7 +567,7 @@ impl UndoData {
             None => out.push(0),
         }
         out.extend_from_slice(&self.prev_current_target);
-        out.extend_from_slice(&self.prev_window_start_timestamp.to_be_bytes());
+        out.extend_from_slice(&self.prev_anchor_timestamp.to_be_bytes());
         out.extend_from_slice(&(self.spent_inputs.len() as u32).to_be_bytes());
         for (commitment, position) in &self.spent_inputs {
             out.extend_from_slice(commitment);
@@ -567,7 +595,7 @@ impl UndoData {
         };
 
         let prev_current_target: [u8; 32] = take(bytes, &mut offset, 32)?.try_into().unwrap();
-        let prev_window_start_timestamp = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+        let prev_anchor_timestamp = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
         let count = u32::from_be_bytes(take(bytes, &mut offset, 4)?.try_into().unwrap());
 
         let mut spent_inputs = Vec::with_capacity(count as usize);
@@ -584,7 +612,7 @@ impl UndoData {
         Ok(UndoData {
             prev_tip_header,
             prev_current_target,
-            prev_window_start_timestamp,
+            prev_anchor_timestamp,
             spent_inputs,
         })
     }
@@ -846,7 +874,7 @@ impl StateReader {
         let retarget = RetargetState::from_bytes(retarget)?;
         Ok(Some(crate::snapshot::SyncPoint {
             target: retarget.target,
-            window_start: retarget.window_start_timestamp,
+            anchor_timestamp: retarget.anchor_timestamp,
             work: work.try_into().map_err(|_| Error::Corrupt("stored chain work was not 32 bytes"))?,
         }))
     }
@@ -1168,7 +1196,7 @@ impl Chain {
 
     fn proof_state_in(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<([u8; 32], u64, [u8; 32])> {
         let retarget = self.retarget_state_after(txn, hash)?;
-        Ok((retarget.target, retarget.window_start_timestamp, self.chain_work(txn, hash)?))
+        Ok((retarget.target, retarget.anchor_timestamp, self.chain_work(txn, hash)?))
     }
 
     /// The tip a chain proof of block `hash` attests: its header, and what
@@ -1219,7 +1247,7 @@ impl Chain {
         if hash == GENESIS_PARENT_HASH {
             return Ok(RetargetState {
                 target: self.difficulty.initial_target,
-                window_start_timestamp: 0,
+                anchor_timestamp: 0,
             });
         }
         let bytes = self
@@ -1300,7 +1328,7 @@ impl Chain {
             return Err(Error::Snapshot("not a valid base block"));
         }
         if let Some(verifier) = &self.chain_proofs {
-            let tip = crate::chain_step::Tip::new(header, (point.target, point.window_start, point.work));
+            let tip = crate::chain_step::Tip::new(header, (point.target, point.anchor_timestamp, point.work));
             if !verifier.verify(&tip, chain_proof) {
                 return Err(Error::Snapshot("the chain proof doesn't attest this block"));
             }
@@ -1333,11 +1361,11 @@ impl Chain {
         }
         self.meta.put(&mut wtxn, TIP_HEADER_KEY, &header.to_bytes())?;
         self.meta.put(&mut wtxn, CURRENT_TARGET_KEY, &point.target)?;
-        self.meta.put(&mut wtxn, WINDOW_START_TIMESTAMP_KEY, &point.window_start.to_be_bytes())?;
+        self.meta.put(&mut wtxn, ANCHOR_TIMESTAMP_KEY, &point.anchor_timestamp.to_be_bytes())?;
         self.meta.put(&mut wtxn, SYNC_BASE_KEY, &header.height.to_be_bytes())?;
         let retarget = RetargetState {
             target: point.target,
-            window_start_timestamp: point.window_start,
+            anchor_timestamp: point.anchor_timestamp,
         };
         self.store_block_records(&mut wtxn, base, point.work, retarget)?;
         self.active_heights.put(&mut wtxn, &header.height.to_be_bytes(), &header.hash())?;
@@ -1386,18 +1414,17 @@ impl Chain {
 
     /// The least proof of work an orphan must show to be pooled: the
     /// active chain's current target, made easier by
-    /// `max_adjustment_factor`. An orphan's real target can't be known
+    /// `ORPHAN_TARGET_RELAX`. An orphan's real target can't be known
     /// without its parent, so this is a heuristic, not consensus -- it
     /// only has to make junk orphans expensive (each costs a real
     /// fraction of a block's work, rather than nothing) without turning
-    /// away legitimate ones. Relaxing by exactly one retarget's maximum
-    /// swing admits an orphan from just past a window boundary on a
-    /// chain that eased up as far as one retarget allows. Rejecting a
+    /// away legitimate ones: a few blocks on, the target has moved by a
+    /// small fraction of a half-life's factor of two. Rejecting a
     /// legitimate orphan is cheap anyway: it just gets accepted
     /// normally once its parent arrives and it's sent again.
     fn orphan_target(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
         let current = self.current_target(txn)?;
-        Ok(pow::scale(current, self.difficulty.max_adjustment_factor, 1))
+        Ok(pow::scale(current, ORPHAN_TARGET_RELAX, 1))
     }
 
     /// The current tip's header hash, or `GENESIS_PARENT_HASH` if no
@@ -1470,8 +1497,8 @@ impl Chain {
         }
     }
 
-    fn window_start_timestamp(&self, txn: &heed::RoTxn) -> Result<u64> {
-        match self.meta.get(txn, WINDOW_START_TIMESTAMP_KEY)? {
+    fn anchor_timestamp(&self, txn: &heed::RoTxn) -> Result<u64> {
+        match self.meta.get(txn, ANCHOR_TIMESTAMP_KEY)? {
             Some(bytes) => bytes
                 .try_into()
                 .map(u64::from_be_bytes)
@@ -1488,12 +1515,12 @@ impl Chain {
     fn retarget_if_due(&mut self, wtxn: &mut heed::RwTxn, applied_header: &BlockHeader) -> Result<RetargetState> {
         let prev = RetargetState {
             target: self.current_target(wtxn)?,
-            window_start_timestamp: self.window_start_timestamp(wtxn)?,
+            anchor_timestamp: self.anchor_timestamp(wtxn)?,
         };
         let next = prev.after(&self.difficulty, applied_header);
         self.meta.put(wtxn, CURRENT_TARGET_KEY, &next.target)?;
         self.meta
-            .put(wtxn, WINDOW_START_TIMESTAMP_KEY, &next.window_start_timestamp.to_be_bytes())?;
+            .put(wtxn, ANCHOR_TIMESTAMP_KEY, &next.anchor_timestamp.to_be_bytes())?;
         Ok(next)
     }
 
@@ -1669,7 +1696,7 @@ impl Chain {
         // why this is the only chance to capture it.
         let prev_tip_header = self.tip_header(wtxn)?;
         let prev_current_target = target;
-        let prev_window_start_timestamp = self.window_start_timestamp(wtxn)?;
+        let prev_anchor_timestamp = self.anchor_timestamp(wtxn)?;
         let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
 
         let (state_root, output_count, spent_inputs, _) = self.resolve_and_apply(wtxn, &block.body, None)?;
@@ -1689,7 +1716,7 @@ impl Chain {
         let undo = UndoData {
             prev_tip_header,
             prev_current_target,
-            prev_window_start_timestamp,
+            prev_anchor_timestamp,
             spent_inputs,
         };
         self.block_undo.put(wtxn, &block.header.hash(), &undo.to_bytes())?;
@@ -1765,7 +1792,7 @@ impl Chain {
         }
         self.meta.put(wtxn, CURRENT_TARGET_KEY, &undo.prev_current_target)?;
         self.meta
-            .put(wtxn, WINDOW_START_TIMESTAMP_KEY, &undo.prev_window_start_timestamp.to_be_bytes())?;
+            .put(wtxn, ANCHOR_TIMESTAMP_KEY, &undo.prev_anchor_timestamp.to_be_bytes())?;
 
         Ok(block)
     }
@@ -2195,11 +2222,20 @@ mod tests {
     /// panicking if any stage fails -- for tests that just want a real,
     /// minable `Block` out of `transactions` without re-deriving all four
     /// steps inline every time.
+    ///
+    /// Each block after the first is stamped exactly one target block
+    /// time after its parent: on schedule, so every target stays the
+    /// initial one and branches of equal length weigh the same (tests
+    /// about retargeting set timestamps themselves).
     fn built_proved_and_mined(chain: &mut Chain, transactions: &[Transaction]) -> Block {
         let unproven = chain.build_block(transactions).unwrap();
         let target = unproven.target;
+        let on_schedule = (unproven.height > 0).then(|| unproven.min_timestamp - 1 + DifficultyConfig::for_tests().target_block_time_ms);
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
+        if let Some(timestamp) = on_schedule {
+            block.header.timestamp = timestamp;
+        }
         assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
         block
     }
@@ -2365,7 +2401,7 @@ mod tests {
         let base = Block { header, body };
         let point = crate::snapshot::SyncPoint {
             target: [0xff; 32],
-            window_start: 0,
+            anchor_timestamp: 0,
             work: [0; 32],
         };
         let dir = std::env::temp_dir().join(format!("storage-cost-{}", std::process::id()));
@@ -2521,37 +2557,29 @@ mod tests {
         assert!(chain.output_record(&rtxn, &a).unwrap().is_some());
     }
 
-    /// Unwinding a block that completed a retarget window must restore
-    /// `current_target` to what it was *before* that retarget, not
-    /// just leave it at whatever it became.
+    /// Unwinding a block must restore `current_target` to what it was
+    /// *before* that block retargeted, not just leave it at whatever it
+    /// became.
     #[test]
-    fn unwind_tip_restores_retargeting_state_across_a_window_boundary() {
+    fn unwind_tip_restores_the_retargeting_state() {
         let (_dir, storage, mut chain) = open();
-        let interval = DifficultyConfig::for_tests().interval;
-        let initial_target = DifficultyConfig::for_tests().initial_target;
-
-        let mut last_block = None;
-        for i in 0..interval {
-            let (_sk, pk) = keypair((i + 1) as u8);
-            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
-            chain.apply_block(&block).unwrap();
-            last_block = Some(block);
-        }
-        let last_block = last_block.unwrap();
-
+        apply_at(&mut chain, &[1_000_000, 1_000_010, 1_000_020]);
         let rtxn = storage.read_txn().unwrap();
-        let target_after_window = chain.current_target(&rtxn).unwrap();
+        let before = chain.current_target(&rtxn).unwrap();
         drop(rtxn);
-        // The window completing is what this test is actually
-        // exercising -- if this doesn't hold, the rest is moot.
-        assert_ne!(target_after_window, initial_target);
-
-        let unwound = unwind_committed(&storage, &mut chain);
-        assert_eq!(unwound.header.hash(), last_block.header.hash());
-
+        // Well behind schedule: easier.
+        apply_at(&mut chain, &[1_000_500]);
         let rtxn = storage.read_txn().unwrap();
-        assert_eq!(chain.current_target(&rtxn).unwrap(), initial_target);
-        assert_eq!(chain.height(&rtxn).unwrap(), Some(interval - 2));
+        let after = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+        // The retarget is what this test is actually exercising -- if
+        // this doesn't hold, the rest is moot.
+        assert!(after > before);
+
+        unwind_committed(&storage, &mut chain);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), before);
+        assert_eq!(chain.height(&rtxn).unwrap(), Some(2));
     }
 
     #[test]
@@ -2576,8 +2604,8 @@ mod tests {
         assert_eq!(work1, per_block_work);
         drop(rtxn);
 
-        // No retarget has happened yet (well within one window), so
-        // the second block is mined against the same target too.
+        // The first block sets the target for the second to the initial
+        // one (`asert`'s anchor), so it's mined against the same target.
         let (_sk2, pk2) = keypair(2);
         let block2 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk2, 50)]);
         chain.apply_block(&block2).unwrap();
@@ -2619,74 +2647,89 @@ mod tests {
         assert_eq!(chain.height(&rtxn).unwrap(), Some(1));
     }
 
-    /// Mine and apply `DifficultyConfig::for_tests().interval` blocks,
-    /// each `ms_apart` after the last, starting from an arbitrary
-    /// (but fixed, and comfortably in the past) timestamp -- enough to
-    /// complete exactly one retarget window, so the test can check what
-    /// `current_target` became afterward.
-    fn apply_one_window(chain: &mut Chain, ms_apart: u64) {
-        let mut timestamp = 1_000_000u64;
-        for i in 0..DifficultyConfig::for_tests().interval {
-            let (_sk, pk) = keypair((i + 1) as u8);
+    /// Mine and apply a block at each of `timestamps` in turn.
+    fn apply_at(chain: &mut Chain, timestamps: &[u64]) {
+        for &timestamp in timestamps {
+            // (A key per timestamp: no two rewards alike.)
+            let (_sk, pk) = keypair((timestamp % 251) as u8 + 1);
             let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
             let target = unproven.target;
             let proof = prover::Proof::placeholder();
             let mut block = unproven.finish(proof);
             block.header.timestamp = timestamp;
-            assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
+            assert!(mine_block(&mut block, &target, 1_000_000, &crate::pow::Params::TEST), "should find a nonce quickly");
             chain.apply_block(&block).unwrap();
-            timestamp += ms_apart;
         }
     }
 
-    /// With `DifficultyConfig::for_tests()` (`interval: 10`,
-    /// `target_block_time_ms: 10`, `max_adjustment_factor: 4`), one
-    /// window spans 9 gaps and is expected to take `10 * 9 = 90`
-    /// milliseconds, clamped to `[90/4, 90*4] = [22, 360]` before scaling.
-    #[test]
-    fn retargets_harder_after_a_window_that_ran_faster_than_target() {
-        let (_dir, storage, mut chain) = open();
-        // Nine gaps of 1 ms each (elapsed = 9) is unmistakably
-        // faster than the 90ms expectation, and clamped up to the
-        // floor of 22 before scaling -- not scaled by the raw 9/90.
-        apply_one_window(&mut chain, 1);
-
-        let rtxn = storage.read_txn().unwrap();
-        assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 22, 90));
+    /// Ten blocks from 1,000,000 ms on, `ms_apart` apart.
+    fn apply_ten(chain: &mut Chain, ms_apart: u64) {
+        let timestamps: Vec<u64> = (0..10).map(|i| 1_000_000 + i * ms_apart).collect();
+        apply_at(chain, &timestamps);
     }
 
+    /// With `DifficultyConfig::for_tests()` (10 ms blocks, a 100 ms
+    /// half-life), ten blocks 1 ms apart end 81 ms ahead of schedule:
+    /// harder, by `2^0.81`.
     #[test]
-    fn retargets_easier_after_a_window_that_ran_slower_than_target() {
+    fn retargets_harder_when_blocks_come_faster_than_target() {
         let (_dir, storage, mut chain) = open();
-        // Nine gaps of 100ms each (elapsed = 900) is unmistakably
-        // slower, and clamped down to the ceiling of 360 before
-        // scaling -- not scaled by the raw 900/90 (which would be 10x,
-        // past the 4x limit).
-        apply_one_window(&mut chain, 100);
+        apply_ten(&mut chain, 1);
 
         let rtxn = storage.read_txn().unwrap();
-        assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 360, 90));
+        let target = chain.current_target(&rtxn).unwrap();
+        assert_eq!(target, asert(&DifficultyConfig::for_tests(), 1_000_000, 9, 1_000_009));
+        assert!(target < pow::scale(INITIAL_MAX_HASH, 100, 170) && target > pow::scale(INITIAL_MAX_HASH, 100, 180));
     }
 
-    /// A window whose elapsed time falls *within* the clamp -- so the
-    /// scaling is driven by the real ratio, not just pegged to one of
-    /// the clamp's bounds. Nine gaps of 5ms (elapsed = 45) is
-    /// exactly half of the 90ms expectation.
+    /// Ten blocks 30 ms apart end 180 ms (1.8 half-lives) behind: easier,
+    /// by `2^1.8`; ten 100 ms apart, 8.1 half-lives behind, saturate at
+    /// the easiest target there is.
     #[test]
-    fn retargets_proportionally_when_within_the_clamp() {
+    fn retargets_easier_when_blocks_come_slower_than_target() {
         let (_dir, storage, mut chain) = open();
-        apply_one_window(&mut chain, 5);
-
+        apply_ten(&mut chain, 30);
         let rtxn = storage.read_txn().unwrap();
-        assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 45, 90));
+        let target = chain.current_target(&rtxn).unwrap();
+        assert_eq!(target, asert(&DifficultyConfig::for_tests(), 1_000_000, 9, 1_000_270));
+        assert!(target > pow::scale(INITIAL_MAX_HASH, 34, 10) && target < pow::scale(INITIAL_MAX_HASH, 36, 10));
+        drop(rtxn);
+
+        let (_dir, storage, mut chain) = open();
+        apply_ten(&mut chain, 100);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), [0xff; 32]);
     }
 
-    /// Unlike `apply_one_window`, which fakes `timestamp` by hand, this
+    /// Exactly one half-life behind schedule doubles the target; exactly
+    /// one ahead halves it; on schedule, it's the initial one.
+    #[test]
+    fn a_half_life_off_schedule_doubles_or_halves_the_target() {
+        let (_dir, storage, mut chain) = open();
+        apply_at(&mut chain, &[1_000_000, 1_000_110]);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 2, 1));
+        drop(rtxn);
+
+        let (_dir, storage, mut chain) = open();
+        let timestamps: Vec<u64> = (0..20).map(|i| 1_000_000 + i).chain([1_000_100]).collect();
+        apply_at(&mut chain, &timestamps);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 1, 2));
+        drop(rtxn);
+
+        let (_dir, storage, mut chain) = open();
+        apply_ten(&mut chain, 10);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), INITIAL_MAX_HASH);
+    }
+
+    /// Unlike `apply_at`, which fakes `timestamp` by hand, this
     /// never touches it at all -- `UnprovenBlock::finish` stamps every
     /// block with the real clock (`block::now_millis`), so this
     /// exercises retargeting against genuinely real elapsed time, not
     /// a simulated stand-in for it. Only practical to do quickly
-    /// because `DifficultyConfig::for_tests()`'s window is
+    /// because `DifficultyConfig::for_tests()`'s blocks are
     /// milliseconds, not seconds (see that method's docs): ten trivial
     /// blocks, mined back to back with no injected delay, run in this
     /// test in well under a second of wall-clock test time.
@@ -2711,7 +2754,7 @@ mod tests {
         let initial_target = chain.current_target(&rtxn).unwrap();
         drop(rtxn);
 
-        for i in 0..DifficultyConfig::for_tests().interval {
+        for i in 0..10 {
             let (_sk, pk) = keypair((i + 1) as u8);
             let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
             let target = unproven.target;
@@ -2725,16 +2768,16 @@ mod tests {
         let new_target = chain.current_target(&rtxn).unwrap();
         assert_ne!(
             new_target, initial_target,
-            "expected a real, ~90ms window to retarget away from the initial target in *some* direction"
+            "expected ten real blocks to retarget away from the initial target in *some* direction"
         );
     }
 
     #[test]
-    fn target_is_unchanged_mid_window() {
+    fn the_first_block_leaves_the_initial_target() {
         let (_dir, storage, mut chain) = open();
         let (_sk, pk) = keypair(1);
-        // One block in (out of RETARGET_INTERVAL) -- nowhere near a
-        // window boundary, so the target must still be the initial one.
+        // The first block is the schedule's anchor: the next target is
+        // the initial one.
         let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
         chain.apply_block(&block).unwrap();
 
@@ -2832,9 +2875,15 @@ mod tests {
         let (_sk, pk) = keypair(1);
         let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
         let proof = prover::Proof::placeholder();
+        let target = unproven.target;
         // Leave the nonce unmined -- pow_valid() will be false, so
-        // validate() fails before chain state is even consulted.
-        let block = unproven.finish(proof);
+        // validate() fails before chain state is even consulted. (The
+        // tests' target is easy enough that an unmined header meets it
+        // one time in 256: move the timestamp until it doesn't.)
+        let mut block = unproven.finish(proof);
+        while block.header.pow_valid(&target, &crate::pow::Params::TEST) {
+            block.header.timestamp += 1;
+        }
 
         let err = chain.apply_block(&block).unwrap_err();
         assert!(matches!(err, Error::InvalidBlock));
@@ -3422,16 +3471,15 @@ mod tests {
         block
     }
 
-    /// A fork straddling a retarget-window boundary: the two branches
-    /// close the window at different speeds, so after it they're on
-    /// different targets. The competing branch's first post-window
-    /// block meets *its own* (easier) target but deliberately not the
-    /// active chain's -- it has to be accepted against the former.
+    /// A fork whose branches run at different speeds, so they end on
+    /// different targets. The competing branch's next block meets *its
+    /// own* (easier) target but deliberately not the active chain's --
+    /// it has to be accepted against the former.
     #[test]
     fn a_side_branch_block_is_checked_against_its_own_branchs_target() {
         let (_dir, storage, mut chain) = open();
         let (_builder_dir, builder_storage, mut builder) = open();
-        let interval = DifficultyConfig::for_tests().interval;
+        let interval = 10;
         let start = 1_000_000u64;
 
         // Heights 0..=5, shared.
@@ -3442,17 +3490,19 @@ mod tests {
             builder.apply_block(&block).unwrap();
         }
 
-        // Heights 6..=9 on each side: active fast (harder after the
-        // window), competing slow (easier).
+        // Heights 6..=9 on each side, on schedule (so equal work) but for
+        // the last: early on the active side (a harder target after it),
+        // late on the competing side (easier).
+        let at = |i: u64, last: u64| if i + 1 < interval { start + 10 * i } else { start + last };
         for i in 6..interval {
             let (_sk, pk) = keypair(1 + i as u8);
-            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], start + 50 + (i - 5));
+            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], at(i, 81));
             chain.apply_block(&block).unwrap();
         }
         let mut competing = Vec::new();
         for i in 6..interval {
             let (_sk, pk) = keypair(100 + i as u8);
-            let block = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk, 50)], start + 50 + 100 * (i - 5));
+            let block = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk, 50)], at(i, 140));
             builder.apply_block(&block).unwrap();
             competing.push(block);
         }
@@ -3466,7 +3516,7 @@ mod tests {
         assert!(competing_target > active_target, "competing branch should have retargeted easier");
 
         // Height 10 on the competing side, re-mined until it meets only
-        // the easier target.
+        // its easier target.
         let (_sk, pk) = keypair(200);
         let mut timestamp = start + 1_000;
         let post_window = loop {
@@ -3577,13 +3627,13 @@ mod tests {
     #[test]
     fn stored_retarget_state_matches_the_active_chains_own() {
         let (_dir, storage, mut chain) = open();
-        apply_one_window(&mut chain, 1);
+        apply_ten(&mut chain, 1);
 
         let rtxn = storage.read_txn().unwrap();
         let tip = chain.tip_hash(&rtxn).unwrap();
         let stored = chain.retarget_state_after(&rtxn, tip).unwrap();
         assert_eq!(stored.target, chain.current_target(&rtxn).unwrap());
-        assert_eq!(stored.window_start_timestamp, chain.window_start_timestamp(&rtxn).unwrap());
+        assert_eq!(stored.anchor_timestamp, chain.anchor_timestamp(&rtxn).unwrap());
     }
 
     /// Overwrite `block`'s nonce with successive values until `accept`

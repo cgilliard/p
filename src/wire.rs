@@ -19,7 +19,7 @@
 //! | 9    | `TX_CHUNK`   | txid (32) ‖ index u32 ‖ data (`CHUNK_LEN`, or less if last)  |
 //! | 10   | `GET_TX_INV` | cookie u64                                                  |
 //! | 11   | `GET_SYNC_POINT` | hash (32)                                               |
-//! | 12   | `SYNC_POINT` | hash (32) ‖ target (32) ‖ window_start u64 ‖ work (32)      |
+//! | 12   | `SYNC_POINT` | hash (32) ‖ target (32) ‖ anchor time u64 ‖ work (32)       |
 //! | 13   | `GET_PIECE`  | cookie u64 ‖ at (32) ‖ level u8 ‖ index u32 ‖ first u32 ‖ count u16 |
 //! | 14   | `PIECE_CHUNK`| at (32) ‖ level u8 ‖ index u32 ‖ size u32 ‖ chunk u32 ‖ data |
 //!
@@ -308,7 +308,7 @@ impl Message {
                 out.push(TYPE_SYNC_POINT);
                 out.extend_from_slice(hash);
                 out.extend_from_slice(&point.target);
-                out.extend_from_slice(&point.window_start.to_be_bytes());
+                out.extend_from_slice(&point.anchor_timestamp.to_be_bytes());
                 out.extend_from_slice(&point.work);
             }
             Message::GetPiece {
@@ -435,7 +435,7 @@ impl Message {
                 hash: read_hash(body),
                 point: crate::snapshot::SyncPoint {
                     target: read_hash(&body[32..]),
-                    window_start: read_u64(&body[64..]),
+                    anchor_timestamp: read_u64(&body[64..]),
                     work: read_hash(&body[72..]),
                 },
             }),
@@ -519,7 +519,7 @@ mod tests {
                 hash: [4; 32],
                 point: crate::snapshot::SyncPoint {
                     target: [5; 32],
-                    window_start: 77,
+                    anchor_timestamp: 77,
                     work: [6; 32],
                 },
             },
