@@ -17,7 +17,7 @@
 //!
 //! So a bad piece is caught on arrival and blamed on whoever sent it, any
 //! number of peers can serve pieces in parallel, and fully spent history
-//! is never downloaded at all. The pieces are the levels 32, 24, 16, 12:
+//! is never downloaded at all. The pieces are the levels 40, 32, 24, 16, 12:
 //! inner pieces up to 256 hashes (8 KB), leaf pieces up to 4096 outputs
 //! (~200 KB; most far fewer).
 
@@ -227,8 +227,8 @@ mod tests {
 
     #[test]
     fn pieces_are_the_levels_down_to_the_leaves() {
-        assert!(is_piece(32, 0) && is_piece(24, 255) && is_piece(16, 65535) && is_piece(12, (1 << 20) - 1));
-        assert!(!is_piece(32, 1) && !is_piece(24, 256) && !is_piece(20, 0) && !is_piece(8, 0) && !is_piece(0, 0));
+        assert!(is_piece(40, 0) && is_piece(32, 255) && is_piece(24, 65535) && is_piece(16, (1 << 24) - 1) && is_piece(12, (1 << 28) - 1));
+        assert!(!is_piece(40, 1) && !is_piece(32, 256) && !is_piece(20, 0) && !is_piece(8, 0) && !is_piece(0, 0));
     }
 
     /// A tree downloads piece by piece into exactly its unspent outputs,
@@ -260,10 +260,10 @@ mod tests {
             fetched.push((piece.level, piece.index));
         }
         assert_eq!(plan.finish(), unspent);
-        // Root, one level-24 and one level-16 piece, and the leaf pieces
-        // with something in them -- not the fully spent one.
+        // Root, one level-32, one level-24 and one level-16 piece, and the
+        // leaf pieces with something in them -- not the fully spent one.
         let leaves: Vec<u64> = fetched.iter().filter(|f| f.0 == LEAF_LEVEL).map(|f| f.1).collect();
-        assert_eq!(fetched.len(), 3 + leaves.len());
+        assert_eq!(fetched.len(), 4 + leaves.len());
         assert!(!leaves.contains(&1) && leaves.contains(&0) && leaves.contains(&4));
         // An empty tree needs nothing.
         assert!(Plan::new(state_tree::empty_root(), 0).next().is_none());

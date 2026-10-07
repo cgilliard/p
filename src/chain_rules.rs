@@ -149,6 +149,10 @@ fn le_bytes(v: u64, n: usize) -> Vec<u8> {
     v.to_le_bytes()[..n].to_vec()
 }
 
+/// Bytes of a time span (milliseconds) in the retarget gadget: three
+/// 16-bit limbs, room for main's clamp (`600 s × 2015 × 4` ≈ 2^32.2).
+const TIME_BYTES: usize = 6;
+
 /// The retarget rule (`chain::next_retarget`) for a block at `height`
 /// with timestamp `ts` (four 16-bit limbs, range-checked), given the
 /// `target` (32 little-endian bytes) and window start `window_start`
@@ -165,7 +169,8 @@ pub fn retarget(
     let interval = config.interval;
     let expected = config.target_block_time_ms * (interval - 1);
     let (lo, hi) = (expected / config.max_adjustment_factor, expected * config.max_adjustment_factor);
-    assert!(hi < 1 << 24 && interval >= 2, "the retarget parameters must fit the gadget");
+    // Clamped times are `TIME_BYTES` bytes in the gadget.
+    assert!(hi < 1 << (8 * TIME_BYTES) && interval >= 2 && interval < 1 << 30, "the retarget parameters must fit the gadget");
 
     // height = q·interval + r, 0 <= r < interval.
     let h = value(b, height);
@@ -192,29 +197,34 @@ pub fn retarget(
     let lo_limbs = const_limbs16(b, lo);
     let (_, below_hi) = subtract(b, &elapsed, &hi_limbs, 16);
     let (_, below_lo) = subtract(b, &elapsed, &lo_limbs, 16);
-    let elapsed_value = b.arith(z, Some(elapsed[1]), None, BabyBear::new(1 << 16), z, Some(elapsed[0]), BabyBear::ONE, [z; 4]);
-    let (lo_c, hi_c) = (b.const_base(BabyBear::new(lo as u32)), b.const_base(BabyBear::new(hi as u32)));
-    let inner = select(b, below_lo, elapsed_value, lo_c);
-    let mid = select(b, below_hi, hi_c, inner);
-    let clamped = select(b, backwards, mid, lo_c);
+    // Limb by limb (the clamp may not fit one element).
+    let clamped: Vec<EVar> = (0..4)
+        .map(|j| {
+            let inner = select(b, below_lo, elapsed[j], lo_limbs[j]);
+            let mid = select(b, below_hi, hi_limbs[j], inner);
+            select(b, backwards, mid, lo_limbs[j])
+        })
+        .collect();
 
     // target · clamped / expected, or all ones if the product overflows.
-    let c = value(b, clamped);
-    let c_bytes = witness_bytes(b, &le_bytes(c, 3));
-    let c_composed = {
-        let k256 = BabyBear::new(256);
-        let t = b.arith(z, Some(c_bytes[2]), None, k256, z, Some(c_bytes[1]), BabyBear::ONE, [z; 4]);
-        b.arith(z, Some(t), None, k256, z, Some(c_bytes[0]), BabyBear::ONE, [z; 4])
-    };
-    b.assert_eq(c_composed, clamped);
+    let c = (0..4).map(|j| value(b, clamped[j]) << (16 * j)).sum::<u64>();
+    let c_bytes = witness_bytes(b, &le_bytes(c, TIME_BYTES));
+    for (j, &limb) in clamped.iter().enumerate() {
+        if 2 * j < TIME_BYTES {
+            let composed = b.arith(z, Some(c_bytes[2 * j + 1]), None, BabyBear::new(256), z, Some(c_bytes[2 * j]), BabyBear::ONE, [z; 4]);
+            b.assert_eq(composed, limb);
+        } else {
+            b.assert_zero(limb);
+        }
+    }
     let t_bytes = bytes_of(b, target);
     let product = mul_small(&t_bytes, c);
     let p = witness_bytes(b, &product);
     assert_product(b, target, &c_bytes, &[], 0, &p);
     let (quotient, remainder) = div_small(&product, expected);
     let q_bytes = witness_bytes(b, &quotient);
-    let r_bytes = witness_bytes(b, &le_bytes(remainder, 3));
-    let d_bytes = const_bytes(b, &le_bytes(expected, 3));
+    let r_bytes = witness_bytes(b, &le_bytes(remainder, TIME_BYTES));
+    let d_bytes = const_bytes(b, &le_bytes(expected, TIME_BYTES));
     let mut p_out = p.clone();
     while p_out.len() < q_bytes.len() + d_bytes.len() - 1 {
         p_out.push(b.zero());
@@ -223,8 +233,7 @@ pub fn retarget(
     let smaller = less_than(b, &r_bytes, &d_bytes);
     let one = b.one();
     b.assert_eq(smaller, one);
-    let high = b.add(p[32], p[33]);
-    let high = b.add(high, p[34]);
+    let high = p[33..].iter().fold(p[32], |acc, &x| b.add(acc, x));
     let fits = is_zero(b, high);
     let all_ones = b.const_base(BabyBear::new(255));
     let next: Vec<EVar> = (0..32)
@@ -298,7 +307,7 @@ pub fn add_work(b: &mut Builder, target: &[EVar], work: &[EVar]) -> Vec<EVar> {
 
 /// `value · m` for little-endian bytes: 35 bytes.
 fn mul_small(value: &[u8], m: u64) -> Vec<u8> {
-    let mut out = vec![0u8; value.len() + 3];
+    let mut out = vec![0u8; value.len() + TIME_BYTES];
     let mut carry: u128 = 0;
     for (k, slot) in out.iter_mut().enumerate() {
         let v = value.get(k).copied().unwrap_or(0) as u128 * m as u128 + carry;
@@ -362,12 +371,17 @@ mod tests {
     /// windows.
     #[test]
     fn retargeting_in_the_circuit_matches_the_chain() {
+        // Dev's ten-block windows, and main's 2016 ten-minute blocks (whose
+        // clamp needs more than 32 bits); the cases' heights are in units
+        // of ten-block windows, scaled to the interval.
+        for (interval, target_block_time_ms) in [(10, 60_000), (10, 600_000), (2016, 600_000)] {
         let config = DifficultyConfig {
             pow: crate::pow::Params::TEST,
             initial_target: [0; 32],
-            interval: 10,
-            target_block_time_ms: 60_000,
+            interval,
+            target_block_time_ms,
             max_adjustment_factor: 4,
+            schedule: crate::prover::DEV_SCHEDULE,
         };
         let easy = crate::block::INITIAL_MAX_HASH;
         let hard = crate::pow::max_hash_with_leading_zero_bits(40);
@@ -382,7 +396,11 @@ mod tests {
             (easy, 9, 1_000_000_000_000, 999_999_999_000), // big timestamps
             (hard, 0, 7, 0),                          // the first block
         ];
+        let scale_time = target_block_time_ms * (interval - 1) / (60_000 * 9);
         for (target, height, ts, ws) in cases {
+            // The same position in the window, and the same pace.
+            let height = height / 10 * interval + if height % 10 == 9 { interval - 1 } else { height % 10 };
+            let (ts, ws) = (ts * scale_time, ws * scale_time);
             let (expected_target, expected_ws) = crate::chain::next_retarget(&config, (target, ws), height, ts);
             let mut b = Builder::new();
             let h = witness(&mut b, height);
@@ -393,6 +411,7 @@ mod tests {
             assert_eq!(bytes_of(&b, &next), le(expected_target), "height {height}, ts {ts}, ws {ws}");
             assert_eq!(limbs_value(&b, &window), expected_ws);
             check(b);
+        }
         }
     }
 

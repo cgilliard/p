@@ -97,9 +97,9 @@ pub const INITIAL_MAX_HASH: [u8; 32] = {
     b
 };
 
-/// `prev_hash`, `state_root`, `body_hash` (32 bytes each), then
-/// `output_count`, `height`, `timestamp` (8 bytes each), and `nonce` (32
-/// bytes) -- `BlockHeader`'s fixed encoded width.
+/// `prev_hash`, `state_root`, `body_hash`, `aux_hash` (32 bytes each),
+/// then `output_count`, `height`, `timestamp` (8 bytes each), and `nonce`
+/// (32 bytes) -- `BlockHeader`'s fixed encoded width.
 ///
 /// `height` **is** a header field, deliberately -- a full node
 /// replaying every block from genesis could always reconstruct it by
@@ -110,7 +110,7 @@ pub const INITIAL_MAX_HASH: [u8; 32] = {
 /// block itself, without trusting an unverifiable claim or replaying
 /// anything. See `chain::Chain`'s docs for how a full node still
 /// double-checks a claimed height against what it already knows.
-pub const HEADER_LEN: usize = 32 * 3 + 8 * 3 + 32;
+pub const HEADER_LEN: usize = 32 * 4 + 8 * 3 + 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
@@ -120,6 +120,12 @@ pub struct BlockHeader {
     /// unspent one's commitment, or spent.
     pub state_root: [u8; 32],
     pub body_hash: [u8; 32],
+    /// Any 32 bytes the miner chooses, with no meaning to consensus: a
+    /// standard place to commit to other data -- the root of a Merkle
+    /// tree of documents being timestamped, say -- so nobody needs to
+    /// make outputs for it. Covered by proof of work like every field,
+    /// and so by the chain proof.
+    pub aux_hash: [u8; 32],
     /// How many outputs the state tree holds after this block: the
     /// position the next output gets.
     pub output_count: u64,
@@ -143,18 +149,13 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Serialize to exactly `HEADER_LEN` bytes: the seven fields,
+    /// Serialize to exactly `HEADER_LEN` bytes: the eight fields,
     /// concatenated in field-declaration order (`height`/`timestamp`
     /// big-endian).
     pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
-        out[0..32].copy_from_slice(&self.prev_hash);
-        out[32..64].copy_from_slice(&self.state_root);
-        out[64..96].copy_from_slice(&self.body_hash);
-        out[96..104].copy_from_slice(&self.output_count.to_be_bytes());
-        out[104..112].copy_from_slice(&self.height.to_be_bytes());
-        out[112..120].copy_from_slice(&self.timestamp.to_be_bytes());
-        out[120..152].copy_from_slice(&self.nonce);
+        out[..HEADER_LEN - 32].copy_from_slice(&self.pow_preimage());
+        out[HEADER_LEN - 32..].copy_from_slice(&self.nonce);
         out
     }
 
@@ -173,10 +174,11 @@ impl BlockHeader {
             prev_hash: bytes[0..32].try_into().unwrap(),
             state_root: bytes[32..64].try_into().unwrap(),
             body_hash: bytes[64..96].try_into().unwrap(),
-            output_count: u64::from_be_bytes(bytes[96..104].try_into().unwrap()),
-            height: u64::from_be_bytes(bytes[104..112].try_into().unwrap()),
-            timestamp: u64::from_be_bytes(bytes[112..120].try_into().unwrap()),
-            nonce: bytes[120..152].try_into().unwrap(),
+            aux_hash: bytes[96..128].try_into().unwrap(),
+            output_count: u64::from_be_bytes(bytes[128..136].try_into().unwrap()),
+            height: u64::from_be_bytes(bytes[136..144].try_into().unwrap()),
+            timestamp: u64::from_be_bytes(bytes[144..152].try_into().unwrap()),
+            nonce: bytes[152..184].try_into().unwrap(),
         })
     }
 
@@ -193,6 +195,7 @@ impl BlockHeader {
         bytes.extend_from_slice(&self.prev_hash);
         bytes.extend_from_slice(&self.state_root);
         bytes.extend_from_slice(&self.body_hash);
+        bytes.extend_from_slice(&self.aux_hash);
         bytes.extend_from_slice(&self.output_count.to_be_bytes());
         bytes.extend_from_slice(&self.height.to_be_bytes());
         bytes.extend_from_slice(&self.timestamp.to_be_bytes());
@@ -359,9 +362,10 @@ impl BlockBody {
     /// Whether `proof` actually attests to this body's `inputs`/
     /// `outputs`, and to the state moving as `state` says (from the
     /// parent's root and output count to the header's) -- see `prover`'s
-    /// docs. By far the most expensive check a block gets.
-    pub fn proof_is_valid(&self, state: &crate::aggregate::StateChange) -> bool {
-        self.proof.verify(&self.inputs, &self.outputs, &self.nonces, state)
+    /// docs -- claiming exactly `reward`. By far the most expensive check
+    /// a block gets.
+    pub fn proof_is_valid(&self, state: &crate::aggregate::StateChange, reward: u64) -> bool {
+        self.proof.verify(&self.inputs, &self.outputs, &self.nonces, state, reward)
     }
 
     /// `to_bytes().len()`, without building the bytes.
@@ -513,6 +517,8 @@ pub struct UnprovenBlock {
     pub inputs: Vec<[u8; 32]>,
     pub outputs: Vec<[u8; 32]>,
     pub nonces: Vec<[u8; NONCE_LEN]>,
+    /// The header's `aux_hash`: zeros unless the miner sets it.
+    pub aux_hash: [u8; 32],
     /// How to prove it: its transactions' chunks and each chunk's state
     /// transition, worked out against the parent's state.
     pub plan: crate::prover::BlockPlan,
@@ -538,14 +544,6 @@ impl UnprovenBlock {
     /// `finish`, also carrying the parent's chain proof (`chain_step`) --
     /// what a block needs on a chain that requires chain proofs.
     pub fn finish_with_chain_proof(self, proof: Proof, chain_proof: Vec<u8>) -> Block {
-        // A placeholder (empty) proof, for chains that skip proof checks,
-        // still records the chunks, so applying the block appends its
-        // outputs in the order this plan did.
-        let proof = if proof.is_empty() && !self.plan.body_chunks.is_empty() {
-            Proof::header_only(self.inputs.len(), self.outputs.len(), &self.plan.body_chunks)
-        } else {
-            proof
-        };
         let body = BlockBody {
             inputs: self.inputs,
             outputs: self.outputs,
@@ -558,6 +556,7 @@ impl UnprovenBlock {
             state_root: self.state_root,
             output_count: self.output_count,
             body_hash: body.body_hash(),
+            aux_hash: self.aux_hash,
             height: self.height,
             timestamp: now_millis().max(self.min_timestamp),
             nonce: [0u8; 32],
@@ -616,9 +615,9 @@ impl Block {
     ///
     /// The proof also attests the state transition, so it's checked
     /// against the parent's state: `parent_state` is its `(state_root,
-    /// output_count)`.
-    pub fn validate(&self, target: &[u8; 32], pow: &pow::Params, parent_state: ([u8; 32], u64)) -> bool {
-        self.validate_structure(target, pow) && self.body.proof_is_valid(&self.state_change(parent_state))
+    /// output_count)`; and the reward, the schedule's at its height.
+    pub fn validate(&self, target: &[u8; 32], pow: &pow::Params, parent_state: ([u8; 32], u64), reward: u64) -> bool {
+        self.validate_structure(target, pow) && self.body.proof_is_valid(&self.state_change(parent_state), reward)
     }
 
     /// The state change this block claims, from its parent's state.
@@ -759,6 +758,7 @@ mod tests {
             state_root: [2u8; 32],
             output_count: 3,
             body_hash: BlockBody::new().body_hash(),
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -780,6 +780,7 @@ mod tests {
             state_root: [2u8; 32],
             output_count: 3,
             body_hash: [4u8; 32],
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -807,6 +808,7 @@ mod tests {
             state_root: [2u8; 32],
             output_count: 3,
             body_hash: [0xABu8; 32], // does not match BlockBody::new()'s hash
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -862,6 +864,7 @@ mod tests {
             state_root: [2u8; 32],
             output_count: 3,
             body_hash: [4u8; 32],
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 1_700_000_000,
             nonce: [0u8; 32],
@@ -879,6 +882,7 @@ mod tests {
             state_root: [2u8; 32],
             output_count: 3,
             body_hash: [4u8; 32],
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 1_700_000_000,
             nonce: [0u8; 32],
@@ -900,6 +904,7 @@ mod tests {
             state_root: [2u8; 32],
             output_count: 3,
             body_hash: [4u8; 32],
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -959,6 +964,7 @@ mod tests {
             state_root: [8u8; 32],
             output_count: 7,
             body_hash: body.body_hash(),
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -1055,6 +1061,7 @@ mod tests {
             state_root: [0u8; 32],
             output_count: 0,
             body_hash: body.body_hash(),
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -1087,6 +1094,7 @@ mod tests {
             state_root: [0u8; 32],
             output_count: 0,
             body_hash: body.body_hash(), // matches honestly, PoW is fine
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -1141,6 +1149,7 @@ mod tests {
             state_root: [0u8; 32],
             output_count: 0,
             body_hash: body.body_hash(),
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],

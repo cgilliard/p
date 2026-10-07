@@ -17,7 +17,8 @@
 //!
 //! Each step also verifies the **block's own proof** -- its tree's root
 //! (`aggregate`: a wrap or an aggregation, by the network's keys) -- and
-//! checks it claims exactly the reward and moves the state from the
+//! checks it claims exactly the reward the schedule gives its height
+//! (`prover::Schedule`; none past the chain's end) and moves the state from the
 //! parent's (as the child attests) to the header's `state_root` and
 //! `output_count`. So a chain proof vouches for every block's validity,
 //! not just its header: transactions authorized and balanced, every
@@ -31,7 +32,7 @@
 //!
 //! ```text
 //! [ step vk | header hash | height, timestamp (4 × 16-bit), output count
-//!   | next target (16 × 16-bit) | state root | window start (4 × 16-bit)
+//!   (2 × 20-bit) | next target (16 × 16-bit) | state root | window start (4 × 16-bit)
 //!   | cumulative work (16 × 16-bit) ]
 //! ```
 
@@ -44,7 +45,7 @@ use crate::ext::Ext;
 use crate::poseidon2::{BabyBear, DOMAIN_VK, digest_from_bytes};
 use crate::recursion;
 use crate::transcript::octet_of;
-use crate::state_circuit::{bits_of, digest_bits, from_bits, hash_bits, pack_octets};
+use crate::state_circuit::{bits_of, canonical_bits, digest_bits, from_bits, hash_bits, pack_octets};
 use crate::stark::{self, Proof};
 
 /// What a chain proof attests about its tip header.
@@ -85,14 +86,15 @@ impl Tip {
         }
     }
 
-    /// `[height, timestamp limbs, output count, 0, 0]`.
+    /// `[height, timestamp limbs, output count limbs, 0]` (the count as
+    /// `aggregate::wide`).
     fn info(&self) -> Octet {
         let mut o = [BabyBear::ZERO; 8];
         o[0] = BabyBear::new(self.height as u32);
         for (j, l) in limbs16(self.timestamp).into_iter().enumerate() {
             o[1 + j] = BabyBear::new(l);
         }
-        o[5] = BabyBear::new(self.output_count as u32);
+        o[5..7].copy_from_slice(&crate::aggregate::wide(self.output_count));
         o
     }
 
@@ -276,22 +278,6 @@ fn lane_of(b: &mut Builder, o: OVar, l: usize) -> EVar {
 
 // ---- proof of work ---------------------------------------------------------------
 
-/// `x`'s 31 bits, lowest first -- its *canonical* value, below p: with
-/// only `bits_of`, a value below 2^27 - 1 could also be written as itself
-/// plus p, and pick another dataset index than validators do.
-fn canonical_bits(b: &mut Builder, x: EVar) -> Vec<EVar> {
-    let bits = bits_of(b, x, 31);
-    // p - 1 = 2^31 - 2^27: the top four bits all set leave only zeros below.
-    let mut top = bits[27];
-    for &bit in &bits[28..31] {
-        top = b.mul(top, bit);
-    }
-    let low = from_bits(b, &bits[..27]);
-    let both = b.mul(top, low);
-    b.assert_zero(both);
-    bits
-}
-
 /// The header's proof-of-work value (`pow::pow_value`), from its attempt's
 /// output `out` (`native`, its values): each lookup's index from the mix,
 /// the item read proven against the dataset tree's root (built in), the
@@ -391,24 +377,29 @@ fn step_builder(child: &ChainProof, block: &Node, header: &BlockHeader, tip: &Ti
         b.assert_zero(gated);
     }
 
-    // The block's proof: by the tree's wrap or aggregation circuit,
-    // claiming exactly the reward, from the parent's state to this one's.
-    let (count_in, count_out) = block_proof(&mut b, block, keys, tree, c_state, public[5])?;
-    let child_count = lane_of(&mut b, c_info, 5);
-    b.assert_eq(count_in, child_count);
-
     // The header's fields.
     let state_root = public[5];
     let body_hash = b.witness_octet(digest_from_bytes(&header.body_hash));
-    if header.output_count >= 1 << 31 {
+    // Any 32 bytes.
+    let aux_bits: Vec<EVar> = header
+        .aux_hash
+        .iter()
+        .flat_map(|&byte| {
+            let cell = b.witness_ext(Ext::from_base(BabyBear::new(byte as u32)));
+            bits_of(&mut b, cell, 8)
+        })
+        .collect();
+    // The output count: below 2^DEPTH, as its two `wide` limbs.
+    use crate::state_tree::{DEPTH, LIMB_BITS};
+    if header.output_count >= 1 << DEPTH {
         return Err(Error::InvalidProof);
     }
     let count: Vec<(EVar, Vec<EVar>)> = limbs16(header.output_count).iter().map(|&l| witness_limb(&mut b, l)).collect();
-    let z = BabyBear::ZERO;
-    let composed_count = b.arith(z, Some(count[1].0), None, BabyBear::new(1 << 16), z, Some(count[0].0), BabyBear::ONE, [z; 4]);
-    b.assert_eq(composed_count, count_out);
-    b.assert_zero(count[2].0);
-    b.assert_zero(count[3].0);
+    let count_bits: Vec<EVar> = count.iter().flat_map(|c| c.1.clone()).collect();
+    for &bit in &count_bits[DEPTH..] {
+        b.assert_zero(bit);
+    }
+    let count_out = [from_bits(&mut b, &count_bits[..LIMB_BITS]), from_bits(&mut b, &count_bits[LIMB_BITS..DEPTH])];
     let timestamp: Vec<(EVar, Vec<EVar>)> = limbs16(header.timestamp).iter().map(|&l| witness_limb(&mut b, l)).collect();
     // Height: the child's plus one, below 2^31 (so its limbs are unique).
     let child_height = lane_of(&mut b, c_info, 0);
@@ -419,6 +410,29 @@ fn step_builder(child: &ChainProof, block: &Node, header: &BlockHeader, tip: &Ti
     h1_bits.push(b.zero());
     let composed = b.arith(BabyBear::ZERO, Some(h1), None, BabyBear::new(1 << 16), BabyBear::ZERO, Some(h0), BabyBear::ONE, [BabyBear::ZERO; 4]);
     b.assert_eq(composed, height);
+    // ... and canonical (`canonical_bits`), so the bits are the height's
+    // own, not the height plus p.
+    let height_bits: Vec<EVar> = h0_bits.iter().chain(&h1_bits[..15]).copied().collect();
+    {
+        let mut top = height_bits[27];
+        for &bit in &height_bits[28..31] {
+            top = b.mul(top, bit);
+        }
+        let low = from_bits(&mut b, &height_bits[..27]);
+        let both = b.mul(top, low);
+        b.assert_zero(both);
+    }
+
+    // The block's proof: by the tree's wrap or aggregation circuit,
+    // claiming exactly the reward at this height, from the parent's state
+    // to this one's.
+    let reward = scheduled_reward(&mut b, &keys.difficulty.schedule, &height_bits);
+    let (count_in, block_out) = block_proof(&mut b, block, keys, tree, c_state, public[5], &reward)?;
+    for l in 0..2 {
+        let child_count = lane_of(&mut b, c_info, 5 + l);
+        b.assert_eq(count_in[l], child_count);
+        b.assert_eq(block_out[l], count_out[l]);
+    }
     let zero_bits = vec![b.zero(); 16];
     // Strictly after the child's timestamp.
     let child_ts: [EVar; 4] = std::array::from_fn(|j| lane_of(&mut b, c_info, 1 + j));
@@ -453,6 +467,7 @@ fn step_builder(child: &ChainProof, block: &Node, header: &BlockHeader, tip: &Ti
     let mut bits = digest_bits(&mut b, c_hash);
     bits.extend(digest_bits(&mut b, state_root));
     bits.extend(digest_bits(&mut b, body_hash));
+    bits.extend(aux_bits);
     bits.extend(be64_bits(&std::array::from_fn(|j| count[j].1.clone())));
     bits.extend(be64_bits(&[h0_bits, h1_bits, zero_bits.clone(), zero_bits]));
     bits.extend(be64_bits(&std::array::from_fn(|j| timestamp[j].1.clone())));
@@ -491,7 +506,7 @@ fn step_builder(child: &ChainProof, block: &Node, header: &BlockHeader, tip: &Ti
     let work = crate::chain_rules::add_work(&mut b, &target, &child_work);
 
     // What this proof attests.
-    let info = pack_octets(&mut b, &[height, ts[0], ts[1], ts[2], ts[3], count_out])[0];
+    let info = pack_octets(&mut b, &[height, ts[0], ts[1], ts[2], ts[3], count_out[0], count_out[1]])[0];
     b.assert_eq_octet(info, public[2]);
     let [t0, t1] = bytes_to_octets(&mut b, &next_target);
     b.assert_eq_octet(t0, public[3]);
@@ -545,13 +560,15 @@ pub fn step_rows(child: &ChainProof, block: &Node, header: &BlockHeader, tip: &T
 
 /// Verify a block's root proof in the circuit and check what it claims:
 /// its key is the tree's wrap or aggregation circuit's (an aggregation's
-/// `vk` input being that key), it balances against exactly the reward,
-/// and it moves the state from `state_in` (the parent's root) to
-/// `state_out` (this header's). Returns its `(count_in, count_out)`.
-fn block_proof(b: &mut Builder, block: &Node, keys: &StepKeys, tree: &TreeParams, state_in: OVar, state_out: OVar) -> Result<(EVar, EVar), Error> {
+/// `vk` input being that key), it balances against exactly `reward` (its
+/// amount limbs), and it moves the state from `state_in` (the parent's
+/// root) to `state_out` (this header's), its outputs filling the window
+/// `count_in..count_out`. Returns its `(count_in, count_out)`, each two
+/// limbs (`aggregate::wide`).
+fn block_proof(b: &mut Builder, block: &Node, keys: &StepKeys, tree: &TreeParams, state_in: OVar, state_out: OVar, reward: &[EVar]) -> Result<([EVar; 2], [EVar; 2]), Error> {
     use crate::aggregate::{add_amount, limbs_of};
     let statement = recursion::verify(b, &block.air, &block.proof, &tree.params).ok_or(Error::InvalidProof)?;
-    if statement.tuples.len() != 6 {
+    if statement.tuples.len() != 8 {
         return Err(Error::InvalidProof);
     }
     let mut tuple_header = octet_of(-BabyBear::ONE);
@@ -562,6 +579,8 @@ fn block_proof(b: &mut Builder, block: &Node, keys: &StepKeys, tree: &TreeParams
         let address = b.const_octet(octet_of(BabyBear::new(k as u32)));
         b.assert_eq_octet(cells[1], address);
     }
+    // (`data`, `challenge` and `product` bind the body, which only
+    // validators see; the state doesn't depend on them.)
     let [vk, _data, amounts, root_in, root_out, counts] = std::array::from_fn(|k| statement.tuples[k][0]);
 
     // Its key: wrap (s = 0) or aggregation (s = 1, carrying its own key).
@@ -585,11 +604,10 @@ fn block_proof(b: &mut Builder, block: &Node, keys: &StepKeys, tree: &TreeParams
         b.assert_zero(gated);
     }
 
-    // Exactly the reward: a == b + REWARD (the limbs are range-checked by
+    // Exactly the reward: a == b + reward (the limbs are range-checked by
     // the wrap and aggregation circuits).
     let limbs = limbs_of(b, amounts);
-    let reward: Vec<EVar> = crate::output::amount_limbs(crate::prover::REWARD).iter().map(|&l| b.const_base(l)).collect();
-    let expected = add_amount(b, &limbs[4..], &reward);
+    let expected = add_amount(b, &limbs[4..], reward);
     for j in 0..4 {
         b.assert_eq(limbs[j], expected[j]);
     }
@@ -597,7 +615,58 @@ fn block_proof(b: &mut Builder, block: &Node, keys: &StepKeys, tree: &TreeParams
     // The state.
     b.assert_eq_octet(root_in, state_in);
     b.assert_eq_octet(root_out, state_out);
-    Ok((lane_of(b, counts, 0), lane_of(b, counts, 1)))
+    let [count_in, count_out, base, end]: [[EVar; 2]; 4] = std::array::from_fn(|k| [lane_of(b, counts, 2 * k), lane_of(b, counts, 2 * k + 1)]);
+    for l in 0..2 {
+        b.assert_eq(base[l], count_in[l]);
+        b.assert_eq(end[l], count_out[l]);
+    }
+    Ok((count_in, count_out))
+}
+
+/// Whether the number with bits `bits` (lowest first) is below the
+/// constant `c`: scanning down from the top, the first bit where they
+/// differ is 0 in it and 1 in `c`. A bit.
+fn below_const(b: &mut Builder, bits: &[EVar], c: u64) -> EVar {
+    if c >> bits.len() != 0 {
+        return b.one();
+    }
+    let mut eq = b.one();
+    let mut lt = b.zero();
+    for (i, &bit) in bits.iter().enumerate().rev() {
+        if (c >> i) & 1 == 1 {
+            // Below here if the bit is 0; still equal if it's 1.
+            let below = b.sub(eq, bit);
+            let below = b.mul(eq, below);
+            lt = b.add(lt, below);
+            eq = b.mul(eq, bit);
+        } else {
+            let one = b.one();
+            let flipped = b.sub(one, bit);
+            eq = b.mul(eq, flipped);
+        }
+    }
+    lt
+}
+
+/// The reward the schedule gives the height whose bits are `height_bits`
+/// (lowest first, canonical), as amount limbs (`output::amount_limbs`);
+/// past the schedule's end, unsatisfiable.
+fn scheduled_reward(b: &mut Builder, schedule: &crate::prover::Schedule, height_bits: &[EVar]) -> Vec<EVar> {
+    if let Some(end) = schedule.end {
+        let before_end = below_const(b, height_bits, end);
+        let one = b.one();
+        b.assert_eq(before_end, one);
+    }
+    let early = below_const(b, height_bits, schedule.first_blocks);
+    let (first, then) = (crate::output::amount_limbs(schedule.first), crate::output::amount_limbs(schedule.then));
+    let z = BabyBear::ZERO;
+    (0..first.len())
+        .map(|j| {
+            // then + early·(first - then)
+            let then_j = b.const_base(then[j]);
+            b.arith(z, Some(early), None, first[j] - then[j], z, Some(then_j), BabyBear::ONE, [z; 4])
+        })
+        .collect()
 }
 
 // ---- chain proofs on a real chain -----------------------------------------------
@@ -654,10 +723,10 @@ impl ChainVerifier {
 /// The chain-proof circuits' verifying keys (caps, hex) for each network:
 /// derived from the circuits, the network's genesis and difficulty rule,
 /// and the tree keys (the `chain_keys` test in `main` regenerates them).
-const GENESIS_CAP: &str = "eb6dcf0d9f6605156f869366cb2af264e273362186672b59bba26412dac0bc42e11a2607f18fed1da766e53343975550a543d93ea660d568b20d91447fce321f676bb9399e095242dc89581d0b5488125619f5026eb17a4b68d2f135794b3f22b5622157a2e0e61f1caaff1deda514479d9b8b091cea9e633ec26e3de3814a3b90054751f823a61813344d731bf3970a24de223734fc353a8d1f28325172ed1b5d12d90fc315ae26026d1e68d9f875229b1fa13a68908a41d8d0e62759b05659e1f3ca05753e3d45b7b63c0d5299ba333843e115a8d970137b859972bb02404788844b0402d99c5fd87fa54efe59496cbc03fc5f9176656c919d3e0838b70756d325703ea61ddd39650b7c25c1b06117478c702b5634c304c65c362b7164942fad83370b4e3ed92eceb0951b3d0cb344e1f31d5851c2dd6a6fcac73955248754e5f02f6125834619547a4f0f603ffb053b4f66419c385d485bca7b4d44455a60929dbd244ecef92191544b0cb03fa80d69230d5619419f33ee82f303ebae20532b0b0245a8dac12cc49f88607d1e21241a20f72b750e58595a2a3d1a473bbf10197ef32224d25a16101843174019c846fd24573ed6745867a1f238589501ea05d69cb81d4405465ffd81fb0a7ebaca186a20464a70996f378c824a33edacfa4c58fc104ef3c8803ea7bf203cff176b758aefea2f9343dc02872c5439ea9bbb363684136258e08b46cbc3f46dbeb21548ab807371f3eb26559d41f32dff870f32272a6b333dec06347c1fa65458505e023b52b725fef1c86116534a56967dd140aae6742b111c8235f1dc5d73ead4514c5b17c11a8ca2e740dee1104449b17e318b5ee20c536a2c717cb9c64554272c3b88bcce44386fb6361d49920ff8df6324ada96639f88a162749f4962468cf8a476864a0195fea030784bd0e092794046f5c0c66185c0070453703b218e7148e057f3bc835f924461f88f1d12e470af4395f823f35487e2969e1ef6e092c49277120eecc079ce5ad02ae27db2e5cff5f103b980703495c464b01b99d6f6480e61ccf0ff65cb20cf8650a46cc1ef4273b1ea8f85b47a4511110cf8e7d0a5b775f2363c6fb1ccc6d096b2eac0b24b75cdd3ba965c33feb72d5585de2ff59b1e4a1699a003e1eea554f55af20d101a2f45f656e54a87482379648aef92614784b6349405f3207e5461b00dfdaa473698fad6ba84cbf43f79e01287f5bfe2cd01a796a0d0a9d0d27763b5bdb02453969422425f6e52c54c748c44bb8b0cb4f335b5e6f5596700696223d6749138b4de1fc152c6067202b1716d430e4cbcc183aa2b6542c165a16e3b11e73b78fd40fc0c14c0b4b35972f1b6b90137fcab81ab2397b0406e1d020b714991a030961741b483577c15e4f33ba4ac807ec4e22327d059709c3b1706ecb513b49c0ed557779a5ae4f";
-const STEP_CAP: &str = "97fa454218443e3273afd8454801bd396db5d100e2959a14e1c1cd5267374a643838190bee575c524f68e50c18c9054c951bcf052ee1696eda53a56f52e8b55cd145734f8ce63d40c585df0a9fea6b336ea01b58fa2cf0229e02675cf427071284329c1d92be7637e635f610113a90771194080e58d7c622c876d94e9c620840beb1ed7345d2d7460ab1f52e63927e37143211726e390404a619fb1e7b897926b44cdc650d93671321f1af020acd2c1f202cdb5326e97e1b4e35b475f6181d37c5e7c4713c10775699aa41378cf7f746ffcbe811de2a45151224aa6b3a2f9b1248c9f6469b3dd6601366952de7f8d21290533b71c8c62957d218605adaaf9556122ad321908b29600963a46af6c8885ec470c6147b57e768efbe2821db4ba43fea10094e8102eb344b137b65316e16520b42621a2db3f33d1b4dd10207df5313e6bbd977b04259204ec6ef6465d4de2587a65858492d0146ea113e195dcc173f32ea7735323b6930733037011c8a01482b35961041d806505317ed05f28c5c2db1e188053ebfec3cda912706442b3d662ebdde0ce7d2a05f7ae47a358cad70184869f14f51bc226180447f0f99dec30cd349b55881bf2a538585a8751251fb4add57d8269935f4729662601aac2a235c965fc51c43246767b333245be39bee68e49c4450d178ee6bc9d83729020e6e5f2c54c55d050f4f258aa81f19d0cba41534ace9073d25266a071dff2405a8bf22d460652fe1e45e0e22c3cd2a03888006a73f865033c80e6473931b398e613a12b445691638ff241f6885fb36ce604263552c6b3f9be955045854422de192163f137e153c65902a26a05511246517455036c87d1e8f03b22d5e66093cfa7fd34f8f9ea42aae55eb23ad985b5719477c098673d751835461517e84d60bee05da5ad574be24c8802142f24d575f3718da5dcb75767565e9b01bc5ef0c3db407e3388ad5840f629d0b4c6c444662a658da58834bf7181f75d03053ac1a65c3995753d9583e18780e1841d8a6b576127b824b642bc66bf89c0707526d5b37fb7d71172f43163da0b75d66d261c7333e2b695cbf80fc0b3d4e507097952374e92de27503e47d63f46f6e18eb6a9b3568a4ec73ccbb1766b93b20381ea9714c1d59886ae7aa1d5e52b50f27a90bfc680a06182558f81d49f877db3b0e85b2174b46a012bf98b41f8919ab1684d47a0940cdae7188211417dc03c003e99cd33ca28d9c402e807c040efd36612edb3b0faa73272a446bca557b46b46f55161814eaf26c2b192da367064c04112afd1c656bb40e1f61a05571e2c1931062d5b421f5112e1797588544c7ff340b94cd080320a2f549dc37c003167fa413e821923152b6156804ede80a41821e6799701436107d495bde1fcf28297af6446ca6b76c74f28a2644dcf364f2a7fb568f1e462a6684fc46";
-const DEV_GENESIS_CAP: &str = "3ca73f38d814ed4d09f6da097b7e6c749c8d8a31e77ebf16273eeb5ab05bd7517a2260334890284dc8629f6a0cc57f487f680b599ce83e34572a6d3fcb4e8f70551d550485b5611f80ffe62604e8710a265a7410f571cf343642ad6c604a5073a5c4ad21196fe162bb4e0b04835db6170fd09955dbc72f4347cf8a70cdc7310254667b38e70c4c69dc577a5245e98071e3dbf2394eaa8e3748465d0493b52b77a69076086d840072fae7434cc3b4d0220743df0313d565481c8dfc37cf188e64012dc764b1ff3e366e45912a71b4be540419e7427d883520492c476d01ab7a430d624b612fecca2d84fe834053283e2a7ac51b45cc081162eed7a72f9239e13fc4501b0b839b432e001d092095f267659c8c204c16c7002036e2e26ea3ac5b383587ff331807e73b4b6f9164f04e831a48c3210ae629314ac8b8a23e2513280ca54ad514095842615390000b925433754f61862fded7d1744c4a1d434421b1074ff1bb1d02fbe133d288dc0a3c4383551032b06b1389f90dca04440b6137151a170f8621a113b258ca2973416f63160b19162e1438f6dc3fa80e682d835db1735411077149b1c461bce8d73ea36d575fe75e8f38f56dc661d4683e67aa61a84cd9d4591a777c0e1cc75c9b4b31e08c2de0ef8712c81d5c745fc51c720004ef0376e081206ff59603391cf85cbc63d05dca957116207bdf34eb1eb4289070650d229dc15e98313e45d75e714dfa14c21c4f7022435fd00e3d4be6ea5f583c813670dad21d4413025f043f9e541b0a743549b8630cb9492c04de37c03a060d2648ba84d0013d5bb26801828f0408127f67fae2b1606b7de639eef8316bca3da641702017143897f11155555f3b016d892027988b13832eef3565983e6f01e4b638abae2c13283c0700a253707114c85d0c103d9530a3d9d364dd267a7605deda624988143212350420bdbb1c0fe59f4a6f0537933656f7f209d0fbbf18cbce9d773718792a7252a15bc50b4d0fb825d35fd52bca2f3036642c8936dd568b61f65f8c839132bb40ff255edd5c18ae1b726fb767d847fcd63d414996f416d0e87155f67ef705e994220266a8a0085960882578d2ab6f8c7119369570150e569fca50486dc75f06e6c73ccff4113c44cf0d017805a64c96afef5f3ef84136bfbd52465dee93214a31556296cc096e906d852c5a36bf3af8385b069796c93fd07704483be33d73618b82551c1e9b25d9cc066d0d826917395649686f22962882723a72e5d49665e921c9760ecae4773778666115099d33895dd54ef7792d5cd5f52a6b24aa811d192bdd4d0e681b7784700568698a774451834a3d890e9c400728fe16aa3f2416d4d1ee76acbd2c46d543c040d98bf577f7e72240825ff934415cc77719e6e7543634c00ae7ecfb0d39aae53b2019045ff23d28587daf2e19cabf7f50";
-const DEV_STEP_CAP: &str = "f394953130d0a61e5818bf58ba6a7d3d4eb569247e93aa754ccc362b175da06445ebbb65970319219647736674eaa8522183cf5958586558d1a21724f500042a57bcde43520f0e3d82aa5c4572e8d10152c32b35e932be008c7ec06463ad0924ad1401183e3a711731f2d271acb6dc5a1f12f01819ada05275f72a0a54354c1fa77cd8423826b6372c081a0867e4c175f34bde53fe9c9167915e091ad11c6f1288859b6d361d034208a4701007333b72d466b3031566ef744cbc77300c3a9f56b7b4ac3a2e0cb12ad1811b13f3e5e5236a25f308d8b2fd31a3c64208473cbc68ee9d722d3751910c247fe36bbbd69c595d79407693fb234723413c1286eb1d2b9cafff630554f2775e07ed43c4608457cb84820b82203c3c4594e219fe40050c32de256b7b27e9577ce4b52c0a720722f3d8ba1b8fd6a60b67d4203c90814f01a97cb71fd9bd7413ca02ec47ff13cd6bae9ac41ec492e5314620fa1d4d20ab2855873342ca5fc71aae04c174796d8211dadcbc660b834166061630500bd2f46a9f87276f97b0a45c4e725170e9e00e2db4eb78666b482a2d302726403c369000e8ddb90ea4187f4f4d511a3a2eced81da153d107310ad31d2dd632726f79f9023b3d7f3ceb917f2709e255447f7dd0152d2c280635b92e0396846c2c3dcfae56eddb3044bb8be5178bbec52fbeaf8c362dc93b7760444b5ab0263421f7351f4cf6155c0d23a1b272cc3dcf33370a4b3fcd9dab6460b9e23bd0c27b538fab9f26697117760f4f014a12da27446ab631459811cc602441ce31665b5857bbec1142234bf15fd6204f4646147b03db3d4b1ce7f4b64e2985232768280c53936b913b9a0804598d0e3644cc329a3f3239f1091ead423a15645d6ab74d9029d7fe2471ce31ae39796d4135becd852540a34b69aaaf662642b39305a39fa65dab3a066368f87e630bfde83913a0ca3cb9d7b81b2f8975133c9a9644dcf5b2594fb69409b50bfa656c6da41dc8af332aa8ea6104fe9b6a13e6bf4569c93f6a4a2773b70bdb31e1521c7a8528a7ed630c524ba51f00dba76cf2f7f474e068824eedc7b63d5096b475adddd3563b83d05f52a78b511ccd24028cafc7382eadb54302f3de751483d41fbc016468862a9d7698a9d429e0c8bf738641b601ab81066d7569d448cf1ab24700ca9169ff7dff4b535ba1642ea9023f33ca6f2685f9f44e7304d2668ea9d112bc6c354d666e8f4bb18fb559a9442b1c9d7c965c1aac3752e64e48022ccdef403f534766de387b01326c443d04bcab0805e7607578fb530b2377764b43efb44692f95f34eb8ebb1b4f0414419fc07213b3475e151a71d81e370f9356cc55b63adf40d85d73f8031ab0758a0f6e92fe2030d30d5c05388c7557a9635f20bae3722adee0008aeb276b64f9384d4f29d173f695893f8014784eb4b1250b";
+const GENESIS_CAP: &str = "3c1c3e0dab62eb34b9a4d5263cb5c84eea26d42250023a7553388b37af318c003b084416580f4900c9d6a35b95bbca5fc3eb3442c5754947450c3404899e880ab2c58639687a0507e7fd64745c499a6733f8281dbf94756b1d246657bbdb9040274695454d5e62076a5296734559db1e985a2f2bdd54ad16db589716ef0f8b4232858f0efad5e33e825ccd70693a8f13d4d1314980b8671cabc743400ccfa729229a6937300cbc70b123b90454a7714586ad420bc640d31414050025b24c89770c629c2109ecd82f6d222064b9a4ca5fcb8c241674391b634ab20d539241980bb5eb8f67885a926b0cba6957be18845d51d86128c410b763f04a0302c0a7fe2dcc3544536c83215ed03141710c8cce1406efde6cac397a3dde45ab13ab70325c8b83907714c7404be9aa6648f3a2f82855e1026e4889d92f02b28b47640f6561f4be0e420ed21c2882510756559e82480b424957c363e601370f8f3ee342bf098a5bdd5ff93604181df35c3bb8446f065e515d2eae97623639c4716d682cbc767e5d134b5614684f3e272d0e4f3cee47a3502a1f58ce0c533c68b903a065d20cda2c3c34e5eceb423566f4375f0e810fdf96573c4d544d101bcb38022b221c3e0acc771f5f46a8126797860e10281f236c66331981ec833295353e2eb5d70e18ad23fc68bf6959421f2f7f0824b0c22094afbe45259d0632532f0d30df12580d07e84902e0241a46a90278260a43e10cf44a8951c9a282434be121098cd5c01c29c51f64ea119e5a30a47e037fc8a35db60f465bf4768959c6d5240256c2c62ff96e43350915443a6ae43732004e8221dc984714a291e249926a286a044d5242950a9f0569ba7e568e05f864d80fb04a637ffd46230f60116b2f8d658062872d44ad856208c93e43d8206c2de17c0f54bc621020b2fc1e304b79ba3ebb9fcf11cea49f54e167a73dfcefca54e7d0263eb88d665f3ed9ad626ee3a0324dd14e5f47c5393d8dc0c9300cf2b029ceda4e2291c74c737c13086ff55512024e5c2d5d2515d546c155e62d95af04342ff2e55678f6be2a7bc09931768d9019b5a0c72881713c6d940f34037c93d36bdc0f3f3179edaf20d4b9136a19b2af2bde15242482bea16a368fd440bbb9d81cba2b47580f591b0517a597020d83fe4a1e20721651a9b8098622ef0340e0f059afe35b444c8c20665f9ca10300c4e8402215370ad3f0ab6c2e99de19ce04be54591ada40bd3cad3649984e2bc2f52321d536925726c8ed0f4c821b6e586ce46ad0eb9c4f3b21b81b2c5403455b44196f9d33b915c027b50f4e3d956e36b1055ba8230741ee020e27b2f7ff3496fd830d3346aa26593984104bd81f770e5ded15f4acd16b42a3ee1d20bea36e57b884707f8885536ef51d1b023e0a15ec3f68241f76a7650049d62e3f165644c66cad2ab447fa69";
+const STEP_CAP: &str = "300b922b8c97233e249ea0465e4af615c7c2de55a0747b443bb34c6c76f6b04613b2870c777db70642755e0bebef87340286b95a227ee3572e27480fce7fd66881ca4c589da4606de1581f109e861f5d10d4e7767cdc834c87544330adc0476382cbbc3d7bf14647dcb5aa6b9886fb7505f7ae35a9488e5e3800f71d09ee443d877d132f530abc3a0b030833bd48805960bfdc33a16bea1d8e72613050b1fe28db1ae61c9ef96e46255be24acaceff5f8623ae2629d93e75534b321a119ade12cd252429f4d3d11d92ca7c0226cedd0084bf7170876e3b10257bfc0197644e264d56f35b3f24ae3aa73a444bbf21ca0e59b7c4496fb4142d7581a3313180702cc5a0df0d6ba91a05b920ad0122b940063301b1018c9d45491d82bc03c531c46621653d522d45ff468ce7261f5aeb87050c9d824f99c0780fc890760ffff574450858ab690969de0f9d35973fc7098a05c830b620f0af230f46f9c86b8437c736bf14af0a61531c6586fd416674d0c6443157de35fb156e2d20bbcb520e67ce296215c9049d9ce129bc9bf075d9ab795c740242682dd792052e2a1e19344fe921952eee0b10ca3c19d31b7d1250537b050b371450f711831e4da38626c38549282c8ebc2382c3db1ecbd5e12016e3b16e57695e6512025b3622b5ed2dfddb8f13fb140e67fb5dce5fdb311b58daff0306096a963b5fa48c7089da7730c1f519251fa6ee0bfcd5a10642f48d5b59e3b218c26d6a41630f27340979a038cc2b84734c9b2f08a7b5635bfcb0a66509ff0a4ac657ea75de241a56a684df020ed97d3130f5404a95499b1d9164866f9e2e4931e9ea753eee5b31336be21d75b1f7872489e76025b0f4ef3c3d9a025ce67044543c9e0069fc583153ae03fd0a8b091d77bc78585510a6da0c6dd5115060aee7261ba856324d7d8e6b773cf22e1d7d556ba9587466f4931d04db026f270cb31c157f0982061f18c45cb8726c2e0f9c643ecab2e15c1556596561983a6a14443b638e34080fb2b6f72f10b74a3fb07c770b9c47096a943ea001908a636afbe8ec1585a9d20ca68302282bb39e5a5c90cb296c98183d43653365f70f4a5700262a10ffdf19461a904b2976dc8e2c0f85da6f58dcb22a2657e5313a71ed6a0722f60fdeb9b9541e7f160bcc59e8195e50e645d13f181c46619e352518ee1309fa1a11ad954a2395e1f777ca1eba400ce98a6a0202826aa3d7280fc5bb735f5f4c1d006de75269574c476c870c77274f35ea499177eb2de7258500bc8175749eff882432be0e4bcf383c268c9a2934ff3056689730d246a3425e3c3debdd3578b3290c9de61a0aa7dbe9319267a51651087617a417e96003b10b49b1f01a1c646a481f72a9e12a87a050273741b9066a7d9c7552cecc44dc1b6c1884649014004235233abed70b4466441428ad9f03e630b004";
+const DEV_GENESIS_CAP: &str = "73bb8c64034f596731c19544cd86c9221b37b6015b1cd234ee36fa0e89e6b748c67ecc273a797744ef52552bf089496d091b304c09fc802ecd971a2bdcb3e83f4aa4243908bde74616720759d0ab9111bdcbd93d6ea3dd407a32264b65251c23e1d8fc59fe94b51076d8af3ea811a03a82944925d2c44d55d7738a3ad675656f93cd0709fd114440c69b012e4a98d44574f04b0a612ee22e00a03b2018fcf4718c2255366417d13d57eab21b4a4d53660a2d2a4c85a3756365846607b5534c4d3f77ea4d2605762d0f23b20a2e3c5f64a5ef641bfb437a4f91b1e147923d4d5a02bebd3ee76f2228bf18fa2cb1d9150ee877b373c9a76657dffd3c5841fe0e0a047e41000d4d3a3118a8646f556c750086fc5e690655aa136d7b6f04bc23795ca892576a016691116b2782119692593683f9f02ef69ed049958ff83b14b6a26cf526e308b67c4a51f27711317ee0934e99b8841be076fb1721014209c06eac45cefb0557692821707f13a46374091e4e8653662a35fbea11e8fa8a3c329dd84dd4276c04b2cd1c27718fc647d4352b6fde91c54797466866717b6a2c70f5c8753ede696eb2bf7e2463f8d4531b5df7559c9a311a341cc82b0875295f44ca724e50a5d65e87c08034f85bae5af210e16113638051cf944b58835dd06f04130d0789123a148639e733be8851041f5a6b5473c8f64b38abb339dc637e5f6690f9455f58dd1631afd1766c4b7f5ec5f30f47245bc56a1c08ce2715bbca29d8025f73cabed8531ef69b1d5c38d02e0e26634f05f7274a96311f614f580d537e6a961bf41e621e219a047632f05e1acb317e28de98ee27a2601d035ad01263ae4bb65ecfbb6e46db62483e3e060f3a5cab8a471886650b339a1e242b0bba62283b0f409a016d48f4d8310f448b813cec2ec73812720902e0c8433b733eaf2f0bf61413ba33e24b2763803339b7d2729b63e04d1690ab5d0d3e2a52a7628b58a60c1d6f414b7f428c227c55940a86390e24be642d9ed42f3f3125157d97b123b0466f00178cac54da602160791eaa326b43a7775300096b7924d15dbeabba762062894ee8c3e91ab208410269f23659bd347e14b0ad9b6e64de9019f7b03a4ea3a057447477341dc24eb32b6463f62c2b9873042e0d3f72b07256706e86c8014abf661775f8561d07d5f1758c1ce83fc8e174583e53901ed9627760c061d40f9f00fb0046282145d5437c7112105f706d3b3f3d7f780245e961666bc987a15706672c195c6771229def915aa970201b49afab65553968757689f2600d25db20a25d795d90aff12e5f30b856d1f8c204bd95fe75e3af7540f7f8d966852b295cef7e5c0301e5b70e7b7531372fd2c24fc439ed4e4d8c4167c1344338d1adc375a9e603316b97dc252ba38172991b8160137dca5108c97050a574f03eb98cd2534c92bd73";
+const DEV_STEP_CAP: &str = "0bfbc2656308af3ccf663c3f2ddb940f47a311237ad43704856acb268654ab00596002286c48ce584a7c4f757b416f043924b51f7e45a00a3a1b7f2ba204db3573905e210a28b872434c702fa422285979a49362365004101989740ea7f8774bfc67eb1400ecc11af6df6e35f0f69c6844b033300f0626360e08f302a59db46b4005bc4cb83bc74835ad59554e0338136475e74adc0b193ba362842e4b82984c84f46e51c64e7764960e471ad96ffc50a7d9230910fcad172626a759d43cf42502d401505d341a19df3ef21528e0c91a620fd70615039b1ce80a701cbbe06616c78c2a52ce6bf75618aef744c35756600125445a2c31e5719028784ec9548a48a01fc629608a6043cfcd550aaca64241ec77d23b4248a86ca8ab240d5f6af31ce5d5f334217d06630596f75f7bb7d8084286de3f93e84a42967aab711d230914cb91b64d5557de1242ef7644e793884b338f4247cff47e3f18875621ef4ca32ad47b1070d4ea476df8facf6332e6e00b8fa1bd14413c943b9844933c7e95bc2efe19556aa16e5e1de2b74c3982cce8442646b829e671d44c263f88323205a86c6bf1be0e044828041b7667664a149b265df3cd133d00a91949b1c41d14a7ef55aa7bdb09e9bf2819e20ccf6e20d37b772ff44a011aceff660d74fc16f195e709299dea4da4ef3a1d0e67444191ba1b126cba515d6bcbc21ecfcd7303b5ff1d5fddec912cfed5d547b545725b697a2e4104d65c66259cdd66a7965472ade08437099e22069268d15d2e2e0f1ce3a57d7254ec274154b84d63f22eb8303be1126913cba12fa784f47106bb1d057bb9c41955857e06119f3264d53dd038cd43f43f9170b3006c0f555e3ab71a6ba215472da2f24441b4582c50b056bf4cb169ba16b871764c1a6f5f32775f1e50c4b30d33106ece617fdc44119a1f590313d33f0077dfaa1302cadf5034b8803cd3232f45a05020650636912a63fd5027773290544332d552f360df699c2d406d1e1b4f491510d24495c4620bb0df670fc1f8c672722d7a47f4aebd46f550c37703f2055c1892834889f37c6d6a68a94663b9dd2565d76b20d89aa96d4dc52a58aaf54454fd9d8350e29cef50a8d54270349c5710fb87bc6b117bb138b9f14e38a609302f9056395a6ac0371ad1b69d55b4f9775f1226c747623f76344c5a126f42805e13bbb60b152b529b035a83814aa5f98775b0974116e360fe38c54fad10eeaa4f42278b8355a2cfc9245df0061245c3e0150c13c972cec2d65a667016126dbdaa1a696a42675ca6de3fec0dd741d175e110375bfb0dda1eeb58aee4de366d0522137ccc01332cc4ad6afb3f36504cbdd3329cdac60abe652014f615ea5fbed6711fb1978259ca274d4496e75806268a4331d14659223cead7078e19d90eb4ac4b04af3eca2db6d0e72b1093a145e7caac19";
 
 fn cap_from_hex(hex: &str) -> Vec<crate::merkle::Hash> {
     let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
@@ -930,6 +999,11 @@ mod tests {
     }
 
     fn check(b: Builder) {
+        assert!(holds(b));
+    }
+
+    /// Whether the circuit's constraints hold.
+    fn holds(b: Builder) -> bool {
         let circuit = b.finish();
         let params = stark::Params {
             log_blowup: 1,
@@ -940,7 +1014,37 @@ mod tests {
         let air = circuit.air(&params);
         let mut t = crate::transcript::Transcript::new(b"pow circuit test");
         let challenges: Vec<Ext> = (0..2).map(|_| t.challenge_ext(b"c")).collect();
-        stark::check(&air, &circuit.witness, &challenges).unwrap();
+        stark::check(&air, &circuit.witness, &challenges).is_ok()
+    }
+
+    /// The circuit's reward is the schedule's at every height around its
+    /// boundaries, and past the end no reward satisfies it.
+    #[test]
+    fn the_reward_in_the_circuit_follows_the_schedule() {
+        use crate::prover::{DEV_SCHEDULE, MAIN_SCHEDULE};
+        let first = MAIN_SCHEDULE.first_blocks;
+        let end = MAIN_SCHEDULE.end.unwrap();
+        for schedule in [MAIN_SCHEDULE, DEV_SCHEDULE] {
+            for height in [0, 1, first - 1, first, first + 1, end - 1, end, end + 1, (1 << 27) - 1, crate::poseidon2::P as u64 - 1] {
+                let build = || {
+                    let mut b = Builder::new();
+                    let x = b.witness_ext(Ext::from_base(BabyBear::new(height as u32)));
+                    let bits = canonical_bits(&mut b, x);
+                    let reward = scheduled_reward(&mut b, &schedule, &bits);
+                    let limbs: Vec<BabyBear> = reward.iter().map(|&l| b.ext_value(l).0[0]).collect();
+                    (b, limbs)
+                };
+                match schedule.reward(height) {
+                    Some(expected) => {
+                        let (b, limbs) = build();
+                        assert_eq!(limbs, crate::output::amount_limbs(expected).to_vec(), "height {height}");
+                        assert!(holds(b), "height {height}");
+                    }
+                    // (The builder refuses a failing assertion outright.)
+                    None => assert!(std::panic::catch_unwind(build).is_err(), "height {height}"),
+                }
+            }
+        }
     }
 
     /// The proof-of-work gadget computes exactly the native value, and its

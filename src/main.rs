@@ -66,10 +66,15 @@ use storage::Storage;
 /// docs -- so this is in bits, not bytes: 16 was too fast, 24 too
 /// slow, 20 closer but still a bit fast. Only an informed guess, not a
 /// calibration: `Chain`'s retargeting corrects for however wrong it
-/// actually is after the first `RETARGET_INTERVAL` blocks regardless,
+/// actually is after the first retarget window regardless (on main,
+/// 2016 blocks -- a few hours or weeks, depending on how wrong it is),
 /// and this number is independent of `block::INITIAL_MAX_HASH` (which
 /// stays fixed and easy, since tests built around it need to mine
 /// quickly -- see that constant's docs).
+///
+/// Main: a ten-minute block is ~5 minutes of proving plus proof of work.
+/// 2^23 attempts is about 5 minutes on one thread of a laptop (the node
+/// mines on one), so the first blocks come about on time.
 const INITIAL_LEADING_ZERO_BITS: u32 = 23;
 /// The dev network's (`network`): easier, so proof of work adds little to
 /// the proving time that already bounds a block.
@@ -77,21 +82,26 @@ const DEV_INITIAL_LEADING_ZERO_BITS: u32 = 20;
 
 /// Retargeting knobs for this driver's actual run -- independent of
 /// `chain::DifficultyConfig::for_tests`'s own numbers (see that
-/// method's docs for why they're deliberately never the same values).
-/// `target_block_time_ms` here is `10_000` (10 real seconds), not the
-/// test suite's `10` (milliseconds) -- same window size, genuinely
-/// different real-world pace, which is exactly the point of the two
-/// being independent numbers.
-const RETARGET_INTERVAL: u64 = 10;
-const TARGET_BLOCK_TIME_MS: u64 = 60_000;
+/// method's docs for why they're deliberately never the same values):
+/// the tests use 10-block windows of 10 ms blocks, to run fast.
+///
+/// Main: Bitcoin's 2016-block window (two weeks at the target pace),
+/// each retarget moving difficulty at most
+/// `MAX_ADJUSTMENT_FACTOR`x either way.
+const RETARGET_INTERVAL: u64 = 2016;
+/// Dev: 10-block windows, so difficulty follows proving time quickly.
+const DEV_RETARGET_INTERVAL: u64 = 10;
+/// Main: ten minutes, which the reward schedule's eras are counted in
+/// (`prover::MAIN_SCHEDULE`).
+const TARGET_BLOCK_TIME_MS: u64 = 600_000;
 /// The dev network's. Below what proving takes (~80 s a block on dev), so
 /// retargeting eases proof of work as far as it goes and blocks come as
 /// fast as they're proven.
 const DEV_TARGET_BLOCK_TIME_MS: u64 = 10_000;
 
-/// This network's starting difficulty and block time. Consensus: the
-/// chain-proof circuit proves retargeting with these, so changing either
-/// means regenerating the network's chain-proof keys (`chain_keys` test)
+/// This network's starting difficulty, block time and retarget window.
+/// Consensus: the chain-proof circuit proves retargeting with these, so
+/// changing any means regenerating the network's chain-proof keys (`chain_keys` test)
 /// and starting from fresh data directories.
 fn leading_zero_bits() -> u32 {
     match network::current() {
@@ -104,6 +114,13 @@ fn target_block_time_ms() -> u64 {
     match network::current() {
         network::Network::Main => TARGET_BLOCK_TIME_MS,
         network::Network::Dev => DEV_TARGET_BLOCK_TIME_MS,
+    }
+}
+
+fn retarget_interval() -> u64 {
+    match network::current() {
+        network::Network::Main => RETARGET_INTERVAL,
+        network::Network::Dev => DEV_RETARGET_INTERVAL,
     }
 }
 const MAX_ADJUSTMENT_FACTOR: u64 = 4;
@@ -160,9 +177,10 @@ fn difficulty_config() -> chain::DifficultyConfig {
             network::Network::Dev => pow::Params::DEV,
         },
         initial_target: pow::max_hash_with_leading_zero_bits(leading_zero_bits()),
-        interval: RETARGET_INTERVAL,
+        interval: retarget_interval(),
         target_block_time_ms: target_block_time_ms(),
         max_adjustment_factor: MAX_ADJUSTMENT_FACTOR,
+        schedule: prover::schedule(),
     }
 }
 
@@ -174,7 +192,7 @@ fn difficulty_config() -> chain::DifficultyConfig {
 ///
 /// Each network (`network`) has its own; they differ only in timestamp
 /// and nonce (the body, and so the state root, is empty in both).
-const GENESIS_STATE_ROOT: &str = "5be6bc002e4d0a70dcdf897284a01d5577381315464b6506f65ce56f7d5bc035";
+const GENESIS_STATE_ROOT: &str = "5abee969c7a1566666504b63de10071be7bfcc3b1301802d076b26655c4b7d2f";
 const GENESIS_BODY_HASH: &str = "ab928c73b05ea858df784d11d3ff2f21f3048d5a0c8e6b4714c6f52e56fd8871";
 
 /// A network's genesis: timestamp, nonce, and the resulting hash.
@@ -185,15 +203,15 @@ struct Genesis {
 }
 
 const MAIN_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_344_142_098,
-    nonce: "a23f000000000000000000000000000000000000000000000000000000000000",
-    hash: "b10e4411c5b6662e4b14ef3156cbaa43ead98b0db7146f0a9b358659d2e92e4f",
+    timestamp_ms: 1_791_397_635_329,
+    nonce: "be2b000000000000000000000000000000000000000000000000000000000000",
+    hash: "9309aa2ea784a2491f81df3567af5e2a911ab25fa4d9182d3852511c4a319b66",
 };
 
 const DEV_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_344_475_356,
-    nonce: "8f13000000000000000000000000000000000000000000000000000000000000",
-    hash: "d334f3477d36581ce3083a5cf8758f22712e4b28e517c75a0267f41293b1034f",
+    timestamp_ms: 1_791_397_128_006,
+    nonce: "a834000000000000000000000000000000000000000000000000000000000000",
+    hash: "bc4e8d30394d1a6676979a5829e96b0323902e3ebd40912c13983e3e3febc10c",
 };
 
 fn genesis() -> &'static Genesis {
@@ -218,6 +236,7 @@ fn genesis_block() -> Block {
             state_root: from_hex32(GENESIS_STATE_ROOT),
             output_count: 0,
             body_hash: from_hex32(GENESIS_BODY_HASH),
+            aux_hash: [0; 32],
             height: 0,
             timestamp: genesis().timestamp_ms,
             nonce: from_hex32(genesis().nonce),

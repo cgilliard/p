@@ -907,6 +907,8 @@ pub const DOMAIN_VK: u32 = 7;
 pub const DOMAIN_DATA_LEAF: u32 = 8;
 /// An internal node of an aggregation tree's data.
 pub const DOMAIN_DATA_NODE: u32 = 9;
+/// The challenge binding a block's proof to its body (`aggregate::challenge`).
+pub const DOMAIN_BINDING: u32 = 10;
 /// A Merkle tree internal node, plus its level -- one domain per level.
 pub const DOMAIN_MERKLE_NODE: u32 = 0x100;
 

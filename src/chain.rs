@@ -145,6 +145,9 @@ pub struct DifficultyConfig {
     /// swing before being clamped, each retarget -- `4` means at most
     /// 4x harder or 4x easier per window. Bitcoin's own value.
     pub max_adjustment_factor: u64,
+    /// The block reward by height, and the height the chain ends at
+    /// (`prover::Schedule`).
+    pub schedule: crate::prover::Schedule,
 }
 
 impl DifficultyConfig {
@@ -162,6 +165,7 @@ impl DifficultyConfig {
             interval: 10,
             target_block_time_ms: 10,
             max_adjustment_factor: 4,
+            schedule: crate::prover::DEV_SCHEDULE,
         }
     }
 }
@@ -299,6 +303,9 @@ pub enum Error {
     /// A transaction handed to `build_block` has more inputs or outputs
     /// than one chunk holds (`prover::CHUNK_SHAPE`) -- a consensus limit.
     TransactionTooLarge,
+    /// The chain has reached its end height (`prover::Schedule::end`): no
+    /// further block is valid.
+    ChainEnded,
     /// A side-branch block's own header is unsound -- `Block::validate`
     /// against the target its own branch's history implies failed.
     InvalidSideBranchBlock,
@@ -395,6 +402,7 @@ impl std::fmt::Display for Error {
             Error::OutputCountMismatch => write!(f, "header's output_count does not match the result of applying the body"),
             Error::InvalidTransaction(i) => write!(f, "transaction at index {i} failed verify()"),
             Error::TransactionTooLarge => write!(f, "a transaction has more inputs or outputs than one chunk holds"),
+            Error::ChainEnded => write!(f, "the chain has reached its end height; no further block is valid"),
             Error::InvalidSideBranchBlock => write!(f, "side-branch block failed validate() against the active target"),
             Error::InvalidSideBranchLineage => write!(f, "side-branch block's prev_hash/height doesn't match its claimed parent"),
             Error::ReorgTooDeep => write!(f, "competing chain's common ancestor is beyond max_reorg_depth"),
@@ -1051,12 +1059,16 @@ impl Chain {
         if !block.validate_structure(target, &self.difficulty.pow) {
             return Ok(false);
         }
+        // Past the schedule's end, nothing is valid.
+        let Some(reward) = self.difficulty.schedule.reward(block.header.height) else {
+            return Ok(false);
+        };
         let is_genesis = self.genesis_hash == Some(block.header.hash());
         if !self.check_proofs || is_genesis {
             return Ok(true);
         }
         let parent = self.parent_state(txn, block.header.prev_hash)?;
-        if !block.body.proof_is_valid(&block.state_change(parent)) {
+        if !block.body.proof_is_valid(&block.state_change(parent), reward) {
             return Ok(false);
         }
         // The parent's chain proof: that the parent is the tip of a valid
@@ -1079,15 +1091,6 @@ impl Chain {
         let bytes = self.blocks.get(txn, &prev_hash)?.ok_or(Error::Corrupt("a parent block is not stored"))?;
         let header = BlockHeader::from_bytes(&bytes[..HEADER_LEN.min(bytes.len())]).map_err(|_| Error::Corrupt("a stored block was corrupt"))?;
         Ok((header.state_root, header.output_count))
-    }
-
-    /// The chunks a received block's proof says to apply its body in; one
-    /// chunk of everything if the proof doesn't say (it's then invalid
-    /// anyway, unless proofs aren't being checked).
-    fn chunks_of(body: &BlockBody) -> ChunkIndices {
-        body.proof
-            .chunk_assignment(body.inputs.len(), body.outputs.len())
-            .unwrap_or_else(|| vec![((0..body.inputs.len()).collect(), (0..body.outputs.len()).collect())])
     }
 
     /// `Error::WrongGenesis` if `header` claims to be a first block but
@@ -1509,85 +1512,97 @@ impl Chain {
     /// checks the roots against one, `build_block` just wants them --
     /// and nothing here commits `wtxn`; that's always the caller's job.
     ///
-    /// Applied chunk by chunk (`chunks`): each chunk's inputs spent, then
-    /// its outputs appended -- so outputs get positions in chunk order,
-    /// as the block's proof applies them. With `record`, also returns each
-    /// chunk's state transition witness (positions, nonces, paths, every
-    /// `CHUNK_SHAPE` slot), for proving.
-    fn resolve_and_apply(&mut self, wtxn: &mut heed::RwTxn, body: &BlockBody, chunks: &ChunkIndices, record: bool) -> Result<ResolveResult> {
-        use crate::aggregate::{ChunkTransition, StateChange};
-        use crate::poseidon2::digest_from_bytes;
-        use crate::prover::CHUNK_SHAPE;
+    /// Applied in body order: every input spent, then every output
+    /// appended -- so a block's outputs take the positions `count..count +
+    /// outputs` in the order the body lists them, however its proof groups
+    /// them. With `chunks` (each chunk's commitments, as indices into the
+    /// body's lists), also returns each chunk's state transition witness
+    /// for proving (`aggregate::ChunkTransition`): the chunks applied in
+    /// turn, in memory (`state_tree::Overlay`), each output at its own
+    /// position.
+    fn resolve_and_apply(&mut self, wtxn: &mut heed::RwTxn, body: &BlockBody, chunks: Option<&ChunkIndices>) -> Result<ResolveResult> {
+        let transitions = match chunks {
+            Some(chunks) => self.chunk_transitions(wtxn, body, chunks)?,
+            None => Vec::new(),
+        };
         let mut spent_inputs = Vec::with_capacity(body.inputs.len());
-        let mut transitions = Vec::new();
-        let mut seen_inputs = 0;
-        let mut seen_outputs = 0;
+        for &commitment in &body.inputs {
+            let position = self
+                .utxo
+                .get(wtxn, commitment)?
+                .ok_or(Error::UnresolvedInput(commitment))?;
+            self.state.spend(wtxn, position)?;
+            self.utxo.remove(wtxn, commitment)?;
+            spent_inputs.push((commitment, position));
+        }
+        for (commitment, nonce) in body.outputs.iter().zip(&body.nonces) {
+            if self.utxo.get(wtxn, *commitment)?.is_some() {
+                return Err(Error::DuplicateOutput(*commitment));
+            }
+            let position = self.state.push(wtxn, commitment, nonce)?;
+            self.utxo.insert(wtxn, *commitment, position)?;
+        }
+        let root = self.state.root(wtxn)?;
+        if let Some(last) = transitions.last()
+            && crate::poseidon2::digest_to_bytes(last.change.root_out) != root
+        {
+            return Err(Error::Corrupt("a block's chunks don't reach the state its body does"));
+        }
+        Ok((root, self.state.count(wtxn)?, spent_inputs, transitions))
+    }
+
+    /// Each chunk's state transition (`resolve_and_apply`), before the
+    /// body is applied.
+    fn chunk_transitions(&self, wtxn: &heed::RwTxn, body: &BlockBody, chunks: &ChunkIndices) -> Result<Vec<crate::aggregate::ChunkTransition>> {
+        use crate::aggregate::{ChunkTransition, StateChange};
+        use crate::prover::CHUNK_SHAPE;
+        let base = self.state.count(wtxn)?;
+        let end = base + body.outputs.len() as u64;
+        let mut overlay = crate::state_tree::Overlay::new(&self.state, wtxn);
+        let mut transitions = Vec::with_capacity(chunks.len());
+        let mut count = base;
+        let (mut seen_inputs, mut seen_outputs) = (0, 0);
         for (ins, outs) in chunks {
-            seen_inputs += ins.len();
-            seen_outputs += outs.len();
-            if record && (ins.len() > CHUNK_SHAPE.inputs || outs.len() > CHUNK_SHAPE.outputs) {
+            if ins.len() > CHUNK_SHAPE.inputs || outs.len() > CHUNK_SHAPE.outputs {
                 return Err(Error::TransactionTooLarge);
             }
-            let root_in = self.state.root(wtxn)?;
-            let count_in = self.state.count(wtxn)?;
-            let mut t_inputs = Vec::new();
-            let mut t_outputs = Vec::new();
+            (seen_inputs, seen_outputs) = (seen_inputs + ins.len(), seen_outputs + outs.len());
+            let (root_in, count_in) = (overlay.root()?, count);
+            let mut inputs = Vec::with_capacity(CHUNK_SHAPE.inputs);
             for &i in ins {
                 let commitment = body.inputs[i];
-                let position = self
-                    .utxo
-                    .get(wtxn, commitment)?
-                    .ok_or(Error::UnresolvedInput(commitment))?;
-                if record {
-                    let nonce = self
-                        .output_record(wtxn, &commitment)?
-                        .ok_or(Error::Corrupt("an unspent output's record is missing"))?
-                        .nonce;
-                    t_inputs.push((position, nonce, self.state.path(wtxn, position)?));
-                }
-                self.state.spend(wtxn, position)?;
-                self.utxo.remove(wtxn, commitment)?;
-                spent_inputs.push((commitment, position));
+                let position = self.utxo.get(wtxn, commitment)?.ok_or(Error::UnresolvedInput(commitment))?;
+                let nonce = self
+                    .output_record(wtxn, &commitment)?
+                    .ok_or(Error::Corrupt("an unspent output's record is missing"))?
+                    .nonce;
+                inputs.push((position, nonce, overlay.path(position)?));
+                overlay.set(position, crate::state_tree::SPENT)?;
             }
-            if record {
-                let count = self.state.count(wtxn)?;
-                for _ in ins.len()..CHUNK_SHAPE.inputs {
-                    t_inputs.push((count, [0; crate::recovery::NONCE_LEN], self.state.path(wtxn, count)?));
-                }
+            while inputs.len() < CHUNK_SHAPE.inputs {
+                inputs.push((end, [0; crate::recovery::NONCE_LEN], overlay.path(end)?));
             }
+            let mut outputs = Vec::with_capacity(CHUNK_SHAPE.outputs);
             for &o in outs {
-                let (commitment, nonce) = (body.outputs[o], body.nonces[o]);
-                if self.utxo.get(wtxn, commitment)?.is_some() {
-                    return Err(Error::DuplicateOutput(commitment));
-                }
-                if record {
-                    let count = self.state.count(wtxn)?;
-                    t_outputs.push(self.state.path(wtxn, count)?);
-                }
-                let position = self.state.push(wtxn, &commitment, &nonce)?;
-                self.utxo.insert(wtxn, commitment, position)?;
+                let position = base + o as u64;
+                outputs.push((position, overlay.path(position)?));
+                overlay.set(position, crate::state_tree::leaf(&body.outputs[o], &body.nonces[o]))?;
+                count += 1;
             }
-            if record {
-                let count = self.state.count(wtxn)?;
-                for _ in outs.len()..CHUNK_SHAPE.outputs {
-                    t_outputs.push(self.state.path(wtxn, count)?);
-                }
-                transitions.push(ChunkTransition {
-                    change: StateChange {
-                        root_in: digest_from_bytes(&root_in),
-                        count_in,
-                        root_out: digest_from_bytes(&self.state.root(wtxn)?),
-                        count_out: self.state.count(wtxn)?,
-                    },
-                    inputs: t_inputs,
-                    outputs: t_outputs,
-                });
+            while outputs.len() < CHUNK_SHAPE.outputs {
+                outputs.push((end, overlay.path(end)?));
             }
+            transitions.push(ChunkTransition {
+                change: StateChange { root_in, count_in, root_out: overlay.root()?, count_out: count },
+                window: (base, end),
+                inputs,
+                outputs,
+            });
         }
         if seen_inputs != body.inputs.len() || seen_outputs != body.outputs.len() {
             return Err(Error::InvalidBlock);
         }
-        Ok((self.state.root(wtxn)?, self.state.count(wtxn)?, spent_inputs, transitions))
+        Ok(transitions)
     }
 
     /// Apply `block` to the chain: resolve its inputs/outputs against
@@ -1657,8 +1672,7 @@ impl Chain {
         let prev_window_start_timestamp = self.window_start_timestamp(wtxn)?;
         let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
 
-        let chunks = Self::chunks_of(&block.body);
-        let (state_root, output_count, spent_inputs, _) = self.resolve_and_apply(wtxn, &block.body, &chunks, false)?;
+        let (state_root, output_count, spent_inputs, _) = self.resolve_and_apply(wtxn, &block.body, None)?;
         for (commitment, nonce) in block.body.outputs.iter().zip(&block.body.nonces) {
             self.utxo.set_origin(wtxn, *commitment, block.header.height, nonce)?;
         }
@@ -2058,9 +2072,9 @@ impl Chain {
         let (prev_hash, height) = self.next_prev_hash_and_height(&wtxn)?;
         let min_timestamp = self.tip_header(&wtxn)?.map_or(0, |parent| parent.timestamp + 1);
         let target = self.current_target(&wtxn)?;
-        // The chunks to prove it in, and so the order its outputs are
-        // appended in: each chunk's transactions' commitments, by their
-        // place in the body.
+        let reward = self.difficulty.schedule.reward(height).ok_or(Error::ChainEnded)?;
+        // The chunks to prove it in: each chunk's transactions'
+        // commitments, by their place in the body.
         let plan_chunks = crate::prover::plan_chunks(transactions).ok_or(Error::TransactionTooLarge)?;
         let index = |list: &[[u8; 32]], c: &[u8; 32]| list.binary_search(c).map_err(|_| Error::InvalidBlock);
         let mut chunks: ChunkIndices = Vec::with_capacity(plan_chunks.len());
@@ -2078,7 +2092,7 @@ impl Chain {
             outs.sort_unstable();
             chunks.push((ins, outs));
         }
-        let (state_root, output_count, _spent_inputs, transitions) = self.resolve_and_apply(&mut wtxn, &body, &chunks, true)?;
+        let (state_root, output_count, _spent_inputs, transitions) = self.resolve_and_apply(&mut wtxn, &body, Some(&chunks))?;
         // Deliberately never committed -- see the module docs. `wtxn`
         // drops here, and LMDB aborts it.
 
@@ -2092,10 +2106,11 @@ impl Chain {
             inputs: body.inputs,
             outputs: body.outputs,
             nonces: body.nonces,
+            aux_hash: [0; 32],
             plan: crate::prover::BlockPlan {
                 chunks: plan_chunks,
-                body_chunks: chunks,
                 transitions,
+                reward,
             },
         })
     }
@@ -2341,6 +2356,7 @@ mod tests {
             prev_hash: [1; 32],
             state_root: root,
             body_hash: body.body_hash(),
+            aux_hash: [0; 32],
             output_count: outputs,
             height: 1,
             timestamp: 1,
@@ -2922,6 +2938,7 @@ mod tests {
             state_root: [0u8; 32],
             output_count: 0,
             body_hash: body.body_hash(),
+            aux_hash: [0; 32],
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],

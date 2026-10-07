@@ -434,7 +434,9 @@ data.
    - **Outputs are appended in chunk order** (body order within each
      chunk): full nodes take the chunk assignment from the proof's
      header; `Chain::build_block` plans the chunks and records each
-     chunk's state witness in the same pass (`BlockPlan`).
+     chunk's state witness in the same pass (`BlockPlan`). *(Since
+     2026-10-07: body order, with the assignment no longer published --
+     `RECURSION.md`, "Privacy enhancements" #1.)*
    - Proof verification moved from `Block::validate` into the chain's
      apply, which knows the parent's `(state_root, output_count)`.
    - Verified: unit and circuit tests; `tree_keys` with consensus
@@ -445,7 +447,8 @@ data.
      plus a wrap (~60 s) even when empty -- ~3.3 min; each further chunk
      of 8 inputs adds a chunk, a wrap and an aggregation.
    - **Dev network** (`network.rs`, `--network dev`), for testing at
-     this cost: light, insecure proof parameters (blowup 4, 8 queries,
+     this cost: light, insecure proof parameters (blowup 4, 8 queries -- 4 since
+     2026-10-07,
      no grinding) and half-size tree proofs (2^17 rows; the wrap is
      127,114 rows, 97%), with its own verifying keys, genesis, wire magic
      (`TBRD`, so dev and main nodes never talk), default data
@@ -550,7 +553,32 @@ data.
    one-chunk block proof ~296 s (157 s of it the chunk), 161.9 KB,
    verify 10.3 ms, peak 7.8 GB; chain step 344,911 rows (66%), proof
    148.6 s, 161 KB, verify 10.2 ms, peak 9.9 GB. Dev is unchanged.
-10. Next: proving ahead (pipelining), and reconsidering the remaining
+10. **Ten-minute blocks, the reward schedule, the aux hash** (done,
+   2026-10-07):
+   - **Main's target block time is ten minutes, retargeting every 2016
+     blocks** (Bitcoin's window: two weeks at the target pace; dev's
+     unchanged: 10 blocks). The clamped window time then exceeds both 2^32 and p, so
+     the retarget gadget clamps limb by limb and takes times as six
+     bytes.
+   - **The reward follows a schedule** (`prover::Schedule`): on main
+     1,000,000,000 a block for seven years (`7 × 144 × 365` blocks),
+     then 7,000,000 for a thousand -- each era issuing 367,920,000,000,000
+     -- and no block is valid from height `1007 × 144 × 365` on. Dev pays
+     `REWARD` forever. Validators check a block's proof against the
+     reward at its height; the chain step selects it from the height's
+     (now canonical) bits and refuses heights past the end.
+   - **The state tree is 40 levels deep** (2^40 positions, a thousand
+     years of full blocks); positions and counts are two 20-bit limbs in
+     the circuits, the chain proof's output count included. Snapshot
+     pieces start at level 40.
+   - **The header carries `aux_hash`** (32 bytes after `body_hash`, 184
+     in all): any value the miner chooses, no meaning to consensus,
+     covered by proof of work and hashed in the chain step. Zeros for
+     now. Wire version 10; geneses and all keys regenerated.
+   - **Dev proofs use 4 queries** (was 8): the deeper tree's paths took
+     dev's wrap to 144,393 rows, over its 2^17; at 4 queries it's
+     122,913 (94%). Main's wrap fits its 2^19 as before.
+11. Next: proving ahead (pipelining), and reconsidering the remaining
    optimizations.
 7. (Earlier plan.) The chain-step circuit, completed: verify parent chain proof + contents proof +
    transition proof; parent header checks (PoW, link, timestamp,

@@ -105,6 +105,15 @@ impl MemTree {
         p
     }
 
+    /// Put an output's leaf at an empty `position`, at or past `count`
+    /// (which then covers it): how a block's chunks fill its window of
+    /// positions, in any order.
+    pub fn place(&mut self, position: u64, leaf: Octet) {
+        self.set(position, leaf);
+        self.position.insert(leaf, position);
+        self.count = self.count.max(position + 1);
+    }
+
     /// Spend an unspent output, by its leaf; its position, or `None`.
     pub fn spend(&mut self, leaf: &Octet) -> Option<u64> {
         let p = self.position.remove(leaf)?;
@@ -129,6 +138,33 @@ pub fn bits_of(b: &mut Builder, x: EVar, n: usize) -> Vec<EVar> {
         rest = half;
     }
     b.assert_zero(rest);
+    bits
+}
+
+/// `x`'s 31 bits, lowest first -- its *canonical* value, below p: with
+/// only `bits_of`, a value below 2^27 - 1 could also be written as itself
+/// plus p (another dataset index than validators pick, say, or another
+/// position in the state tree).
+pub(crate) fn canonical_bits(b: &mut Builder, x: EVar) -> Vec<EVar> {
+    let bits = bits_of(b, x, 31);
+    // p - 1 = 2^31 - 2^27: the top four bits all set leave only zeros below.
+    let mut top = bits[27];
+    for &bit in &bits[28..31] {
+        top = b.mul(top, bit);
+    }
+    let low = from_bits(b, &bits[..27]);
+    let both = b.mul(top, low);
+    b.assert_zero(both);
+    bits
+}
+
+/// A position's `DEPTH` path bits, lowest first: its canonical value
+/// (positions stay below p), so each position has exactly one path.
+pub(crate) fn position_bits(b: &mut Builder, position: EVar) -> Vec<EVar> {
+    let mut bits = canonical_bits(b, position);
+    while bits.len() < DEPTH {
+        bits.push(b.zero());
+    }
     bits
 }
 
@@ -162,7 +198,7 @@ pub fn leaf_hash(b: &mut Builder, commitment: OVar, nonce: OVar) -> OVar {
 /// new root.
 pub fn spend(b: &mut Builder, root: OVar, commitment: OVar, nonce: OVar, position: u64, siblings: &[Octet]) -> OVar {
     let p = b.witness_ext(Ext::from_base(BabyBear::new(position as u32)));
-    let bits = bits_of(b, p, DEPTH);
+    let bits = position_bits(b, p);
     let leaf = leaf_hash(b, commitment, nonce);
     let spent = b.const_octet(SPENT);
     replace(b, root, &bits, siblings, leaf, spent)
@@ -171,7 +207,7 @@ pub fn spend(b: &mut Builder, root: OVar, commitment: OVar, nonce: OVar, positio
 /// Append the output `(commitment, nonce)` at position `count`: the new
 /// root and count.
 pub fn append(b: &mut Builder, root: OVar, count: EVar, commitment: OVar, nonce: OVar, siblings: &[Octet]) -> (OVar, EVar) {
-    let bits = bits_of(b, count, DEPTH);
+    let bits = position_bits(b, count);
     let leaf = leaf_hash(b, commitment, nonce);
     let empty = b.const_octet(EMPTY);
     let root = replace(b, root, &bits, siblings, empty, leaf);

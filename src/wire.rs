@@ -54,7 +54,7 @@ pub fn magic() -> [u8; 4] {
         crate::network::Network::Dev => DEV_MAGIC,
     }
 }
-pub const VERSION: u8 = 9;
+pub const VERSION: u8 = 10;
 
 /// Largest packet this protocol ever sends or accepts -- comfortably
 /// under the 1280-byte IPv6 minimum MTU (and every realistic IPv4 path

@@ -288,8 +288,9 @@ Solved by slates: the receiver creates their own output during
 blocks for it (phase 2). No invoices, no scanning for unknown amounts.
 
 - [ ] Confirmation tracking and display for received outputs.
-- [ ] Later: paying someone *without* an interactive exchange would need
-      encrypted notes (open questions).
+- [ ] Later: slates over Tor (or another onion network), so neither
+      party needs an open port. (Encrypted notes were decided against:
+      open questions.)
 
 ## Phase 10 -- tests
 
@@ -323,17 +324,19 @@ blocks for it (phase 2). No invoices, no scanning for unknown amounts.
   smaller per-transaction shape would need its own wrap key), and ~138
   KB per transaction vs ~4-8 KB plaintext. Big privacy win; decide when
   to do it.
-- **Payment detection without invoices.** An encrypted note attached to
-  each output (amount, encrypted to the recipient) would let payers pay
-  any address and recipients scan. Post-quantum encryption (e.g.
-  ML-KEM) adds ~1 KB per output and a key per address; and consensus
-  would need to carry the notes (block space).
-- **Wallet recovery from the seed alone.** Scanning needs amounts, so a
-  seed alone can find only outputs whose amounts can be guessed (exact
-  rewards). Options: back up the wallet store too; encrypted notes
-  (above) would also solve this; or a deterministic amount rule for
-  rewards (pay `REWARD` and fees to separate keys, so at least rewards
-  are recoverable).
+- **Payment detection without invoices** (decided against, 2026-10-07).
+  An encrypted note on each output (its amount and key index, encrypted
+  to the recipient with ML-KEM) would let payers pay any address and
+  recipients scan -- but it makes outputs ~830–1,150 bytes instead of 48
+  (about 10× fewer transactions per block, ~5× the storage per unspent
+  output), adds a lattice assumption, and still needs a fresh one-time
+  WOTS key from the recipient. Payments stay interactive (slates); later,
+  slates are exchanged over Tor or another onion network, so neither
+  party needs an open port. Wallet software only, no consensus change.
+- **Wallet recovery from the seed alone** (done: `docs/RECOVERY.md`).
+  Every output carries a 16-byte recovery nonce, readable with the
+  wallet's view key, so a scan of the chain finds every output with its
+  exact amount.
 - **Coinbase maturity**: wallet-only, or a consensus rule?
 - **Fee policy**: per transaction + per input? Fees are public in
   plaintext transactions but hidden on chain (only the block total).

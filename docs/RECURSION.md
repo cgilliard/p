@@ -345,12 +345,12 @@ the body's commitment lists:
 - **Direct** (`0`): `u32` trace block count, then the `block_air` proof
   at `PARAMS`, as before.
 - **Tree** (`1`): the root's totals `A`, `B` (`u64` each; must satisfy
-  `A − B = REWARD`), the chunk count (`u16`), each input's then each
-  output's chunk index (`u16`, in body order), then the root proof. The
-  body's commitment lists stay globally sorted; a chunk's lists are its
-  commitments in body order (so sorted, as its statement requires). A
-  verifier rebuilds each chunk's statement from them and checks the root
-  against the tree's verifying key (`VerifyingKey::verify_block`).
+  `A − B = REWARD`), whether the root is an aggregation (`1`) or a wrap
+  (`0`), the root's `data` (32 bytes), then the root proof. Nothing says
+  which chunk holds which commitment (since 2026-10-07; see "Privacy
+  enhancements" below). A verifier computes the challenge and product
+  from the body and `data`, and checks the root against the tree's
+  verifying key (`VerifyingKey::verify_block`).
 
 Consensus constants (`prover`): `CHUNK_SHAPE` (4096 blocks = 2^17 rows,
 10 inputs, 256 outputs), `CHUNK_PARAMS` (= `PARAMS`, hiding), `TREE`
@@ -371,28 +371,61 @@ before publishing, falling back to a direct proof if anything fails
 ## Privacy enhancements (optional, not required)
 
 Neither of these is needed for soundness or for the protocol to work;
-they would only reduce what a tree-proven block reveals to observers.
-Both change consensus (the proof format or the tree's parameters), so
-they're cheapest to decide before the format is frozen.
+they only reduce what a tree-proven block reveals to observers. Both
+change consensus (the proof format or the tree's parameters), so they're
+cheapest to decide before the format is frozen.
 
-What a block reveals today: inputs and outputs are bare commitments,
+What a block reveals: inputs and outputs are bare commitments,
 `H(pubkey_hash, amount)` under fresh one-time keys, so amounts and
 recipients stay hidden from everyone but the transacting parties and the
-miner. A **direct** proof also hides transaction boundaries -- the body
-is one sorted list of inputs and one of outputs, so each block is in
-effect a CoinJoin of everything in it. Private submission (a user sending
-a transaction to one miner instead of the public mempool) is a matter of
-miner software, not consensus, and needs nothing here.
+miner. The body is one sorted list of inputs and one of outputs, so each
+block is in effect a CoinJoin of everything in it. Per-chunk amounts were
+never public (the tree sums them; only the block's totals are). Private
+submission (a user sending a transaction to one miner instead of the
+public mempool) is a matter of miner software, not consensus, and needs
+nothing here.
 
-1. **Hide chunk grouping in tree proofs.** A tree proof publishes each
-   commitment's chunk index, and a chunk holds whole transactions, so it
-   reveals which commitments travel together (and the chunks' net
-   amounts). Options: commit to the assignment inside the proof instead
-   of publishing it; or have the aggregation circuit prove the chunks'
-   commitment sets together form the block's sorted lists, so no
-   per-chunk structure is public. Until then a miner can soften it within
-   today's rules: use a direct proof when the block fits, or pack several
-   transactions into each chunk, so the grouping only says "same chunk".
+1. **Hide chunk grouping in tree proofs (done, 2026-10-07).** A tree
+   proof used to publish each commitment's chunk index, revealing which
+   commitments travel together; validators also appended outputs in
+   chunk order. Now (`aggregate`'s module docs):
+   - **The body is bound by a product, not by chunk statements.** Every
+     tree node carries a `challenge` `(r, γ)` and a `product`: a wrap's is
+     `Π (r − f(c))` over its chunk's commitments (`f` folds a commitment,
+     and an output's nonce, with powers of `γ`; inputs and outputs are
+     tagged apart), an aggregation's its children's multiplied. The
+     verifier computes the challenge as a hash of the root's `data` and
+     the body, and the same product over the body. By Schwartz–Zippel a
+     different multiset matches with probability about `5n / |F^4|`
+     (`n` commitments, `|F^4|` ≈ 2^124).
+   - **`data` commits to the chunks before the challenge is drawn,** so
+     the chunks can't be chosen to fit it. Each leaf's data is salted
+     (fresh random elements, private to the wrap), so `data` can't be
+     checked against a guess at the grouping either.
+   - **Outputs take the positions `count..count + n` in body order,**
+     whichever chunk proves them. A wrap places each output at its own
+     (witness) position, which must be empty and inside the block's
+     window; the root's counts make the window exactly as long as the
+     outputs placed. Positions are canonical (`position_bits`), so each
+     has one path. (This also closed a gap in the chain proof: positions
+     were decomposed into 32 bits without a canonical check, so on its
+     own a chain proof could have placed an output at an aliased
+     position. Native validators always caught it.)
+   - **Validators no longer need the grouping:** they spend inputs and
+     append outputs in body order (`Chain::resolve_and_apply`); the
+     miner works each chunk's witness out in memory
+     (`state_tree::Overlay`).
+   - **What's still public:** whether the block has one chunk or more
+     (the verifier needs the root's key). The header is 33 bytes (the
+     kind and `data`) in place of 2 plus 2 per commitment: smaller from
+     16 commitments up, ~60 KB smaller for a full block. Proving and
+     verification costs are unchanged within measurement:
+     each wrap does ~30 extension multiplications and two 16-bit range
+     checks per slot more.
+   - **It depends on #2:** the published root proof isn't
+     zero-knowledge, so the argument that it leaks nothing about its
+     children (their data and products, which would reveal the
+     grouping) is #2's argument.
 2. **Make the tree's outer layers zero-knowledge.** `TREE` uses `hiding:
    false` (half the LDE, smaller and faster). Its witnesses are the chunk
    proofs, which *are* hiding, so the leak is probably harmless -- but

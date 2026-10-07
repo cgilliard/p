@@ -54,8 +54,12 @@ use crate::circuit::Octet;
 use crate::poseidon2::{BabyBear, digest_from_bytes, digest_to_bytes, perm24};
 use crate::storage::Storage;
 
-/// Levels: room for 2^32 outputs.
-pub const DEPTH: usize = 32;
+/// Levels: room for 2^40 outputs (about 1.1 trillion), every output ever
+/// created keeping its position -- a thousand years of full blocks.
+/// Positions and counts are two `LIMB_BITS` limbs in circuits, each well
+/// below p.
+pub const DEPTH: usize = 40;
+pub const LIMB_BITS: usize = 20;
 /// Node hashes' domains: `DOMAIN_STATE_NODE + level`. (0x300: the
 /// second layout, leaves committing to nonces -- distinct from the first,
 /// so a chain stored under it has a different genesis and won't open.)
@@ -464,6 +468,50 @@ impl StateTree {
     }
 }
 
+/// The stored tree with some leaves changed in memory: for working out
+/// the paths of changes made in another order than the store makes them
+/// (a block's chunks, each applying its share -- `chain::Chain::
+/// build_block`). Nothing is written.
+pub struct Overlay<'a, 't> {
+    tree: &'a StateTree,
+    txn: &'a heed::RoTxn<'t>,
+    nodes: std::collections::HashMap<(usize, u64), Octet>,
+}
+
+impl<'a, 't> Overlay<'a, 't> {
+    pub fn new(tree: &'a StateTree, txn: &'a heed::RoTxn<'t>) -> Self {
+        Overlay { tree, txn, nodes: Default::default() }
+    }
+
+    fn get(&self, level: usize, index: u64) -> Result<Octet> {
+        match self.nodes.get(&(level, index)) {
+            Some(&hash) => Ok(hash),
+            None => self.tree.get(self.txn, level, index),
+        }
+    }
+
+    pub fn root(&self) -> Result<Octet> {
+        self.get(DEPTH, 0)
+    }
+
+    /// `StateTree::path`, with the changes so far.
+    pub fn path(&self, position: u64) -> Result<Vec<Octet>> {
+        (0..DEPTH).map(|h| self.get(h, (position >> h) ^ 1)).collect()
+    }
+
+    /// Set the leaf at `position`.
+    pub fn set(&mut self, position: u64, leaf: Octet) -> Result<()> {
+        self.nodes.insert((0, position), leaf);
+        for h in 1..=DEPTH {
+            let index = position >> h;
+            let left = self.get(h - 1, 2 * index)?;
+            let right = self.get(h - 1, 2 * index + 1)?;
+            self.nodes.insert((h, index), node(h - 1, &left, &right));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,4 +745,45 @@ mod tests {
         }
     }
 
+
+    /// Changes made in memory, in another order, end where the store does
+    /// after making them its own way -- and every path along the way leads
+    /// from its leaf to the changed tree's root.
+    #[test]
+    fn an_overlay_tracks_changes_in_any_order() {
+        let (_d, storage, tree) = open("overlay");
+        let mut wtxn = storage.write_txn().unwrap();
+        for k in 0..40 {
+            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+        }
+        let climb = |position: u64, leaf: Octet, path: &[Octet]| {
+            path.iter().enumerate().fold(leaf, |h, (level, sibling)| {
+                if (position >> level) & 1 == 0 { node(level, &h, sibling) } else { node(level, sibling, &h) }
+            })
+        };
+        let mut overlay = Overlay::new(&tree, &wtxn);
+        // Spends and appends interleaved, the appends out of position order.
+        for (spend, append) in [(Some(17), 43), (None, 40), (Some(3), 44), (Some(39), 41), (None, 42)] {
+            if let Some(p) = spend {
+                let path = overlay.path(p).unwrap();
+                assert_eq!(climb(p, leaf(&commitment(p), &nonce(p)), &path), overlay.root().unwrap());
+                overlay.set(p, SPENT).unwrap();
+                assert_eq!(climb(p, SPENT, &path), overlay.root().unwrap());
+            }
+            let path = overlay.path(append).unwrap();
+            assert_eq!(climb(append, EMPTY, &path), overlay.root().unwrap());
+            let new = leaf(&commitment(append), &nonce(append));
+            overlay.set(append, new).unwrap();
+            assert_eq!(climb(append, new, &path), overlay.root().unwrap());
+        }
+        let root = overlay.root().unwrap();
+        drop(overlay);
+        for p in [3, 17, 39] {
+            tree.spend(&mut wtxn, p).unwrap();
+        }
+        for k in 40..45 {
+            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+        }
+        assert_eq!(digest_to_bytes(root), tree.root(&wtxn).unwrap());
+    }
 }

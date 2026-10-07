@@ -586,7 +586,12 @@ impl Node {
         } else {
             self.mempool.select(TEMPLATE_TX_BYTES)
         };
-        let (_, reward) = match self.wallet.reward_output(prover::REWARD + fees) {
+        let Some(subsidy) = prover::schedule().reward(self.tip_height() + 1) else {
+            error!("the chain has reached its end height: no further block can be mined");
+            self.mining = false;
+            return;
+        };
+        let (_, reward) = match self.wallet.reward_output(subsidy + fees) {
             Ok(r) => r,
             Err(e) => {
                 error!("wallet: failed to make a reward output: {e}");
