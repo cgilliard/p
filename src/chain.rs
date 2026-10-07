@@ -122,6 +122,9 @@ const TIP_HEADER_KEY: &[u8] = b"tip_header";
 /// the rule actually does with these.
 #[derive(Clone, Copy, Debug)]
 pub struct DifficultyConfig {
+    /// The proof-of-work function's parameters (`pow::Params`): the
+    /// dataset's size, an item's cost, and reads per attempt.
+    pub pow: crate::pow::Params,
     /// The PoW target a brand new chain starts at, before the first
     /// retarget happens. Only matters for a genuinely new chain -- if
     /// this one's already been applied to before, whatever's actually
@@ -154,6 +157,7 @@ impl DifficultyConfig {
     /// fast too.
     pub fn for_tests() -> Self {
         DifficultyConfig {
+            pow: crate::pow::Params::TEST,
             initial_target: crate::block::INITIAL_MAX_HASH,
             interval: 10,
             target_block_time_ms: 10,
@@ -1044,7 +1048,7 @@ impl Chain {
     /// which is trusted by consensus (it's hardcoded) and couldn't prove
     /// anything anyway: its empty body claims no reward.
     fn block_is_valid(&self, txn: &heed::RoTxn, block: &Block, target: &[u8; 32]) -> Result<bool> {
-        if !block.validate_structure(target) {
+        if !block.validate_structure(target, &self.difficulty.pow) {
             return Ok(false);
         }
         let is_genesis = self.genesis_hash == Some(block.header.hash());
@@ -1255,6 +1259,11 @@ impl Chain {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         })
+    }
+
+    /// The proof-of-work parameters this chain checks (and is mined at).
+    pub fn pow_params(&self) -> crate::pow::Params {
+        self.difficulty.pow
     }
 
     /// The height a fast sync started this chain at, if one did.
@@ -1934,7 +1943,7 @@ impl Chain {
             // Only the proof of work, and only against a relaxed
             // target: everything else (and the real target) is checked
             // once the parent is known and this is accepted for real.
-            if !block.header.pow_valid(&orphan_target) {
+            if !block.header.pow_valid(&orphan_target, &self.difficulty.pow) {
                 return Err(Error::OrphanPowTooWeak);
             }
             if self.orphans.len() >= self.max_orphans {
@@ -2176,7 +2185,7 @@ mod tests {
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
-        assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
         block
     }
 
@@ -2608,7 +2617,7 @@ mod tests {
             let proof = prover::Proof::placeholder();
             let mut block = unproven.finish(proof);
             block.header.timestamp = timestamp;
-            assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
+            assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
             chain.apply_block(&block).unwrap();
             timestamp += ms_apart;
         }
@@ -2692,7 +2701,7 @@ mod tests {
             let target = unproven.target;
             let proof = prover::Proof::placeholder();
             let mut block = unproven.finish(proof); // timestamp: the real clock, untouched
-            assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
+            assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
             chain.apply_block(&block).unwrap();
         }
 
@@ -2741,7 +2750,7 @@ mod tests {
         assert_eq!(block.header.body_hash, block.body.body_hash());
         // Not mined -- finish's job stops at assembling the fields, not
         // finding a satisfying nonce.
-        assert!(!block.header.pow_valid(&INITIAL_MAX_HASH));
+        assert!(!block.header.pow_valid(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     #[test]
@@ -2763,7 +2772,7 @@ mod tests {
         let tx = reward_transaction(&pk, 50);
 
         let block = built_proved_and_mined(&mut chain, &[tx]);
-        assert!(block.validate_structure(&INITIAL_MAX_HASH));
+        assert!(block.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
 
         chain.apply_block(&block).unwrap();
 
@@ -2824,7 +2833,7 @@ mod tests {
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
-        assert!(mine_block(&mut block, &target, 100_000));
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
 
         let err = chain.apply_block(&block).unwrap_err();
         assert!(matches!(err, Error::WrongParent));
@@ -2842,7 +2851,7 @@ mod tests {
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
-        assert!(mine_block(&mut block, &target, 100_000));
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
 
         let err = chain.apply_block(&block).unwrap_err();
         assert!(matches!(err, Error::WrongHeight));
@@ -2859,7 +2868,7 @@ mod tests {
         // Comfortably past MAX_FUTURE_DRIFT_MS -- re-mined since
         // changing `timestamp` changes the PoW preimage.
         block.header.timestamp = now_millis() + MAX_FUTURE_DRIFT_MS + 3600;
-        assert!(mine_block(&mut block, &target, 100_000));
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
 
         let err = chain.apply_block(&block).unwrap_err();
         assert!(matches!(err, Error::TimestampTooFarInFuture));
@@ -2876,7 +2885,7 @@ mod tests {
         // Just inside the tolerance -- must not be rejected on that
         // basis alone.
         block.header.timestamp = now_millis() + MAX_FUTURE_DRIFT_MS - 1;
-        assert!(mine_block(&mut block, &target, 100_000));
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
 
         chain.apply_block(&block).unwrap();
     }
@@ -2918,7 +2927,7 @@ mod tests {
             nonce: [0u8; 32],
         };
         let mut block = Block { header, body };
-        assert!(mine_block(&mut block, &INITIAL_MAX_HASH, 100_000));
+        assert!(mine_block(&mut block, &INITIAL_MAX_HASH, 100_000, &crate::pow::Params::TEST));
 
         let err = chain.apply_block(&block).unwrap_err();
         assert!(matches!(err, Error::UnresolvedInput(c) if c == commitment_of(&pk_a, 50)));
@@ -2978,7 +2987,7 @@ mod tests {
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
-        assert!(mine_block(&mut block, &target, 100_000));
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
 
         let err = chain.apply_block(&block).unwrap_err();
         assert!(matches!(err, Error::StateRootMismatch));
@@ -3347,7 +3356,7 @@ mod tests {
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut bad = unproven.finish(proof);
-        assert!(mine_block(&mut bad, &target, 100_000));
+        assert!(mine_block(&mut bad, &target, 100_000, &crate::pow::Params::TEST));
 
         // Built on top of `bad`, which `builder` itself never applied --
         // only its lineage matters; it should never get as far as
@@ -3359,7 +3368,7 @@ mod tests {
         unproven.height = bad.header.height + 1;
         let proof = prover::Proof::placeholder();
         let mut after = unproven.finish(proof);
-        assert!(mine_block(&mut after, &target, 100_000));
+        assert!(mine_block(&mut after, &target, 100_000, &crate::pow::Params::TEST));
 
         for block in good {
             assert_eq!(chain.accept_block(block).unwrap(), AcceptOutcome::StoredAsSideBranch);
@@ -3392,7 +3401,7 @@ mod tests {
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         block.header.timestamp = timestamp;
-        assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
         block
     }
 
@@ -3445,7 +3454,7 @@ mod tests {
         let mut timestamp = start + 1_000;
         let post_window = loop {
             let block = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk, 50)], timestamp);
-            if !block.header.pow_valid(&active_target) {
+            if !block.header.pow_valid(&active_target, &crate::pow::Params::TEST) {
                 break block;
             }
             timestamp += 1;
@@ -3582,7 +3591,7 @@ mod tests {
         drop(rtxn);
 
         let mut orphan = build_chain(2, 1).into_iter().nth(1).unwrap();
-        renonce_until(&mut orphan, |header| !header.pow_valid(&orphan_target));
+        renonce_until(&mut orphan, |header| !header.pow_valid(&orphan_target, &crate::pow::Params::TEST));
 
         assert!(matches!(chain.accept_block(orphan), Err(Error::OrphanPowTooWeak)));
         assert!(chain.orphans.is_empty());
@@ -3602,7 +3611,7 @@ mod tests {
 
         let mut orphan = build_chain(2, 1).into_iter().nth(1).unwrap();
         renonce_until(&mut orphan, |header| {
-            header.pow_valid(&orphan_target) && !header.pow_valid(&current_target)
+            header.pow_valid(&orphan_target, &crate::pow::Params::TEST) && !header.pow_valid(&current_target, &crate::pow::Params::TEST)
         });
 
         assert_eq!(chain.accept_block(orphan).unwrap(), AcceptOutcome::Orphaned);
@@ -3668,7 +3677,7 @@ mod tests {
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
         assert_eq!(block.header.timestamp, ahead + 1);
-        assert!(mine_block(&mut block, &target, 100_000));
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
         chain.apply_block(&block).unwrap();
     }
 
@@ -3715,12 +3724,12 @@ mod tests {
         let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &transactions, &unproven.plan, [3; 32]).unwrap();
         let mut real = unproven.finish(proof);
         real.header.timestamp = real.header.timestamp.max(min_timestamp);
-        assert!(mine_block(&mut real, &target, 100_000));
+        assert!(mine_block(&mut real, &target, 100_000, &crate::pow::Params::TEST));
 
         let mut fake = real.clone();
         fake.body.proof = prover::Proof::placeholder();
         fake.header.body_hash = fake.body.body_hash();
-        assert!(mine_block(&mut fake, &target, 100_000));
+        assert!(mine_block(&mut fake, &target, 100_000, &crate::pow::Params::TEST));
         assert!(matches!(chain.apply_block(&fake), Err(Error::InvalidBlock)));
 
         chain.apply_block(&real).unwrap();

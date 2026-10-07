@@ -26,12 +26,21 @@
 //!   block to block directly; each absorbed top is received from the bus
 //!   -- from its chain's last block, or, for a chain with digit 7, straight
 //!   from the signature (the digit itself is received instead).
-//! - `DIG`: the digit derivation `compress(param, TAG_MESSAGE, message,
+//! - `DIG`: the digit derivation `compress(param, TAG_MESSAGE, bound,
 //!   randomizer)`, whose 8 output elements are decomposed, canonically,
 //!   into 3-bit digits in the block's spare rows -- the first 64 sent on
 //!   the bus to their chains, and required to sum to `TARGET_SUM`. Each
-//!   input's section starts with one; it receives its transaction's
-//!   message from the bus.
+//!   input's section starts with one; it receives the *bound* message
+//!   from `BIND`, and sends its randomizer to `SEL`.
+//! - `SEL`, `TLEAF`, `TNODE`, `BIND`: the text block the signature binds
+//!   (`docs/BIBLE.md`, `wots::signed_digest`). `SEL` computes
+//!   `compress(param, TAG_SELECT, message, randomizer)` and decomposes it
+//!   like `DIG` does, sending its first element's low 16 bits -- the
+//!   block's position -- to the path. `TLEAF` hashes the block (free
+//!   witness, sent to `BIND`) into its leaf; sixteen `TNODE`s hash it up,
+//!   each swapping by its bit, to `scripture::TEXT_ROOT`. `BIND` computes
+//!   `compress(TAG_BIND, message, block)` and sends it to `DIG`. Both
+//!   `SEL` and `BIND` receive the transaction's message.
 //! - `CIN` / `COUT`: an input's / output's commitment
 //!   `hash_elements(DOMAIN_COMMITMENT, pubkey_hash ‖ amount limbs)`. An
 //!   input's key hash comes directly from the `PK` sponge just before it;
@@ -75,7 +84,7 @@ use crate::poseidon2::{
 use crate::poseidon2_air::{Poseidon2Chip, ROWS};
 use crate::stark::{Air, AuxBoundary, AuxFrame, Boundary};
 use crate::transaction::Transaction;
-use crate::wots::{self, CHAIN_LEN, CHAIN_STEPS, PARAM_LEN, TAG_CHAIN, TAG_MESSAGE, TARGET_SUM, V};
+use crate::wots::{self, CHAIN_LEN, CHAIN_STEPS, PARAM_LEN, TAG_BIND, TAG_CHAIN, TAG_MESSAGE, TAG_SELECT, TARGET_SUM, V};
 
 // ---- Columns -------------------------------------------------------------
 
@@ -90,7 +99,7 @@ const K_COUT: usize = 52;
 const K_MSG: usize = 53;
 const K_PAD: usize = 54;
 const K_BAL: usize = 55;
-const KINDS: [usize; 8] = [K_CHAIN, K_PK, K_DIG, K_CIN, K_COUT, K_MSG, K_PAD, K_BAL];
+const KINDS: [usize; 12] = [K_CHAIN, K_PK, K_DIG, K_CIN, K_COUT, K_MSG, K_PAD, K_BAL, K_SEL, K_TLEAF, K_TNODE, K_BIND];
 
 const UID: usize = 56;
 const TX: usize = 57;
@@ -153,7 +162,11 @@ const BIT2: usize = 211;
 const LACC2: usize = 215;
 /// An output's recovery nonce, as eight 16-bit limbs (`COUT`).
 const NONCE: usize = 219;
-pub const WIDTH: usize = 227;
+const K_SEL: usize = 227;
+const K_TLEAF: usize = 228;
+const K_TNODE: usize = 229;
+const K_BIND: usize = 230;
+pub const WIDTH: usize = 231;
 
 /// The column holding carry `k` out of limb `k` of the running total.
 fn carry_column(k: usize) -> usize {
@@ -162,7 +175,7 @@ fn carry_column(k: usize) -> usize {
 
 /// Columns constant within a block.
 fn constant_columns() -> impl Iterator<Item = usize> {
-    (K_CHAIN..LIMB + AMOUNT_LIMBS).chain(CRY..CRY + 3).chain([CRY3]).chain(NONCE..NONCE + 8)
+    (K_CHAIN..LIMB + AMOUNT_LIMBS).chain(CRY..CRY + 3).chain([CRY3]).chain(NONCE..NONCE + 8).chain(K_SEL..K_BIND + 1)
 }
 
 // ---- Periodic columns (after the chip's own) ----------------------------
@@ -183,7 +196,11 @@ const PR_ROW9: usize = CHIP_PERIODIC + 8;
 const PR_ROW10: usize = CHIP_PERIODIC + 9;
 const PR_DROW: usize = CHIP_PERIODIC + 10;
 const PR_LMASK6: usize = CHIP_PERIODIC + 11;
-const NUM_PERIODIC: usize = CHIP_PERIODIC + 12;
+/// Rows 0-4 / row 5: where `SEL` sends its 16 position bits (three per
+/// row, then one).
+const PR_LT5: usize = CHIP_PERIODIC + 12;
+const PR_ROW5: usize = CHIP_PERIODIC + 13;
+const NUM_PERIODIC: usize = CHIP_PERIODIC + 14;
 
 // ---- Bus ----------------------------------------------------------------
 
@@ -195,6 +212,18 @@ pub const TAG_PIN: u32 = 5;
 pub const TAG_POUT: u32 = 6;
 /// The public amounts `a`, `b`: `[TAG_NET, 0, 0, a limbs, b limbs]`.
 pub const TAG_NET: u32 = 7;
+/// `DIG` to `SEL`: the randomizer.
+const TAG_RAND: u32 = 8;
+/// `BIND` to `DIG`: the bound message.
+const TAG_BOUND: u32 = 9;
+/// `TLEAF` to `BIND`: the text block.
+const TAG_TEXT: u32 = 10;
+/// Up the text path: a level's input hash.
+const TAG_TNODE: u32 = 11;
+/// `SEL` to the path: one bit of the position.
+const TAG_IDX: u32 = 12;
+/// The text path's length.
+const TEXT_LEVELS: u32 = crate::scripture::DEPTH as u32;
 /// `[tag, a, b]` and 16 values: an output's commitment and nonce, the
 /// widest thing sent.
 const TUPLE_LEN: usize = 19;
@@ -353,7 +382,7 @@ impl BlockAir {
         }
         // Section ids, transaction ids, and the section's parameter.
         out.push(px * (n[UID] - c[UID] - n[K_DIG]));
-        out.push(px * (one - n[K_DIG]) * (n[K_CHAIN] + n[K_PK] + n[K_CIN]) * (n[TX] - c[TX]));
+        out.push(px * (one - n[K_DIG]) * (n[K_CHAIN] + n[K_PK] + n[K_CIN] + n[K_SEL] + n[K_BIND]) * (n[TX] - c[TX]));
         for i in 0..PARAM_LEN {
             out.push(px * (one - n[K_DIG]) * (n[PARAM + i] - c[PARAM + i]));
         }
@@ -444,23 +473,25 @@ impl BlockAir {
             out.push(p0 * kd * c[STATE + i]);
         }
         let (lt10, row9, row10) = (p[PR_LT10], p[PR_ROW9], p[PR_ROW10]);
+        // The decomposition serves `SEL` too.
+        let kdec = kd + c[K_SEL];
         let eight = k(8);
         let eight_pow_9 = k(8u32.pow(9));
         let mut digit_sum = F::ZERO;
         for e in 0..LANES {
             let digit = c[B0 + e] + c[B1 + e] + c[B1 + e] + k(4) * c[B2 + e];
-            out.push(kd * lt10 * (c[REM + e] - digit - eight * n[REM + e]));
+            out.push(kdec * lt10 * (c[REM + e] - digit - eight * n[REM + e]));
             for bit in [B0, B1, B2] {
-                out.push(kd * lt10 * c[bit + e] * (c[bit + e] - one));
+                out.push(kdec * lt10 * c[bit + e] * (c[bit + e] - one));
             }
             let output = c[CARRY + e] + c[IN + e];
-            out.push(kd * p0 * (c[REM + e] - output));
-            out.push(kd * row10 * c[REM + e] * (c[REM + e] - one));
+            out.push(kdec * p0 * (c[REM + e] - output));
+            out.push(kdec * row10 * c[REM + e] * (c[REM + e] - one));
             out.push(c[H1 + e] - n[REM + e] * c[B0 + e] * c[B1 + e]);
             out.push(c[H2 + e] - c[H1 + e] * c[B2 + e]);
             // Canonical: a top bit of 1 with top digit 7 leaves no room
             // below P for any lower bits.
-            out.push(kd * row9 * c[H2 + e] * (output - eight_pow_9 * c[REM + e]));
+            out.push(kdec * row9 * c[H2 + e] * (output - eight_pow_9 * c[REM + e]));
             if e < 6 {
                 digit_sum = digit_sum + digit;
             } else if e == 6 {
@@ -470,6 +501,56 @@ impl BlockAir {
         out.push(kd * lt10 * (n[DSUM] - c[DSUM] - digit_sum));
         out.push(kd * p0 * c[DSUM]);
         out.push(kd * row10 * (c[DSUM] - k(TARGET_SUM)));
+
+        // SEL: compress(param, TAG_SELECT, message, randomizer).
+        let ks = c[K_SEL];
+        for i in 0..PARAM_LEN {
+            out.push(ks * (c[IN + i] - c[PARAM + i]));
+        }
+        out.push(ks * (c[IN + 5] - k(TAG_SELECT)));
+        for i in 21..24 {
+            out.push(p0 * ks * c[STATE + i]);
+        }
+
+        // TLEAF: the text block's leaf, `scripture::leaf`.
+        let ktl = c[K_TLEAF];
+        for i in crate::scripture::BLOCK_ELEMENTS..16 {
+            out.push(ktl * c[IN + i]);
+        }
+        out.push(p0 * ktl * (c[STATE + 16] - k(crate::scripture::DOMAIN_TEXT_LEAF)));
+        out.push(p0 * ktl * (c[STATE + 17] - k(crate::scripture::BLOCK_LEN as u32)));
+        for i in 18..24 {
+            out.push(p0 * ktl * c[STATE + i]);
+        }
+
+        // TNODE: one level of the text path -- the hash from below (PREV)
+        // on the side its bit (FLO) says, the level's capacity, and at the
+        // top (LAST, level 15) the text's root.
+        let ktn = c[K_TNODE];
+        out.push(p0 * ktn * (c[STATE + 16] - k(crate::scripture::DOMAIN_TEXT_NODE) - c[C]));
+        out.push(p0 * ktn * (c[STATE + 17] - k(16)));
+        for i in 18..24 {
+            out.push(p0 * ktn * c[STATE + i]);
+        }
+        for i in 0..8 {
+            let left = c[IN + i] - c[PREV + i];
+            let right = c[IN + 8 + i] - c[PREV + i];
+            out.push(ktn * ((one - c[FLO]) * left + c[FLO] * right));
+        }
+        let top = k(TEXT_LEVELS - 1);
+        out.push(ktn * c[LAST] * (c[C] - top));
+        out.push(ktn * (one - c[LAST]) * (one - (c[C] - top) * c[W]));
+        let root = crate::scripture::text_root();
+        for i in 0..8 {
+            out.push(ktn * c[LAST] * (c[CARRY + i] - F::from_base(root[i])));
+        }
+
+        // BIND: compress(TAG_BIND, message, block).
+        let kbind = c[K_BIND];
+        out.push(kbind * (c[IN] - k(TAG_BIND)));
+        for i in 20..24 {
+            out.push(p0 * kbind * c[STATE + i]);
+        }
 
         // CIN / COUT: input structure and 16-bit limbs.
         let commit = c[K_CIN] + c[K_COUT];
@@ -551,6 +632,14 @@ impl BlockAir {
         let item: Vec<F> = absorbed(0).into_iter().chain(absorbed(1)).collect();
         let compress_out: Vec<F> = (0..8).map(|i| c[CARRY + i] + c[IN + i]).collect();
         let (kc, kp, kd, kin, kout, km) = (c[K_CHAIN], c[K_PK], c[K_DIG], c[K_CIN], c[K_COUT], c[K_MSG]);
+        let (ks, ktl, ktn, kbind) = (c[K_SEL], c[K_TLEAF], c[K_TNODE], c[K_BIND]);
+        // Row 0's state from element 14 on: the randomizer (DIG, SEL), or
+        // the text block's tail (BIND).
+        let state_at = |i: usize| if i < 16 { c[IN + i] } else { c[STATE + i] };
+        let randomizer: Vec<F> = (14..21).map(state_at).collect();
+        let bound_block: Vec<F> = (9..9 + crate::scripture::BLOCK_ELEMENTS).map(state_at).collect();
+        let lt5 = p[PR_LT5];
+        let three_rows = p[PR_DROW] + p[PR_DROW] + p[PR_DROW];
         let digit = |e: usize| c[B0 + e] + c[B1 + e] + c[B1 + e] + k(4) * c[B2 + e];
         let pk_half = |half: usize, flag: usize, chain: F| -> Vec<F> {
             let trivial = tuple(TAG_CH, c[UID], chain, &[k(CHAIN_STEPS)]);
@@ -564,45 +653,75 @@ impl BlockAir {
         slots.push(Interaction {
             multiplicity: -(kc * p0 * c[START]) - kp * p0 * (one - c[FIRST]) - kd * p0
                 - km * p0 * (one - c[FIRST]) * c[ALO]
-                + (kin + kout) * pout,
+                + (kin + kout) * pout
+                - ks * p0
+                + ktl * p0
+                - ktn * p0
+                - kbind * p0,
             values: mix(&[
                 (kc, tuple(TAG_CH, c[UID], c[C], &[c[S]])),
                 (kp, pk_half(0, FLO, two_c - one)),
-                (kd, tuple(TAG_MSG, c[TX], F::ZERO, &range(IN + 6, 8))),
+                (kd, tuple(TAG_BOUND, c[UID], F::ZERO, &range(IN + 6, 8))),
                 (km, tuple(TAG_ITEM, c[TX], c[RLO], &item)),
                 (kin, tuple(TAG_PIN, F::ZERO, F::ZERO, &carry8)),
                 (kout, tuple(TAG_POUT, F::ZERO, F::ZERO, &committed)),
+                (ks, tuple(TAG_MSG, c[TX], F::ZERO, &range(IN + 6, 8))),
+                (ktl, tuple(TAG_TEXT, c[UID], F::ZERO, &range(IN, crate::scripture::BLOCK_ELEMENTS))),
+                (ktn, tuple(TAG_TNODE, c[UID], c[C], &range(PREV, 8))),
+                (kbind, tuple(TAG_MSG, c[TX], F::ZERO, &range(IN + 1, 8))),
             ]),
         });
         // Slot 1.
         slots.push(Interaction {
-            multiplicity: kc * pout * c[END] - kp * p0 * (one - c[LAST]) + (kin + kout) * pout,
+            multiplicity: kc * pout * c[END] - kp * p0 * (one - c[LAST]) + (kin + kout) * pout + kd * p0 - ks * p0 + ktl * pout
+                - ktn * p0
+                - kbind * p0,
             values: mix(&[
                 (kc, tuple(TAG_TOP, c[UID], c[C], &compress_out)),
                 (kp, pk_half(1, FHI, two_c)),
                 (kin, tuple(TAG_ITEM, c[TX], one, &carry8)),
                 (kout, tuple(TAG_ITEM, c[TX], F::ZERO, &committed)),
+                (kd, tuple(TAG_RAND, c[UID], F::ZERO, &randomizer)),
+                (ks, tuple(TAG_RAND, c[UID], F::ZERO, &randomizer)),
+                (ktl, tuple(TAG_TNODE, c[UID], F::ZERO, &carry8)),
+                (ktn, tuple(TAG_IDX, c[UID], c[C], &[c[FLO]])),
+                (kbind, tuple(TAG_TEXT, c[UID], F::ZERO, &bound_block)),
             ]),
         });
         // Slot 2: a message, once per input; or digit lane 0; or the
         // public amounts.
         let kb = c[K_BAL];
         let net: Vec<F> = range(LIMB, AMOUNT_LIMBS).into_iter().chain(range(LACC, AMOUNT_LIMBS)).collect();
+        // (Twice per input: SEL and BIND each receive it.)
         slots.push(Interaction {
-            multiplicity: km * pout * c[LAST] * c[NIN] + kd * lt10 + kb * p0,
+            multiplicity: km * pout * c[LAST] * (c[NIN] + c[NIN]) + kd * lt10 + kb * p0
+                + ktn * pout * (one - c[LAST])
+                + kbind * pout
+                + ks * (lt5 + p[PR_ROW5]),
             values: mix(&[
                 (km, tuple(TAG_MSG, c[TX], F::ZERO, &carry8)),
                 (kd, tuple(TAG_CH, c[UID], p[PR_DROW], &[digit(0)])),
                 (kb, tuple(TAG_NET, F::ZERO, F::ZERO, &net)),
+                (ktn, tuple(TAG_TNODE, c[UID], c[C] + one, &carry8)),
+                (kbind, tuple(TAG_BOUND, c[UID], F::ZERO, &compress_out)),
+                (ks, tuple(TAG_IDX, c[UID], three_rows, &[c[B0]])),
             ]),
         });
         // Slots 3-8: digit lanes 1-6.
+        // (Slots 3-4 also carry SEL's position bits 1 and 2 of each row.)
         for e in 1..7 {
             let mask = if e < 6 { lt10 } else { p[PR_LMASK6] };
             let chain = k((DIGITS_PER_LANE * e) as u32) + p[PR_DROW];
+            let mut parts = vec![(kd, tuple(TAG_CH, c[UID], chain, &[digit(e)]))];
+            let mut multiplicity = kd * mask;
+            if e <= 2 {
+                let bit = [B1, B2][e - 1];
+                parts.push((ks, tuple(TAG_IDX, c[UID], three_rows + k(e as u32), &[c[bit]])));
+                multiplicity = multiplicity + ks * lt5;
+            }
             slots.push(Interaction {
-                multiplicity: kd * mask,
-                values: mix(&[(kd, tuple(TAG_CH, c[UID], chain, &[digit(e)]))]),
+                multiplicity,
+                values: mix(&parts),
             });
         }
         slots
@@ -661,6 +780,8 @@ impl Air for BlockAir {
         columns.push(column(&|r| (r == 10) as u32));
         columns.push(column(&|r| if r < DIGITS_PER_LANE { r as u32 } else { 0 }));
         columns.push(column(&|r| (r < V - 6 * DIGITS_PER_LANE) as u32));
+        columns.push(column(&|r| (r < 5) as u32));
+        columns.push(column(&|r| (r == 5) as u32));
         columns
     }
 
@@ -847,10 +968,14 @@ fn build_shaped(
                         r[1] = r[1] + bb(trial);
                         r
                     })
-                    .find(|&r| wots::derive_digits(&param, message, r).iter().sum::<u32>() == TARGET_SUM)
+                    .find(|&r| wots::derive_digits(&param, wots::signed_digest(&param, message, r), r).iter().sum::<u32>() == TARGET_SUM)
                     .unwrap()
             };
-            let digits = wots::derive_digits(&param, message, randomizer);
+            // The text block the signature binds.
+            let position = wots::select(&param, message, randomizer);
+            let text = crate::scripture::block_elements(position % crate::scripture::BLOCKS);
+            let bound = wots::bind(message, position);
+            let digits = wots::derive_digits(&param, bound, randomizer);
             let param_header = |spec: Spec| -> Spec {
                 (0..PARAM_LEN).fold(spec, |s, i| s.set(PARAM + i, param[i]))
             };
@@ -859,9 +984,45 @@ fn build_shaped(
             let mut state = [BabyBear::ZERO; 24];
             state[..PARAM_LEN].copy_from_slice(&param);
             state[5] = bb(TAG_MESSAGE);
-            state[6..14].copy_from_slice(&message);
+            state[6..14].copy_from_slice(&bound);
             state[14..21].copy_from_slice(&randomizer);
             specs.push(param_header(Spec::new(K_DIG, state)).set(UID, bb(uid)).set(TX, tx_id));
+
+            // The text block: selected, proven in the text tree, bound.
+            let mut state = [BabyBear::ZERO; 24];
+            state[..PARAM_LEN].copy_from_slice(&param);
+            state[5] = bb(TAG_SELECT);
+            state[6..14].copy_from_slice(&message);
+            state[14..21].copy_from_slice(&randomizer);
+            specs.push(param_header(Spec::new(K_SEL, state)).set(UID, bb(uid)).set(TX, tx_id));
+            let mut state = iv(crate::scripture::DOMAIN_TEXT_LEAF, crate::scripture::BLOCK_LEN as u32);
+            state[..text.len()].copy_from_slice(&text);
+            specs.push(param_header(Spec::new(K_TLEAF, state)).set(UID, bb(uid)));
+            let mut hash: [BabyBear; 8] = perm.permute(state)[..8].try_into().unwrap();
+            for (level, sibling) in crate::scripture::tree().path(position).into_iter().enumerate() {
+                let bit = (position >> level) & 1;
+                let mut state = iv(crate::scripture::DOMAIN_TEXT_NODE + level as u32, 16);
+                let (left, right) = if bit == 1 { (sibling, hash) } else { (hash, sibling) };
+                state[..8].copy_from_slice(&left);
+                state[8..16].copy_from_slice(&right);
+                let last = level as u32 == TEXT_LEVELS - 1;
+                let gap = bb(level as u32) - bb(TEXT_LEVELS - 1);
+                let mut spec = param_header(Spec::new(K_TNODE, state))
+                    .set(UID, bb(uid))
+                    .set(C, bb(level as u32))
+                    .set(FLO, bb(bit as u32))
+                    .set(LAST, bb(last as u32))
+                    .set(W, if last { BabyBear::ZERO } else { gap.inverse() });
+                spec.prev[..8].copy_from_slice(&hash);
+                specs.push(spec);
+                hash = perm.permute(state)[..8].try_into().unwrap();
+            }
+            debug_assert_eq!(hash, crate::scripture::text_root());
+            let mut state = [BabyBear::ZERO; 24];
+            state[0] = bb(TAG_BIND);
+            state[1..9].copy_from_slice(&message);
+            state[9..9 + text.len()].copy_from_slice(&text);
+            specs.push(param_header(Spec::new(K_BIND, state)).set(UID, bb(uid)).set(TX, tx_id));
 
             // Chains.
             for c in 0..V {
@@ -1171,7 +1332,7 @@ fn fill(air: &BlockAir, specs: &[Spec]) -> Vec<Vec<BabyBear>> {
                 columns[LACC2 + j][row] = bb((checked_total[j] & mask) as u32);
             }
             columns[ACC_TOP][row] = if r == 0 { acc_top } else { updated_top };
-            if spec.kind == K_DIG && r <= DIGITS_PER_LANE {
+            if (spec.kind == K_DIG || spec.kind == K_SEL) && r <= DIGITS_PER_LANE {
                 let mut dsum = 0u32;
                 for e in 0..LANES {
                     let rem = lanes[e] >> (3 * r);

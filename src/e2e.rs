@@ -71,7 +71,7 @@ mod tests {
         let proof =
             prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
-        assert!(mine_block(&mut block, &target, 100_000), "should find a nonce quickly");
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
         chain.apply_block(&block)
     }
 
@@ -236,7 +236,7 @@ mod tests {
             let size = proof.len();
             let mut block = unproven.finish(proof);
             block.header.timestamp = block.header.timestamp.max(min_timestamp);
-            assert!(mine_block(&mut block, &target, u64::MAX));
+            assert!(mine_block(&mut block, &target, u64::MAX, &crate::pow::Params::TEST));
             let height = block.header.height;
             assert_eq!(chain.accept_block(block).unwrap(), chain::AcceptOutcome::Applied, "block {height}");
             let view = chain.view().unwrap();
@@ -257,8 +257,10 @@ mod tests {
         for _ in 0..10 {
             assert!(!mine(&mut chain, &mut mempool).0);
         }
+        // The rewards from heights 0 ..= 10 - maturity have matured.
+        let maturity = crate::wallet::coinbase_maturity();
         let b = wallet.balance(tip(&chain)).unwrap();
-        assert_eq!((b.spendable, b.immature), (REWARD, 9 * REWARD), "the first reward has matured");
+        assert_eq!((b.spendable, b.immature), ((11 - maturity) * REWARD, (maturity - 1) * REWARD), "the first rewards have matured");
 
         // Block 11: split the mature reward into 12 outputs of 0.08.
         let piece = 80_000_000;
@@ -312,7 +314,7 @@ mod tests {
         let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &transactions, &unproven.plan, [7; 32]).unwrap();
         let mut block = unproven.finish(proof);
         block.header.timestamp = block.header.timestamp.max(min_timestamp);
-        assert!(mine_block(&mut block, &target, u64::MAX));
+        assert!(mine_block(&mut block, &target, u64::MAX, &crate::pow::Params::TEST));
         assert_eq!(chain.accept_block(block).unwrap(), chain::AcceptOutcome::Applied);
         let view = chain.view().unwrap();
         for w in wallets.iter().chain([&miner]) {
@@ -457,7 +459,7 @@ mod tests {
             let unproven = c.build_block(&[]).unwrap();
             let target = unproven.target;
             let mut g = unproven.finish(prover::Proof::placeholder());
-            assert!(mine_block(&mut g, &target, u64::MAX));
+            assert!(mine_block(&mut g, &target, u64::MAX, &crate::pow::Params::TEST));
             g
         };
         let storage = Storage::open(&dir.0.join("chain")).unwrap();
@@ -485,7 +487,7 @@ mod tests {
             println!("block {}: chain proof {chain_proof_time:.1?}, block proof {:.1?}", unproven.height, start.elapsed());
             let mut block = unproven.finish_with_chain_proof(proof, chain_proof.unwrap_or_else(|| made.clone()));
             block.header.timestamp = block.header.timestamp.max(min_timestamp);
-            assert!(mine_block(&mut block, &target, u64::MAX));
+            assert!(mine_block(&mut block, &target, u64::MAX, &crate::pow::Params::TEST));
             (block, made)
         };
 

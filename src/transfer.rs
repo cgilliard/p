@@ -691,7 +691,7 @@ mod tests {
         let target = unproven.target;
         let proof = crate::prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
-        assert!(block::mine_block(&mut block, &target, 100_000));
+        assert!(block::mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
         block
     }
 

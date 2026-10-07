@@ -550,7 +550,7 @@ mod tests {
             let target = unproven.target;
             let proof = crate::prover::Proof::placeholder();
             let mut block = unproven.finish(proof);
-            assert!(crate::block::mine_block(&mut block, &target, 100_000));
+            assert!(crate::block::mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
             assert!(block.to_bytes().len() > crate::wire::CHUNK_LEN);
             a.chain.apply_block(&block).unwrap();
         }
@@ -674,7 +674,7 @@ mod tests {
             let unproven = a.chain.build_block(&transactions).unwrap();
             let target = unproven.target;
             let mut block = unproven.finish(crate::prover::Proof::placeholder());
-            assert!(crate::block::mine_block(&mut block, &target, 100_000));
+            assert!(crate::block::mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
             a.chain.apply_block(&block).unwrap();
             c.chain.apply_block(&block).unwrap();
             blocks.push(block);

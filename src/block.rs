@@ -199,19 +199,20 @@ impl BlockHeader {
         bytes
     }
 
-    /// This header's own hash -- what a following block's `prev_hash`
-    /// would point to. The same hash already computed while mining it.
+    /// This header's id -- what a following block's `prev_hash` points
+    /// to (`pow::header_id`: one permutation of the hashed header and the
+    /// nonce, the same one every mining attempt computes).
     pub fn hash(&self) -> [u8; 32] {
-        pow::pow_hash(&self.pow_preimage(), self.nonce)
+        pow::header_id(&self.pow_preimage(), self.nonce)
     }
 
-    /// Whether `nonce` actually satisfies `target` for this header's
-    /// preimage. `target` is supplied by the caller rather than a fixed
-    /// constant: the right target for a given height depends on chain
-    /// history (see `chain`'s docs on difficulty retargeting), which
-    /// this type has no access to on its own.
-    pub fn pow_valid(&self, target: &[u8; 32]) -> bool {
-        pow::verify(&self.pow_preimage(), self.nonce, target)
+    /// Whether `nonce` actually satisfies `target` for this header, under
+    /// proof-of-work parameters `pow` -- computing the dataset items it
+    /// needs (no dataset). `target` is supplied by the caller rather than
+    /// a fixed constant: the right target for a given height depends on
+    /// chain history (see `chain`'s docs on difficulty retargeting).
+    pub fn pow_valid(&self, target: &[u8; 32], pow: &pow::Params) -> bool {
+        pow::verify(&self.pow_preimage(), self.nonce, target, pow)
     }
 }
 
@@ -616,8 +617,8 @@ impl Block {
     /// The proof also attests the state transition, so it's checked
     /// against the parent's state: `parent_state` is its `(state_root,
     /// output_count)`.
-    pub fn validate(&self, target: &[u8; 32], parent_state: ([u8; 32], u64)) -> bool {
-        self.validate_structure(target) && self.body.proof_is_valid(&self.state_change(parent_state))
+    pub fn validate(&self, target: &[u8; 32], pow: &pow::Params, parent_state: ([u8; 32], u64)) -> bool {
+        self.validate_structure(target, pow) && self.body.proof_is_valid(&self.state_change(parent_state))
     }
 
     /// The state change this block claims, from its parent's state.
@@ -634,8 +635,8 @@ impl Block {
     /// Everything `validate` checks *except* the proof -- every cheap,
     /// structural rule. Separate so a caller can run these first, or (in
     /// tests about other things) skip the proof entirely.
-    pub fn validate_structure(&self, target: &[u8; 32]) -> bool {
-        if !self.header.pow_valid(target) {
+    pub fn validate_structure(&self, target: &[u8; 32], pow: &pow::Params) -> bool {
+        if !self.header.pow_valid(target, pow) {
             return false;
         }
         if !self.body.inputs.iter().chain(&self.body.outputs).all(crate::prover::is_canonical) {
@@ -693,9 +694,9 @@ impl Block {
 /// that module's docs on difficulty retargeting) -- mining against
 /// anything else just wastes work, since `apply_block` checks against
 /// its own idea of the right target, not whatever was mined against.
-pub fn mine_header(header: &mut BlockHeader, target: &[u8; 32], max_attempts: u64) -> bool {
+pub fn mine_header(header: &mut BlockHeader, target: &[u8; 32], max_attempts: u64, pow: &pow::Params) -> bool {
     let preimage = header.pow_preimage();
-    match pow::mine(&preimage, target, max_attempts) {
+    match pow::mine(&preimage, target, max_attempts, pow) {
         Some((nonce, _)) => {
             header.nonce = nonce;
             true
@@ -708,8 +709,8 @@ pub fn mine_header(header: &mut BlockHeader, target: &[u8; 32], max_attempts: u6
 /// value to call this on until `prover::prove_block` has already run
 /// (see `UnprovenBlock::finish`): that's what keeps mining from starting
 /// before proving does.
-pub fn mine_block(block: &mut Block, target: &[u8; 32], max_attempts: u64) -> bool {
-    mine_header(&mut block.header, target, max_attempts)
+pub fn mine_block(block: &mut Block, target: &[u8; 32], max_attempts: u64, pow: &pow::Params) -> bool {
+    mine_header(&mut block.header, target, max_attempts, pow)
 }
 
 #[cfg(test)]
@@ -733,7 +734,7 @@ mod tests {
     /// attempt budget -- 1-in-256 odds per attempt, so this finishes in a
     /// handful of tries almost always.
     fn mined_header(mut header: BlockHeader) -> BlockHeader {
-        assert!(mine_header(&mut header, &INITIAL_MAX_HASH, 100_000), "should find a nonce quickly");
+        assert!(mine_header(&mut header, &INITIAL_MAX_HASH, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
         header
     }
 
@@ -744,7 +745,7 @@ mod tests {
         for counter in 0u64..64 {
             let mut nonce = [0u8; 32];
             nonce[..8].copy_from_slice(&counter.to_le_bytes());
-            if !pow::meets_target(&pow::pow_hash(preimage, nonce), &INITIAL_MAX_HASH) {
+            if !pow::meets_target(&pow::pow_value_of(preimage, nonce, &pow::Params::TEST), &INITIAL_MAX_HASH) {
                 return nonce;
             }
         }
@@ -767,7 +768,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(block.validate_structure(&INITIAL_MAX_HASH));
+        assert!(block.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     /// PoW is checked first -- an arbitrary (wrong) `body_hash` is fine
@@ -792,7 +793,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     /// A header whose `body_hash` doesn't match the actual body is
@@ -815,7 +816,7 @@ mod tests {
             body: BlockBody::new(),
         };
 
-        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     /// A transaction that doesn't verify (unsigned) is rejected by
@@ -882,14 +883,14 @@ mod tests {
             timestamp: 1_700_000_000,
             nonce: [0u8; 32],
         });
-        assert!(header.pow_valid(&INITIAL_MAX_HASH));
+        assert!(header.pow_valid(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
 
         let tampered = BlockHeader {
             height: 0,
             timestamp: header.timestamp + 1,
             ..header
         };
-        assert!(!tampered.pow_valid(&INITIAL_MAX_HASH));
+        assert!(!tampered.pow_valid(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     #[test]
@@ -967,7 +968,7 @@ mod tests {
         let decoded = Block::from_bytes(&block.to_bytes()).unwrap();
         assert_eq!(decoded.header, block.header);
         assert_eq!(decoded.body, block.body);
-        assert!(decoded.validate_structure(&INITIAL_MAX_HASH));
+        assert!(decoded.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     /// `BlockBody::from_bytes` only checks byte-level well-formedness --
@@ -1060,7 +1061,7 @@ mod tests {
         });
         let block = Block { header, body };
 
-        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     /// The end-to-end version of the point above: a block whose body is
@@ -1092,7 +1093,7 @@ mod tests {
         });
         let block = Block { header, body };
 
-        assert!(!block.validate_structure(&INITIAL_MAX_HASH));
+        assert!(!block.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     #[test]
@@ -1157,9 +1158,9 @@ mod tests {
         let mut other = body.clone();
         other.nonces[1] = [4; NONCE_LEN];
         assert_ne!(other.body_hash(), body.body_hash(), "nonces are committed to");
-        assert!(mined_block(body.clone()).validate_structure(&INITIAL_MAX_HASH));
+        assert!(mined_block(body.clone()).validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
         body.nonces.pop();
-        assert!(!mined_block(body).validate_structure(&INITIAL_MAX_HASH));
+        assert!(!mined_block(body).validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     /// Inputs and outputs can't trade places without changing the hash
@@ -1188,11 +1189,11 @@ mod tests {
         let fits = (MAX_BLOCK_BYTES - HEADER_LEN - 16) / (32 + NONCE_LEN);
         let at_limit = mined_block(body_with_outputs(fits));
         assert!(at_limit.encoded_len() <= MAX_BLOCK_BYTES);
-        assert!(at_limit.validate_structure(&INITIAL_MAX_HASH));
+        assert!(at_limit.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
 
         let over = mined_block(body_with_outputs(fits + 1));
         assert!(over.encoded_len() > MAX_BLOCK_BYTES);
-        assert!(!over.validate_structure(&INITIAL_MAX_HASH));
+        assert!(!over.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
     }
 
     /// A count that claims far more records than the bytes hold fails as

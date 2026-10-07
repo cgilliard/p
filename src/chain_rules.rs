@@ -363,6 +363,7 @@ mod tests {
     #[test]
     fn retargeting_in_the_circuit_matches_the_chain() {
         let config = DifficultyConfig {
+            pow: crate::pow::Params::TEST,
             initial_target: [0; 32],
             interval: 10,
             target_block_time_ms: 60_000,

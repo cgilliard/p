@@ -1,36 +1,98 @@
 //! Proof of work: a cheap-to-check, expensive-to-produce puzzle a block
-//! header's nonce must solve, so that producing a valid header costs real
-//! computation -- the mechanism (independent of anything STARK/FRI-related
-//! elsewhere in this crate) that makes it costly to spam the chain with
-//! headers or rewrite history, by requiring real work per header.
+//! header's nonce must solve -- **memory-bound** (`docs/BIBLE.md`): an
+//! attempt is mostly reading a dataset expanded from the Bible's text, so
+//! mining is bound by memory (DRAM, or SRAM on an ASIC -- ASICs are
+//! welcome), not by hashing.
 //!
-//! The puzzle: hash `header_bytes || nonce` with Poseidon2, and the result
-//! must be no larger than a given `max_hash`, compared as a 256-bit
-//! big-endian integer -- which is exactly lexicographic `[u8; 32]`
-//! comparison, so no actual big-integer type is needed. A smaller
-//! `max_hash` means fewer of the 2^256 possible outputs qualify, so
-//! finding a satisfying nonce takes more expected attempts; this is the
-//! same target-based design Bitcoin uses, just with Poseidon2 in place of
-//! double-SHA256.
+//! # The dataset
 //!
-//! `header_bytes` is opaque here -- whatever the eventual `Block`/header
-//! type serializes everything-but-the-nonce into, this module just hashes
-//! whatever bytes it's handed. No dependency on `block` or anything else
-//! in this crate besides `poseidon2`.
+//! `2^items_log` items of `ITEM_ELEMS` field elements (512 bytes), each
+//! computed independently from a block of the text (`scripture`) at a
+//! deliberately high cost -- `item_rounds` Poseidon2 permutations -- so
+//! recomputing an item costs far more than reading it: **miners** keep the
+//! dataset in memory (`Dataset`; 64 MiB on main). **Validators** don't:
+//! they recompute only the items a header touches, from the text alone --
+//! light enough for very small hardware.
 //!
-//! The nonce itself is a full 32 bytes, not a `u64` -- deliberately wider
-//! than any attempt budget `mine` could plausibly need, so the field's
-//! on-the-wire width never has to change later for a reason as mundane as
-//! "ran out of nonce space." `mine`'s search loop still just increments a
-//! plain `u64` counter internally and encodes it into the low 8 bytes of
-//! the 32-byte field each attempt (the rest stay zero) -- nothing about
-//! how mining actually works depends on the wider type.
-
+//! # One attempt
+//!
+//! - **Midstate:** the header (all but the nonce) is hashed once per
+//!   template (`prefix`); an attempt is one permutation of prefix ‖ nonce,
+//!   whose output is the block's **id** (what `prev_hash` points to) and
+//!   the starting **mix** (16 elements).
+//! - `lookups` times: an index from the mix (`2^items_log` items), that
+//!   item read, and folded into the mix with field arithmetic: every
+//!   element times a mix-dependent weight (`acc[e] = Σ_c item[16c+e] ·
+//!   mix[(e+c) mod 16]`), then one nonlinear step (`t = acc + mix`,
+//!   `mix[e] = t[e]·t[e+1] + K[e]`). Every element of every item read
+//!   counts, with weights that change every attempt (so items can't be
+//!   precompressed); each index depends on the last read (no prefetching
+//!   or skipping); the 128 products are independent (they vectorize, so
+//!   memory, not arithmetic, bounds a CPU too); and no hashing per lookup.
+//! - The **proof-of-work value**: Poseidon2(id ‖ mix), which must be no
+//!   larger than the target (as 256-bit big-endian integers, as in
+//!   Bitcoin).
+//!
+//! An attempt's compute is ~2 permutations and cheap elementwise
+//! arithmetic; its memory is `lookups` × 512 bytes. The parameters are
+//! consensus (`chain::DifficultyConfig::pow`): `Params::MAIN` and `DEV`
+//! for the networks, `TEST` (tiny) for tests.
+//!
+//! The nonce is a full 32 bytes; `mine` counts a `u64` in its low 8.
 #![allow(dead_code)]
 
-use crate::poseidon2::hash_bytes_32;
+use crate::poseidon2::{BabyBear, digest_to_bytes, hash_bytes, hash_octets, perm24};
+use crate::scripture;
 
 pub type Nonce = [u8; 32];
+
+/// Field elements per dataset item: 512 bytes.
+pub const ITEM_ELEMS: usize = 128;
+/// The mix's width, and how many elements are folded in at a time.
+pub const MIX: usize = 16;
+
+const DOMAIN_ATTEMPT: u32 = 0x600;
+const DOMAIN_ITEM: u32 = 0x601;
+const DOMAIN_POW: u32 = 0x602;
+/// A dataset item's leaf in the dataset tree.
+pub const DOMAIN_ITEM_LEAF: u32 = 0x603;
+/// Plus the level: the dataset tree's nodes.
+pub const DOMAIN_DATASET_NODE: u32 = 0x700;
+/// `attempt`'s domain, as the circuit lays it out.
+pub const ATTEMPT_DOMAIN: u32 = DOMAIN_ATTEMPT;
+/// The final hash's domain.
+pub const POW_DOMAIN: u32 = DOMAIN_POW;
+
+/// The mixing constants `K`.
+pub const K: [u32; MIX] = [
+    0x0123_4567, 0x0234_5678, 0x0345_6789, 0x0456_789a, 0x0567_89ab, 0x0678_9abc, 0x0789_abcd, 0x089a_bcde,
+    0x09ab_cdef, 0x0abc_def0, 0x0bcd_ef01, 0x0cde_f012, 0x0def_0123, 0x0ef0_1234, 0x0f01_2345, 0x1012_3456,
+];
+
+/// Proof-of-work parameters -- consensus, per network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Params {
+    /// `log2` of the dataset's item count.
+    pub items_log: u32,
+    /// Permutations per item: what recomputing one costs.
+    pub item_rounds: u32,
+    /// Dataset reads per attempt.
+    pub lookups: u32,
+}
+
+impl Params {
+    /// 2^17 items × 512 B = 64 MiB: SRAM-feasible for an ASIC.
+    pub const MAIN: Params = Params { items_log: 17, item_rounds: 128, lookups: 64 };
+    /// 16 MiB, for quick startup -- and 12 lookups, so the chain step's
+    /// proof of work fits dev's smaller (2^17-row) recursion.
+    pub const DEV: Params = Params { items_log: 15, item_rounds: 128, lookups: 12 };
+    /// Tiny, for tests that mine many blocks.
+    pub const TEST: Params = Params { items_log: 6, item_rounds: 2, lookups: 4 };
+
+    pub fn items(&self) -> usize {
+        1 << self.items_log
+    }
+}
 
 fn nonce_from_counter(counter: u64) -> Nonce {
     let mut nonce = [0u8; 32];
@@ -38,44 +100,369 @@ fn nonce_from_counter(counter: u64) -> Nonce {
     nonce
 }
 
-/// `Poseidon2(header_bytes || nonce)`.
-pub fn pow_hash(header_bytes: &[u8], nonce: Nonce) -> [u8; 32] {
-    let mut bytes = Vec::with_capacity(header_bytes.len() + nonce.len());
-    bytes.extend_from_slice(header_bytes);
-    bytes.extend_from_slice(&nonce);
-    hash_bytes_32(&bytes)
+/// A header's prefix: everything but its nonce, hashed -- once per
+/// template.
+pub fn prefix(header_bytes: &[u8]) -> [BabyBear; 8] {
+    hash_bytes(header_bytes)
 }
 
-/// Whether `hash` satisfies the target `max_hash` -- true exactly when
-/// `hash <= max_hash`, treating both as 256-bit big-endian integers.
-/// `[u8; 32]`'s derived `Ord` already compares lexicographically
-/// byte-by-byte from index 0, which *is* big-endian integer comparison,
-/// so there's nothing to implement beyond the `<=` itself.
+/// The nonce as field elements, three bytes to an element.
+fn nonce_elements(nonce: &Nonce) -> [BabyBear; 11] {
+    std::array::from_fn(|e| {
+        let chunk = &nonce[3 * e..(3 * e + 3).min(32)];
+        BabyBear::new(chunk.iter().rev().fold(0u32, |acc, &b| (acc << 8) | b as u32))
+    })
+}
+
+/// One permutation of prefix ‖ nonce: the block's id (`[..8]`) and the
+/// starting mix (`[8..]`).
+pub fn attempt(prefix: &[BabyBear; 8], nonce: &Nonce) -> [BabyBear; 24] {
+    let mut state = [BabyBear::ZERO; 24];
+    state[..8].copy_from_slice(prefix);
+    state[8..19].copy_from_slice(&nonce_elements(nonce));
+    state[19] = BabyBear::new(DOMAIN_ATTEMPT);
+    perm24().permute(state)
+}
+
+/// The block id: what the header hashes to.
+pub fn header_id(header_bytes: &[u8], nonce: Nonce) -> [u8; 32] {
+    let out = attempt(&prefix(header_bytes), &nonce);
+    digest_to_bytes(out[..8].try_into().unwrap())
+}
+
+/// Dataset item `i`, computed: a block of the text and `i`, through
+/// `item_rounds` permutations, then squeezed out to `ITEM_ELEMS` elements.
+pub fn item(params: &Params, i: usize) -> [BabyBear; ITEM_ELEMS] {
+    let perm = perm24();
+    let mut state = [BabyBear::ZERO; 24];
+    state[..scripture::BLOCK_ELEMENTS].copy_from_slice(&scripture::block_elements(i % scripture::BLOCKS));
+    state[11] = BabyBear::new((i & 0xff_ffff) as u32);
+    state[12] = BabyBear::new((i >> 24) as u32);
+    state[16] = BabyBear::new(DOMAIN_ITEM);
+    state[17] = BabyBear::new(params.item_rounds);
+    for _ in 0..params.item_rounds {
+        state = perm.permute(state);
+    }
+    let mut out = [BabyBear::ZERO; ITEM_ELEMS];
+    for (k, chunk) in out.chunks_exact_mut(16).enumerate() {
+        if k > 0 {
+            state = perm.permute(state);
+        }
+        chunk.copy_from_slice(&state[..16]);
+    }
+    out
+}
+
+/// The whole dataset, in memory: what a miner reads -- items as raw
+/// (reduced) `u32`s, for `fast`.
+pub struct Dataset {
+    pub params: Params,
+    elements: Vec<u32>,
+}
+
+impl Dataset {
+    /// Compute every item, across every core.
+    pub fn generate(params: Params) -> Dataset {
+        let items = crate::parallel::map(params.items(), |i| item(&params, i));
+        Dataset {
+            params,
+            elements: items.into_iter().flatten().map(|e| e.value()).collect(),
+        }
+    }
+
+    pub fn item(&self, i: usize) -> &[u32] {
+        &self.elements[i * ITEM_ELEMS..(i + 1) * ITEM_ELEMS]
+    }
+}
+
+/// The miner's fast path: the same mixing as `fold`, on raw `u32` lanes
+/// with Montgomery multiplication -- no division, so it vectorizes (and
+/// is compiled for AVX2 when the CPU has it). Consensus is `fold`; this
+/// must agree with it exactly (`the_fast_path_matches_the_reference`).
+mod fast {
+    use super::{ITEM_ELEMS, K, MIX};
+    use crate::poseidon2::P;
+
+    /// 2^64 mod p: Montgomery form is `x·2^32`, reached by multiplying by
+    /// this and reducing.
+    const R2: u64 = 1_172_168_163;
+    /// -p^-1 mod 2^32.
+    const P_INV_NEG: u32 = 0x77ffffff;
+
+    /// `x · 2^-32 mod p`, for `x < p · 2^32`.
+    #[inline(always)]
+    fn reduce(x: u64) -> u32 {
+        let q = (x as u32).wrapping_mul(P_INV_NEG);
+        let t = ((x + q as u64 * P as u64) >> 32) as u32;
+        if t >= P { t - P } else { t }
+    }
+
+    #[inline(always)]
+    fn add(a: u32, b: u32) -> u32 {
+        let s = a + b;
+        if s >= P { s - P } else { s }
+    }
+
+    /// `a` in Montgomery form, so that `reduce(b · mont(a)) = a·b`.
+    #[inline(always)]
+    fn mont(a: u32) -> u32 {
+        reduce(a as u64 * R2)
+    }
+
+    #[inline(always)]
+    fn fold_lanes(mix: &mut [u32; MIX], item: &[u32]) {
+        let item: &[u32; ITEM_ELEMS] = item.try_into().unwrap();
+        // The weights, laid out like the item: weight[16c + e] =
+        // mix[(e + c) % 16], in Montgomery form -- so the 128 products are
+        // one straight loop.
+        let m: [u32; MIX] = std::array::from_fn(|e| mont(mix[e]));
+        let mut weights = [0u32; ITEM_ELEMS];
+        for c in 0..ITEM_ELEMS / MIX {
+            for e in 0..MIX {
+                weights[MIX * c + e] = m[(e + c) % MIX];
+            }
+        }
+        let mut products = [0u32; ITEM_ELEMS];
+        for k in 0..ITEM_ELEMS {
+            products[k] = reduce(item[k] as u64 * weights[k] as u64);
+        }
+        let mut acc = [0u32; MIX];
+        for c in 0..ITEM_ELEMS / MIX {
+            for e in 0..MIX {
+                acc[e] = add(acc[e], products[MIX * c + e]);
+            }
+        }
+        let mut t = [0u32; MIX];
+        for e in 0..MIX {
+            t[e] = add(acc[e], mix[e]);
+        }
+        let tm: [u32; MIX] = std::array::from_fn(|e| mont(t[(e + 1) % MIX]));
+        for e in 0..MIX {
+            mix[e] = add(reduce(t[e] as u64 * tm[e] as u64), K[e]);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn fold_avx2(mix: &mut [u32; MIX], item: &[u32]) {
+        fold_lanes(mix, item)
+    }
+
+    /// `super::fold`, fast.
+    pub fn fold(mix: &mut [u32; MIX], item: &[u32]) {
+        debug_assert_eq!(item.len(), ITEM_ELEMS);
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has AVX2.
+            return unsafe { fold_avx2(mix, item) };
+        }
+        fold_lanes(mix, item)
+    }
+
+    /// `super::index_of`, on raw lanes.
+    pub fn index_of(items_log: u32, mix: &[u32; MIX]) -> usize {
+        let sum = mix.iter().fold(0u64, |a, &b| a + b as u64) % P as u64;
+        sum as usize & ((1 << items_log) - 1)
+    }
+}
+
+/// The dataset for `params`, generated on first use and kept. Each
+/// parameter set generates on its own: one being generated doesn't hold
+/// up another.
+pub fn dataset(params: Params) -> std::sync::Arc<Dataset> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Slot = Arc<OnceLock<Arc<Dataset>>>;
+    static DATASETS: OnceLock<Mutex<Vec<(Params, Slot)>>> = OnceLock::new();
+    let slot = {
+        let mut datasets = DATASETS.get_or_init(Default::default).lock().unwrap();
+        match datasets.iter().find(|(p, _)| *p == params) {
+            Some((_, slot)) => slot.clone(),
+            None => {
+                let slot: Slot = Default::default();
+                datasets.push((params, slot.clone()));
+                slot
+            }
+        }
+    };
+    slot.get_or_init(|| Arc::new(Dataset::generate(params))).clone()
+}
+
+/// An item's leaf in the dataset tree: one sponge over its 128 elements.
+pub fn item_leaf(item: &[BabyBear]) -> [BabyBear; 8] {
+    hash_octets(DOMAIN_ITEM_LEAF, ITEM_ELEMS * 4, item)
+}
+
+/// The dataset tree's node capacity at `level` (0: just above leaves).
+pub fn node_capacity(level: usize) -> [BabyBear; 8] {
+    let mut c = [BabyBear::ZERO; 8];
+    c[0] = BabyBear::new(DOMAIN_DATASET_NODE + level as u32);
+    c[1] = BabyBear::new(16);
+    c
+}
+
+/// The dataset tree's node above `left` and `right` at `level`.
+pub fn node(level: usize, left: &[BabyBear; 8], right: &[BabyBear; 8]) -> [BabyBear; 8] {
+    let mut state = [BabyBear::ZERO; 24];
+    state[..8].copy_from_slice(left);
+    state[8..16].copy_from_slice(right);
+    state[16..].copy_from_slice(&node_capacity(level));
+    perm24().permute(state)[..8].try_into().unwrap()
+}
+
+/// A Merkle tree over the dataset's items: what a chain step proves its
+/// header's lookups against (its root is built into the step's key). Kept
+/// by provers -- miners -- alongside the dataset: 2^(items_log + 1)
+/// digests (8 MB on main).
+pub struct DatasetTree {
+    levels: Vec<Vec<[BabyBear; 8]>>,
+}
+
+impl DatasetTree {
+    pub fn build(data: &Dataset) -> DatasetTree {
+        let leaves = crate::parallel::map(data.params.items(), |i| {
+            let item: Vec<BabyBear> = data.item(i).iter().map(|&v| BabyBear::new(v)).collect();
+            item_leaf(&item)
+        });
+        let mut levels = vec![leaves];
+        for h in 0..data.params.items_log as usize {
+            let next = levels[h].chunks_exact(2).map(|p| node(h, &p[0], &p[1])).collect();
+            levels.push(next);
+        }
+        DatasetTree { levels }
+    }
+
+    pub fn root(&self) -> [BabyBear; 8] {
+        self.levels.last().unwrap()[0]
+    }
+
+    /// Item `i`'s siblings, bottom first.
+    pub fn path(&self, i: usize) -> Vec<[BabyBear; 8]> {
+        (0..self.levels.len() - 1).map(|h| self.levels[h][(i >> h) ^ 1]).collect()
+    }
+}
+
+/// The dataset tree for `params`, built on first use and kept.
+pub fn dataset_tree(params: Params) -> std::sync::Arc<DatasetTree> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Slot = Arc<OnceLock<Arc<DatasetTree>>>;
+    static TREES: OnceLock<Mutex<Vec<(Params, Slot)>>> = OnceLock::new();
+    let slot = {
+        let mut trees = TREES.get_or_init(Default::default).lock().unwrap();
+        match trees.iter().find(|(p, _)| *p == params) {
+            Some((_, slot)) => slot.clone(),
+            None => {
+                let slot: Slot = Default::default();
+                trees.push((params, slot.clone()));
+                slot
+            }
+        }
+    };
+    slot.get_or_init(|| Arc::new(DatasetTree::build(&dataset(params)))).clone()
+}
+
+/// The items an attempt reads, in order (index, item) -- a chain step's
+/// witness for its header's proof of work.
+pub fn lookups(params: &Params, out: &[BabyBear; 24]) -> Vec<(usize, Vec<BabyBear>)> {
+    let data = dataset(*params);
+    let mut mix: [BabyBear; MIX] = out[8..].try_into().unwrap();
+    let mut read = Vec::with_capacity(params.lookups as usize);
+    for _ in 0..params.lookups {
+        let i = index_of(params, &mix);
+        let item: Vec<BabyBear> = data.item(i).iter().map(|&v| BabyBear::new(v)).collect();
+        fold(&mut mix, &item);
+        read.push((i, item));
+    }
+    read
+}
+
+/// The index the mix picks.
+pub fn index_of(params: &Params, mix: &[BabyBear; MIX]) -> usize {
+    let sum = mix.iter().fold(BabyBear::ZERO, |a, &b| a + b);
+    sum.value() as usize & (params.items() - 1)
+}
+
+/// Fold an item into the mix (consensus; see the module docs).
+pub fn fold(mix: &mut [BabyBear; MIX], item: &[BabyBear]) {
+    let acc: [BabyBear; MIX] = std::array::from_fn(|e| {
+        item.chunks_exact(MIX)
+            .enumerate()
+            .fold(BabyBear::ZERO, |sum, (c, chunk)| sum + chunk[e] * mix[(e + c) % MIX])
+    });
+    let t: [BabyBear; MIX] = std::array::from_fn(|e| acc[e] + mix[e]);
+    for e in 0..MIX {
+        mix[e] = t[e] * t[(e + 1) % MIX] + BabyBear::new(K[e]);
+    }
+}
+
+/// The proof-of-work value of an attempt's output, reading items through
+/// `read`.
+pub fn pow_value<'a>(params: &Params, out: &[BabyBear; 24], mut read: impl FnMut(usize) -> std::borrow::Cow<'a, [BabyBear]>) -> [u8; 32] {
+    let mut mix: [BabyBear; MIX] = out[8..].try_into().unwrap();
+    for _ in 0..params.lookups {
+        let item = read(index_of(params, &mix));
+        fold(&mut mix, &item);
+    }
+    let mut elements = [BabyBear::ZERO; 24];
+    elements[..8].copy_from_slice(&out[..8]);
+    elements[8..].copy_from_slice(&mix);
+    digest_to_bytes(hash_octets(DOMAIN_POW, 24, &elements))
+}
+
+/// The proof-of-work value of `header_bytes` with `nonce`, items computed
+/// as needed -- what a validator does (no dataset).
+pub fn pow_value_of(header_bytes: &[u8], nonce: Nonce, params: &Params) -> [u8; 32] {
+    let out = attempt(&prefix(header_bytes), &nonce);
+    pow_value(params, &out, |i| std::borrow::Cow::Owned(item(params, i).to_vec()))
+}
+
+/// Whether `hash` satisfies the target `max_hash` -- `hash <= max_hash`
+/// as 256-bit big-endian integers, which is exactly `[u8; 32]`'s
+/// lexicographic order.
 pub fn meets_target(hash: &[u8; 32], max_hash: &[u8; 32]) -> bool {
     hash <= max_hash
 }
 
-/// Check whether `nonce` is a valid proof of work for `header_bytes`
-/// under target `max_hash`.
-pub fn verify(header_bytes: &[u8], nonce: Nonce, max_hash: &[u8; 32]) -> bool {
-    meets_target(&pow_hash(header_bytes, nonce), max_hash)
+/// Whether `nonce` is a valid proof of work for `header_bytes` under
+/// target `max_hash` -- without the dataset.
+pub fn verify(header_bytes: &[u8], nonce: Nonce, max_hash: &[u8; 32], params: &Params) -> bool {
+    meets_target(&pow_value_of(header_bytes, nonce, params), max_hash)
 }
 
-/// Search nonces starting at 0, returning the first `(nonce, hash)` that
-/// meets `max_hash`, or `None` if none of the first `max_attempts` do. A
-/// real miner would keep searching indefinitely (or until outrun by a
-/// competing block); the cap here exists only so callers -- tests,
-/// especially -- can bound the work instead of looping forever against an
-/// unreachable target.
-pub fn mine(header_bytes: &[u8], max_hash: &[u8; 32], max_attempts: u64) -> Option<(Nonce, [u8; 32])> {
-    for counter in 0..max_attempts {
+/// Search nonces from 0 with the dataset, returning the first `(nonce,
+/// block id)` whose proof-of-work value meets `max_hash`, or `None` if
+/// none of the first `max_attempts` do -- bounded so callers (the node's
+/// loop, tests) can interleave other work.
+pub fn mine(header_bytes: &[u8], max_hash: &[u8; 32], max_attempts: u64, params: &Params) -> Option<(Nonce, [u8; 32])> {
+    mine_from(header_bytes, max_hash, 0, max_attempts, params)
+}
+
+/// `mine`, from nonce counter `first`.
+pub fn mine_from(header_bytes: &[u8], max_hash: &[u8; 32], first: u64, max_attempts: u64, params: &Params) -> Option<(Nonce, [u8; 32])> {
+    let data = dataset(*params);
+    let prefix = prefix(header_bytes);
+    for counter in first..first + max_attempts {
         let nonce = nonce_from_counter(counter);
-        let hash = pow_hash(header_bytes, nonce);
-        if meets_target(&hash, max_hash) {
-            return Some((nonce, hash));
+        let out = attempt(&prefix, &nonce);
+        if meets_target(&pow_value_with(&data, &out), max_hash) {
+            return Some((nonce, digest_to_bytes(out[..8].try_into().unwrap())));
         }
     }
     None
+}
+
+/// `pow_value`, reading `data` on the fast path -- what a miner does.
+pub fn pow_value_with(data: &Dataset, out: &[BabyBear; 24]) -> [u8; 32] {
+    let mut mix: [u32; MIX] = std::array::from_fn(|e| out[8 + e].value());
+    for _ in 0..data.params.lookups {
+        let i = fast::index_of(data.params.items_log, &mix);
+        fast::fold(&mut mix, data.item(i));
+    }
+    let mut elements = [BabyBear::ZERO; 24];
+    elements[..8].copy_from_slice(&out[..8]);
+    for e in 0..MIX {
+        elements[8 + e] = BabyBear::new(mix[e]);
+    }
+    digest_to_bytes(hash_octets(DOMAIN_POW, 24, &elements))
 }
 
 /// Multiply `value`, treated as a 256-bit big-endian integer, by the
@@ -316,20 +703,14 @@ pub fn work_for_target(target: [u8; 32]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pow_hash_differs_across_nonces() {
-        assert_ne!(
-            pow_hash(b"abc", nonce_from_counter(0)),
-            pow_hash(b"abc", nonce_from_counter(1))
-        );
-    }
+    const T: Params = Params::TEST;
 
     #[test]
-    fn pow_hash_differs_across_headers() {
-        assert_ne!(
-            pow_hash(b"abc", nonce_from_counter(0)),
-            pow_hash(b"xyz", nonce_from_counter(0))
-        );
+    fn ids_differ_across_nonces_and_headers() {
+        assert_ne!(header_id(b"abc", nonce_from_counter(0)), header_id(b"abc", nonce_from_counter(1)));
+        assert_ne!(header_id(b"abc", nonce_from_counter(0)), header_id(b"xyz", nonce_from_counter(0)));
+        // The proof-of-work value isn't the id.
+        assert_ne!(header_id(b"abc", nonce_from_counter(0)), pow_value_of(b"abc", nonce_from_counter(0), &T));
     }
 
     #[test]
@@ -351,51 +732,126 @@ mod tests {
     }
 
     #[test]
-    fn verify_accepts_a_hash_used_as_its_own_target() {
+    fn verify_accepts_a_value_used_as_its_own_target() {
         let header = b"block header bytes";
         let nonce = nonce_from_counter(42);
-        let hash = pow_hash(header, nonce);
-        // hash <= hash is always true, so this is valid regardless of how
-        // hard the target actually is.
-        assert!(verify(header, nonce, &hash));
+        let value = pow_value_of(header, nonce, &T);
+        assert!(verify(header, nonce, &value, &T));
+        assert!(!verify(header, nonce, &[0u8; 32], &T)); // only an exactly-zero value would pass
     }
 
+    /// Mining with the dataset and validating without it agree, and
+    /// mining returns the smallest satisfying nonce and its id.
     #[test]
-    fn verify_rejects_hash_above_an_unreachable_target() {
-        let header = b"block header bytes";
-        let max_hash = [0u8; 32]; // only an exactly-zero hash would pass
-        assert!(!verify(header, nonce_from_counter(0), &max_hash));
-    }
-
-    #[test]
-    fn mine_finds_a_solution_under_a_trivial_target() {
-        let header = b"block header";
-        let max_hash = [0xffu8; 32]; // every possible hash qualifies
-        let (nonce, hash) = mine(header, &max_hash, 10).expect("should find a solution");
-        assert_eq!(nonce, nonce_from_counter(0));
-        assert_eq!(hash, pow_hash(header, nonce_from_counter(0)));
-        assert!(verify(header, nonce, &max_hash));
-    }
-
-    /// `mine` must return the *smallest* nonce that satisfies the target,
-    /// not just any satisfying nonce -- checked by setting the target to
-    /// exactly counter 3's hash (so that nonce is guaranteed to satisfy
-    /// it) and confirming mining stops at or before it.
-    #[test]
-    fn mine_returns_the_smallest_satisfying_nonce() {
+    fn mining_with_the_dataset_matches_validating_without_it() {
         let header = b"abc";
-        let target = pow_hash(header, nonce_from_counter(3));
-        let (nonce, hash) = mine(header, &target, 10).expect("counter 3 itself satisfies the target");
+        let target = pow_value_of(header, nonce_from_counter(3), &T);
+        let (nonce, id) = mine(header, &target, 10, &T).expect("counter 3 itself satisfies the target");
         assert!(u64::from_le_bytes(nonce[..8].try_into().unwrap()) <= 3);
-        assert_eq!(hash, pow_hash(header, nonce));
-        assert!(meets_target(&hash, &target));
+        assert_eq!(id, header_id(header, nonce));
+        assert!(verify(header, nonce, &target, &T));
+        assert!(mine(header, &[0u8; 32], 100, &T).is_none());
+        // The stored dataset is exactly the computed items.
+        let d = dataset(T);
+        for i in [0, 1, T.items() - 1] {
+            assert_eq!(d.item(i), item(&T, i).map(|e| e.value()));
+        }
     }
 
+    /// The miner's fast path agrees with the reference (consensus) mixing
+    /// exactly, on random inputs and at the field's edges.
     #[test]
-    fn mine_returns_none_when_attempts_are_exhausted_under_an_impossible_target() {
-        let header = b"abc";
-        let max_hash = [0u8; 32];
-        assert!(mine(header, &max_hash, 1000).is_none());
+    fn the_fast_path_matches_the_reference() {
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % crate::poseidon2::P as u64) as u32
+        };
+        let edge = |k: usize| [0, 1, crate::poseidon2::P - 1, crate::poseidon2::P - 2][k % 4];
+        for round in 0..200 {
+            let mix: [u32; MIX] = std::array::from_fn(|e| if round < 4 { edge(e + round) } else { next() });
+            let item: Vec<u32> = (0..ITEM_ELEMS).map(|k| if round < 4 { edge(k + round) } else { next() }).collect();
+            let mut fast_mix = mix;
+            fast::fold(&mut fast_mix, &item);
+            let mut reference = mix.map(BabyBear::new);
+            let item_ref: Vec<BabyBear> = item.iter().map(|&v| BabyBear::new(v)).collect();
+            fold(&mut reference, &item_ref);
+            assert_eq!(fast_mix, reference.map(|e| e.value()), "round {round}");
+            assert_eq!(fast::index_of(T.items_log, &fast_mix), index_of(&T, &reference));
+        }
+        // And whole attempts agree.
+        let d = dataset(T);
+        for c in 0..20 {
+            let out = attempt(&prefix(b"agree"), &nonce_from_counter(c));
+            let reference = pow_value(&T, &out, |i| std::borrow::Cow::Owned(item(&T, i).to_vec()));
+            assert_eq!(pow_value_with(&d, &out), reference);
+        }
+    }
+
+    /// Items depend on their index and on the text, and every lookup moves
+    /// the mix.
+    #[test]
+    fn items_and_mixing() {
+        assert_ne!(item(&T, 0), item(&T, 1));
+        assert_ne!(item(&T, 0), item(&Params { item_rounds: 3, ..T }, 0));
+        let mut mix = [BabyBear::ONE; MIX];
+        let before = mix;
+        fold(&mut mix, &item(&T, 5));
+        assert_ne!(mix, before);
+        assert!(index_of(&T, &mix) < T.items());
+    }
+
+    /// Hash rate with the real parameters, and how memory-bound it is:
+    /// mining against the real dataset vs one small enough to sit in cache
+    /// (same work per attempt, only the memory differs). `[NETWORK=..]
+    /// cargo test --release -- --ignored --nocapture pow_rates`.
+    #[test]
+    #[ignore]
+    fn pow_rates() {
+        for (name, params) in [("main", Params::MAIN), ("dev", Params::DEV), ("in cache (64 KiB)", Params { items_log: 7, ..Params::MAIN })] {
+            let start = std::time::Instant::now();
+            let d = dataset(params);
+            println!("{name}: dataset {} MiB generated in {:.1?}", (d.params.items() * ITEM_ELEMS * 4) >> 20, start.elapsed());
+            let header = b"pow rates";
+            let bytes_per_attempt = (params.lookups as usize * ITEM_ELEMS * 4) as f64;
+            for threads in [1u64, crate::parallel::threads() as u64] {
+                let attempts = 20_000 * threads;
+                let start = std::time::Instant::now();
+                crate::parallel::map_each(threads as usize, |t| mine_from(header, &[0u8; 32], t as u64 * attempts, attempts / threads, &params));
+                let rate = attempts as f64 / start.elapsed().as_secs_f64();
+                println!("  {threads:>2} thread(s): {rate:>9.0} attempts/s ({:.2} GB/s of items read)", rate * bytes_per_attempt / 1e9);
+            }
+            // Where one attempt's time goes, on one thread.
+            let n = 20_000u32;
+            let (pre, nonce) = (prefix(header), nonce_from_counter(7));
+            let start = std::time::Instant::now();
+            for c in 0..n {
+                std::hint::black_box(attempt(&pre, &nonce_from_counter(c as u64)));
+            }
+            let t_attempt = start.elapsed() / n;
+            let mut mix = [1u32; MIX];
+            let item0 = d.item(3).to_vec();
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                fast::fold(&mut mix, std::hint::black_box(&item0));
+            }
+            let t_fold = start.elapsed() / n;
+            let out = attempt(&pre, &nonce);
+            let start = std::time::Instant::now();
+            for _ in 0..n / 10 {
+                std::hint::black_box(pow_value_with(&d, &out));
+            }
+            let t_value = start.elapsed() / (n / 10);
+            println!("  one attempt: {t_attempt:.2?} start + {:.2?} = {} folds (in cache) ; whole pow value {t_value:.2?}", t_fold * params.lookups, params.lookups);
+            let start = std::time::Instant::now();
+            let n = 50;
+            for c in 0..n {
+                pow_value_of(header, nonce_from_counter(c), &params);
+            }
+            println!("  validating one header (no dataset): {:.2?}", start.elapsed() / n as u32);
+        }
     }
 
     #[test]

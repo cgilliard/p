@@ -94,6 +94,10 @@ const TAG_PARAM: u32 = 1;
 const TAG_SECRET: u32 = 2;
 pub(crate) const TAG_CHAIN: u32 = 3;
 pub(crate) const TAG_MESSAGE: u32 = 4;
+/// Choosing the text block a signature binds (`select`).
+pub(crate) const TAG_SELECT: u32 = 5;
+/// Binding it into the signed digest (`bind`).
+pub(crate) const TAG_BIND: u32 = 6;
 
 pub struct SecretKey {
     param: Param,
@@ -254,6 +258,39 @@ pub(crate) fn chain_step(
     perm24.compress::<CHAIN_LEN>(input)
 }
 
+/// The text block a signature with `randomizer` binds (`docs/BIBLE.md`):
+/// a position in the text tree (`scripture`, 2^16 positions, block
+/// `position mod BLOCKS`), chosen by the signer's own randomness -- a
+/// different block for every randomizer tried, so signing takes the whole
+/// text. `compress(param, TAG_SELECT, message, randomizer)`'s first
+/// element's low 16 bits.
+pub(crate) fn select(param: &Param, message_digest: [BabyBear; 8], randomizer: [BabyBear; RAND_LEN]) -> usize {
+    let mut input = [BabyBear::ZERO; 24];
+    input[0..PARAM_LEN].copy_from_slice(param);
+    input[5] = BabyBear::new(TAG_SELECT);
+    input[6..14].copy_from_slice(&message_digest);
+    input[14..21].copy_from_slice(&randomizer);
+    let out: [BabyBear; 8] = crate::poseidon2::perm24().compress(input);
+    (out[0].value() & 0xffff) as usize
+}
+
+/// The message bound to the text block at `position`:
+/// `compress(TAG_BIND, message, block)` -- what the digits are derived
+/// from, so the signature covers the block as well as the message.
+pub(crate) fn bind(message_digest: [BabyBear; 8], position: usize) -> [BabyBear; 8] {
+    let mut input = [BabyBear::ZERO; 24];
+    input[0] = BabyBear::new(TAG_BIND);
+    input[1..9].copy_from_slice(&message_digest);
+    input[9..9 + crate::scripture::BLOCK_ELEMENTS].copy_from_slice(&crate::scripture::block_elements(position % crate::scripture::BLOCKS));
+    crate::poseidon2::perm24().compress(input)
+}
+
+/// What a signature's digits are derived from: the message, bound to the
+/// text block the randomizer selects.
+pub(crate) fn signed_digest(param: &Param, message_digest: [BabyBear; 8], randomizer: [BabyBear; RAND_LEN]) -> [BabyBear; 8] {
+    bind(message_digest, select(param, message_digest, randomizer))
+}
+
 /// Derive the target-sum digit vector for (param, message_digest,
 /// randomizer): `PoseidonCompress_{24,8}` produces 8 field elements, each
 /// decomposed into 10 base-`W` digits (3 bits each, well inside an element's
@@ -338,7 +375,7 @@ pub fn sign(sk: &SecretKey, message_digest: [BabyBear; 8]) -> Option<Signature> 
         let mut randomizer = [BabyBear::ZERO; RAND_LEN];
         randomizer[0] = BabyBear::new(trial);
 
-        let digits = derive_digits(&sk.param, message_digest, randomizer);
+        let digits = derive_digits(&sk.param, signed_digest(&sk.param, message_digest, randomizer), randomizer);
         if digits.iter().sum::<u32>() != TARGET_SUM {
             continue;
         }
@@ -361,7 +398,7 @@ pub fn sign(sk: &SecretKey, message_digest: [BabyBear; 8]) -> Option<Signature> 
 pub fn verify(pk: &PublicKey, message_digest: [BabyBear; 8], sig: &Signature) -> bool {
     let perm24 = crate::poseidon2::perm24();
 
-    let digits = derive_digits(&pk.param, message_digest, sig.randomizer);
+    let digits = derive_digits(&pk.param, signed_digest(&pk.param, message_digest, sig.randomizer), sig.randomizer);
     if digits.iter().sum::<u32>() != TARGET_SUM {
         return false;
     }
@@ -441,10 +478,28 @@ mod tests {
         for msg in [&b"a"[..], &b"bb"[..], &b"ccc"[..]] {
             let digest = hash_message(msg);
             let sig = sign(&sk, digest).unwrap();
-            let digits = derive_digits(&sk.param, digest, sig.randomizer);
+            let digits = derive_digits(&sk.param, signed_digest(&sk.param, digest, sig.randomizer), sig.randomizer);
             assert_eq!(digits.iter().sum::<u32>(), TARGET_SUM);
             assert!(digits.iter().all(|&d| d < W));
         }
+    }
+
+    /// A signature binds the text block its randomizer selects: the same
+    /// signature fails if the block is replaced (here, by binding another
+    /// position), and different randomizers select different blocks.
+    #[test]
+    fn signatures_bind_a_text_block() {
+        let (sk, pk) = keygen(&seed(8));
+        let digest = hash_message(b"bound");
+        let sig = sign(&sk, digest).unwrap();
+        assert!(verify(&pk, digest, &sig));
+        let position = select(&pk.param, digest, sig.randomizer);
+        let other = bind(digest, position + 1);
+        let digits = derive_digits(&pk.param, other, sig.randomizer);
+        assert_ne!(digits, derive_digits(&pk.param, signed_digest(&pk.param, digest, sig.randomizer), sig.randomizer));
+        let positions: std::collections::HashSet<usize> =
+            (0..20u32).map(|t| select(&pk.param, digest, std::array::from_fn(|i| BabyBear::new(if i == 0 { t } else { 0 })))).collect();
+        assert!(positions.len() > 15, "randomizers pick (nearly always) different blocks");
     }
 
     /// Simulates an actual signer/verifier split: the signer's `SecretKey`

@@ -32,6 +32,7 @@ mod pow;
 mod prover;
 mod recovery;
 mod recursion;
+mod scripture;
 mod slate;
 mod snapshot;
 mod stark;
@@ -149,11 +150,15 @@ const SOCKET_READ_TIMEOUT_MS: u64 = 20;
 /// blocks the network received to the chain, and starts over on a new
 /// template if the tip moved -- so this bounds how long it can keep
 /// mining on a stale tip.
-const MINE_BATCH: u64 = 200_000;
+const MINE_BATCH: u64 = 20_000;
 
 /// This network's retargeting configuration.
 fn difficulty_config() -> chain::DifficultyConfig {
     chain::DifficultyConfig {
+        pow: match network::current() {
+            network::Network::Main => pow::Params::MAIN,
+            network::Network::Dev => pow::Params::DEV,
+        },
         initial_target: pow::max_hash_with_leading_zero_bits(leading_zero_bits()),
         interval: RETARGET_INTERVAL,
         target_block_time_ms: target_block_time_ms(),
@@ -180,15 +185,15 @@ struct Genesis {
 }
 
 const MAIN_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_313_050_115,
-    nonce: "2b4d020000000000000000000000000000000000000000000000000000000000",
-    hash: "0000002d0cee266dc68e3b5bcafe751855c1fb2ca617a61261411e67f518564d",
+    timestamp_ms: 1_791_344_142_098,
+    nonce: "a23f000000000000000000000000000000000000000000000000000000000000",
+    hash: "b10e4411c5b6662e4b14ef3156cbaa43ead98b0db7146f0a9b358659d2e92e4f",
 };
 
 const DEV_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_313_115_161,
-    nonce: "a45f010000000000000000000000000000000000000000000000000000000000",
-    hash: "00000102fb8485137bd9444e357ffd67631f691b572bda4e23b5b2725cb9b656",
+    timestamp_ms: 1_791_344_475_356,
+    nonce: "8f13000000000000000000000000000000000000000000000000000000000000",
+    hash: "d334f3477d36581ce3083a5cf8758f22712e4b28e517c75a0267f41293b1034f",
 };
 
 fn genesis() -> &'static Genesis {
@@ -708,6 +713,9 @@ fn main() {
     if args.network != network::Network::Main {
         info!("Network: {} (light, insecure proofs -- for testing only)", args.network.name());
     }
+    if !scripture::check() {
+        die("the embedded text (data/akjv.txt.gz) isn't the pinned one: this build is broken");
+    }
     let genesis = genesis_block();
     assert_eq!(hex(&genesis.header.hash()), self::genesis().hash, "genesis constants are inconsistent");
     info!("Genesis block: {}", self::genesis().hash);
@@ -813,7 +821,7 @@ mod tests {
         assert_eq!(hex32(&genesis.header.hash()), self::genesis().hash);
         // Structure only: genesis is exempt from the proof check (see
         // `Chain`'s `block_is_valid`) -- its empty body claims no reward.
-        assert!(genesis.validate_structure(&difficulty_config().initial_target));
+        assert!(genesis.validate_structure(&difficulty_config().initial_target, &difficulty_config().pow));
     }
 
     /// Opening an empty chain applies genesis; reopening it is fine.
@@ -841,7 +849,7 @@ mod tests {
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut first = unproven.finish(proof);
-        assert!(mine_block(&mut first, &target, 100_000));
+        assert!(mine_block(&mut first, &target, 100_000, &pow::Params::TEST));
         other.apply_block(&first).unwrap();
         drop(other);
 
@@ -864,7 +872,7 @@ mod tests {
         let target = unproven.target;
         let proof = prover::Proof::placeholder();
         let mut block = unproven.finish(proof);
-        while !mine_block(&mut block, &target, MINE_BATCH) {
+        while !mine_block(&mut block, &target, MINE_BATCH, &difficulty_config().pow) {
             block.header.timestamp = now_millis();
         }
         let h = &block.header;
@@ -899,7 +907,7 @@ mod tests {
         let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &txs, &unproven.plan, [2; 32]).unwrap();
         let mut block = unproven.finish_with_chain_proof(proof, g_proof);
         block.header.timestamp = block.header.timestamp.max(min_timestamp);
-        while !mine_block(&mut block, &target, MINE_BATCH) {
+        while !mine_block(&mut block, &target, MINE_BATCH, &difficulty_config().pow) {
             block.header.timestamp = now_millis();
         }
         let hash = block.header.hash();

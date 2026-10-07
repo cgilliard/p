@@ -505,7 +505,7 @@ impl Node {
                 batches,
                 ..
             } => {
-                if !mine_block(block, target, crate::MINE_BATCH) {
+                if !mine_block(block, target, crate::MINE_BATCH, &self.chain.pow_params()) {
                     *batches += 1;
                     // A fresh timestamp opens a fresh nonce space.
                     block.header.timestamp = now_millis().max(*min_timestamp);
