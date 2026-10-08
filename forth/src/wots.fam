@@ -1,0 +1,443 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/wots.fam — the protocol's one-time signatures: target-sum Winternitz over
+\ Poseidon2 (see ../rust/src/wots.rs, which this must match exactly).
+\
+\ V = 64 hash chains, base W = 8 (digits 0..7, 7 steps per chain).  A signature
+\ is valid when the digits derived from (param, message, randomizer) sum to
+\ exactly 224 and walking each signed value the remaining steps reaches the
+\ public key's top.  The digits are derived from the message *bound to a block
+\ of the Bible* (docs/BIBLE.md): the randomizer selects one of 2^16 positions,
+\ position mod BLOCKS names a 32-byte block of the gzipped AKJV, and that
+\ block's 11 elements are hashed in with the message.
+\
+\ The text: set `wtext` to its address and `wtextn` to its length (1291059
+\ bytes, data/akjv.txt.gz exactly as shipped) before signing or verifying.
+\
+\ Layouts, one element per cell -- the same as the Rust byte encodings (RV32
+\ is little-endian), so wire bytes can be used in place once each element is
+\ reduced (`fred`):
+\   public key  param (5) | tops (64 x 8)       517 cells
+\   secret key  param (5) | chains (64 x 8)     517 cells
+\   signature   randomizer (7) | values (64 x 8) 519 cells
+\   digest      8 cells
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: wtext variable ;    \ the AKJV text's address
+: wtextn variable ;   \ and length in bytes
+
+\ ── Helpers ──
+
+\ wlazy ( var n -- a )   var's buffer, allocating n bytes on first use.
+: wlazy ( var n -- a )
+	over @ dup if nip nip else drop alloc dup rot ! then
+;
+
+\ wcpy ( src dst n -- )   copy n cells (n >= 1).
+: wcpy ( src dst n -- )
+	0 lit do over i 2 lit lshift + @ over i 2 lit lshift + ! loop 2drop
+;
+
+\ wzero ( a n -- )   zero n cells (n >= 1).
+: wzero ( a n -- )   0 lit do 0 lit over i 2 lit lshift + ! loop drop ;
+
+\ weq ( a b n -- flag )   whether n cells at a and b are equal.
+: weq ( a b n -- flag )
+	-1 lit swap 0 lit do
+		2 lit pick i 2 lit lshift + @ 2 lit pick i 2 lit lshift + @ = and
+	loop
+	nip nip
+;
+
+\ Scratch: a permutation state, the digits (bytes), the signed digest, a
+\ chain value, and a public key's hash input.
+: wstv variable ;   : wst ( -- a )   wstv 60 lit wlazy ;
+: wdgv variable ;   : wdg ( -- a )   wdgv 40 lit wlazy ;
+: wsdv variable ;   : wsd ( -- a )   wsdv 20 lit wlazy ;
+: wtmv variable ;   : wtmp ( -- a )  wtmv 20 lit wlazy ;
+: wpkv variable ;   : wpkb ( -- a )  wpkv 820 lit wlazy ;
+
+\ ── Chains ──
+
+\ wstep ( val param chain step -- )   one chain step, in place on the 8
+\        cells at val: compress24(param, 3, chain, step, val, 0...).
+: wstep ( val param chain step -- )
+	wst 18 lit wzero
+	wst 1C lit + !                       \ cell 7: the step
+	wst 18 lit + !                       \ cell 6: the chain
+	wst 5 lit wcpy                       \ cells 0..4: param
+	3 lit wst 14 lit + !                 \ cell 5: TAG_CHAIN
+	dup wst 20 lit + 8 lit wcpy          \ cells 8..15: the value
+	wst p2cmp
+	wst swap 8 lit wcpy
+;
+
+\ wchain ( val param chain from to -- )   steps from .. to-1 (none if from >= to).
+: wchain ( val param chain from to -- )
+	2dup u< if
+		swap do 2 lit pick 2 lit pick 2 lit pick i wstep loop
+	else 2drop then
+	2drop drop
+;
+
+\ ── Keys ──
+
+\ wseed ( seed st -- )   the seed's 8 little-endian words, each reduced, into
+\        st's cells 0..7.
+: wseed ( seed st -- )
+	8 lit 0 lit do over i 2 lit lshift + @ fred over i 2 lit lshift + ! loop 2drop
+;
+
+\ wkeygen ( seed sk pk -- )   the key pair from a 32-byte seed: param =
+\        compress16(seed, 1)[..5]; chain i = compress16(seed, 2, i); its top
+\        is 7 steps on.  Fresh, never-reused seeds only.
+: wksd variable ;   : wksk variable ;   : wkpk variable ;
+: wkeygen ( seed sk pk -- )
+	wkpk ! wksk ! wksd !
+	wst 18 lit wzero  wksd @ wst wseed  1 lit wst 20 lit + !  wst p2cmp16
+	wst wksk @ 5 lit wcpy
+	wst wkpk @ 5 lit wcpy
+	40 lit 0 lit do
+		wst 18 lit wzero  wksd @ wst wseed
+		2 lit wst 20 lit + !  i wst 24 lit + !  wst p2cmp16
+		wst wksk @ i 5 lit lshift + 14 lit + 8 lit wcpy
+		wst wkpk @ i 5 lit lshift + 14 lit + 8 lit wcpy
+		wkpk @ i 5 lit lshift + 14 lit +  wkpk @  i  0 lit 7 lit wchain
+	loop
+;
+
+\ wpkhash ( pk out -- )   the key's hash, as an output records it:
+\        hash_elements(4, param padded to 8 with zeros, tops).
+: wpkhash ( pk out -- )
+	swap
+	dup wpkb 5 lit wcpy
+	wpkb 14 lit + 3 lit wzero
+	14 lit + wpkb 20 lit + 200 lit wcpy
+	wst wpkb 208 lit 4 lit p2hash
+	wst swap 8 lit wcpy
+;
+
+\ ── The text block ──
+
+\ wbyte ( off k -- b )   byte k (0..31) of the block at text offset off;
+\        0 past the end of the text.
+: wbyte ( off k -- b )
+	dup 20 lit u< if
+		+ dup wtextn @ u< if wtext @ + c@ else drop 0 lit then
+	else 2drop 0 lit then
+;
+
+\ welem ( off k -- x )   the element of bytes k, k+1, k+2, little-endian.
+: welem ( off k -- x )
+	2dup 2 lit + wbyte 8 lit lshift
+	2 lit pick 2 lit pick 1 lit + wbyte or 8 lit lshift
+	-rot wbyte or
+;
+
+\ wsel ( param digest rand -- pos )   the text position a randomizer selects:
+\        compress24(param, 5, digest, rand)[0]'s low 16 bits.
+: wsel ( param digest rand -- pos )
+	wst 18 lit wzero
+	wst 38 lit + 7 lit wcpy              \ cells 14..20: the randomizer
+	wst 18 lit + 8 lit wcpy              \ cells 6..13: the digest
+	wst 5 lit wcpy                       \ cells 0..4: param
+	5 lit wst 14 lit + !                 \ cell 5: TAG_SELECT
+	wst p2cmp
+	wst @ FFFF lit and
+;
+
+\ wbind ( digest pos out -- )   the digest bound to block (pos mod BLOCKS):
+\        compress24(6, digest, the block's 11 elements).
+: wbo variable ;
+: wbind ( digest pos out -- )
+	wbo !
+	wtextn @ 1F lit + 5 lit rshift %     ( digest block )
+	wst 18 lit wzero
+	6 lit wst !                          \ cell 0: TAG_BIND
+	swap wst 4 lit + 8 lit wcpy          \ cells 1..8: the digest
+	5 lit lshift                         ( offset )
+	B lit 0 lit do dup i 3 lit * welem wst i 2 lit lshift + 24 lit + ! loop
+	drop
+	wst p2cmp
+	wst wbo @ 8 lit wcpy
+;
+
+\ ── Digits ──
+
+\ wsdig ( param digest rand -- )   the signed digest, into wsd:
+\        bind(digest, select(param, digest, rand)).
+: wsdig ( param digest rand -- )
+	2 lit pick 2 lit pick 2 lit pick wsel
+	2 lit pick swap wsd wbind
+	2drop drop
+;
+
+\ wdigits ( param sd rand -- )   the 64 digits, into wdg (bytes):
+\        compress24(param, 4, sd, rand), each element giving 10 base-8 digits,
+\        low first; the first 64.
+: wdigits ( param sd rand -- )
+	wst 18 lit wzero
+	wst 38 lit + 7 lit wcpy
+	wst 18 lit + 8 lit wcpy
+	wst 5 lit wcpy
+	4 lit wst 14 lit + !                 \ cell 5: TAG_MESSAGE
+	wst p2cmp
+	0 lit                                ( idx )
+	7 lit 0 lit do
+		wst i 2 lit lshift + @            ( idx v )
+		A lit 0 lit do
+			over 40 lit u< if
+				dup 7 lit and 2 lit pick wdg + c!
+				3 lit rshift swap 1 lit + swap
+			then
+		loop
+		drop
+	loop
+	drop
+;
+
+\ wsum ( -- n )   the digits' sum.
+: wsum ( -- n )   0 lit 40 lit 0 lit do wdg i + c@ + loop ;
+
+\ ── Signing and verifying ──
+
+: wgk variable ;   : wgd variable ;   : wgs variable ;
+
+\ wsign ( sk digest sig -- flag )   sign: randomizers (t, 0, ...) for t = 0,
+\        1, ... until the digits sum to 224 (at most 4096 tries); each value is
+\        its chain walked `digit` steps.  The key must never sign again.
+: wsign ( sk digest sig -- flag )
+	wgs ! wgd ! wgk !
+	0 lit
+	1000 lit 0 lit do
+		dup 0= if
+			wgs @ 7 lit wzero  i wgs @ !
+			wgk @ wgd @ wgs @ wsdig
+			wgk @ wsd wgs @ wdigits
+			wsum E0 lit = if
+				40 lit 0 lit do
+					wgk @ i 5 lit lshift + 14 lit +  wgs @ i 5 lit lshift + 1C lit +  8 lit wcpy
+					wgs @ i 5 lit lshift + 1C lit +  wgk @  i  0 lit  wdg i + c@  wchain
+				loop
+				drop -1 lit
+			then
+		then
+	loop
+;
+
+\ wverify ( pk digest sig -- flag )   whether sig signs digest under pk.
+: wverify ( pk digest sig -- flag )
+	wgs ! wgd ! wgk !
+	wgk @ wgd @ wgs @ wsdig
+	wgk @ wsd wgs @ wdigits
+	wsum E0 lit = if
+		-1 lit
+		40 lit 0 lit do
+			wgs @ i 5 lit lshift + 1C lit + wtmp 8 lit wcpy
+			wtmp wgk @ i wdg i + c@ 7 lit wchain
+			wtmp wgk @ i 5 lit lshift + 14 lit + 8 lit weq and
+		loop
+	else 0 lit then
+;
+
+\ ── Tests (./tools/fam --test src/poseidon2.fam src/wots.fam) ──
+\ Vectors printed by the Rust node's wots module.  The test text is sparse:
+\ only the block a signature here selects, and the last (partial) block, are
+\ filled in; the rest is zero, and the bytes past the end are 0xFF, to check
+\ they're never read.
+
+: wtseed variable ;   : wtsk variable ;   : wtpk variable ;   : wtsig variable ;
+: wtdig variable ;
+
+\ wtsetup ( -- )   the test text, a key pair, the test digest, a signature buffer.
+: wtsetup ( -- )
+	wtext @ 0= if
+		13B373 lit alloc wtext !  1291059u lit wtextn !
+		FB9C8E70 lit wtext @ 9D6E0 lit + !
+		6A715BF0 lit wtext @ 9D6E4 lit + !
+		A4B2E5E9 lit wtext @ 9D6E8 lit + !
+		204288C lit wtext @ 9D6EC lit + !
+		229DE068 lit wtext @ 9D6F0 lit + !
+		36E8F555 lit wtext @ 9D6F4 lit + !
+		B5C677AA lit wtext @ 9D6F8 lit + !
+		341177BA lit wtext @ 9D6FC lit + !
+		1B lit wtext @ 13B320 lit + c!
+		49 lit wtext @ 13B321 lit + c!
+		CB lit wtext @ 13B322 lit + c!
+		15 lit wtext @ 13B323 lit + c!
+		2F lit wtext @ 13B324 lit + c!
+		FE lit wtext @ 13B325 lit + c!
+		1F lit wtext @ 13B326 lit + c!
+		FF lit wtext @ 13B327 lit + c!
+		F1 lit wtext @ 13B328 lit + c!
+		FF lit wtext @ 13B329 lit + c!
+		1 lit wtext @ 13B32A lit + c!
+		8E lit wtext @ 13B32B lit + c!
+		2 lit wtext @ 13B32C lit + c!
+		9C lit wtext @ 13B32D lit + c!
+		6A lit wtext @ 13B32E lit + c!
+		B5 lit wtext @ 13B32F lit + c!
+		3C lit wtext @ 13B330 lit + c!
+		42 lit wtext @ 13B331 lit + c!
+		0 lit wtext @ 13B332 lit + c!
+		40 lit 0 lit do FF lit wtext @ 13B333 lit + i + c! loop
+		20 lit alloc wtseed !
+		3712EDC8 lit wtseed @ 0 lit + !
+		CBA6815C lit wtseed @ 4 lit + !
+		5F3A15F0 lit wtseed @ 8 lit + !
+		F3CEA984 lit wtseed @ C lit + !
+		87623D18 lit wtseed @ 10 lit + !
+		1BF6D1AC lit wtseed @ 14 lit + !
+		AF8A6540 lit wtseed @ 18 lit + !
+		431EF9D4 lit wtseed @ 1C lit + !
+		814 lit alloc wtsk !  814 lit alloc wtpk !  81C lit alloc wtsig !
+		wtseed @ wtsk @ wtpk @ wkeygen
+		20 lit alloc wtdig !
+		28u lit wtdig @ 0 lit + !
+		1007u lit wtdig @ 4 lit + !
+		2007u lit wtdig @ 8 lit + !
+		3007u lit wtdig @ C lit + !
+		4007u lit wtdig @ 10 lit + !
+		5007u lit wtdig @ 14 lit + !
+		6007u lit wtdig @ 18 lit + !
+		7007u lit wtdig @ 1C lit + !
+	then
+;
+
+Test {
+	keygen {
+		wtsetup
+		wtpk @ 0 lit + @ 1059021437u lit asrt_eq
+		wtpk @ 4 lit + @ 261839433u lit asrt_eq
+		wtpk @ 8 lit + @ 1581994506u lit asrt_eq
+		wtpk @ C lit + @ 827167597u lit asrt_eq
+		wtpk @ 10 lit + @ 1675318671u lit asrt_eq
+		wtsk @ 0 lit + @ 1059021437u lit asrt_eq
+		wtsk @ 4 lit + @ 261839433u lit asrt_eq
+		wtsk @ 8 lit + @ 1581994506u lit asrt_eq
+		wtsk @ C lit + @ 827167597u lit asrt_eq
+		wtsk @ 10 lit + @ 1675318671u lit asrt_eq
+		wtpk @ 14 lit + @ 1659507359u lit asrt_eq
+		wtpk @ 18 lit + @ 793243060u lit asrt_eq
+		wtpk @ 1C lit + @ 1898271965u lit asrt_eq
+		wtpk @ 20 lit + @ 1271473883u lit asrt_eq
+		wtpk @ 24 lit + @ 1727643667u lit asrt_eq
+		wtpk @ 28 lit + @ 198434565u lit asrt_eq
+		wtpk @ 2C lit + @ 2004126227u lit asrt_eq
+		wtpk @ 30 lit + @ 1654744193u lit asrt_eq
+		wtpk @ 7F4 lit + @ 419667078u lit asrt_eq
+		wtpk @ 7F8 lit + @ 426105285u lit asrt_eq
+		wtpk @ 7FC lit + @ 203305907u lit asrt_eq
+		wtpk @ 800 lit + @ 1430211643u lit asrt_eq
+		wtpk @ 804 lit + @ 1119643562u lit asrt_eq
+		wtpk @ 808 lit + @ 515470827u lit asrt_eq
+		wtpk @ 80C lit + @ 571625579u lit asrt_eq
+		wtpk @ 810 lit + @ 71924710u lit asrt_eq
+		wtsk @ B4 lit + @ 861491459u lit asrt_eq
+		wtsk @ B8 lit + @ 62967478u lit asrt_eq
+		wtsk @ BC lit + @ 1096047932u lit asrt_eq
+		wtsk @ C0 lit + @ 694524085u lit asrt_eq
+		wtsk @ C4 lit + @ 279316988u lit asrt_eq
+		wtsk @ C8 lit + @ 966093929u lit asrt_eq
+		wtsk @ CC lit + @ 1189659050u lit asrt_eq
+		wtsk @ D0 lit + @ 1095597519u lit asrt_eq
+	}
+	pubkey_hash {
+		wtsetup
+		wtpk @ wsd wpkhash
+		wsd 0 lit + @ 1739888258u lit asrt_eq
+		wsd 4 lit + @ 179138851u lit asrt_eq
+		wsd 8 lit + @ 1635171151u lit asrt_eq
+		wsd C lit + @ 1608260854u lit asrt_eq
+		wsd 10 lit + @ 452196216u lit asrt_eq
+		wsd 14 lit + @ 1201614247u lit asrt_eq
+		wsd 18 lit + @ 1991137137u lit asrt_eq
+		wsd 1C lit + @ 1100594948u lit asrt_eq
+	}
+	text_elements {
+		wtsetup
+		13B320 lit 0 lit welem 13322523u lit asrt_eq
+		13B320 lit 3 lit welem 16658197u lit asrt_eq
+		13B320 lit 6 lit welem 15859487u lit asrt_eq
+		13B320 lit 9 lit welem 9306623u lit asrt_eq
+		13B320 lit C lit welem 6986754u lit asrt_eq
+		13B320 lit F lit welem 4340917u lit asrt_eq
+		13B320 lit 12 lit welem 0u lit asrt_eq
+		13B320 lit 15 lit welem 0u lit asrt_eq
+		13B320 lit 18 lit welem 0u lit asrt_eq
+		13B320 lit 1B lit welem 0u lit asrt_eq
+		13B320 lit 1E lit welem 0u lit asrt_eq
+	}
+	select_bind {
+		wtsetup
+		1C lit alloc dup 7 lit wzero              ( rand: trial 0 )
+		wtpk @ wtdig @ 2 lit pick wsel 60497u lit asrt_eq
+		wtpk @ wtdig @ rot wsdig
+		wsd 0 lit + @ 1315383740u lit asrt_eq
+		wsd 4 lit + @ 1238513791u lit asrt_eq
+		wsd 8 lit + @ 1557087022u lit asrt_eq
+		wsd C lit + @ 389536319u lit asrt_eq
+		wsd 10 lit + @ 502355126u lit asrt_eq
+		wsd 14 lit + @ 1477188382u lit asrt_eq
+		wsd 18 lit + @ 250176617u lit asrt_eq
+		wsd 1C lit + @ 1808748686u lit asrt_eq
+	}
+	sign {
+		wtsetup
+		wtsk @ wtdig @ wtsig @ wsign assert
+		wtsig @ @ 0 lit asrt_eq                     \ the first randomizer
+		wdg 0 lit + c@ 3 lit asrt_eq
+		wdg 1 lit + c@ 4 lit asrt_eq
+		wdg 2 lit + c@ 3 lit asrt_eq
+		wdg 1F lit + c@ 7 lit asrt_eq
+		wdg 3E lit + c@ 1 lit asrt_eq
+		wdg 3F lit + c@ 0 lit asrt_eq
+		wtsig @ 1C lit + @ 56146118u lit asrt_eq
+		wtsig @ 20 lit + @ 1231103499u lit asrt_eq
+		wtsig @ 24 lit + @ 1496046160u lit asrt_eq
+		wtsig @ 28 lit + @ 1834960431u lit asrt_eq
+		wtsig @ 2C lit + @ 1178937892u lit asrt_eq
+		wtsig @ 30 lit + @ 1073251290u lit asrt_eq
+		wtsig @ 34 lit + @ 1101079223u lit asrt_eq
+		wtsig @ 38 lit + @ 1717209992u lit asrt_eq
+		wtsig @ 3C lit + @ 1420145406u lit asrt_eq
+		wtsig @ 40 lit + @ 877410384u lit asrt_eq
+		wtsig @ 44 lit + @ 468236053u lit asrt_eq
+		wtsig @ 48 lit + @ 33518483u lit asrt_eq
+		wtsig @ 4C lit + @ 61654880u lit asrt_eq
+		wtsig @ 50 lit + @ 722781333u lit asrt_eq
+		wtsig @ 54 lit + @ 952031071u lit asrt_eq
+		wtsig @ 58 lit + @ 1064100168u lit asrt_eq
+		wtsig @ 7FC lit + @ 371304265u lit asrt_eq
+		wtsig @ 800 lit + @ 940646771u lit asrt_eq
+		wtsig @ 804 lit + @ 273598034u lit asrt_eq
+		wtsig @ 808 lit + @ 547705760u lit asrt_eq
+		wtsig @ 80C lit + @ 621761327u lit asrt_eq
+		wtsig @ 810 lit + @ 247390649u lit asrt_eq
+		wtsig @ 814 lit + @ 764643977u lit asrt_eq
+		wtsig @ 818 lit + @ 320277961u lit asrt_eq
+	}
+	verify {
+		wtsetup
+		wtsk @ wtdig @ wtsig @ wsign assert
+		wtpk @ wtdig @ wtsig @ wverify assert
+	}
+	wrong_digest {
+		wtsetup
+		wtsk @ wtdig @ wtsig @ wsign assert
+		20 lit alloc wtdig @ over 8 lit wcpy
+		dup @ 1 lit fadd over !                      \ another digest
+		wtpk @ swap wtsig @ wverify 0 lit asrt_eq
+	}
+	tampered_value {
+		wtsetup
+		wtsk @ wtdig @ wtsig @ wsign assert
+		wtsig @ 1C lit + dup @ 1 lit fadd swap !
+		wtpk @ wtdig @ wtsig @ wverify 0 lit asrt_eq
+	}
+	tampered_randomizer {
+		wtsetup
+		wtsk @ wtdig @ wtsig @ wsign assert
+		wtsig @ dup @ 1 lit fadd swap !
+		wtpk @ wtdig @ wtsig @ wverify 0 lit asrt_eq
+	}
+}

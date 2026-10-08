@@ -17,8 +17,8 @@
 \ Constants are written in decimal exactly as in the Rust source.  `,` emits a
 \ word most-significant byte first, so tables are read back with `be@`.
 \
-\ Only width 24 is here: width 16 is used only to make signatures, which a
-\ validating node never does.
+\ Width 24 is the protocol's hash; width 16 (`p2perm16`) is used only to
+\ derive WOTS keys (src/wots.fam).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 \ ── Field arithmetic ──
@@ -198,6 +198,82 @@ E39E0EFC ,   \ bnez t4,loop
 15u ,   \ -1/2^27
 ;
 
+\ Width 16's tables (EXTERNAL_RC_INITIAL_16, EXTERNAL_RC_FINAL_16,
+\ INTERNAL_RC_16 -- 13 partial rounds -- and `diagonal_16`).
+: p2rci16  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004010 ,   \ jal   x0,+260          ( skip the 64 constants )
+\ round 0
+1774958255u ,   1185780729u ,   1621102414u ,   1796380621u ,   588815102u ,   1932426223u ,   1925334750u ,   747903232u ,
+89648862u ,   360728943u ,   977184635u ,   1425273457u ,   256487465u ,   1200041953u ,   572403254u ,   448208942u ,
+\ round 1
+1215789478u ,   944884184u ,   953948096u ,   547326025u ,   646827752u ,   889997530u ,   1536873262u ,   86189867u ,
+1065944411u ,   32019634u ,   333311454u ,   456061748u ,   1963448500u ,   1827584334u ,   1391160226u ,   1348741381u ,
+\ round 2
+88424255u ,   104111868u ,   1763866748u ,   79691676u ,   1988915530u ,   1050669594u ,   359890076u ,   573163527u ,
+222820492u ,   159256268u ,   669703072u ,   763177444u ,   889367200u ,   256335831u ,   704371273u ,   25886717u ,
+\ round 3
+51754520u ,   1833211857u ,   454499742u ,   1384520381u ,   777848065u ,   1053320300u ,   1851729162u ,   344647910u ,
+401996362u ,   1046925956u ,   5351995u ,   1212119315u ,   754867989u ,   36972490u ,   751272725u ,   506915399u ,
+;
+
+: p2rcf16  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004010 ,   \ jal   x0,+260          ( skip the 64 constants )
+\ round 0
+1922082829u ,   1870549801u ,   1502529704u ,   1990744480u ,   1700391016u ,   1702593455u ,   321330495u ,   528965731u ,
+183414327u ,   1886297254u ,   1178602734u ,   1923111974u ,   744004766u ,   549271463u ,   1781349648u ,   542259047u ,
+\ round 1
+1536158148u ,   715456982u ,   503426110u ,   340311124u ,   1558555932u ,   1226350925u ,   742828095u ,   1338992758u ,
+1641600456u ,   1843351545u ,   301835475u ,   43203215u ,   386838401u ,   1520185679u ,   1235297680u ,   904680097u ,
+\ round 2
+1491801617u ,   1581784677u ,   913384905u ,   247083962u ,   532844013u ,   107190701u ,   213827818u ,   1979521776u ,
+1358282574u ,   1681743681u ,   1867507480u ,   1530706910u ,   507181886u ,   695185447u ,   1172395131u ,   1250800299u ,
+\ round 3
+1503161625u ,   817684387u ,   498481458u ,   494676004u ,   1404253825u ,   108246855u ,   59414691u ,   744214112u ,
+890862029u ,   1342765939u ,   1417398904u ,   1897591937u ,   1066647396u ,   1682806907u ,   1015795079u ,   1619482808u ,
+;
+
+: p2rcp16  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F008003 ,   \ jal   x0,+56          ( skip the 13 constants )
+1518359488u ,   1765533241u ,   945325693u ,   422793067u ,   311365592u ,   1311448267u ,   1629555936u ,
+1009879353u ,   190525218u ,   786108885u ,   557776863u ,   212616710u ,   605745517u ,
+;
+
+: p2dg16  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004004 ,   \ jal   x0,+68          ( skip the 16 constants )
+2013265919u ,   \ -2
+1u ,   \ 1
+2u ,   \ 2
+1006632961u ,   \ 1/2
+3u ,   \ 3
+4u ,   \ 4
+1006632960u ,   \ -1/2
+2013265918u ,   \ -3
+2013265917u ,   \ -4
+2005401601u ,   \ 1/2^8
+1509949441u ,   \ 1/2^2
+1761607681u ,   \ 1/2^3
+2013265906u ,   \ 1/2^27
+7864320u ,   \ -1/2^8
+125829120u ,   \ -1/2^4
+15u ,   \ -1/2^27
+;
+
 \ ── The permutation ──
 
 \ p2sbox ( x -- x^7 )
@@ -224,13 +300,18 @@ E39E0EFC ,   \ bnez t4,loop
 	p2t01233 @ p2x0 @ dup fadd fadd      p2ma @ C lit + !   \ x3 = t01233 + 2x0
 ;
 
-\ p2ext ( st -- )   the external linear layer on the 24 cells at st.
+\ The width being permuted (16 or 24 cells) and its tables: set by p2perm
+\ and p2perm16, read by the round words below.
+: p2wid variable ;   : p2dg variable ;   : p2ri variable ;   : p2rp variable ;
+: p2rf variable ;    : p2np variable ;
+
+\ p2ext ( st -- )   the external linear layer on the p2wid cells at st.
 : p2ext ( st -- )
-	6 lit 0 lit do dup i 4 lit lshift + p2mat4 loop
+	p2wid @ 2 lit rshift 0 lit do dup i 4 lit lshift + p2mat4 loop
 	4 lit 0 lit do                                    \ each position mod 4
 		0 lit
-		6 lit 0 lit do over i 4 lit lshift + j 2 lit lshift + @ fadd loop
-		6 lit 0 lit do
+		p2wid @ 2 lit rshift 0 lit do over i 4 lit lshift + j 2 lit lshift + @ fadd loop
+		p2wid @ 2 lit rshift 0 lit do
 			over i 4 lit lshift + j 2 lit lshift +     ( st sum a )
 			dup @ 2 lit pick fadd swap !
 		loop
@@ -240,9 +321,9 @@ E39E0EFC ,   \ bnez t4,loop
 ;
 
 \ p2full ( st rc -- st )   a full round: every cell gets its constant and the
-\        S-box, then the external layer.  rc: the round's 24 constants.
+\        S-box, then the external layer.  rc: the round's constants.
 : p2full ( st rc -- st )
-	18 lit 0 lit do
+	p2wid @ 0 lit do
 		over i 2 lit lshift +                     ( st rc a )
 		dup @ 2 lit pick i 2 lit lshift + be@ fadd p2sbox swap !
 	loop
@@ -253,22 +334,56 @@ E39E0EFC ,   \ bnez t4,loop
 \        then the internal layer, out[i] = d[i]*s[i] + sum(s).
 : p2part ( st c -- st )
 	over @ fadd p2sbox over !
-	0 lit 18 lit 0 lit do over i 2 lit lshift + @ fadd loop     ( st sum )
-	18 lit 0 lit do
+	0 lit p2wid @ 0 lit do over i 2 lit lshift + @ fadd loop     ( st sum )
+	p2wid @ 0 lit do
 		over i 2 lit lshift +                     ( st sum a )
-		dup @ i 2 lit lshift p2diag + be@ fmul 2 lit pick fadd swap !
+		dup @ i 2 lit lshift p2dg @ + be@ fmul 2 lit pick fadd swap !
 	loop
+	drop
+;
+
+\ p2run ( st -- )   the permutation at the width and tables set above.
+: p2run ( st -- )
+	dup p2ext
+	4 lit 0 lit do p2ri @ i p2wid @ 2 lit lshift * + p2full loop
+	p2np @ 0 lit do p2rp @ i 2 lit lshift + be@ p2part loop
+	4 lit 0 lit do p2rf @ i p2wid @ 2 lit lshift * + p2full loop
 	drop
 ;
 
 \ p2perm ( st -- )   permute the 24 cells at st in place.
 : p2perm ( st -- )
-	dup p2ext
-	4 lit 0 lit do p2rci i 60 lit * + p2full loop
-	15 lit 0 lit do p2rcp i 2 lit lshift + be@ p2part loop
-	4 lit 0 lit do p2rcf i 60 lit * + p2full loop
+	18 lit p2wid !  p2diag p2dg !  p2rci p2ri !  p2rcp p2rp !  p2rcf p2rf !
+	15 lit p2np !
+	p2run
+;
+
+\ p2perm16 ( st -- )   permute the 16 cells at st in place (width 16: 13
+\        partial rounds).  Used only by WOTS key generation.
+: p2perm16 ( st -- )
+	10 lit p2wid !  p2dg16 p2dg !  p2rci16 p2ri !  p2rcp16 p2rp !  p2rcf16 p2rf !
+	D lit p2np !
+	p2run
+;
+
+\ ── Compression ──
+
+\ p2cmp / p2cmp16 ( st -- )   the Rust `compress::<8>`: permute, then add
+\        the input's first 8 cells back into the output's -- the result is
+\        st's first 8 cells.
+: p2svb variable ;
+: p2sv ( -- a )   p2svb @ dup 0= if drop 20 lit alloc dup p2svb ! then ;
+: p2save ( st -- st )   8 lit 0 lit do dup i 2 lit lshift + @ p2sv i 2 lit lshift + ! loop ;
+: p2fwd ( st -- )
+	8 lit 0 lit do dup i 2 lit lshift + dup @ p2sv i 2 lit lshift + @ fadd swap ! loop
 	drop
 ;
+: p2cmp ( st -- )     p2save dup p2perm p2fwd ;
+: p2cmp16 ( st -- )   p2save dup p2perm16 p2fwd ;
+
+\ fred ( x -- x mod p )   reduce any 32-bit value (a decoded element: the
+\        Rust `BabyBear::new`).
+: fred ( x -- x mod p )   begin dup 2013265921u lit u< 0= while 2013265921u lit - repeat ;
 
 \ ── The sponge ──
 
@@ -401,6 +516,62 @@ Test {
 		dup 58 lit + @ 781522191u lit asrt_eq
 		dup 5C lit + @ 999813579u lit asrt_eq
 		drop
+	}
+	plonky3_kat16 {
+		40 lit alloc
+		0 lit 894848333u lit p2t!
+		1 lit 1437655012u lit p2t!
+		2 lit 1200606629u lit p2t!
+		3 lit 1690012884u lit p2t!
+		4 lit 71131202u lit p2t!
+		5 lit 1749206695u lit p2t!
+		6 lit 1717947831u lit p2t!
+		7 lit 120589055u lit p2t!
+		8 lit 19776022u lit p2t!
+		9 lit 42382981u lit p2t!
+		A lit 1831865506u lit p2t!
+		B lit 724844064u lit p2t!
+		C lit 171220207u lit p2t!
+		D lit 1299207443u lit p2t!
+		E lit 227047920u lit p2t!
+		F lit 1783754913u lit p2t!
+		dup p2perm16
+		dup 0 lit + @ 516096821u lit asrt_eq
+		dup 4 lit + @ 90309867u lit asrt_eq
+		dup 8 lit + @ 1101817252u lit asrt_eq
+		dup C lit + @ 1660784290u lit asrt_eq
+		dup 10 lit + @ 360715097u lit asrt_eq
+		dup 14 lit + @ 1789519026u lit asrt_eq
+		dup 18 lit + @ 1788910906u lit asrt_eq
+		dup 1C lit + @ 563338433u lit asrt_eq
+		dup 20 lit + @ 319524748u lit asrt_eq
+		dup 24 lit + @ 1741414159u lit asrt_eq
+		dup 28 lit + @ 1650859320u lit asrt_eq
+		dup 2C lit + @ 894311162u lit asrt_eq
+		dup 30 lit + @ 1121347488u lit asrt_eq
+		dup 34 lit + @ 1692793758u lit asrt_eq
+		dup 38 lit + @ 1052633829u lit asrt_eq
+		dup 3C lit + @ 1344246938u lit asrt_eq
+		drop
+	}
+	compress {
+		60 lit alloc
+		18 lit 0 lit do 0 lit over i 2 lit lshift + ! loop
+		dup p2cmp
+		dup 0 lit + @ 400117224u lit asrt_eq
+		dup 4 lit + @ 993058517u lit asrt_eq
+		dup 8 lit + @ 1143686568u lit asrt_eq
+		dup C lit + @ 167077231u lit asrt_eq
+		dup 10 lit + @ 512027304u lit asrt_eq
+		dup 14 lit + @ 1699297555u lit asrt_eq
+		dup 18 lit + @ 73036051u lit asrt_eq
+		dup 1C lit + @ 384892923u lit asrt_eq
+		drop
+	}
+	reduce {
+		FFFFFFFF lit fred 268435453u lit asrt_eq       \ 2^32 - 1 - 2p
+		2013265921u lit fred 0 lit asrt_eq
+		2013265920u lit fred 2013265920u lit asrt_eq
 	}
 	hash_0 {
 		60 lit alloc dup p2telems 0 lit 7 lit p2hash
