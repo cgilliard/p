@@ -304,7 +304,9 @@ coinbase maturity of outputs younger than H.
 - **State structure**: today's PMMR + bitmap re-hashed with elements, or
   a combined PMMR-with-spent-flags, or an indexed Merkle tree of
   unspent outputs? Decide by measuring rows per input and per output.
-- **Duplicate outputs** (settled for now): the no-duplicate-of-a-live-
+- **Duplicate outputs** (settled, 2026-10-08: not an issue -- there are
+  no light clients; every node either validates every block or fast-syncs
+  and then does): the no-duplicate-of-a-live-
   output rule isn't in the chain proof (it needs non-membership). Every
   node still enforces it: natively on every block it applies, and a
   fast-synced node on its snapshot (two unspent outputs alike are

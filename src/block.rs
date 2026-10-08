@@ -96,9 +96,10 @@ pub const INITIAL_MAX_HASH: [u8; 32] = {
     b
 };
 
-/// `prev_hash`, `state_root`, `body_hash`, `aux_hash` (32 bytes each),
-/// then `output_count`, `height`, `timestamp` (8 bytes each), and `nonce`
-/// (32 bytes) -- `BlockHeader`'s fixed encoded width.
+/// `version` (4 bytes), `prev_hash`, `state_root`, `body_hash`,
+/// `aux_hash` (32 bytes each), then `output_count`, `height`, `timestamp`
+/// (8 bytes each), and `nonce` (32 bytes) -- `BlockHeader`'s fixed encoded
+/// width.
 ///
 /// `height` **is** a header field, deliberately -- a full node
 /// replaying every block from genesis could always reconstruct it by
@@ -109,10 +110,18 @@ pub const INITIAL_MAX_HASH: [u8; 32] = {
 /// block itself, without trusting an unverifiable claim or replaying
 /// anything. See `chain::Chain`'s docs for how a full node still
 /// double-checks a claimed height against what it already knows.
-pub const HEADER_LEN: usize = 32 * 4 + 8 * 3 + 32;
+pub const HEADER_LEN: usize = 4 + 32 * 4 + 8 * 3 + 32;
+
+/// The block version this node builds, and the least any block may carry
+/// (consensus, proven by chain proofs too). A future change of the rules
+/// raises it from some height on; until then a miner can set a higher
+/// version to signal it's ready for the next one.
+pub const BLOCK_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
+    /// The rules this block follows: at least `BLOCK_VERSION`.
+    pub version: u32,
     pub prev_hash: [u8; 32],
     /// The root of the chain's state tree after this block
     /// (`state_tree`): every output ever created, by position -- each
@@ -148,9 +157,8 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Serialize to exactly `HEADER_LEN` bytes: the eight fields,
-    /// concatenated in field-declaration order (`height`/`timestamp`
-    /// big-endian).
+    /// Serialize to exactly `HEADER_LEN` bytes: the nine fields,
+    /// concatenated in field-declaration order (the numbers big-endian).
     pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
         out[..HEADER_LEN - 32].copy_from_slice(&self.pow_preimage());
@@ -170,14 +178,15 @@ impl BlockHeader {
             return Err(Error::Truncated);
         }
         Ok(BlockHeader {
-            prev_hash: bytes[0..32].try_into().unwrap(),
-            state_root: bytes[32..64].try_into().unwrap(),
-            body_hash: bytes[64..96].try_into().unwrap(),
-            aux_hash: bytes[96..128].try_into().unwrap(),
-            output_count: u64::from_be_bytes(bytes[128..136].try_into().unwrap()),
-            height: u64::from_be_bytes(bytes[136..144].try_into().unwrap()),
-            timestamp: u64::from_be_bytes(bytes[144..152].try_into().unwrap()),
-            nonce: bytes[152..184].try_into().unwrap(),
+            version: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+            prev_hash: bytes[4..36].try_into().unwrap(),
+            state_root: bytes[36..68].try_into().unwrap(),
+            body_hash: bytes[68..100].try_into().unwrap(),
+            aux_hash: bytes[100..132].try_into().unwrap(),
+            output_count: u64::from_be_bytes(bytes[132..140].try_into().unwrap()),
+            height: u64::from_be_bytes(bytes[140..148].try_into().unwrap()),
+            timestamp: u64::from_be_bytes(bytes[148..156].try_into().unwrap()),
+            nonce: bytes[156..188].try_into().unwrap(),
         })
     }
 
@@ -191,6 +200,7 @@ impl BlockHeader {
     /// transitively.
     pub(crate) fn pow_preimage(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEADER_LEN - 32);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
         bytes.extend_from_slice(&self.prev_hash);
         bytes.extend_from_slice(&self.state_root);
         bytes.extend_from_slice(&self.body_hash);
@@ -557,6 +567,7 @@ impl UnprovenBlock {
             output_count: self.output_count,
             body_hash: body.body_hash(),
             aux_hash: self.aux_hash,
+            version: crate::block::BLOCK_VERSION,
             height: self.height,
             timestamp: now_millis().max(self.min_timestamp),
             nonce: [0u8; 32],
@@ -636,7 +647,7 @@ impl Block {
     /// structural rule. Separate so a caller can run these first, or (in
     /// tests about other things) skip the proof entirely.
     pub fn validate_structure(&self, target: &[u8; 32], pow: &pow::Params) -> bool {
-        if !self.header.pow_valid(target, pow) {
+        if self.header.version < BLOCK_VERSION || !self.header.pow_valid(target, pow) {
             return false;
         }
         if !self.body.inputs.iter().chain(&self.body.outputs).all(crate::prover::is_canonical) {
@@ -761,6 +772,7 @@ mod tests {
             output_count: 3,
             body_hash: BlockBody::new().body_hash(),
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -783,6 +795,7 @@ mod tests {
             output_count: 3,
             body_hash: [4u8; 32],
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -811,6 +824,7 @@ mod tests {
             output_count: 3,
             body_hash: [0xABu8; 32], // does not match BlockBody::new()'s hash
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -867,11 +881,42 @@ mod tests {
             output_count: 3,
             body_hash: [4u8; 32],
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 1_700_000_000,
             nonce: [0u8; 32],
         });
         assert_eq!(BlockHeader::from_bytes(&header.to_bytes()).unwrap(), header);
+        // The version leads, and counts.
+        let signalling = BlockHeader { version: 7, ..header.clone() };
+        assert_eq!(signalling.to_bytes()[..4], 7u32.to_be_bytes());
+        assert_eq!(BlockHeader::from_bytes(&signalling.to_bytes()).unwrap().version, 7);
+        assert_ne!(signalling.hash(), header.hash());
+    }
+
+    /// A block below `BLOCK_VERSION` is invalid; a higher version (a miner
+    /// signalling for the next rules) is fine.
+    #[test]
+    fn a_block_needs_at_least_the_current_version() {
+        let easy = INITIAL_MAX_HASH;
+        let body = BlockBody::new();
+        let block_at = |version: u32| {
+            let header = mined_header(BlockHeader {
+                prev_hash: [1u8; 32],
+                state_root: [2u8; 32],
+                output_count: 3,
+                body_hash: body.body_hash(),
+                aux_hash: [0; 32],
+                version,
+                height: 0,
+                timestamp: 1_700_000_000,
+                nonce: [0u8; 32],
+            });
+            Block { header, body: body.clone() }
+        };
+        assert!(!block_at(0).validate_structure(&easy, &pow::Params::TEST));
+        assert!(block_at(BLOCK_VERSION).validate_structure(&easy, &pow::Params::TEST));
+        assert!(block_at(BLOCK_VERSION + 1).validate_structure(&easy, &pow::Params::TEST));
     }
 
     /// `timestamp` is part of what PoW hashes over -- changing it after
@@ -885,6 +930,7 @@ mod tests {
             output_count: 3,
             body_hash: [4u8; 32],
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 1_700_000_000,
             nonce: [0u8; 32],
@@ -907,6 +953,7 @@ mod tests {
             output_count: 3,
             body_hash: [4u8; 32],
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -967,6 +1014,7 @@ mod tests {
             output_count: 7,
             body_hash: body.body_hash(),
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -1064,6 +1112,7 @@ mod tests {
             output_count: 0,
             body_hash: body.body_hash(),
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -1097,6 +1146,7 @@ mod tests {
             output_count: 0,
             body_hash: body.body_hash(), // matches honestly, PoW is fine
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],
@@ -1152,6 +1202,7 @@ mod tests {
             output_count: 0,
             body_hash: body.body_hash(),
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],

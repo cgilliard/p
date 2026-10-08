@@ -183,7 +183,7 @@ const SYNC_BASE_KEY: &[u8] = b"sync_base";
 /// Data written in another layout is refused (`Error::OldStorage`), not
 /// misread.
 const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
-const STORAGE_VERSION: u32 = 3;
+const STORAGE_VERSION: u32 = 4;
 
 /// Database name: every applied block, in full (`Block::to_bytes`),
 /// keyed by its own header hash. The one place this module keeps
@@ -2422,6 +2422,7 @@ mod tests {
             state_root: root,
             body_hash: body.body_hash(),
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             output_count: outputs,
             height: 1,
             timestamp: 1,
@@ -3092,6 +3093,7 @@ mod tests {
             output_count: 0,
             body_hash: body.body_hash(),
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: 0,
             nonce: [0u8; 32],

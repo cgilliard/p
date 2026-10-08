@@ -431,6 +431,21 @@ built: a spend submitted too early is refused until they hold.
 
 ## Decisions (2026-10-07)
 
+- **Duplicate outputs aren't a contract concern** (2026-10-08). Paying the
+  same policy the same amount twice makes the same commitment, and a
+  duplicate of a live output is refused -- by every node applying a
+  block, and by a fast sync's snapshot import. The chain proof doesn't
+  check that rule (`CHAIN_RECURSION.md`, open questions), but nothing
+  relies on the chain proof alone: there are no light clients, and a
+  fast-synced node refuses a state with live duplicates and validates
+  every block after it in full. No coins can come of one either (each
+  duplicate is paid for, balanced in its block's proof).
+- **Reusing a policy:** to pay one policy more than once (the same
+  amount, at the same time), give each output its own lock with a `salt`
+  line in the policy file: a branch whose only key is the salt, which
+  nobody holds, so it never spends but changes the root. Or vary the
+  amount by a unit.
+
 - **HTLCs per channel:** at most `20 − n` in flight (8 with 12 parties):
   that many payments in progress through a channel at once. An HTLC lasts
   only until its payment completes, so this caps concurrency, not volume.

@@ -38,6 +38,7 @@ spending policies (for trying them out; see docs/CONTRACTS.md):
   lock <amount> <policy> [fee]   pay into an output locked to the policy in file <policy>,
                                  one line per branch: `branch threshold=2 keys=<id>,<id>
                                  [after_height=N] [after_age=N] [hashlock=<image>] [rebind=S]`
+                                 (a `salt <hex>` line gives a policy paid twice its own lock)
   spend <policy> <branch> <amount> [to=<policy>] [fee=F] [state=K] [preimage=P] [out=<file>]
                                  write an unsigned spend of a policy output (<amount>) by a
                                  branch (from 0), paying amount - fee to this wallet, or to

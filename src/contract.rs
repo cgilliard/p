@@ -12,6 +12,11 @@
 //!
 //! `threshold` and `keys` are required; the rest are optional. Key ids
 //! come from `key`, hash lock images from `hashlock`, both as hex.
+//!
+//! A `salt <hex>` line adds a branch whose only key is the salt -- a key
+//! nobody holds, so it never spends -- giving the policy a different lock:
+//! how to pay one policy more than once in the same amount (a duplicate of
+//! a live output is refused).
 
 #![allow(dead_code)]
 
@@ -62,7 +67,11 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.split_first() {
             Some((&"branch", fields)) => branches.push(parse_branch(fields).map_err(|e| format!("line {}: {e}", n + 1))?),
-            _ => return Err(format!("line {}: expected `branch ...`", n + 1)),
+            Some((&"salt", [salt])) => {
+                let salt = parse_hash(salt).map_err(|e| format!("line {}: {e}", n + 1))?;
+                branches.push(parse_branch(&["threshold=1", &format!("keys={}", hex(&salt))]).map_err(|e| format!("line {}: salt: {e}", n + 1))?);
+            }
+            _ => return Err(format!("line {}: expected `branch ...` or `salt <hex>`", n + 1)),
         }
     }
     let policy = Policy { branches };
@@ -184,7 +193,11 @@ mod tests {
         assert_eq!(policy.branches[0].after_height, 100);
         assert!(policy.branches[1].hashlock.is_some());
         assert_eq!((policy.branches[2].threshold, policy.branches[2].rebind, policy.branches[2].after_age), (2, Some(4), 5));
-        for bad in ["", "branch keys=00", &format!("branch threshold=2 keys={}", key(1)), "leaf threshold=1", &format!("branch threshold=1 keys={} colour=red", key(1))] {
+        // A salt: one more (unusable) branch, and another lock.
+        let salted = parse_policy(&format!("{text}salt {}\n", key(9))).unwrap();
+        assert_eq!(salted.branches.len(), 4);
+        assert_ne!(salted.lock(), policy.lock());
+        for bad in ["", "branch keys=00", "salt", "salt zz", &format!("branch threshold=2 keys={}", key(1)), "leaf threshold=1", &format!("branch threshold=1 keys={} colour=red", key(1))] {
             assert!(parse_policy(bad).is_err(), "{bad}");
         }
     }

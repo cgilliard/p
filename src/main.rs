@@ -203,15 +203,15 @@ struct Genesis {
 }
 
 const MAIN_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_397_635_329,
-    nonce: "be2b000000000000000000000000000000000000000000000000000000000000",
-    hash: "9309aa2ea784a2491f81df3567af5e2a911ab25fa4d9182d3852511c4a319b66",
+    timestamp_ms: 1_791_423_574_524,
+    nonce: "ee25000000000000000000000000000000000000000000000000000000000000",
+    hash: "0ae6a56bd798665b288b080eeccfd663f6d50851beed4965082c9d4bc4e8ad64",
 };
 
 const DEV_GENESIS: Genesis = Genesis {
-    timestamp_ms: 1_791_397_128_006,
-    nonce: "a834000000000000000000000000000000000000000000000000000000000000",
-    hash: "bc4e8d30394d1a6676979a5829e96b0323902e3ebd40912c13983e3e3febc10c",
+    timestamp_ms: 1_791_423_488_875,
+    nonce: "f10f000000000000000000000000000000000000000000000000000000000000",
+    hash: "4e99d03cd8ccfa7154643b5ccc70055944e76a3408ede52476fe2f28b3690b74",
 };
 
 fn genesis() -> &'static Genesis {
@@ -237,6 +237,7 @@ fn genesis_block() -> Block {
             output_count: 0,
             body_hash: from_hex32(GENESIS_BODY_HASH),
             aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
             height: 0,
             timestamp: genesis().timestamp_ms,
             nonce: from_hex32(genesis().nonce),

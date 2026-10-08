@@ -337,7 +337,8 @@ blocks for it (phase 2). No invoices, no scanning for unknown amounts.
   Every output carries a 16-byte recovery nonce, readable with the
   wallet's view key, so a scan of the chain finds every output with its
   exact amount.
-- **Coinbase maturity**: wallet-only, or a consensus rule?
+- **Coinbase maturity** (decided, 2026-10-08): wallet-only, not
+  consensus.
 - **Fee policy**: per transaction + per input? Fees are public in
   plaintext transactions but hidden on chain (only the block total).
 - **Seed encryption** and a password prompt.
