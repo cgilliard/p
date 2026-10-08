@@ -1,0 +1,122 @@
+# MIT License
+#
+# Copyright (c) 2026 Christopher Gilliard
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# If porting fam0 to real hardware or any environment with a bootloader,
+# add back explicit initialization for s3 and s4 after the `mv s2, s1` line:
+#
+#     li  s4, 0        # comment flag = false
+#     li  s3, 1        # nibble toggle = "expecting high"
+#
+# and invert `beqz s3, store_low` back to `bnez s3, store_low` below.
+# This grows fam0 to 176 bytes (44 instructions) but makes it
+# reset-state-independent. The tradeoff is 8 bytes for robustness.
+# See comments below for actual instructions.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# _start:
+13 0B A0 00	# addi	s6,zero,10 ; Constant: (\n) and Hex limit (10)
+B7 0A 00 10	# lui	s5,0x10000 ; Constant: UART base address
+B7 04 10 80	# lui	s1,0x80100 ; s1 = 0x80100000 = start of output buffer
+13 89 04 00	# addi	s2,s1,0 ; s2 = high-water mark (starts == s1)
+
+# If on real hardware, uncomment these lines to init values
+# 13 0A 00 00    # addi    s4,zero,0 ; li s4, 0  — comment flag = false
+# 93 09 10 00    # addi    s3,zero,1 ; li s3, 1  — nibble toggle = "expecting high"
+
+# [in QEMU mode] rely on GPR reset = 0; see uncommented list above for HW path.
+# s3 (nibble toggle, want "high") — rely on GPR reset = 0; the store
+# block uses beqz-after-xor so s3 = 0 correctly means "expecting
+# high nibble next" on the first iteration.
+# Main input processing loop
+# loop:
+# UART poll: check for incoming byte
+03 CF 5A 00	# lbu	t5,5(s5) ; Read Line Status Register
+13 7F 1F 00	# andi	t5,t5,1 ; Mask: Data Ready bit
+E3 0C 0F FE	# beq	t5,zero,loop ; Wait if no data
+03 C3 0A 00	# lbu	t1,0(s5) ; Read byte from Receive Buffer
+
+# Logic: Handle line comments
+63 14 63 01	# bne	t1,s6,not_backn ; If not newline, skip reset
+13 0A 00 00	# addi	s4,zero,0 ; At '\n', set in-comment = false
+
+# not_backn:
+13 0E 30 02	# addi	t3,zero,35 ; Load comment start delimiter
+63 14 C3 01	# bne	t1,t3,skip_start_comment
+13 0A 10 00	# addi	s4,zero,1 ; At '#', set in-comment = true
+
+# skip_start_comment:
+# Logic: Check for End of Transmission (ASCII 4)
+13 0E 40 00	# addi	t3,zero,4
+63 00 C3 05	# beq	t1,t3,end_loop ; Exit input loop if EOT received
+
+# If currently inside a comment, ignore all characters
+E3 1A 0A FC	# bne	s4,zero,loop
+
+# Logic: ASCII Hex to Binary Nibble conversion. Whitespace and control
+# codes (< '0') naturally fall through the two bltu checks to `j loop`
+# because `addi t1,-48` makes them wrap large-unsigned; no explicit
+# whitespace filter is needed.
+13 03 03 FD	# addi	t1,t1,-48 ; Normalize '0' to 0
+63 6A 63 01	# bltu	t1,s6,store ; If 0-9, it's a valid hex digit
+13 03 93 FF	# addi	t1,t1,-7 ; Normalize 'A'-'F' (55-48=7 offset)
+13 0E 00 01	# addi	t3,zero,16
+63 64 C3 01	# bltu	t1,t3,store ; If 10-15, it's a valid hex digit
+6F F0 DF FB	# jal	zero,loop ; Otherwise, skip invalid hex char
+
+# Logic: Pack two 4-bit nibbles into one 8-bit byte
+# Invariant: after each xor, s3=1 → just parsed high nibble;
+# s3=0 → just parsed low nibble (and must emit the byte).
+# store:
+93 C9 19 00	# xori	s3,s3,1 ; Toggle high/low state
+63 86 09 00	# beq	s3,zero,store_low ; If 0, just finished the low nibble
+# If on real hardware comment out above line and uncomment the line below
+# 63 96 09 00    # bne    s3,zero,store_low
+93 1E 43 00	# slli	t4,t1,0x4 ; Store high nibble in t4
+6F F0 DF FA	# jal	zero,loop
+
+# store_low:
+B3 EE 6E 00	# or	t4,t4,t1 ; Combine high and low nibbles
+23 00 D9 01	# sb	t4,0(s2) ; Store resulting byte in buffer
+13 09 19 00	# addi	s2,s2,1 ; Increment high-water pointer
+6F F0 DF F9	# jal	zero,loop
+
+# end_loop:
+# Final Output: Stream the constructed binary back through the UART
+# output:
+63 80 24 03	# beq	s1,s2,end_output ; Stop when read ptr == write ptr
+03 CE 04 00	# lbu	t3,0(s1) ; Load byte from buffer
+93 84 14 00	# addi	s1,s1,1 ; Increment read pointer
+
+# retry:
+03 C3 5A 00	# lbu	t1,5(s5) ; Check Line Status Register
+13 73 03 02	# andi	t1,t1,32 ; Mask: Transmitter Holding Register
+E3 0C 03 FE	# beq	t1,zero,retry ; Wait until UART is ready to send
+23 80 CA 01	# sb	t3,0(s5) ; Send byte to UART
+6F F0 5F FE	# jal	zero,end_loop
+
+# Shutdown
+# end_output:
+B7 0A 10 00	# lui	s5,0x100 ; QEMU Virt Device address
+37 53 00 00	# lui	t1,0x5 ; Power-off command
+13 03 53 55	# addi	t1,t1,1365
+23 A0 6A 00	# sw	t1,0(s5) ; Exit
