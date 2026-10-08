@@ -183,7 +183,7 @@ const SYNC_BASE_KEY: &[u8] = b"sync_base";
 /// Data written in another layout is refused (`Error::OldStorage`), not
 /// misread.
 const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
-const STORAGE_VERSION: u32 = 2;
+const STORAGE_VERSION: u32 = 3;
 
 /// Database name: every applied block, in full (`Block::to_bytes`),
 /// keyed by its own header hash. The one place this module keeps
@@ -292,6 +292,9 @@ pub enum Error {
     /// `Transaction::verify()` -- the index is its position in the slice
     /// that was passed in.
     InvalidTransaction(usize),
+    /// A transaction handed to `build_block` spends a policy output whose
+    /// timelocks don't hold yet at the block's height.
+    LockNotMet(usize),
     /// A transaction handed to `build_block` has more inputs or outputs
     /// than one chunk holds (`prover::CHUNK_SHAPE`) -- a consensus limit.
     TransactionTooLarge,
@@ -393,7 +396,8 @@ impl std::fmt::Display for Error {
             Error::StateRootMismatch => write!(f, "header's state_root does not match the result of applying the body"),
             Error::OutputCountMismatch => write!(f, "header's output_count does not match the result of applying the body"),
             Error::InvalidTransaction(i) => write!(f, "transaction at index {i} failed verify()"),
-            Error::TransactionTooLarge => write!(f, "a transaction has more inputs or outputs than one chunk holds"),
+            Error::TransactionTooLarge => write!(f, "a transaction has more inputs, outputs or signatures than one chunk holds"),
+            Error::LockNotMet(i) => write!(f, "transaction at index {i} spends a policy output whose timelocks don't hold yet"),
             Error::ChainEnded => write!(f, "the chain has reached its end height; no further block is valid"),
             Error::InvalidSideBranchBlock => write!(f, "side-branch block failed validate() against the active target"),
             Error::InvalidSideBranchLineage => write!(f, "side-branch block's prev_hash/height doesn't match its claimed parent"),
@@ -470,6 +474,12 @@ impl RetargetState {
         let (target, anchor_timestamp) = next_retarget(config, (self.target, self.anchor_timestamp), header.height, header.timestamp);
         RetargetState { target, anchor_timestamp }
     }
+}
+
+/// A block height as a state-tree leaf holds it (`state_tree::leaf`):
+/// below 2^31, as chain proofs require of every height.
+fn leaf_height(height: u64) -> Result<u32> {
+    u32::try_from(height).ok().filter(|h| *h < 1 << 31).ok_or(Error::InvalidBlock)
 }
 
 /// The retarget rule, on its own: the `(target, anchor timestamp)` in
@@ -907,7 +917,7 @@ impl StateReader {
                 if position < as_of.count {
                     let record = self.output_index.get(txn, &commitment)?.ok_or(Error::Corrupt("a spent output's record is missing"))?;
                     let record = OutputRecord::decode(commitment, record)?;
-                    as_of.restored.insert(position, (commitment, record.nonce));
+                    as_of.restored.insert(position, (commitment, record.nonce, leaf_height(record.height)?));
                 }
             }
         }
@@ -1096,7 +1106,10 @@ impl Chain {
             return Ok(true);
         }
         let parent = self.parent_state(txn, block.header.prev_hash)?;
-        if !block.body.proof_is_valid(&block.state_change(parent), reward) {
+        let Ok(height) = leaf_height(block.header.height) else {
+            return Ok(false);
+        };
+        if !block.body.proof_is_valid(&block.state_change(parent), height, reward) {
             return Ok(false);
         }
         // The parent's chain proof: that the parent is the tip of a valid
@@ -1356,8 +1369,8 @@ impl Chain {
                 return Err(Error::DuplicateOutput(pair[0].1));
             }
         }
-        for (position, commitment, nonce) in by_commitment {
-            self.utxo.create(&mut wtxn, *commitment, *position, header.height, nonce)?;
+        for (position, commitment, nonce, height) in by_commitment {
+            self.utxo.create(&mut wtxn, *commitment, *position, *height as u64, nonce)?;
         }
         self.meta.put(&mut wtxn, TIP_HEADER_KEY, &header.to_bytes())?;
         self.meta.put(&mut wtxn, CURRENT_TARGET_KEY, &point.target)?;
@@ -1547,9 +1560,10 @@ impl Chain {
     /// for proving (`aggregate::ChunkTransition`): the chunks applied in
     /// turn, in memory (`state_tree::Overlay`), each output at its own
     /// position.
-    fn resolve_and_apply(&mut self, wtxn: &mut heed::RwTxn, body: &BlockBody, chunks: Option<&ChunkIndices>) -> Result<ResolveResult> {
+    fn resolve_and_apply(&mut self, wtxn: &mut heed::RwTxn, body: &BlockBody, height: u64, chunks: Option<&ChunkIndices>) -> Result<ResolveResult> {
+        let height = leaf_height(height)?;
         let transitions = match chunks {
-            Some(chunks) => self.chunk_transitions(wtxn, body, chunks)?,
+            Some(chunks) => self.chunk_transitions(wtxn, body, height, chunks)?,
             None => Vec::new(),
         };
         let mut spent_inputs = Vec::with_capacity(body.inputs.len());
@@ -1566,7 +1580,7 @@ impl Chain {
             if self.utxo.get(wtxn, *commitment)?.is_some() {
                 return Err(Error::DuplicateOutput(*commitment));
             }
-            let position = self.state.push(wtxn, commitment, nonce)?;
+            let position = self.state.push(wtxn, &(*commitment, *nonce, height))?;
             self.utxo.insert(wtxn, *commitment, position)?;
         }
         let root = self.state.root(wtxn)?;
@@ -1580,7 +1594,7 @@ impl Chain {
 
     /// Each chunk's state transition (`resolve_and_apply`), before the
     /// body is applied.
-    fn chunk_transitions(&self, wtxn: &heed::RwTxn, body: &BlockBody, chunks: &ChunkIndices) -> Result<Vec<crate::aggregate::ChunkTransition>> {
+    fn chunk_transitions(&self, wtxn: &heed::RwTxn, body: &BlockBody, height: u32, chunks: &ChunkIndices) -> Result<Vec<crate::aggregate::ChunkTransition>> {
         use crate::aggregate::{ChunkTransition, StateChange};
         use crate::prover::CHUNK_SHAPE;
         let base = self.state.count(wtxn)?;
@@ -1599,21 +1613,20 @@ impl Chain {
             for &i in ins {
                 let commitment = body.inputs[i];
                 let position = self.utxo.get(wtxn, commitment)?.ok_or(Error::UnresolvedInput(commitment))?;
-                let nonce = self
+                let record = self
                     .output_record(wtxn, &commitment)?
-                    .ok_or(Error::Corrupt("an unspent output's record is missing"))?
-                    .nonce;
-                inputs.push((position, nonce, overlay.path(position)?));
+                    .ok_or(Error::Corrupt("an unspent output's record is missing"))?;
+                inputs.push((position, record.nonce, leaf_height(record.height)?, overlay.path(position)?));
                 overlay.set(position, crate::state_tree::SPENT)?;
             }
             while inputs.len() < CHUNK_SHAPE.inputs {
-                inputs.push((end, [0; crate::recovery::NONCE_LEN], overlay.path(end)?));
+                inputs.push((end, [0; crate::recovery::NONCE_LEN], 0, overlay.path(end)?));
             }
             let mut outputs = Vec::with_capacity(CHUNK_SHAPE.outputs);
             for &o in outs {
                 let position = base + o as u64;
                 outputs.push((position, overlay.path(position)?));
-                overlay.set(position, crate::state_tree::leaf(&body.outputs[o], &body.nonces[o]))?;
+                overlay.set(position, crate::state_tree::leaf(&body.outputs[o], &body.nonces[o], height))?;
                 count += 1;
             }
             while outputs.len() < CHUNK_SHAPE.outputs {
@@ -1622,6 +1635,7 @@ impl Chain {
             transitions.push(ChunkTransition {
                 change: StateChange { root_in, count_in, root_out: overlay.root()?, count_out: count },
                 window: (base, end),
+                height,
                 inputs,
                 outputs,
             });
@@ -1699,7 +1713,7 @@ impl Chain {
         let prev_anchor_timestamp = self.anchor_timestamp(wtxn)?;
         let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
 
-        let (state_root, output_count, spent_inputs, _) = self.resolve_and_apply(wtxn, &block.body, None)?;
+        let (state_root, output_count, spent_inputs, _) = self.resolve_and_apply(wtxn, &block.body, block.header.height, None)?;
         for (commitment, nonce) in block.body.outputs.iter().zip(&block.body.nonces) {
             self.utxo.set_origin(wtxn, *commitment, block.header.height, nonce)?;
         }
@@ -1766,7 +1780,7 @@ impl Chain {
             let record = self
                 .output_record(wtxn, commitment)?
                 .ok_or(Error::Corrupt("a spent output's record is missing"))?;
-            self.state.unspend(wtxn, *position, commitment, &record.nonce)?;
+            self.state.unspend(wtxn, *position, &(*commitment, record.nonce, leaf_height(record.height)?))?;
             self.utxo.insert(wtxn, *commitment, *position)?;
         }
         // Reverse the outputs: each one this block created disappears
@@ -2109,7 +2123,7 @@ impl Chain {
             let (mut ins, mut outs) = (Vec::new(), Vec::new());
             for &t in txs {
                 for input in &transactions[t].inputs {
-                    ins.push(index(&body.inputs, &crate::output::Output::new(&input.pubkey, input.amount).commitment())?);
+                    ins.push(index(&body.inputs, &input.commitment())?);
                 }
                 for output in &transactions[t].outputs {
                     outs.push(index(&body.outputs, &output.commitment())?);
@@ -2119,7 +2133,21 @@ impl Chain {
             outs.sort_unstable();
             chunks.push((ins, outs));
         }
-        let (state_root, output_count, _spent_inputs, transitions) = self.resolve_and_apply(&mut wtxn, &body, Some(&chunks))?;
+        // The heights its proof publishes, and its inputs' timelocks
+        // checked against them.
+        let mut created = std::collections::HashMap::new();
+        for commitment in &body.inputs {
+            if let Some(record) = self.output_record(&wtxn, commitment)? {
+                created.insert(*commitment, leaf_height(record.height)?);
+            }
+        }
+        let heights = crate::block_air::Heights { block: leaf_height(height)?, created };
+        for (t, tx) in transactions.iter().enumerate() {
+            if !tx.locks_hold(heights.block, |c| heights.created.get(c).copied()) {
+                return Err(Error::LockNotMet(t));
+            }
+        }
+        let (state_root, output_count, _spent_inputs, transitions) = self.resolve_and_apply(&mut wtxn, &body, height, Some(&chunks))?;
         // Deliberately never committed -- see the module docs. `wtxn`
         // drops here, and LMDB aborts it.
 
@@ -2138,6 +2166,7 @@ impl Chain {
                 chunks: plan_chunks,
                 transitions,
                 reward,
+                heights,
             },
         })
     }
@@ -2376,7 +2405,7 @@ mod tests {
                     c.copy_from_slice(&random().to_le_bytes());
                 }
                 let nonce: [u8; 16] = [random().to_le_bytes(), random().to_le_bytes()].concat().try_into().unwrap();
-                (position, commitment, nonce)
+                (position, commitment, nonce, (random() % 1_000_000) as u32)
             })
             .collect();
         let (empty, spent) = (crate::state_tree::empty_hashes(), crate::state_tree::spent_hashes());
@@ -2770,6 +2799,81 @@ mod tests {
             new_target, initial_target,
             "expected ten real blocks to retarget away from the initial target in *some* direction"
         );
+    }
+
+    /// Every unspent output's state-tree leaf records the height of the
+    /// block that created it -- and still does after a spend of another
+    /// output is unwound.
+    #[test]
+    fn every_leaf_records_its_outputs_creation_height() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        for (i, pk) in [pk_a.clone(), keypair(2).1, keypair(3).1].iter().enumerate() {
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(pk, 50 + i as u64)]);
+            chain.apply_block(&block).unwrap();
+        }
+        let (_sk, pk_b) = keypair(4);
+        let spend = spend_transaction(&sk_a, &pk_a, 50, &pk_b);
+        let block = built_proved_and_mined(&mut chain, &[spend]);
+        chain.apply_block(&block).unwrap();
+        let heights = |chain: &Chain| -> Vec<(u64, u32)> {
+            let rtxn = storage.read_txn().unwrap();
+            chain.state.unspent_in(&rtxn, 0, 1 << 40).unwrap().iter().map(|e| (e.0, e.3)).collect()
+        };
+        // Outputs at positions 0, 1, 2 from heights 0, 1, 2; position 0 spent
+        // at height 3, which created position 3.
+        assert_eq!(heights(&chain), [(1, 1), (2, 2), (3, 3)]);
+        // And the leaves hash it.
+        let rtxn = storage.read_txn().unwrap();
+        for (position, commitment, nonce, height) in chain.state.unspent_in(&rtxn, 0, 1 << 40).unwrap() {
+            assert_eq!(chain.state.leaf_at(&rtxn, position).unwrap(), crate::state_tree::leaf(&commitment, &nonce, height));
+        }
+        drop(rtxn);
+        unwind_committed(&storage, &mut chain);
+        assert_eq!(heights(&chain), [(0, 0), (1, 1), (2, 2)]);
+    }
+
+    /// An output locked to a policy (a 2-of-2, after an age of 3) is spent
+    /// by its branch -- refused by `build_block` while it's too young,
+    /// accepted once the lock holds.
+    #[test]
+    fn a_policy_output_is_spent_once_its_locks_hold() {
+        use crate::policy::{Branch, Policy};
+        let (_dir, _storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let first = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&first).unwrap();
+        let ((sk_b, pk_b), (sk_c, pk_c)) = (keypair(2), keypair(3));
+        let key = |pk: &PublicKey| crate::poseidon2::digest_to_bytes(pk.hash());
+        let branch = Branch { threshold: 2, keys: vec![key(&pk_b), key(&pk_c)], after_height: 0, after_age: 3, hashlock: None, rebind: None };
+        let policy = Policy { branches: vec![branch.clone()] };
+        let mut fund = Transaction::new();
+        fund.add_input(&pk_a, 50).unwrap();
+        fund.add_output(Output::locked(policy.lock(), 50)).unwrap();
+        assert!(fund.sign_input(&pk_a, &sk_a));
+        let funded = built_proved_and_mined(&mut chain, &[fund]);
+        chain.apply_block(&funded).unwrap(); // height 1: the policy output's creation
+
+        let spend = {
+            let mut tx = Transaction::new();
+            tx.add_policy_input(branch, 0, vec![], None, 50).unwrap();
+            tx.add_output(Output::new(&keypair(4).1, 50)).unwrap();
+            let commitment = Output::locked(policy.lock(), 50).commitment();
+            assert!(tx.sign_policy_input(&commitment, 0, &pk_b, crate::keytree::KeyProof::one_time(), &sk_b));
+            assert!(tx.sign_policy_input(&commitment, 1, &pk_c, crate::keytree::KeyProof::one_time(), &sk_c));
+            assert!(tx.verify());
+            tx
+        };
+        // Heights 2 and 3: too young (age 1, 2).
+        for k in 0..2u8 {
+            assert!(matches!(chain.build_block(std::slice::from_ref(&spend)), Err(Error::LockNotMet(0))));
+            let filler = built_proved_and_mined(&mut chain, &[reward_transaction(&keypair(10 + k).1, 50)]);
+            chain.apply_block(&filler).unwrap();
+        }
+        // Height 4: age 3.
+        let block = built_proved_and_mined(&mut chain, &[spend]);
+        assert_eq!(block.header.height, 4);
+        chain.apply_block(&block).unwrap();
     }
 
     #[test]

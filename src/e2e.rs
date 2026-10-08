@@ -387,7 +387,7 @@ mod tests {
         assert!(on_chain.len() >= 12, "{} unspent", on_chain.len());
         let used = alice.outputs().unwrap().iter().map(|o| o.key.index).max().unwrap();
         let words = alice.keychain().phrase();
-        let in_flight_inputs: Vec<[u8; 32]> = in_flight.inputs.iter().map(|i| Output::new(&i.pubkey, i.amount).commitment()).collect();
+        let in_flight_inputs: Vec<[u8; 32]> = in_flight.inputs.iter().map(|i| i.commitment()).collect();
         let mut after_in_flight: Vec<([u8; 32], u64)> = on_chain.iter().filter(|(c, _)| !in_flight_inputs.contains(c)).copied().collect();
         after_in_flight.extend(in_flight.outputs.iter().map(|o| (o.commitment(), o.amount)));
         after_in_flight.sort();

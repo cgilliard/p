@@ -909,6 +909,16 @@ pub const DOMAIN_DATA_LEAF: u32 = 8;
 pub const DOMAIN_DATA_NODE: u32 = 9;
 /// The challenge binding a block's proof to its body (`aggregate::challenge`).
 pub const DOMAIN_BINDING: u32 = 10;
+/// A spending policy's branch (`policy::Branch::leaf`).
+pub const DOMAIN_POLICY_LEAF: u32 = 11;
+/// A hash lock's image of its preimage (`policy::hashlock`).
+pub const DOMAIN_HASHLOCK: u32 = 12;
+/// A spending policy's tree node, plus its level (`policy::node`).
+pub const DOMAIN_POLICY_NODE: u32 = 0x800;
+/// A multi-use key's tree node, plus its level (`keytree::node`).
+pub const DOMAIN_KEY_NODE: u32 = 0x900;
+/// A REBIND signature's message (`transaction::rebind_message`).
+pub const DOMAIN_REBIND: u32 = 13;
 /// A Merkle tree internal node, plus its level -- one domain per level.
 pub const DOMAIN_MERKLE_NODE: u32 = 0x100;
 

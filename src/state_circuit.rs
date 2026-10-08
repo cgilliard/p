@@ -188,9 +188,13 @@ pub(crate) fn replace(b: &mut Builder, root: OVar, bits: &[EVar], siblings: &[Oc
     root_from(b, new, bits, &siblings)
 }
 
-/// An unspent output's leaf, `leaf(commitment, nonce)`, in the circuit.
-pub fn leaf_hash(b: &mut Builder, commitment: OVar, nonce: OVar) -> OVar {
-    let cap = b.const_octet(leaf_capacity());
+/// An unspent output's leaf, `leaf(commitment, nonce, height)`, in the
+/// circuit: `leaf_capacity`'s domain and rate length, and `height` (a
+/// cell) beside them.
+pub fn leaf_hash(b: &mut Builder, commitment: OVar, nonce: OVar, height: EVar) -> OVar {
+    let fixed = leaf_capacity(0);
+    let (domain, rate) = (b.const_base(fixed[0]), b.const_base(fixed[1]));
+    let cap = pack_octets(b, &[domain, rate, height])[0];
     b.permute(commitment, nonce, cap, None)[0]
 }
 
@@ -199,7 +203,8 @@ pub fn leaf_hash(b: &mut Builder, commitment: OVar, nonce: OVar) -> OVar {
 pub fn spend(b: &mut Builder, root: OVar, commitment: OVar, nonce: OVar, position: u64, siblings: &[Octet]) -> OVar {
     let p = b.witness_ext(Ext::from_base(BabyBear::new(position as u32)));
     let bits = position_bits(b, p);
-    let leaf = leaf_hash(b, commitment, nonce);
+    let zero = b.zero();
+    let leaf = leaf_hash(b, commitment, nonce, zero);
     let spent = b.const_octet(SPENT);
     replace(b, root, &bits, siblings, leaf, spent)
 }
@@ -208,18 +213,20 @@ pub fn spend(b: &mut Builder, root: OVar, commitment: OVar, nonce: OVar, positio
 /// root and count.
 pub fn append(b: &mut Builder, root: OVar, count: EVar, commitment: OVar, nonce: OVar, siblings: &[Octet]) -> (OVar, EVar) {
     let bits = position_bits(b, count);
-    let leaf = leaf_hash(b, commitment, nonce);
+    let zero = b.zero();
+    let leaf = leaf_hash(b, commitment, nonce, zero);
     let empty = b.const_octet(EMPTY);
     let root = replace(b, root, &bits, siblings, empty, leaf);
     let next = b.add_base(count, BabyBear::ONE);
     (root, next)
 }
 
-/// An output as the state sees it: its commitment and nonce limbs.
+/// An output as the state sees it: its commitment and nonce limbs. (This
+/// spike's outputs are all created at height 0.)
 pub type StateOutput = (Octet, Octet);
 
 fn leaf_of((commitment, nonce): &StateOutput) -> Octet {
-    crate::state_tree::compress_leaf(commitment, nonce)
+    crate::state_tree::compress_leaf(commitment, nonce, 0)
 }
 
 /// One block's state transition, in the circuit, against `tree` (which

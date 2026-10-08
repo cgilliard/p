@@ -75,8 +75,10 @@ pub fn nonce_limbs(nonce: &[u8; NONCE_LEN]) -> [BabyBear; 8] {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Output {
-    /// Poseidon2 hash of the owning public key.
-    pub pubkey_hash: [u8; PUBKEY_HASH_LEN],
+    /// What spending it takes: the owning public key's Poseidon2 hash
+    /// (`wots::PublicKey::hash`), or a spending policy's root
+    /// (`policy::Policy::lock`).
+    pub lock: [u8; PUBKEY_HASH_LEN],
     pub amount: u64,
     /// The owner's recovery nonce (`recovery`): its key index and amount,
     /// readable only with the owner's view key. Published with the
@@ -91,11 +93,13 @@ impl Output {
     /// (an input's, say); an output actually created needs a real one
     /// (`with_nonce`).
     pub fn new(pk: &PublicKey, amount: u64) -> Self {
-        Output {
-            pubkey_hash: digest_to_bytes(pk.hash()),
-            amount,
-            nonce: [0; NONCE_LEN],
-        }
+        Output::locked(digest_to_bytes(pk.hash()), amount)
+    }
+
+    /// An output to `lock` (a key hash or a policy's root), with an
+    /// all-zero nonce, like `new`.
+    pub fn locked(lock: [u8; PUBKEY_HASH_LEN], amount: u64) -> Self {
+        Output { lock, amount, nonce: [0; NONCE_LEN] }
     }
 
     pub fn with_nonce(self, nonce: [u8; NONCE_LEN]) -> Self {
@@ -103,8 +107,8 @@ impl Output {
     }
 
     /// The commitment published for this output (and, when it's spent,
-    /// for the input spending it): `hash_elements` over the public-key
-    /// hash's 8 elements and the amount as four 16-bit limbs,
+    /// for the input spending it): `hash_elements` over the lock's 8
+    /// elements and the amount as four 16-bit limbs,
     /// least-significant first.
     ///
     /// Limbs, rather than the amount's raw bytes, so every `u64` amount
@@ -114,21 +118,21 @@ impl Output {
     /// larger one. 16-bit limbs never wrap, and a circuit range-checks
     /// them directly.
     pub fn commitment(&self) -> [u8; 32] {
-        let mut elements = digest_from_bytes(&self.pubkey_hash).to_vec();
+        let mut elements = digest_from_bytes(&self.lock).to_vec();
         elements.extend(amount_limbs(self.amount));
         digest_to_bytes(hash_elements(DOMAIN_COMMITMENT, &elements))
     }
 
-    /// `pubkey_hash ‖ amount (u64 LE) ‖ nonce`.
+    /// `lock ‖ amount (u64 LE) ‖ nonce`.
     pub fn to_bytes(&self) -> [u8; OUTPUT_LEN] {
         let mut out = [0u8; OUTPUT_LEN];
-        out[..PUBKEY_HASH_LEN].copy_from_slice(&self.pubkey_hash);
+        out[..PUBKEY_HASH_LEN].copy_from_slice(&self.lock);
         out[PUBKEY_HASH_LEN..PUBKEY_HASH_LEN + 8].copy_from_slice(&self.amount.to_le_bytes());
         out[PUBKEY_HASH_LEN + 8..].copy_from_slice(&self.nonce);
         out
     }
 
-    /// Decode from bytes, the inverse of `to_bytes`. `pubkey_hash` is
+    /// Decode from bytes, the inverse of `to_bytes`. `lock` is
     /// opaque bytes and `amount` is a plain `u64`, so the only way this
     /// can fail is `bytes` not being exactly `OUTPUT_LEN` long --
     /// checked explicitly here (rather than taking a `[u8; OUTPUT_LEN]`
@@ -137,11 +141,11 @@ impl Output {
     /// wire, say -- can never panic, only return `None`.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let bytes: [u8; OUTPUT_LEN] = bytes.try_into().ok()?;
-        let mut pubkey_hash = [0u8; PUBKEY_HASH_LEN];
-        pubkey_hash.copy_from_slice(&bytes[..PUBKEY_HASH_LEN]);
+        let mut lock = [0u8; PUBKEY_HASH_LEN];
+        lock.copy_from_slice(&bytes[..PUBKEY_HASH_LEN]);
         let amount = u64::from_le_bytes(bytes[PUBKEY_HASH_LEN..PUBKEY_HASH_LEN + 8].try_into().unwrap());
         let nonce = bytes[PUBKEY_HASH_LEN + 8..].try_into().unwrap();
-        Some(Output { pubkey_hash, amount, nonce })
+        Some(Output { lock, amount, nonce })
     }
 }
 

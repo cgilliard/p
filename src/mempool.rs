@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 
-use crate::output::Output;
 use crate::prover::CHUNK_SHAPE;
 use crate::transaction::Transaction;
 use crate::wallet::ChainView;
@@ -48,7 +47,7 @@ impl std::fmt::Display for Rejection {
 }
 
 fn input_commitments(tx: &Transaction) -> Vec<[u8; 32]> {
-    tx.inputs.iter().map(|i| Output::new(&i.pubkey, i.amount).commitment()).collect()
+    tx.inputs.iter().map(|i| i.commitment()).collect()
 }
 
 fn output_commitments(tx: &Transaction) -> Vec<[u8; 32]> {
@@ -99,8 +98,8 @@ impl Mempool {
             // Only a block's reward creates coins from nothing.
             return Err(Rejection::Invalid("no inputs"));
         }
-        if tx.inputs.len() > CHUNK_SHAPE.inputs || tx.outputs.len() > CHUNK_SHAPE.outputs {
-            return Err(Rejection::Invalid("too many inputs or outputs for one chunk"));
+        if tx.inputs.len() > CHUNK_SHAPE.inputs || tx.outputs.len() > CHUNK_SHAPE.outputs || tx.signature_count() > crate::prover::CHUNK_SIGNATURES {
+            return Err(Rejection::Invalid("too many inputs, outputs or signatures for one chunk"));
         }
         if tx.fee().is_none() {
             return Err(Rejection::Invalid("outputs exceed inputs"));
@@ -119,6 +118,13 @@ impl Mempool {
         }
         if !inputs.iter().all(|i| chain.is_unspent(i)) {
             return Err(Rejection::Conflict);
+        }
+        // Policy inputs' timelocks must hold in the next block (heights
+        // only grow, so it stays valid -- short of a reorg, which
+        // `revalidate` catches).
+        let next = u32::try_from(chain.tip_height() + 1).unwrap_or(u32::MAX);
+        if !tx.locks_hold(next, |c| chain.output_record(c).and_then(|(h, _)| u32::try_from(h).ok())) {
+            return Err(Rejection::Invalid("a timelock doesn't hold yet"));
         }
         for other in others {
             let (their_inputs, their_outputs) = (input_commitments(other), output_commitments(other));

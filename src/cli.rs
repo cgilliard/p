@@ -29,7 +29,25 @@ const HELP: &str = "commands:
   mine on|off                    start or stop mining
   seed                           show the wallet's 24 backup words (keep them secret!)
   help                           this
-  quit                           stop the node";
+  quit                           stop the node
+
+spending policies (for trying them out; see docs/CONTRACTS.md):
+  key [height]                   a new key to list in a policy: one-time, or a key tree of
+                                 2^height signatures (16 is the usual; it takes ~45 s)
+  hashlock                       a fresh hash-lock preimage and its image
+  lock <amount> <policy> [fee]   pay into an output locked to the policy in file <policy>,
+                                 one line per branch: `branch threshold=2 keys=<id>,<id>
+                                 [after_height=N] [after_age=N] [hashlock=<image>] [rebind=S]`
+  spend <policy> <branch> <amount> [to=<policy>] [fee=F] [state=K] [preimage=P] [out=<file>]
+                                 write an unsigned spend of a policy output (<amount>) by a
+                                 branch (from 0), paying amount - fee to this wallet, or to
+                                 another policy; a REBIND branch declares state K
+  sign <file>                    sign a transaction file with this wallet's policy keys
+  fee <file> <amount>            add a fee input and change from the wallet, signed
+  rebind <file> <policy> <branch> <amount>
+                                 re-point a REBIND input at another output (before `fee`)
+  submit <file>                  submit a fully signed transaction file
+  inspect <file>                 summarize a transaction file";
 
 /// A file argument; a leading `~/` means the home directory (there's no
 /// shell here to expand it).
@@ -79,6 +97,52 @@ pub fn parse(line: &str) -> Option<Result<Request, String>> {
         ("mine", ["off"]) => Ok(Request::Mine(false)),
         ("mine", _) => usage("mine on|off"),
         ("seed", []) => Ok(Request::Seed),
+        ("key", []) => Ok(Request::ContractKey { height: 0 }),
+        ("key", [h]) => match h.parse::<usize>() {
+            Ok(height) if height <= crate::keytree::MAX_HEIGHT => Ok(Request::ContractKey { height }),
+            _ => Err(format!("a key tree's height is 0 to {}", crate::keytree::MAX_HEIGHT)),
+        },
+        ("key", _) => usage("key [height]"),
+        ("hashlock", []) => Ok(Request::Hashlock),
+        ("lock", [a, policy, rest @ ..]) if rest.len() <= 1 => (|| {
+            let fee = match rest {
+                [] => DEFAULT_FEE,
+                [f] => amount_or_err(f)?,
+                _ => unreachable!(),
+            };
+            Ok(Request::LockFunds { amount: amount(a)?, fee, policy: path(policy) })
+        })(),
+        ("lock", _) => usage("lock <amount> <policy file> [fee]"),
+        ("spend", [policy, branch, a, options @ ..]) => (|| {
+            let branch = branch.parse::<u32>().map_err(|_| format!("not a branch number: {branch}"))?;
+            let (mut to, mut fee, mut state, mut preimage, mut out) = (None, DEFAULT_FEE, 0, None, None);
+            for option in options {
+                match option.split_once('=') {
+                    Some(("to", "self")) => to = None,
+                    Some(("to", file)) => to = Some(path(file)),
+                    Some(("fee", f)) => fee = amount_or_err(f)?,
+                    Some(("state", k)) => state = k.parse::<u32>().map_err(|_| format!("not a state: {k}"))?,
+                    Some(("preimage", p)) => preimage = Some(crate::contract::parse_hash(p)?),
+                    Some(("out", file)) => out = Some(path(file)),
+                    _ => return Err(format!("unknown option: {option} (to=, fee=, state=, preimage=, out=)")),
+                }
+            }
+            Ok(Request::SpendPolicy { policy: path(policy), branch, amount: amount(a)?, to, fee, state, preimage, out })
+        })(),
+        ("spend", _) => usage("spend <policy> <branch> <amount> [to=<policy>] [fee=F] [state=K] [preimage=P] [out=<file>]"),
+        ("sign", [file]) => Ok(Request::SignFile { file: path(file) }),
+        ("sign", _) => usage("sign <file>"),
+        ("fee", [file, f]) => amount_or_err(f).map(|fee| Request::AttachFee { file: path(file), fee }),
+        ("fee", _) => usage("fee <file> <amount>"),
+        ("rebind", [file, policy, branch, a]) => (|| {
+            let branch = branch.parse::<u32>().map_err(|_| format!("not a branch number: {branch}"))?;
+            Ok(Request::Rebind { file: path(file), policy: path(policy), branch, amount: amount(a)? })
+        })(),
+        ("rebind", _) => usage("rebind <file> <policy> <branch> <amount>"),
+        ("submit", [file]) => Ok(Request::SubmitFile { file: path(file) }),
+        ("submit", _) => usage("submit <file>"),
+        ("inspect", [file]) => Ok(Request::Inspect { file: path(file) }),
+        ("inspect", _) => usage("inspect <file>"),
         ("quit" | "exit", []) => Ok(Request::Quit),
         ("help" | "?", _) => Err(HELP.to_string()),
         _ => Err(format!("unknown command: {line} (try `help`)", line = line.trim())),
@@ -182,6 +246,32 @@ mod tests {
         assert!(err("mine maybe").starts_with("usage"));
         assert!(err("fly").contains("unknown command"));
         assert!(err("help").contains("finalize <file>"));
+    }
+
+    #[test]
+    fn policy_commands_parse() {
+        assert!(matches!(ok("key"), Request::ContractKey { height: 0 }));
+        assert!(matches!(ok("key 16"), Request::ContractKey { height: 16 }));
+        assert!(parse("key 21").unwrap().is_err());
+        assert!(matches!(ok("hashlock"), Request::Hashlock));
+        assert!(matches!(ok("lock 2 p.txt"), Request::LockFunds { amount: 2_000_000_000, fee: DEFAULT_FEE, .. }));
+        assert!(matches!(ok("lock 2 p.txt 0.01"), Request::LockFunds { fee: 10_000_000, .. }));
+        match ok("spend p.txt 1 3 to=q.txt fee=0 state=7 out=u.tx") {
+            Request::SpendPolicy { branch, amount, to, fee, state, preimage, out, .. } => {
+                assert_eq!((branch, amount, fee, state, preimage), (1, 3 * UNITS_PER_COIN, 0, 7, None));
+                assert_eq!(to.unwrap(), PathBuf::from("q.txt"));
+                assert_eq!(out.unwrap(), PathBuf::from("u.tx"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(ok("spend p.txt 0 1"), Request::SpendPolicy { to: None, fee: DEFAULT_FEE, state: 0, .. }));
+        assert!(parse("spend p.txt 0 1 colour=red").unwrap().unwrap_err().contains("unknown option"));
+        assert!(parse("spend p.txt 0 1 preimage=zz").unwrap().is_err());
+        assert!(matches!(ok("sign u.tx"), Request::SignFile { .. }));
+        assert!(matches!(ok("fee u.tx 0.001"), Request::AttachFee { fee: 1_000_000, .. }));
+        assert!(matches!(ok("rebind u.tx p.txt 0 5"), Request::Rebind { branch: 0, amount: 5_000_000_000, .. }));
+        assert!(matches!(ok("submit u.tx"), Request::SubmitFile { .. }));
+        assert!(matches!(ok("inspect u.tx"), Request::Inspect { .. }));
     }
 
     #[test]

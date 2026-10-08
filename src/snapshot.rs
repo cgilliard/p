@@ -31,8 +31,9 @@ type Octet = [BabyBear; 8];
 pub const LEAF_LEVEL: usize = 12;
 /// How many levels one inner piece spans.
 pub const FANOUT_BITS: usize = 8;
-/// A leaf piece's entry: offset in the subtree (u16), commitment, nonce.
-const ENTRY_LEN: usize = 2 + 32 + NONCE_LEN;
+/// A leaf piece's entry: offset in the subtree (u16), commitment, nonce,
+/// creation height (u32).
+const ENTRY_LEN: usize = 2 + 32 + NONCE_LEN + 4;
 /// The largest a piece can be: a leaf piece of nothing but unspent outputs.
 pub const MAX_PIECE_BYTES: usize = (1 << LEAF_LEVEL) * ENTRY_LEN;
 
@@ -75,10 +76,11 @@ pub fn encode_inner(children: &[Octet]) -> Vec<u8> {
 pub fn encode_leaves(index: u64, entries: &[Entry]) -> Vec<u8> {
     let base = index << LEAF_LEVEL;
     let mut out = Vec::with_capacity(entries.len() * ENTRY_LEN);
-    for (position, commitment, nonce) in entries {
+    for (position, commitment, nonce, height) in entries {
         out.extend_from_slice(&((position - base) as u16).to_be_bytes());
         out.extend_from_slice(commitment);
         out.extend_from_slice(nonce);
+        out.extend_from_slice(&height.to_be_bytes());
     }
     out
 }
@@ -183,7 +185,8 @@ impl Plan {
             if offset >= 1 << LEAF_LEVEL || position >= self.count || !in_order {
                 return None;
             }
-            entries.push((position, e[2..34].try_into().unwrap(), e[34..].try_into().unwrap()));
+            let height = u32::from_be_bytes(e[34 + NONCE_LEN..].try_into().unwrap());
+            entries.push((position, e[2..34].try_into().unwrap(), e[34..34 + NONCE_LEN].try_into().unwrap(), height));
         }
         Some(entries)
     }
@@ -203,7 +206,7 @@ mod tests {
 
     fn entry(p: u64) -> Entry {
         let h = hash_bytes_32(&p.to_le_bytes());
-        (p, h, h[..16].try_into().unwrap())
+        (p, h, h[..16].try_into().unwrap(), (p % 5_000) as u32)
     }
 
     /// Serve every piece of a tree from its full contents.

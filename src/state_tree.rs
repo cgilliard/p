@@ -6,10 +6,12 @@
 //! order blocks create them -- and a leaf there:
 //!
 //! - `EMPTY` before anything is appended at it,
-//! - `leaf(commitment, nonce)` while it's unspent -- the output's
-//!   commitment and its recovery nonce, so the root authenticates both
-//!   (a fast-synced node's snapshot nonces can be checked, like its
-//!   commitments),
+//! - `leaf(commitment, nonce, height)` while it's unspent -- the output's
+//!   commitment, its recovery nonce, and the height of the block that
+//!   created it, so the root authenticates all three (a fast-synced
+//!   node's snapshot nonces can be checked, like its commitments; a
+//!   contract's relative timelock can be proven from the height,
+//!   `docs/CONTRACTS.md`),
 //! - `SPENT` once it's spent.
 //!
 //! The chain commits to `(root, count)`: the root of the `DEPTH`-level
@@ -77,8 +79,9 @@ pub const SPENT: Octet = {
 
 const NODES_DB: &str = "state_tree";
 const META_DB: &str = "state_meta";
-/// Unspent outputs by position (u64 BE) -> commitment ‖ nonce: what a leaf
-/// hashes, kept so a peer can be sent a subtree's contents (`snapshot`).
+/// Unspent outputs by position (u64 BE) -> commitment ‖ nonce ‖ height
+/// (u32 BE): what a leaf hashes, kept so a peer can be sent a subtree's
+/// contents (`snapshot`).
 const LEAVES_DB: &str = "state_leaves";
 const COUNT_KEY: &[u8] = b"count";
 
@@ -104,23 +107,31 @@ pub fn node(level: usize, left: &Octet, right: &Octet) -> Octet {
     compress(DOMAIN_STATE_NODE + level as u32, left, right)
 }
 
-/// The capacity octet of an unspent output's leaf hash.
-pub fn leaf_capacity() -> Octet {
+/// The capacity octet of an unspent output's leaf hash: its domain, the
+/// rate length, and the height of the block that created it (below 2^31,
+/// so one element).
+pub fn leaf_capacity(height: u32) -> Octet {
     let mut c = [BabyBear::ZERO; 8];
     c[0] = BabyBear::new(DOMAIN_STATE_LEAF);
     c[1] = BabyBear::new(16);
+    c[2] = BabyBear::new(height);
     c
 }
 
 /// An unspent output's leaf: its commitment and recovery nonce (as
-/// `output::nonce_limbs`), one permutation.
-pub fn leaf(commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN]) -> Octet {
-    compress_leaf(&digest_from_bytes(commitment), &crate::output::nonce_limbs(nonce))
+/// `output::nonce_limbs`), and its creation height in the capacity -- one
+/// permutation.
+pub fn leaf(commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN], height: u32) -> Octet {
+    compress_leaf(&digest_from_bytes(commitment), &crate::output::nonce_limbs(nonce), height)
 }
 
 /// `leaf`, from the commitment's and nonce's field elements.
-pub fn compress_leaf(commitment: &Octet, nonce_limbs: &Octet) -> Octet {
-    compress(DOMAIN_STATE_LEAF, commitment, nonce_limbs)
+pub fn compress_leaf(commitment: &Octet, nonce_limbs: &Octet, height: u32) -> Octet {
+    let mut state = [BabyBear::ZERO; 24];
+    state[..8].copy_from_slice(commitment);
+    state[8..16].copy_from_slice(nonce_limbs);
+    state[16..].copy_from_slice(&leaf_capacity(height));
+    perm24().permute(state)[..8].try_into().unwrap()
 }
 
 /// The hash of an all-`EMPTY` subtree of each height `0..=DEPTH`.
@@ -144,8 +155,13 @@ pub fn spent_hashes() -> Vec<Octet> {
     hashes
 }
 
-/// An unspent output: its position, commitment and recovery nonce.
-pub type Entry = (u64, [u8; 32], [u8; crate::recovery::NONCE_LEN]);
+/// An unspent output: its position, commitment, recovery nonce and
+/// creation height.
+pub type Entry = (u64, [u8; 32], [u8; crate::recovery::NONCE_LEN], u32);
+
+/// An unspent output's leaf data: commitment, recovery nonce, creation
+/// height.
+pub type LeafData = ([u8; 32], [u8; crate::recovery::NONCE_LEN], u32);
 
 /// The hash of subtree `(level, index)` of a tree holding `count` outputs,
 /// of which those in it still unspent are `unspent` (in position order, all
@@ -161,7 +177,7 @@ pub fn subtree_hash(level: usize, index: u64, count: u64, unspent: &[Entry], emp
     }
     if level == 0 {
         return match unspent {
-            [(_, commitment, nonce)] => leaf(commitment, nonce),
+            [(_, commitment, nonce, height)] => leaf(commitment, nonce, *height),
             _ => SPENT,
         };
     }
@@ -178,7 +194,7 @@ pub fn subtree_hash(level: usize, index: u64, count: u64, unspent: &[Entry], emp
 #[derive(Clone, Debug, Default)]
 pub struct AsOf {
     pub count: u64,
-    pub restored: std::collections::BTreeMap<u64, ([u8; 32], [u8; crate::recovery::NONCE_LEN])>,
+    pub restored: std::collections::BTreeMap<u64, LeafData>,
 }
 
 pub fn empty_root() -> [u8; 32] {
@@ -251,8 +267,8 @@ impl StateTree {
         })
     }
 
-    fn put_leaf(&self, wtxn: &mut heed::RwTxn, position: u64, commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN]) -> Result<()> {
-        self.leaves.put(wtxn, &position.to_be_bytes(), &[&commitment[..], &nonce[..]].concat())?;
+    fn put_leaf(&self, wtxn: &mut heed::RwTxn, position: u64, (commitment, nonce, height): &LeafData) -> Result<()> {
+        self.leaves.put(wtxn, &position.to_be_bytes(), &[&commitment[..], &nonce[..], &height.to_be_bytes()].concat())?;
         Ok(())
     }
 
@@ -268,10 +284,12 @@ impl StateTree {
             }
             let (key, value) = item?;
             let position = u64::from_be_bytes(key.try_into().map_err(|_| Error::Corrupt("leaf key"))?);
-            if value.len() != 32 + crate::recovery::NONCE_LEN {
+            const N: usize = crate::recovery::NONCE_LEN;
+            if value.len() != 32 + N + 4 {
                 return Err(Error::Corrupt("leaf record"));
             }
-            out.push((position, value[..32].try_into().unwrap(), value[32..].try_into().unwrap()));
+            let height = u32::from_be_bytes(value[32 + N..].try_into().unwrap());
+            out.push((position, value[..32].try_into().unwrap(), value[32..32 + N].try_into().unwrap(), height));
         }
         Ok(out)
     }
@@ -293,7 +311,7 @@ impl StateTree {
         }
         if level == 0 {
             return Ok(match as_of.restored.get(&lo) {
-                Some((commitment, nonce)) => leaf(commitment, nonce),
+                Some((commitment, nonce, height)) => leaf(commitment, nonce, *height),
                 None => self.get(txn, 0, lo)?,
             });
         }
@@ -309,7 +327,7 @@ impl StateTree {
             return Ok(Vec::new());
         }
         let mut out = self.unspent_in(txn, lo, hi)?;
-        out.extend(as_of.restored.range(lo..hi).map(|(&p, &(c, n))| (p, c, n)));
+        out.extend(as_of.restored.range(lo..hi).map(|(&p, &(c, n, h))| (p, c, n, h)));
         out.sort_unstable_by_key(|e| e.0);
         Ok(out)
     }
@@ -334,8 +352,8 @@ impl StateTree {
         for (k, hash) in stored {
             self.nodes.put(wtxn, &k, &digest_to_bytes(hash))?;
         }
-        for (position, commitment, nonce) in unspent {
-            self.put_leaf(wtxn, *position, commitment, nonce)?;
+        for &(position, commitment, nonce, height) in unspent {
+            self.put_leaf(wtxn, position, &(commitment, nonce, height))?;
         }
         self.set_count(wtxn, count)?;
         Ok(digest_to_bytes(root))
@@ -425,12 +443,12 @@ impl StateTree {
     }
 
     /// Append an output; its position.
-    pub fn push(&self, wtxn: &mut heed::RwTxn, commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN]) -> Result<u64> {
+    pub fn push(&self, wtxn: &mut heed::RwTxn, data: &LeafData) -> Result<u64> {
         let position = self.count(wtxn)?;
         if position >= 1 << DEPTH {
             return Err(Error::Full);
         }
-        self.put_leaf(wtxn, position, commitment, nonce)?;
+        self.put_leaf(wtxn, position, data)?;
         self.set_count(wtxn, position + 1)?;
         self.update(wtxn, position)?;
         Ok(position)
@@ -443,8 +461,8 @@ impl StateTree {
     }
 
     /// Undo `spend`: the output at `position` is unspent again.
-    pub fn unspend(&self, wtxn: &mut heed::RwTxn, position: u64, commitment: &[u8; 32], nonce: &[u8; crate::recovery::NONCE_LEN]) -> Result<()> {
-        self.put_leaf(wtxn, position, commitment, nonce)?;
+    pub fn unspend(&self, wtxn: &mut heed::RwTxn, position: u64, data: &LeafData) -> Result<()> {
+        self.put_leaf(wtxn, position, data)?;
         self.update(wtxn, position)
     }
 
@@ -541,6 +559,14 @@ mod tests {
         hash_bytes_32(&(k + 1_000_000).to_le_bytes())[..16].try_into().unwrap()
     }
 
+    fn height(k: u64) -> u32 {
+        (k % 1_000) as u32 + 7
+    }
+
+    fn data(k: u64) -> LeafData {
+        (commitment(k), nonce(k), height(k))
+    }
+
     /// The stored tree agrees with the in-memory reference
     /// (`state_circuit::MemTree`), operation by operation.
     #[test]
@@ -551,12 +577,12 @@ mod tests {
         assert_eq!(tree.root(&wtxn).unwrap(), empty_root());
         assert_eq!(tree.root(&wtxn).unwrap(), digest_to_bytes(reference.root()));
         for k in 0..40 {
-            assert_eq!(tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap(), k);
-            reference.append(leaf(&commitment(k), &nonce(k)));
+            assert_eq!(tree.push(&mut wtxn, &data(k)).unwrap(), k);
+            reference.append(leaf(&commitment(k), &nonce(k), height(k)));
         }
         for k in [3, 17, 39, 0] {
             tree.spend(&mut wtxn, k).unwrap();
-            reference.spend(&leaf(&commitment(k), &nonce(k)));
+            reference.spend(&leaf(&commitment(k), &nonce(k), height(k)));
         }
         assert_eq!(tree.root(&wtxn).unwrap(), digest_to_bytes(reference.root()));
         assert_eq!(tree.count(&wtxn).unwrap(), 40);
@@ -564,10 +590,11 @@ mod tests {
             assert_eq!(tree.path(&wtxn, p).unwrap(), reference.path(p));
         }
         assert_eq!(tree.leaf_at(&wtxn, 3).unwrap(), SPENT);
-        assert_eq!(tree.leaf_at(&wtxn, 4).unwrap(), leaf(&commitment(4), &nonce(4)));
+        assert_eq!(tree.leaf_at(&wtxn, 4).unwrap(), leaf(&commitment(4), &nonce(4), height(4)));
         assert_eq!(tree.leaf_at(&wtxn, 40).unwrap(), EMPTY);
         // The leaf commits to the nonce as well as the commitment.
-        assert_ne!(leaf(&commitment(4), &nonce(4)), leaf(&commitment(4), &nonce(5)));
+        assert_ne!(leaf(&commitment(4), &nonce(4), height(4)), leaf(&commitment(4), &nonce(5), height(4)));
+        assert_ne!(leaf(&commitment(4), &nonce(4), height(4)), leaf(&commitment(4), &nonce(4), height(5)));
     }
 
     /// Undoing appends and spends restores the exact previous state --
@@ -577,17 +604,17 @@ mod tests {
         let (_d, storage, tree) = open("undo");
         let mut wtxn = storage.write_txn().unwrap();
         for k in 0..10 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         let (root, stored) = (tree.root(&wtxn).unwrap(), tree.nodes.len(&wtxn).unwrap());
         tree.spend(&mut wtxn, 2).unwrap();
         tree.spend(&mut wtxn, 7).unwrap();
         for k in 10..15 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         tree.truncate(&mut wtxn, 5).unwrap();
-        tree.unspend(&mut wtxn, 7, &commitment(7), &nonce(7)).unwrap();
-        tree.unspend(&mut wtxn, 2, &commitment(2), &nonce(2)).unwrap();
+        tree.unspend(&mut wtxn, 7, &data(7)).unwrap();
+        tree.unspend(&mut wtxn, 2, &data(2)).unwrap();
         assert_eq!(tree.root(&wtxn).unwrap(), root);
         assert_eq!(tree.count(&wtxn).unwrap(), 10);
         assert_eq!(tree.nodes.len(&wtxn).unwrap(), stored);
@@ -602,7 +629,7 @@ mod tests {
         let (_d, storage, tree) = open("sparse");
         let mut wtxn = storage.write_txn().unwrap();
         for k in 0..1000 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         // ~2 per leaf below the occupied subtree, plus one per level above.
         let stored = tree.nodes.len(&wtxn).unwrap();
@@ -618,7 +645,7 @@ mod tests {
         let (_d2, storage2, imported) = open("import-dst");
         let mut wtxn = storage.write_txn().unwrap();
         for k in 0..300 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         // Everything spent but a few, leaving fully spent regions.
         let keep = [5u64, 6, 130, 257, 299];
@@ -645,14 +672,14 @@ mod tests {
         // Both go on the same way.
         for t in [(&tree, &mut wtxn), (&imported, &mut wtxn2)] {
             t.0.spend(t.1, 130).unwrap();
-            t.0.push(t.1, &commitment(300), &nonce(300)).unwrap();
+            t.0.push(t.1, &data(300)).unwrap();
             t.0.spend(t.1, 300).unwrap();
-            t.0.push(t.1, &commitment(301), &nonce(301)).unwrap();
+            t.0.push(t.1, &data(301)).unwrap();
         }
         assert_eq!(imported.root(&wtxn2).unwrap(), tree.root(&wtxn).unwrap());
         assert_eq!(imported.unspent_in(&wtxn2, 0, 1000).unwrap(), tree.unspent_in(&wtxn, 0, 1000).unwrap());
         // Out-of-range entries are refused.
-        assert!(imported.import(&mut wtxn2, 3, &[(3, commitment(1), nonce(1))]).is_err());
+        assert!(imported.import(&mut wtxn2, 3, &[(3, commitment(1), nonce(1), height(1))]).is_err());
     }
 
     /// Views as of an earlier state, from the current tree plus what
@@ -662,7 +689,7 @@ mod tests {
         let (_d, storage, tree) = open("as-of");
         let mut wtxn = storage.write_txn().unwrap();
         for k in 0..100 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         for k in [1, 2, 3, 50] {
             tree.spend(&mut wtxn, k).unwrap();
@@ -673,10 +700,10 @@ mod tests {
         let mut as_of = AsOf { count: 100, ..AsOf::default() };
         for k in [0, 4, 99] {
             tree.spend(&mut wtxn, k).unwrap();
-            as_of.restored.insert(k, (commitment(k), nonce(k)));
+            as_of.restored.insert(k, (commitment(k), nonce(k), height(k)));
         }
         for k in 100..140 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         tree.spend(&mut wtxn, 120).unwrap();
         assert_ne!(tree.root(&wtxn).unwrap(), root);
@@ -708,7 +735,7 @@ mod tests {
             let count = tree.count(&wtxn).unwrap();
             match random(10) {
                 0..=4 => {
-                    tree.push(&mut wtxn, &commitment(next), &nonce(next)).unwrap();
+                    tree.push(&mut wtxn, &data(next)).unwrap();
                     next += 1;
                 }
                 5..=7 if count > 0 => {
@@ -721,7 +748,7 @@ mod tests {
                     let p = random(count);
                     if tree.unspent_in(&wtxn, p, p + 1).unwrap().is_empty() {
                         let k = p; // commitment(k) was pushed at p only if never truncated; any value does here
-                        tree.unspend(&mut wtxn, p, &commitment(k + 1_000_000), &nonce(k)).unwrap();
+                        tree.unspend(&mut wtxn, p, &(commitment(k + 1_000_000), nonce(k), height(k))).unwrap();
                     }
                 }
                 _ if count > 0 => tree.truncate(&mut wtxn, random(count.min(40)) + 1).unwrap(),
@@ -754,7 +781,7 @@ mod tests {
         let (_d, storage, tree) = open("overlay");
         let mut wtxn = storage.write_txn().unwrap();
         for k in 0..40 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         let climb = |position: u64, leaf: Octet, path: &[Octet]| {
             path.iter().enumerate().fold(leaf, |h, (level, sibling)| {
@@ -766,13 +793,13 @@ mod tests {
         for (spend, append) in [(Some(17), 43), (None, 40), (Some(3), 44), (Some(39), 41), (None, 42)] {
             if let Some(p) = spend {
                 let path = overlay.path(p).unwrap();
-                assert_eq!(climb(p, leaf(&commitment(p), &nonce(p)), &path), overlay.root().unwrap());
+                assert_eq!(climb(p, leaf(&commitment(p), &nonce(p), height(p)), &path), overlay.root().unwrap());
                 overlay.set(p, SPENT).unwrap();
                 assert_eq!(climb(p, SPENT, &path), overlay.root().unwrap());
             }
             let path = overlay.path(append).unwrap();
             assert_eq!(climb(append, EMPTY, &path), overlay.root().unwrap());
-            let new = leaf(&commitment(append), &nonce(append));
+            let new = leaf(&commitment(append), &nonce(append), height(append));
             overlay.set(append, new).unwrap();
             assert_eq!(climb(append, new, &path), overlay.root().unwrap());
         }
@@ -782,7 +809,7 @@ mod tests {
             tree.spend(&mut wtxn, p).unwrap();
         }
         for k in 40..45 {
-            tree.push(&mut wtxn, &commitment(k), &nonce(k)).unwrap();
+            tree.push(&mut wtxn, &data(k)).unwrap();
         }
         assert_eq!(digest_to_bytes(root), tree.root(&wtxn).unwrap());
     }

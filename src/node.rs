@@ -52,6 +52,29 @@ pub enum Request {
     Status,
     Mine(bool),
     Seed,
+    /// A new key for spending policies: one-time, or a key tree of
+    /// `2^height` leaves (`docs/CONTRACTS.md`; `contract`).
+    ContractKey { height: usize },
+    /// A fresh hash-lock preimage and its image.
+    Hashlock,
+    /// Pay `amount` (plus `fee`) into an output locked to the policy in
+    /// `policy`.
+    LockFunds { amount: u64, fee: u64, policy: PathBuf },
+    /// Write an unsigned spend of a policy output (`amount`, locked to the
+    /// policy in `policy`) by branch `branch`, paying `amount - fee` to
+    /// this wallet or (`to`) another policy; a REBIND branch declares
+    /// `state`.
+    SpendPolicy { policy: PathBuf, branch: u32, amount: u64, to: Option<PathBuf>, fee: u64, state: u32, preimage: Option<[u8; 32]>, out: Option<PathBuf> },
+    /// Sign a transaction file with this wallet's policy keys.
+    SignFile { file: PathBuf },
+    /// Add a fee input (and change) from the wallet to a transaction file.
+    AttachFee { file: PathBuf, fee: u64 },
+    /// Re-point a transaction file's REBIND input at another output.
+    Rebind { file: PathBuf, policy: PathBuf, branch: u32, amount: u64 },
+    /// Submit a transaction file.
+    SubmitFile { file: PathBuf },
+    /// Summarize a transaction file.
+    Inspect { file: PathBuf },
     Quit,
 }
 
@@ -725,6 +748,86 @@ impl Node {
                     .collect();
                 Ok(lines.join("\n"))
             }
+            Request::ContractKey { height } => {
+                let id = self.wallet.new_contract_key(height).map_err(|e| e.to_string())?;
+                let kind = if height == 0 { "a one-time key (signs once)".to_string() } else { format!("a key tree of {} signatures", 1u64 << height) };
+                Ok(format!("key {}\n{kind} -- list it in a policy's `keys=`", crate::hex(&id)))
+            }
+            Request::Hashlock => {
+                let preimage = crate::poseidon2::hash_bytes_32(&crate::keychain::random_bytes());
+                let image = crate::policy::hashlock(&preimage).ok_or("preimage generation failed")?;
+                Ok(format!(
+                    "preimage {}\nimage    {}\n(the image goes in a policy's `hashlock=`; keep the preimage secret until it's spent)",
+                    crate::hex(&preimage),
+                    crate::hex(&image)
+                ))
+            }
+            Request::LockFunds { amount, fee, policy } => {
+                let policy = crate::contract::read_policy(&policy)?;
+                let tx = self.wallet.lock_funds(policy.lock(), amount, fee, tip).map_err(|e| e.to_string())?;
+                let output = crate::output::Output::locked(policy.lock(), amount).commitment();
+                self.submit(tx).map_err(|e| format!("signed, but not accepted: {e}"))?;
+                Ok(format!("submitted: {} locked to the policy (output {})", format_amount(amount), crate::hex(&output[..8])))
+            }
+            Request::SpendPolicy { policy, branch, amount, to, fee, state, preimage, out } => {
+                let policy = crate::contract::read_policy(&policy)?;
+                let b = policy.branches.get(branch as usize).ok_or("no such branch (they're numbered from 0)")?.clone();
+                let paid = amount.checked_sub(fee).filter(|&p| p > 0).ok_or("the fee must be less than the amount")?;
+                if let Some(s) = b.rebind
+                    && state <= s
+                {
+                    return Err(format!("a REBIND branch at state {s} needs a higher state= declared"));
+                }
+                let output = match &to {
+                    None => self.wallet.fresh_output(paid).map_err(|e| e.to_string())?,
+                    Some(file) => crate::output::Output::locked(crate::contract::read_policy(file)?.lock(), paid),
+                };
+                let path = policy.path(branch).iter().map(|h| crate::poseidon2::digest_to_bytes(*h)).collect();
+                let mut tx = Transaction::new();
+                let named = if b.rebind.is_some() { vec![output.commitment()] } else { Vec::new() };
+                let state = if b.rebind.is_some() { state } else { 0 };
+                tx.add_rebind_input(b, branch, path, preimage, amount, state, named).map_err(|e| e.to_string())?;
+                tx.add_output(output).map_err(|e| e.to_string())?;
+                let file = out.unwrap_or_else(|| PathBuf::from(format!("{}.tx", crate::hex(&tx.inputs[0].commitment()[..8]))));
+                crate::contract::write_transaction(&tx, &file)?;
+                Ok(format!("wrote {} -- each signer runs `sign` on it, then `submit` it\n{}", file.display(), crate::contract::describe(&tx).trim_end()))
+            }
+            Request::SignFile { file } => {
+                let mut tx = crate::contract::read_transaction(&file)?;
+                let added = self.wallet.sign_contract(&mut tx).map_err(|e| e.to_string())?;
+                crate::contract::write_transaction(&tx, &file)?;
+                Ok(format!("added {added} signature(s) to {}\n{}", file.display(), crate::contract::describe(&tx).trim_end()))
+            }
+            Request::AttachFee { file, fee } => {
+                let tx = crate::contract::read_transaction(&file)?;
+                let tx = self.wallet.attach_fee(tx, fee, tip).map_err(|e| e.to_string())?;
+                crate::contract::write_transaction(&tx, &file)?;
+                Ok(format!("added a fee of {} to {}\n{}", format_amount(fee), file.display(), crate::contract::describe(&tx).trim_end()))
+            }
+            Request::Rebind { file, policy, branch, amount } => {
+                let mut tx = crate::contract::read_transaction(&file)?;
+                let policy = crate::contract::read_policy(&policy)?;
+                let b = policy.branches.get(branch as usize).ok_or("no such branch (they're numbered from 0)")?.clone();
+                let current = tx.inputs.iter().find(|i| i.rebinds()).ok_or("the transaction has no REBIND input")?.commitment();
+                let path = policy.path(branch).iter().map(|h| crate::poseidon2::digest_to_bytes(*h)).collect();
+                if !tx.rebind(&current, b, branch, path, amount) {
+                    return Err("can't re-point it: it already has an ordinary signature (re-point before `fee`)".into());
+                }
+                crate::contract::write_transaction(&tx, &file)?;
+                Ok(format!("re-pointed {}\n{}", file.display(), crate::contract::describe(&tx).trim_end()))
+            }
+            Request::SubmitFile { file } => {
+                let tx = crate::contract::read_transaction(&file)?;
+                if !tx.verify() {
+                    return Err("not fully signed yet (see `inspect`)".into());
+                }
+                let id = tx.id();
+                match self.submit(tx) {
+                    Ok(_) | Err(Rejection::AlreadyKnown) => Ok(format!("submitted: transaction {}", crate::hex(&id[..8]))),
+                    Err(e) => Err(format!("not accepted: {e}")),
+                }
+            }
+            Request::Inspect { file } => Ok(crate::contract::describe(&crate::contract::read_transaction(&file)?).trim_end().to_string()),
             Request::Send { amount, fee, file } => {
                 let slate = self.wallet.send(amount, fee, tip).map_err(|e| e.to_string())?;
                 let path = file.unwrap_or_else(|| PathBuf::from(format!("{}.s1.slate", slate.id_hex())));

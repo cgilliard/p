@@ -48,7 +48,6 @@
 
 #![allow(dead_code)]
 
-use crate::output::Output;
 use crate::poseidon2::hash_bytes_32;
 use crate::pow;
 use crate::prover::Proof;
@@ -288,7 +287,7 @@ impl BlockBody {
             return false;
         }
         for input in &tx.inputs {
-            let commitment = Output::new(&input.pubkey, input.amount).commitment();
+            let commitment = input.commitment();
             self.push_input(commitment);
         }
         for output in &tx.outputs {
@@ -361,11 +360,12 @@ impl BlockBody {
 
     /// Whether `proof` actually attests to this body's `inputs`/
     /// `outputs`, and to the state moving as `state` says (from the
-    /// parent's root and output count to the header's) -- see `prover`'s
-    /// docs -- claiming exactly `reward`. By far the most expensive check
+    /// parent's root and output count to the header's, its outputs at
+    /// `height`) -- see `prover`'s docs -- claiming exactly `reward`. By
+    /// far the most expensive check
     /// a block gets.
-    pub fn proof_is_valid(&self, state: &crate::aggregate::StateChange, reward: u64) -> bool {
-        self.proof.verify(&self.inputs, &self.outputs, &self.nonces, state, reward)
+    pub fn proof_is_valid(&self, state: &crate::aggregate::StateChange, height: u32, reward: u64) -> bool {
+        self.proof.verify(&self.inputs, &self.outputs, &self.nonces, state, height, reward)
     }
 
     /// `to_bytes().len()`, without building the bytes.
@@ -617,7 +617,8 @@ impl Block {
     /// against the parent's state: `parent_state` is its `(state_root,
     /// output_count)`; and the reward, the schedule's at its height.
     pub fn validate(&self, target: &[u8; 32], pow: &pow::Params, parent_state: ([u8; 32], u64), reward: u64) -> bool {
-        self.validate_structure(target, pow) && self.body.proof_is_valid(&self.state_change(parent_state), reward)
+        let Ok(height) = u32::try_from(self.header.height) else { return false };
+        self.validate_structure(target, pow) && self.body.proof_is_valid(&self.state_change(parent_state), height, reward)
     }
 
     /// The state change this block claims, from its parent's state.
@@ -715,6 +716,7 @@ pub fn mine_block(block: &mut Block, target: &[u8; 32], max_attempts: u64, pow: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::Output;
     use crate::wots::{self, PublicKey, SecretKey};
 
     fn keypair(byte: u8) -> (SecretKey, PublicKey) {

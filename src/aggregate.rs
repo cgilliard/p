@@ -23,22 +23,25 @@
 //!   it moves between (`StateChange`), and the block's **window** of
 //!   output positions (`counts` = `[count_in, count_out, base, end]`).
 //! - `challenge` and `product` tie the tree to the block's body without
-//!   saying which chunk holds what (below).
+//!   saying which chunk holds what (below). `product`'s octet also
+//!   carries the block's **height** (`[product, height, 0, 0, 0]`), which
+//!   every leaf the block appends records.
 //!
 //! - A **wrap** circuit (W) verifies one chunk proof; `data` is the hash
 //!   of the chunk's statement with its amounts blanked, and a random salt
 //!   (`chunk_data`), and `amounts` its `[a limbs, b limbs]`, range-checked.
 //!   It also **applies the chunk to the state** (`apply_transition`): each
-//!   input's output -- `leaf(commitment, nonce)` at its position --
-//!   becomes spent, and each output's leaf is placed at its own position
-//!   in the block's window, an empty one; unused slots change nothing.
+//!   input's output -- `leaf(commitment, nonce, height)` at its position,
+//!   `height` its creation height -- becomes spent, and each output's
+//!   leaf, at the block's height, is placed at its own position in the
+//!   block's window, an empty one; unused slots change nothing.
 //!   Its `vk` input is unused.
 //! - An **aggregation** circuit (A) verifies two tree proofs; `data` is
 //!   the hash of theirs (`data_node`), `amounts` their sum (carried, so it
 //!   can't wrap), `product` theirs multiplied, and the state runs from the
 //!   left child's start, through the point where it ends and the right
 //!   child starts (they must match), to the right child's end. Both carry
-//!   its window and challenge.
+//!   its window, challenge and height.
 //!
 //! Since all tree proofs have one shape, A's verifier logic handles any
 //! child; *which* circuit a child is of is told by its verifying key, the
@@ -108,7 +111,8 @@ pub fn vk_digest(cap: &[Hash]) -> Octet {
 }
 
 /// A tree leaf's data: the hash of a chunk's statement with its amounts
-/// blanked (they travel separately, summed), and `salt` -- fresh random
+/// and height blanked (they travel separately -- the amounts summed, the
+/// height in every node), and `salt` -- fresh random
 /// elements, so the root's data can't be checked against a guess at how
 /// a block's commitments are grouped.
 pub fn chunk_data(chunk: &BlockAir, salt: Octet) -> Octet {
@@ -119,8 +123,8 @@ pub fn chunk_data(chunk: &BlockAir, salt: Octet) -> Octet {
 
 fn blanked_statement(chunk: &BlockAir) -> Vec<BabyBear> {
     let (_, mut tuples) = chunk.bus().expect("the block circuit has a bus");
-    for v in &mut tuples[0].1[3..] {
-        *v = BabyBear::ZERO; // the amounts tuple: [tag, 0, 0, a limbs, b limbs]
+    for v in &mut tuples[0].1[1..] {
+        *v = BabyBear::ZERO; // the amounts tuple: [tag, height, 0, a limbs, b limbs]
     }
     recursion::recursive_statement(&chunk.statement_header(), &tuples)
 }
@@ -180,10 +184,11 @@ pub fn chunk_product(chunk: &BlockAir, challenge: &Octet) -> Ext {
     product(challenge, chunk.public_inputs(), &outputs)
 }
 
-/// `[product, 0, 0, 0, 0]`.
-fn product_octet(p: Ext) -> Octet {
+/// `[product, height, 0, 0, 0]`.
+fn product_octet(p: Ext, height: u32) -> Octet {
     let mut o = [BabyBear::ZERO; 8];
     o[..4].copy_from_slice(&p.0);
+    o[4] = BabyBear::new(height);
     o
 }
 
@@ -224,6 +229,8 @@ pub struct Node {
     pub window: (u64, u64),
     pub challenge: Octet,
     pub product: Ext,
+    /// The block's height: its appended leaves' (`state_tree::leaf`).
+    pub height: u32,
 }
 
 /// The chain state (`state_tree`) a tree proof moves between: root and
@@ -256,23 +263,25 @@ pub fn wide(v: u64) -> [BabyBear; 2] {
 }
 
 /// What a wrap needs, beyond the chunk proof, to apply its chunk to the
-/// state: the block's window of output positions; for each input slot (in
-/// the statement's order), the spent output's position and recovery nonce
-/// and the path to it at its turn; for each output slot, its position (in
-/// the window: the output's place in the body's list, from `base`) and
-/// the path at its turn. (Unused slots are no-ops at position `end`,
-/// empty throughout the block.)
+/// state: the block's window of output positions and its height; for each
+/// input slot (in the statement's order), the spent output's position,
+/// recovery nonce and creation height, and the path to it at its turn;
+/// for each output slot, its position (in the window: the output's place
+/// in the body's list, from `base`) and the path at its turn. (Unused
+/// slots are no-ops at position `end`, empty throughout the block.)
 #[derive(Clone, Debug)]
 pub struct ChunkTransition {
     pub change: StateChange,
     pub window: (u64, u64),
-    pub inputs: Vec<(u64, [u8; crate::recovery::NONCE_LEN], Vec<Octet>)>,
+    pub height: u32,
+    pub inputs: Vec<(u64, [u8; crate::recovery::NONCE_LEN], u32, Vec<Octet>)>,
     pub outputs: Vec<(u64, Vec<Octet>)>,
 }
 
 /// A tree node's public inputs, as values.
-fn public_values(vk: Octet, data: Octet, amounts: (u64, u64), state: &StateChange, window: (u64, u64), challenge: Octet, product: Ext) -> [Octet; 8] {
-    [vk, data, amounts_octet(amounts), state.root_in, state.root_out, state.counts_octet(window), challenge, product_octet(product)]
+#[allow(clippy::too_many_arguments)]
+fn public_values(vk: Octet, data: Octet, amounts: (u64, u64), state: &StateChange, window: (u64, u64), challenge: Octet, product: Ext, height: u32) -> [Octet; 8] {
+    [vk, data, amounts_octet(amounts), state.root_in, state.root_out, state.counts_octet(window), challenge, product_octet(product, height)]
 }
 
 /// The public inputs as bus tuples (`circuit::Builder::with_public`
@@ -402,28 +411,32 @@ fn wrap_builder(chunk: &BlockAir, proof: &Proof, transition: &ChunkTransition, b
         transition.window,
         binding.challenge,
         chunk_product(chunk, &binding.challenge),
+        transition.height,
     ));
     let statement = recursion::verify(&mut b, chunk, proof, params).ok_or(Error::InvalidProof)?;
     let (ins, outs) = chunk.capacity().ok_or(Error::InvalidProof)?;
     if statement.tuples.len() != 1 + ins + outs || transition.inputs.len() != ins || transition.outputs.len() != outs {
         return Err(Error::InvalidProof);
     }
-    let product = apply_transition(&mut b, &statement, ins, outs, transition, [public[3], public[4], public[5]], public[6]);
+    // [product, height, 0, 0, 0].
     let (product_lo, product_hi) = b.halves(public[7]);
+    let height = b.lane(product_hi, 0);
+    b.assert_eq(product_hi, height);
+    let product = apply_transition(&mut b, &statement, ins, outs, transition, [public[3], public[4], public[5]], public[6], height);
     b.assert_eq(product, product_lo);
-    b.assert_zero(product_hi);
 
-    // The amounts tuple, first: [TAG_NET, 0, 0, a0..a3 | b0..b3, 0, 0, ...].
+    // The amounts tuple, first: [TAG_NET, height, 0, a0..a3 | b0..b3, 0, 0,
+    // ...] -- the chunk's height the tree's.
     let net = &statement.tuples[0];
     let (lo0, hi0) = b.halves(net[0]);
     let (lo1, hi1) = b.halves(net[1]);
     let tag = b.lane(lo0, 0);
     let expected_tag = b.const_base(BabyBear::new(crate::block_air::TAG_NET));
     b.assert_eq(tag, expected_tag);
-    for l in [1, 2] {
-        let lane = b.lane(lo0, l);
-        b.assert_zero(lane);
-    }
+    let chunk_height = b.lane(lo0, 1);
+    b.assert_eq(chunk_height, height);
+    let lane = b.lane(lo0, 2);
+    b.assert_zero(lane);
     let last = b.lane(lo1, 3);
     b.assert_zero(last);
     b.assert_zero(hi1);
@@ -531,12 +544,14 @@ fn assert_near(b: &mut Builder, active: EVar, x: [EVar; 2], y: [EVar; 2], offset
 }
 
 /// Apply a chunk's inputs and outputs, as its statement lists them, to
-/// the state: `[root_in, root_out, counts]` are the public cells. Each
-/// used input slot's output -- `leaf(commitment, nonce)` at its position
-/// -- becomes `SPENT`; each used output slot's leaf goes to its position,
-/// which must be empty and inside the block's window `base..end`, and
-/// the count grows by the outputs placed. Unused slots (multiplicity 0)
-/// change nothing.
+/// the state: `[root_in, root_out, counts]` are the public cells, and
+/// `height` the block's. Each used input slot's output -- `leaf(commitment,
+/// nonce, created)` at its position, `created` the creation height the
+/// statement gives it (which its timelocks were checked against) --
+/// becomes `SPENT`; each used output slot's leaf, at `height`, goes to
+/// its position, which must be empty and inside the block's window
+/// `base..end`, and the count grows by the outputs placed. Unused slots
+/// (multiplicity 0) change nothing.
 ///
 /// Returns the chunk's product (`product`) under `challenge`: each used
 /// slot's term, multiplied.
@@ -554,6 +569,7 @@ fn apply_transition(
     t: &ChunkTransition,
     state: [OVar; 3],
     challenge: OVar,
+    height: EVar,
 ) -> EVar {
     use crate::block_air::{TAG_PIN, TAG_POUT};
     use crate::state_circuit::{leaf_hash, replace};
@@ -591,9 +607,10 @@ fn apply_transition(
         let f = b.mul_add(c_lo, powers[0], expected);
         let mut f = b.mul_add(c_hi, powers[1], f);
         if slot < ins {
-            let (position, nonce, siblings) = &t.inputs[slot];
+            let (position, nonce, _, siblings) = &t.inputs[slot];
             let nonce = b.witness_octet(crate::output::nonce_limbs(nonce));
-            let leaf = leaf_hash(b, commitment, nonce);
+            let created = lane_of(b, cells[0], 1);
+            let leaf = leaf_hash(b, commitment, nonce, created);
             let old = select_octet(b, used, empty, leaf);
             let new = select_octet(b, used, empty, spent);
             let (_, bits) = witness_wide(b, *position);
@@ -604,7 +621,7 @@ fn apply_transition(
             let (n_lo, n_hi) = b.halves(nonce);
             f = b.mul_add(n_lo, powers[2], f);
             f = b.mul_add(n_hi, powers[3], f);
-            let leaf = leaf_hash(b, commitment, nonce);
+            let leaf = leaf_hash(b, commitment, nonce, height);
             let new = select_octet(b, used, empty, leaf);
             let (p, bits) = witness_wide(b, *position);
             // A used slot's position: base <= p < end.
@@ -666,6 +683,7 @@ pub fn wrap(
         window: transition.window,
         challenge: binding.challenge,
         product: chunk_product(chunk, &binding.challenge),
+        height: transition.height,
     })
 }
 
@@ -681,11 +699,11 @@ pub(crate) fn assert_select(b: &mut Builder, x: EVar, s: EVar, y: EVar, z: EVar)
 
 /// A parent's values over `children`: data, amounts, state change and
 /// product; `None` if they don't fit together (amounts overflowing, the
-/// state not continuing, another window or challenge).
+/// state not continuing, another window, challenge or height).
 fn parent_of(children: [&Node; 2]) -> Option<(Octet, (u64, u64), StateChange, Ext)> {
     let [l, r] = children;
     let amounts = (l.amounts.0.checked_add(r.amounts.0)?, l.amounts.1.checked_add(r.amounts.1)?);
-    if l.state.root_out != r.state.root_in || l.state.count_out != r.state.count_in || l.window != r.window || l.challenge != r.challenge {
+    if l.state.root_out != r.state.root_in || l.state.count_out != r.state.count_in || l.window != r.window || l.challenge != r.challenge || l.height != r.height {
         return None;
     }
     let state = StateChange {
@@ -701,8 +719,9 @@ fn parent_of(children: [&Node; 2]) -> Option<(Octet, (u64, u64), StateChange, Ex
 /// value of its `vk` input, `wrap_vk` the wrap circuit's key.
 fn aggregate_circuit(children: [&Node; 2], wrap_vk: Octet, self_vk: Octet, tree: &TreeParams) -> Result<Circuit, Error> {
     let (data, amounts, state, product) = parent_of(children).ok_or(Error::InvalidProof)?;
-    let (window, challenge) = (children[0].window, children[0].challenge);
-    let (mut b, public) = Builder::with_public(&public_values(self_vk, data, amounts, &state, window, challenge, product));
+    let (window, challenge, height) = (children[0].window, children[0].challenge, children[0].height);
+    let (mut b, public) = Builder::with_public(&public_values(self_vk, data, amounts, &state, window, challenge, product, height));
+    let product_hi = b.halves(public[7]).1;
     let (self_lo, self_hi) = b.halves(public[0]);
     let wrap_vk = b.const_octet(wrap_vk);
     let (wrap_lo, wrap_hi) = b.halves(wrap_vk);
@@ -744,8 +763,10 @@ fn aggregate_circuit(children: [&Node; 2], wrap_vk: Octet, self_vk: Octet, tree:
             let gated = b.mul(s, d);
             b.assert_zero(gated);
         }
-        // The same challenge.
+        // The same challenge and height.
         b.assert_eq_octet(statement.tuples[6][0], public[6]);
+        let child_hi = b.halves(statement.tuples[7][0]).1;
+        b.assert_eq(child_hi, product_hi);
         child_data.push(data_cell);
         child_amounts.push(limbs_of(&mut b, amounts_cell));
         child_states.push([statement.tuples[3][0], statement.tuples[4][0], statement.tuples[5][0]]);
@@ -765,9 +786,8 @@ fn aggregate_circuit(children: [&Node; 2], wrap_vk: Octet, self_vk: Octet, tree:
     b.assert_eq_octet(cell, public[2]);
 
     let product = b.mul(child_products[0], child_products[1]);
-    let (product_lo, product_hi) = b.halves(public[7]);
+    let product_lo = b.halves(public[7]).0;
     b.assert_eq(product, product_lo);
-    b.assert_zero(product_hi);
 
     // The state: the left child's ends where the right's starts; this
     // node moves from the left's start to the right's end. Both have its
@@ -811,6 +831,7 @@ pub fn aggregate(key: &Key, wrap: &Key, children: [&Node; 2], tree: &TreeParams,
         window: children[0].window,
         challenge: children[0].challenge,
         product,
+        height: children[0].height,
         air,
         proof,
     })
@@ -873,7 +894,7 @@ impl VerifyingKey {
     ///
     /// The root also attests the block's state transition, `state`: from
     /// the parent's state root and output count to the new ones, the
-    /// outputs at positions `count_in..count_out`.
+    /// outputs at positions `count_in..count_out` with the block's height.
     pub fn verify_block(&self, block: &RootClaim, reward: u64, proof: &Proof) -> bool {
         if block.amounts.0.checked_sub(block.amounts.1) != Some(reward) {
             return false;
@@ -894,7 +915,7 @@ impl VerifyingKey {
         } else {
             (&self.wrap_cap, [BabyBear::ZERO; 8])
         };
-        let air = self.circuit(cap, public_tuples(public_values(vk, block.data, block.amounts, &block.state, window, challenge, product)));
+        let air = self.circuit(cap, public_tuples(public_values(vk, block.data, block.amounts, &block.state, window, challenge, product, block.height)));
         Node {
             air,
             proof,
@@ -904,18 +925,20 @@ impl VerifyingKey {
             window,
             challenge,
             product,
+            height: block.height,
         }
     }
 }
 
 /// What a block's root proof is checked against: the block's body
-/// (inputs; outputs with their nonces), its state change, and what the
-/// proof itself publishes -- the root's kind, data and amounts.
+/// (inputs; outputs with their nonces), its state change and height, and
+/// what the proof itself publishes -- the root's kind, data and amounts.
 #[derive(Clone, Debug)]
 pub struct RootClaim {
     pub inputs: Vec<Octet>,
     pub outputs: Vec<(Octet, Octet)>,
     pub state: StateChange,
+    pub height: u32,
     pub aggregated: bool,
     pub data: Octet,
     pub amounts: (u64, u64),
@@ -945,6 +968,17 @@ mod tests {
         outputs: Vec<(Octet, Octet)>,
     }
 
+    /// The test blocks' height, and their inputs' creation height.
+    const HEIGHT: u32 = 5;
+    const CREATED: u32 = 2;
+
+    /// `block_air::build_chunk` at `HEIGHT`, every input created at
+    /// `CREATED`.
+    fn chunk_at(txs: &[Transaction], net: (u64, u64), shape: ChunkShape) -> Result<Witness, crate::block_air::WitnessError> {
+        let created = txs.iter().flat_map(|t| &t.inputs).map(|i| (i.commitment(), CREATED)).collect();
+        crate::block_air::build_chunk(txs, net, shape, &crate::block_air::Heights { block: HEIGHT, created })
+    }
+
     fn block_of(chunks: &[&BlockAir]) -> TestBlock {
         block_placed(chunks, |p| p)
     }
@@ -963,7 +997,7 @@ mod tests {
         inputs.sort_by_key(|c| crate::poseidon2::digest_to_bytes(*c));
         outputs.sort_by_key(|(c, _)| crate::poseidon2::digest_to_bytes(*c));
         for input in &inputs {
-            tree.append(compress_leaf(input, &zero));
+            tree.append(compress_leaf(input, &zero, CREATED));
         }
         let (root_in, base) = (tree.root(), tree.count());
         let end = base + outputs.len() as u64;
@@ -976,12 +1010,12 @@ mod tests {
             for slot in 0..ins {
                 match c.public_inputs().get(slot) {
                     Some(input) => {
-                        let leaf = compress_leaf(input, &zero);
+                        let leaf = compress_leaf(input, &zero, CREATED);
                         let p = tree.position_of(&leaf).unwrap();
-                        t_inputs.push((p, [0; crate::recovery::NONCE_LEN], tree.path(p)));
+                        t_inputs.push((p, [0; crate::recovery::NONCE_LEN], CREATED, tree.path(p)));
                         tree.spend(&leaf);
                     }
-                    None => t_inputs.push((end, [0; crate::recovery::NONCE_LEN], tree.path(end))),
+                    None => t_inputs.push((end, [0; crate::recovery::NONCE_LEN], 0, tree.path(end))),
                 }
             }
             let mut t_outputs = Vec::new();
@@ -990,7 +1024,7 @@ mod tests {
                     (Some(o), Some(n)) => {
                         let p = place(base + outputs.iter().position(|(x, _)| x == o).unwrap() as u64);
                         t_outputs.push((p, tree.path(p)));
-                        tree.place(p, compress_leaf(o, n));
+                        tree.place(p, compress_leaf(o, n, HEIGHT));
                         count += 1;
                     }
                     _ => t_outputs.push((end, tree.path(end))),
@@ -999,6 +1033,7 @@ mod tests {
             transitions.push(ChunkTransition {
                 change: StateChange { root_in: root, count_in, root_out: tree.root(), count_out: count },
                 window: (base, end),
+                height: HEIGHT,
                 inputs: t_inputs,
                 outputs: t_outputs,
             });
@@ -1045,9 +1080,9 @@ mod tests {
     /// spend paying a fee of 50, and a spend paying none.
     fn chunks() -> Vec<Witness> {
         vec![
-            crate::block_air::build_chunk(&[reward(1, REWARD + 50)], (REWARD + 50, 0), SHAPE).unwrap(),
-            crate::block_air::build_chunk(&[spend(2, 700, &[500, 150])], (0, 50), SHAPE).unwrap(),
-            crate::block_air::build_chunk(&[spend(3, 400, &[300, 100])], (0, 0), SHAPE).unwrap(),
+            chunk_at(&[reward(1, REWARD + 50)], (REWARD + 50, 0), SHAPE).unwrap(),
+            chunk_at(&[spend(2, 700, &[500, 150])], (0, 50), SHAPE).unwrap(),
+            chunk_at(&[spend(3, 400, &[300, 100])], (0, 0), SHAPE).unwrap(),
         ]
     }
 
@@ -1065,11 +1100,11 @@ mod tests {
         }
         // The fee chunk claiming a different fee doesn't balance.
         assert!(matches!(
-            crate::block_air::build_chunk(&[spend(2, 700, &[500, 150])], (0, 49), SHAPE),
+            chunk_at(&[spend(2, 700, &[500, 150])], (0, 49), SHAPE),
             Err(crate::block_air::WitnessError::Unbalanced)
         ));
         // Too much for the shape.
-        assert!(crate::block_air::build_chunk(&[spend(2, 700, &[500, 100, 50])], (0, 50), SHAPE).is_err());
+        assert!(chunk_at(&[spend(2, 700, &[500, 100, 50])], (0, 50), SHAPE).is_err());
     }
 
     #[test]
@@ -1091,9 +1126,10 @@ mod tests {
     }
 
     /// A chunk's data doesn't depend on its amounts (they're summed in the
-    /// tree instead), but does on everything else, its salt included.
+    /// tree instead) or height (every node carries it), but does on
+    /// everything else, its salt and inputs' creation heights included.
     #[test]
-    fn chunk_data_blanks_only_the_amounts() {
+    fn chunk_data_blanks_only_the_amounts_and_height() {
         let c = &chunks()[1];
         let same = BlockAir::chunk(
             c.air.num_blocks(),
@@ -1102,9 +1138,23 @@ mod tests {
             c.air.public_nonces().to_vec(),
             (7, 7),
             Some((SHAPE.inputs, SHAPE.outputs)),
-        );
+        )
+        .with_heights(c.air.height(), c.air.public_input_heights().to_vec());
         let salt = octet_of(BabyBear::new(5));
         assert_eq!(chunk_data(&c.air, salt), chunk_data(&same, salt));
+        // Its inputs' creation heights are part of it.
+        let mut later: Vec<u32> = c.air.public_input_heights().to_vec();
+        later[0] += 1;
+        let later = BlockAir::chunk(
+            c.air.num_blocks(),
+            c.air.public_inputs().to_vec(),
+            c.air.public_outputs().to_vec(),
+            c.air.public_nonces().to_vec(),
+            c.air.net(),
+            Some((SHAPE.inputs, SHAPE.outputs)),
+        )
+        .with_heights(c.air.height(), later);
+        assert_ne!(chunk_data(&c.air, salt), chunk_data(&later, salt));
         assert_ne!(chunk_data(&c.air, salt), chunk_data(&c.air, octet_of(BabyBear::new(6))));
         let other = BlockAir::chunk(
             c.air.num_blocks(),
@@ -1192,6 +1242,7 @@ mod tests {
             inputs: block.inputs.clone(),
             outputs: block.outputs.clone(),
             state: block.state,
+            height: HEIGHT,
             aggregated: true,
             data,
             amounts: root.amounts,
@@ -1216,6 +1267,7 @@ mod tests {
         refused(&|c| c.outputs[0].1[0] = c.outputs[0].1[0] + BabyBear::ONE, REWARD);
         refused(&|c| c.data[0] = c.data[0] + BabyBear::ONE, REWARD);
         refused(&|c| c.aggregated = false, REWARD);
+        refused(&|c| c.height += 1, REWARD);
     }
 
     /// A wrap can't put an output anywhere but its own window: past the
@@ -1261,7 +1313,7 @@ mod tests {
             params: Params { hiding, ..consensus },
         };
         println!("tree parameters: {:?}", tree.params);
-        let chunk = crate::block_air::build_chunk(&[spend(2, 700, &[500, 150])], (0, 50), SHAPE).unwrap();
+        let chunk = chunk_at(&[spend(2, 700, &[500, 150])], (0, 50), SHAPE).unwrap();
         let proof = stark::prove(&chunk.air, &chunk.trace, &consensus, [7; 32]).unwrap();
         let start = std::time::Instant::now();
         let block = block_of(&[&chunk.air]);
@@ -1299,8 +1351,8 @@ mod tests {
         // FULL=1: chunks of the consensus shape, as a real block's.
         let shape = if std::env::var("FULL").is_ok_and(|v| v == "1") { crate::prover::CHUNK_SHAPE } else { SHAPE };
         let chunks = [
-            crate::block_air::build_chunk(&[reward(1, REWARD + 50)], (REWARD + 50, 0), shape).unwrap(),
-            crate::block_air::build_chunk(&[spend(2, 700, &[500, 150])], (0, 50), shape).unwrap(),
+            chunk_at(&[reward(1, REWARD + 50)], (REWARD + 50, 0), shape).unwrap(),
+            chunk_at(&[spend(2, 700, &[500, 150])], (0, 50), shape).unwrap(),
         ];
         let start = time();
         let proofs: Vec<Proof> = chunks.iter().map(|w| stark::prove(&w.air, &w.trace, &consensus, [7; 32]).unwrap()).collect();
@@ -1331,6 +1383,7 @@ mod tests {
             inputs: block.inputs,
             outputs: block.outputs,
             state: block.state,
+            height: HEIGHT,
             aggregated: true,
             data,
             amounts: root.amounts,

@@ -126,11 +126,11 @@ fn sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
     values.into_iter().try_fold(0u64, |a, v| a.checked_add(v))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn unhex(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) || !text.is_ascii() {
         return None;
     }
@@ -251,7 +251,7 @@ impl Slate {
         if keys.windows(2).any(|w| w[0] == w[1]) {
             return Err(Error::Malformed("an input appears twice"));
         }
-        if !self.outputs.iter().all(|o| is_canonical(&o.pubkey_hash)) {
+        if !self.outputs.iter().all(|o| is_canonical(&o.lock)) {
             return Err(Error::Malformed("an output's key hash isn't canonical"));
         }
         let spent = sum(self.inputs.iter().map(|(_, a)| *a)).ok_or(Error::Unbalanced)?;

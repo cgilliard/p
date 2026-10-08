@@ -47,6 +47,7 @@ use heed::types::Bytes;
 
 use crate::keychain::{KeyId, Keychain};
 use crate::output::Output;
+use crate::poseidon2::digest_to_bytes;
 use crate::recovery::{self, NONCE_LEN, ViewKey};
 use crate::slate::{self, Slate};
 use crate::storage::Storage;
@@ -77,6 +78,48 @@ pub fn coinbase_maturity() -> u64 {
 
 const SEED_KEY: &[u8] = b"seed";
 const NEXT_INDEX_KEY: &[u8] = b"next_index";
+/// The number of the next key made for spending policies.
+const NEXT_CONTRACT_KEY: &[u8] = b"next_contract_key";
+/// The key account one-time policy keys come from.
+const CONTRACT_ACCOUNT: u32 = 1;
+
+/// A key made for spending policies: its number (its key account index,
+/// or its tree's seed), its tree's height (0: one-time), the next unused
+/// leaf, and the hash of the one message a one-time key signed.
+struct ContractKey {
+    number: u32,
+    height: u8,
+    next_leaf: u32,
+    signed: Option<[u8; 32]>,
+}
+
+impl ContractKey {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.number.to_le_bytes().to_vec();
+        out.push(self.height);
+        out.extend(self.next_leaf.to_le_bytes());
+        match self.signed {
+            Some(h) => {
+                out.push(1);
+                out.extend(h);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let number = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+        let height = *bytes.get(4)?;
+        let next_leaf = u32::from_le_bytes(bytes.get(5..9)?.try_into().ok()?);
+        let signed = match bytes.get(9)? {
+            0 if bytes.len() == 10 => None,
+            1 if bytes.len() == 42 => Some(bytes[10..42].try_into().ok()?),
+            _ => return None,
+        };
+        Some(ContractKey { number, height, next_leaf, signed })
+    }
+}
 /// Present while a wallet restored from its backup words hasn't yet
 /// scanned a fully synced chain (`restore`, `finish_recovery`).
 const RECOVERING_KEY: &[u8] = b"recovering";
@@ -174,6 +217,8 @@ pub enum Error {
     /// Restored from backup words, and still waiting for a synced chain
     /// to scan (`finish_recovery`): no keys are handed out until then.
     Recovering,
+    /// A spending-policy operation that doesn't apply (`docs/CONTRACTS.md`).
+    Contract(&'static str),
 }
 
 impl From<crate::storage::Error> for Error {
@@ -213,6 +258,7 @@ impl std::fmt::Display for Error {
             Error::AlreadyFinalized => write!(f, "that slate was already finalized with a different response"),
             Error::Exists => write!(f, "a wallet already exists there -- restore into a new directory"),
             Error::Recovering => write!(f, "the wallet is still being recovered (waiting for the chain to sync)"),
+            Error::Contract(what) => write!(f, "{what}"),
         }
     }
 }
@@ -459,6 +505,11 @@ pub struct Wallet {
     slates: Database<Bytes, Bytes>,
     /// Signed transactions that aren't slates (`self_transfer`), by id.
     transactions: Database<Bytes, Bytes>,
+    /// Keys made for spending policies (`new_contract_key`), by key id.
+    contract_keys: Database<Bytes, Bytes>,
+    /// Key trees generated this session, by key id (regenerating one is
+    /// `2^h` key generations).
+    trees: std::sync::Mutex<std::collections::HashMap<[u8; 32], std::sync::Arc<crate::keytree::KeyTree>>>,
     /// Seals every output we create with a recovery nonce (`recovery`).
     view_key: ViewKey,
 }
@@ -502,6 +553,7 @@ impl Wallet {
         let outputs = storage.database("wallet_outputs")?;
         let slates = storage.database("wallet_slates")?;
         let transactions = storage.database("wallet_transactions")?;
+        let contract_keys = storage.database("wallet_contract_keys")?;
         let mut wtxn = storage.write_txn()?;
         let keychain = match meta.get(&wtxn, SEED_KEY)? {
             Some(seed) => {
@@ -529,6 +581,8 @@ impl Wallet {
             outputs,
             slates,
             transactions,
+            contract_keys,
+            trees: Default::default(),
         })
     }
 
@@ -657,7 +711,7 @@ impl Wallet {
         let mut wtxn = self.storage.write_txn()?;
         let mut ours = false;
         for input in &tx.inputs {
-            let commitment = Output::new(&input.pubkey, input.amount).commitment();
+            let commitment = input.commitment();
             if let Some(mut o) = self.get_output(&wtxn, &commitment)?
                 && !matches!(o.lock, Lock::Signed(_))
             {
@@ -970,6 +1024,162 @@ impl Wallet {
         Ok(tx)
     }
 
+    // ---- spending policies ----------------------------------------------
+    //
+    // A thin layer for trying out the primitives from the command line
+    // (`contract`): keys to list in policies, signing policy inputs with
+    // them, and funding and fee inputs from the wallet. No channel logic.
+
+    /// A new key to list in a spending policy, made from the seed: a
+    /// one-time key (`height` 0), or a key tree of `2^height` (`keytree`;
+    /// generating one takes `2^height` key generations). Returns its id.
+    pub fn new_contract_key(&self, height: usize) -> Result<[u8; 32]> {
+        if height > crate::keytree::MAX_HEIGHT {
+            return Err(Error::Contract("a key tree has at most 20 levels"));
+        }
+        let mut wtxn = self.storage.write_txn()?;
+        let number = match self.meta.get(&wtxn, NEXT_CONTRACT_KEY)? {
+            Some(b) => u32::from_le_bytes(b.try_into().map_err(|_| Error::Corrupt("next contract key"))?),
+            None => 0,
+        };
+        self.meta.put(&mut wtxn, NEXT_CONTRACT_KEY, &(number + 1).to_le_bytes())?;
+        let id = if height == 0 {
+            digest_to_bytes(self.keychain.public_key(KeyId::new(CONTRACT_ACCOUNT, number)).hash())
+        } else {
+            let tree = crate::keytree::KeyTree::generate(&self.tree_seed(number), height);
+            let id = tree.id();
+            self.trees.lock().unwrap().insert(id, std::sync::Arc::new(tree));
+            id
+        };
+        let record = ContractKey { number, height: height as u8, next_leaf: 0, signed: None };
+        self.contract_keys.put(&mut wtxn, &id, &record.to_bytes())?;
+        wtxn.commit()?;
+        Ok(id)
+    }
+
+    /// Key tree `number`'s seed.
+    fn tree_seed(&self, number: u32) -> [u8; 32] {
+        crate::poseidon2::hash_bytes_32(&[b"key tree".as_slice(), self.keychain.seed(), &number.to_le_bytes()].concat())
+    }
+
+    /// The key tree with id `id`, made from tree `number`'s seed.
+    fn tree(&self, id: &[u8; 32], number: u32, height: usize) -> std::sync::Arc<crate::keytree::KeyTree> {
+        let mut trees = self.trees.lock().unwrap();
+        trees.entry(*id).or_insert_with(|| std::sync::Arc::new(crate::keytree::KeyTree::generate(&self.tree_seed(number), height))).clone()
+    }
+
+    /// Sign every policy input of `tx` with each of this wallet's keys its
+    /// branch lists and that hasn't signed it yet, up to the threshold. A
+    /// key tree signs with its next unused leaf -- recorded as used before
+    /// the signature exists, so no leaf ever signs twice; a one-time key
+    /// signs only one message, ever. Returns how many signatures it added.
+    pub fn sign_contract(&self, tx: &mut Transaction) -> Result<usize> {
+        use crate::transaction::Spend;
+        let mut added = 0;
+        for i in 0..tx.inputs.len() {
+            let Spend::Policy(p) = &tx.inputs[i].spend else { continue };
+            let commitment = tx.inputs[i].commitment();
+            let message = tx.message_for(&tx.inputs[i]).ok_or(Error::Contract("a REBIND input names an output the transaction lacks"))?;
+            let message_hash = crate::poseidon2::hash_bytes_32(&digest_to_bytes(message));
+            let (keys, threshold) = (p.branch.keys.clone(), p.branch.threshold as usize);
+            for (index, key) in keys.iter().enumerate() {
+                let Spend::Policy(p) = &tx.inputs[i].spend else { unreachable!() };
+                if p.signers.len() >= threshold || p.signers.iter().any(|s| s.index as usize == index) {
+                    continue;
+                }
+                let mut wtxn = self.storage.write_txn()?;
+                let Some(bytes) = self.contract_keys.get(&wtxn, key)? else { continue };
+                let mut record = ContractKey::from_bytes(bytes).ok_or(Error::Corrupt("contract key"))?;
+                let (sk, pk, proof) = if record.height == 0 {
+                    if record.signed.is_some_and(|h| h != message_hash) {
+                        return Err(Error::Contract("a one-time key already signed something else (use a key tree for keys that sign repeatedly)"));
+                    }
+                    record.signed = Some(message_hash);
+                    let (sk, pk) = self.keychain.derive(KeyId::new(CONTRACT_ACCOUNT, record.number));
+                    (sk, pk, crate::keytree::KeyProof::one_time())
+                } else {
+                    let leaf = record.next_leaf;
+                    if leaf as u64 >= 1u64 << record.height {
+                        return Err(Error::Contract("a key tree has signed with every leaf"));
+                    }
+                    record.next_leaf += 1;
+                    let tree = self.tree(key, record.number, record.height as usize);
+                    let (sk, pk) = tree.leaf(leaf);
+                    (sk, pk, tree.proof(leaf))
+                };
+                // Recorded before the signature exists.
+                self.contract_keys.put(&mut wtxn, key, &record.to_bytes())?;
+                wtxn.commit()?;
+                if !tx.sign_policy_input(&commitment, index as u8, &pk, proof, &sk) {
+                    return Err(Error::Contract("signing failed"));
+                }
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// An output of ours, to a fresh key -- where a policy spend can pay.
+    pub fn fresh_output(&self, amount: u64) -> Result<Output> {
+        let mut wtxn = self.storage.write_txn()?;
+        let record = self.expect_output(&mut wtxn, amount, Origin::Change)?;
+        wtxn.commit()?;
+        Ok(self.sealed_output(record.key, amount))
+    }
+
+    /// Fund an output locked to `lock` (a policy's root, or a key's id)
+    /// with `amount` of the wallet's coins, plus `fee`: a signed
+    /// transaction, its inputs marked as spent like `self_transfer`'s.
+    pub fn lock_funds(&self, lock: [u8; 32], amount: u64, fee: u64, tip_height: u64) -> Result<Transaction> {
+        if amount == 0 {
+            return Err(Error::Contract("lock a nonzero amount"));
+        }
+        let mut tx = Transaction::new();
+        tx.add_output(Output::locked(lock, amount)).map_err(|_| Error::Corrupt("transaction"))?;
+        self.pay_from_wallet(tx, amount.checked_add(fee).ok_or(Error::InsufficientFunds { spendable: 0, needed: u64::MAX })?, tip_height)
+    }
+
+    /// Add `fee` to `tx` from the wallet: an input (or a few), change, and
+    /// their signatures -- for a REBIND transaction, after it's signed (and
+    /// after it's re-pointed: `Transaction::rebind`).
+    pub fn attach_fee(&self, tx: Transaction, fee: u64, tip_height: u64) -> Result<Transaction> {
+        if fee == 0 {
+            return Err(Error::Contract("attach a nonzero fee"));
+        }
+        self.pay_from_wallet(tx, fee, tip_height)
+    }
+
+    /// Add wallet inputs covering `needed` to `tx`, and change, then sign
+    /// them; stored, and the inputs marked as signed away, like
+    /// `self_transfer`.
+    fn pay_from_wallet(&self, mut tx: Transaction, needed: u64, tip_height: u64) -> Result<Transaction> {
+        let (chosen, total) = self.select(needed, tip_height)?;
+        let mut wtxn = self.storage.write_txn()?;
+        let change = total - needed;
+        for o in &chosen {
+            tx.add_input(&self.keychain.public_key(o.key), o.amount).map_err(|_| Error::Contract("the transaction is already finalized"))?;
+        }
+        if change > 0 {
+            let record = self.expect_output(&mut wtxn, change, Origin::Change)?;
+            tx.add_output(self.sealed_output(record.key, change)).map_err(|_| Error::Contract("the transaction is already finalized"))?;
+        }
+        for o in &chosen {
+            let (sk, pk) = self.keychain.derive(o.key);
+            if !tx.sign_input(&pk, &sk) {
+                return Err(Error::Slate(slate::Error::SigningFailed));
+            }
+        }
+        let id = tx.id();
+        let lock: [u8; 16] = id[..16].try_into().unwrap();
+        for mut o in chosen {
+            o.lock = Lock::Signed(lock);
+            self.put_output(&mut wtxn, &o)?;
+        }
+        self.transactions.put(&mut wtxn, &id, &tx.to_bytes())?;
+        wtxn.commit()?;
+        Ok(tx)
+    }
+
     // ---- slates ---------------------------------------------------------
 
     /// Start paying `amount` (plus `fee`): pick spendable outputs, make the
@@ -1140,7 +1350,7 @@ impl Wallet {
         }
         let pending = |tx: &Transaction| {
             tx.inputs.iter().any(|i| {
-                let c = Output::new(&i.pubkey, i.amount).commitment();
+                let c = i.commitment();
                 self.get_output(&rtxn, &c).ok().flatten().is_some_and(|o| !o.spent)
             })
         };
@@ -1198,7 +1408,7 @@ mod tests {
         }
 
         fn mine_tx(&self, tx: &Transaction) {
-            let inputs: Vec<_> = tx.inputs.iter().map(|i| Output::new(&i.pubkey, i.amount).commitment()).collect();
+            let inputs: Vec<_> = tx.inputs.iter().map(|i| i.commitment()).collect();
             self.mine_outputs(&inputs, &tx.outputs);
         }
 
@@ -1729,4 +1939,88 @@ mod tests {
         let fresh = OwnedOutput { lock: Lock::Free, seen_height: None, spent: false, ..o };
         assert_eq!(OwnedOutput::from_bytes(o.commitment, &fresh.to_bytes()), Some(fresh));
     }
+
+    // ---- spending policies ----
+
+    use crate::policy::{Branch, Policy};
+
+    fn two_of_two(a: [u8; 32], b: [u8; 32], rebind: Option<u32>) -> Policy {
+        Policy { branches: vec![Branch { threshold: 2, keys: vec![a, b], after_height: 0, after_age: 0, hashlock: None, rebind }] }
+    }
+
+    /// Alice funds a 2-of-2 between her and Bob; a spend of it to Bob is
+    /// signed by each wallet's key in turn. A one-time key won't sign a
+    /// second, different message.
+    #[test]
+    fn wallets_fund_a_policy_and_sign_its_spends() {
+        let (da, db) = (TempDir::new("policy alice"), TempDir::new("policy bob"));
+        let chain = FakeChain::default();
+        let alice = funded(&da, "policy alice", &chain, &[REWARD]);
+        let bob = open(&db, "policy bob");
+        let (ka, kb) = (alice.new_contract_key(0).unwrap(), bob.new_contract_key(0).unwrap());
+        let policy = two_of_two(ka, kb, None);
+        let fund = alice.lock_funds(policy.lock(), 1_000, 10, chain.tip_height()).unwrap();
+        assert!(fund.verify());
+        assert!(fund.outputs.iter().any(|o| o.commitment() == Output::locked(policy.lock(), 1_000).commitment()));
+        chain.mine_tx(&fund);
+
+        let spend_to = |w: &Wallet| {
+            let mut tx = Transaction::new();
+            tx.add_policy_input(policy.branches[0].clone(), 0, vec![], None, 1_000).unwrap();
+            tx.add_output(w.fresh_output(990).unwrap()).unwrap();
+            tx
+        };
+        let mut spend = spend_to(&bob);
+        assert_eq!(alice.sign_contract(&mut spend).unwrap(), 1);
+        assert!(!spend.verify());
+        assert_eq!(alice.sign_contract(&mut spend).unwrap(), 0, "already signed");
+        assert_eq!(bob.sign_contract(&mut spend).unwrap(), 1);
+        assert!(spend.verify());
+        // Signing the same message again is harmless; a different one isn't.
+        let mut again = spend.clone();
+        let crate::transaction::Spend::Policy(p) = &mut again.inputs[0].spend else { unreachable!() };
+        p.signers.clear();
+        assert_eq!(alice.sign_contract(&mut again).unwrap(), 1);
+        let mut other = spend_to(&alice);
+        assert!(matches!(alice.sign_contract(&mut other), Err(Error::Contract(_))));
+    }
+
+    /// Key trees sign REBIND updates, each signature with a fresh leaf: an
+    /// update re-pointed at another earlier one keeps its signatures, and
+    /// takes a fee from a wallet afterwards. A tree runs out after `2^h`
+    /// signatures.
+    #[test]
+    fn key_trees_sign_rebind_updates_with_fresh_leaves() {
+        let (da, db) = (TempDir::new("tree alice"), TempDir::new("tree bob"));
+        let chain = FakeChain::default();
+        let alice = funded(&da, "tree alice", &chain, &[REWARD]);
+        let bob = open(&db, "tree bob");
+        let (ta, tb) = (alice.new_contract_key(1).unwrap(), bob.new_contract_key(1).unwrap());
+        let at = |state: u32| two_of_two(ta, tb, Some(state));
+        let update = |from: u32, to: u32| {
+            let output = Output::locked(at(to).lock(), 1_000);
+            let mut tx = Transaction::new();
+            tx.add_rebind_input(at(from).branches[0].clone(), 0, vec![], None, 1_000, to, vec![output.commitment()]).unwrap();
+            tx.add_output(output).unwrap();
+            tx
+        };
+        let mut u3 = update(1, 3);
+        assert_eq!(alice.sign_contract(&mut u3).unwrap(), 1);
+        assert_eq!(bob.sign_contract(&mut u3).unwrap(), 1);
+        assert!(u3.verify());
+        let from = Output::locked(at(1).lock(), 1_000).commitment();
+        assert!(u3.rebind(&from, at(2).branches[0].clone(), 0, vec![], 1_000));
+        assert!(u3.verify(), "the same signatures, re-pointed");
+        let with_fee = alice.attach_fee(u3, 20, chain.tip_height()).unwrap();
+        assert!(with_fee.verify());
+        assert_eq!(with_fee.fee(), Some(20));
+        // The second (and last) leaf of each tree.
+        let mut u4 = update(3, 4);
+        assert_eq!(alice.sign_contract(&mut u4).unwrap(), 1);
+        assert_eq!(bob.sign_contract(&mut u4).unwrap(), 1);
+        assert!(u4.verify());
+        let mut u5 = update(4, 5);
+        assert!(matches!(alice.sign_contract(&mut u5), Err(Error::Contract(_))), "out of leaves");
+    }
+
 }

@@ -150,6 +150,10 @@ fn nonce_elements(nonces: &[[u8; NONCE_LEN]]) -> Vec<[BabyBear; 8]> {
 /// transaction is proven whole in one chunk. Sized so the wrap circuit --
 /// which verifies the chunk proof *and* applies the chunk's 28 state
 /// updates -- fits the tree's 2^18 rows.
+/// Signatures a chunk proves, at most -- and so a transaction (each about
+/// 278 of a chunk's 4096 blocks; `docs/CONTRACTS.md`).
+pub const CHUNK_SIGNATURES: usize = 12;
+
 pub const CHUNK_SHAPE: ChunkShape = ChunkShape {
     num_blocks: 4096,
     inputs: 8,
@@ -225,8 +229,8 @@ pub const TREE: TreeParams = TreeParams {
 /// The verifying keys: the wrap and aggregation circuits' preprocessed
 /// caps, as hex. Derived from the circuits (see the `tree_keys` test,
 /// which regenerates them); any change to those circuits changes these.
-const WRAP_CAP: &str = "e05fe047224021099c5129750516af15bad9ac268ff7514f483d1c0bb2ba4b219e2eee1a36b110772957516a73ab9542f76f4015c0840e49e96b9e602096d525271bc33dcc75440187b9ad091b2b5223b7a4715107c0783aa5f50d1cb773930acf8a150256a87b42016769068d09c919d10877460be19c1320b6697548f3661094694933c19b631437e3990de06c5a492ce5f55d31326113f7f80e433355842a464348211abd402d59cbc048683d2c2880f5b1553d131d165adb9d2fbe08a03ecf0cbb038ebbac28e61fd05f8d9a566a50296a176ad27a3396b8de2a5c26b755c486565d2092a45ba5e38f3e9dbc572f50852919c67a173d812f54227336806fd920091ec71cfc32cf19ae716f25092df053322d02b4911af6ec4225cabc3f4aec661554d6d502156391ce3b99a9251813005349cebc7e6ad260700954634363f23ae26ee2a5630bb2294a04739d5513703c8a2ccbefdc4b2efd1f0685687740c2576870dfe8a0436ead6e14e10bfe4f664a6d001caa36611234a44535c3215c3cc4775e24a7b72b5126776fb9c2b121399dc576ed551335bac0da74c7dd353def2cdf28505c9040aa4ba36f5fa1e772e454d269cbada01b63cf236135eee862f895a50a82055152b210eb48d2626761cc81ea6bd324cf4386932900b12223383f6ac006139ce610c5bca400ee8bff0d3577b123deb0da76efe6764ddb2d0449958be82604f1c034b26f2105bdbe990ef85c87117c4dcd0d5ac1030c9c27ec6e5356892ea3d4cb6c3d01f2416a72441960919943ce051c6f270efc4fed730d174f0a7d6a80c7f271d33f7d428d52eb3e1e085f6c7a43bc5f53a72642e68c391de799f56de03aa8629af1560763f8c72784ca266eee034f1a21ea2a59aaa85b29b3ec6a649487b036d015e6762d76264db8eaa81103b1e2242b9c3f09f6e877225c386c39ec36f8765c50d238ce8bc22ef047126a377c225789fa3d0fa5d10e1cb7432a0bcb29f265862b8e048950e26a46115b3958866c718789a034e21c4b2a817fce09ec55740a6a7101155bbe013dd0d64423fb26530208521616ce741572503f365d2f76aa37d2e6a85a32945c5f688ed003d5798c4f16a3616890cb31568b7878189db88133c06c861efd036772007ff54db1ac4c3bae33b6170c89673b89b665179c7134756adbe04609b2a05269d169195f7fbd6aa96da534edc47b02f079120323245819cc7f3a54ed9f1d105b94e55a320ff71738abbc747ffad55cb721bd12387dab72222c511767b8225cbe3884634f699d1ece6e6d0a901f21248ed996577ed817703384563085f3415971e77e268d85c826ddbff026dcb0423167ffac06738ca34bfe5ba002e47bc311e63233104277b840c507703a57b7f26e593e225669e2bc07fecf4d772759310ddbf090676305b377d5d6c256da6d9972";
-const AGGREGATE_CAP: &str = "18274869ee271673e7c9b4260bac0a593a48d60ef21f173e88f28d1dac5fac3de7b2a863a85f7766b36afe6c51d3d00ba4e4ec3425f60d12458dd309a12ac076557e350b9ccbcd71a8cae14da6b0f726b498ea389d58ff30fb595b5c1c07ef4b5cfa396917c9221aa4c6a55dd223c13bf91daa5609e6af0b17a1d008c123f45cc9156a720a57654d8b8cbf424961f82451f0ae3f7718fb34d307842dae4cbe57a7d112620aa4756e8096d03bd76658380157a07636bca63e5071543cda9e7d5a42f77419ebdf673752eb94515f68db3d2f0c40217cf63d612562a804fee6da6e51841964560a5f339b5d400be2ce3a48d1c16259f391520d493e25638a6a2d0687cc9a5acc1e52508346bb34c403060db19fbb47e7fd8e1745683b4a1564092b29a2c80826e7d44780707d103f18c441fb67ba6679421600f5eaa1502f8c9e0960c4d656c55da4513ce1633b8ddf7a35b742912af5fa253a8cbbb86ec7abec4fc2d23917d62c8963e0836f66f97b44177a36860c685422725acbdc40c13b4d3c843a7857afa2f7573346a76ac3ef252888f190387ea4b710d6169c3fda38226fa9d6e662e9b0a50e52f71b579543b61ea5c3fb33e9bfb644abd1954aab94e63ca43aaf52424125729252ad56d9a35960c6acae53ec0ea563871ff25b454f8e5fbc2a7f0f56ff8e411674932a7b1c633d02a9097724cbdb2ca5a5943d60687f64d8ed6811d779c1776ef83541c9f13d51f841f7350cc37412ecf772291fa6c1356f4ca13f47b4c56e71523e135284b672204ddd1ac363c63d0bbf5a0bceb1fc6160c1311450799676f233c20165b0664d25d9f450e596aa3859c19431305f2a4779308809b428a5425739e41db0a8386952517e4c1998d163aa759b1794472a4635cd8e1cc09ed67304b5f0450baae420083a0774e9cfbe710b599e4ebe156f29cdd8b26ce5ed071d3a57b8018442bd5fc6019d66d2d7f96c36692926dab93968a4ccbf2a0ffb692db7cf4510dd54926737046542f4bbc571ebce2d7666c308771392051ca621ca274a12204ecc4eb96d4a4055672c12f75467024d753e87360258d4a84489875200fecc8c6731d9ee5b4fa7163e5ab1801d863e1d12d5c69a6b282a082f738c72123064a10073f151603585470ea3a41b11ffeb7c7439dc373e6c847b75e153af66f7221244dd2d25411ab504479f04143253cd1d52b5cd6649f7c0f50527b66a74c055916d227176057676282698f0786d618a161d9857f76a5b2dc5227a03f802d73bf660106bee68d6b16b48d5c5d54ed0f34a114c5eb91576af2d2d886e1473be839a6728f775212798076488baff538784a50efc1bf0080a40f92545a7b40cc7b610065b57575a39e73007d6872f515568182925060d56fa7b474f909bd06b63eee654d5b2b03d553d8d4a391805354fe18d75847f3b38";
+const WRAP_CAP: &str = "8483463ae08b054813b0736c9fdb783fb640d9416c9c841d006ddf74b0fc973aa2c86c41ae565755f1f6313a8c21cd6441625b77ebc10369a8650b753770b52d4edc2a4c35d0af674f691759f596d46d60a87b13ef82b855042f4c727aeb43112796c81cb510044c4dc8a46994638f260ebdba03436df270d4567004fd32cc33d75b341343dbf46043bdb0053cfb910709367242f4cf591eed6f1d602a80d13f27658a2b173baa1923968434f42fc8001d1daf2fa98a104f6e1ee8568d415b141d64700ff937e6686036176c9fcc4a58f8848c547518e4168a491d27cd6dcd5289fc435a3c24e256e709f428ac68ff6e4396c744b4b41c5fea70f953727c4530b26dc86063f7ca1699b0922f5b96380c778f1072cdb136582e37a8123d011b136a5c02029284e05aa269842485074602ad9e146c6f44954e8128943ed7beba20645e933d57a29663488fbf11b3e7b10447e4314ac993011758e137379173ec46569d310b403a451bed575a570ac6ae2c46373f717b6e707486788b40b010c538d598a866f61f681aca22910d990729067fc0594e74a815593509a421172d10421b5eb1505f41cf1070e089764f6a98530d176160f3903241ec9be715afa1262743d1ce364b41255044f64940f69d8a0bb493286b98212b3187f5d330327cd7439f2c5c606de30f39109f8d5da16885466f7a3347a2ec06488e12ee59f07c8a4c169a33762e9f141128880d3c7b1638427fab794165a83712f305ae4034eaa73c61f3f164db14583df968e07728160d4441df890624187e6b2229b277b7b2cc08fbde0250aabc635c0689971e67797202e03b2e52fa4be70d0bbc2260594c9510b6857c31e9775e47adbd33297b39a5030d16f94a05859170532ec45447fc075656981076f5f9b6239c839b40687658426cf1d754a925c52705df925a76c08757545cc90110a933558cfffd1f08d30d309bdcbd620572f83d59472b51abd4b619be714f55517d1b5156832c6845871e5c52194c630f65755eac614906d7744c49e1095a59d9a8981c3a49455a936eb23995c07762981de1103cd23a2d38d9df0c2cb2a21a5e8790123e720e5cd383053fb50de02ed81a484a6be1cb44719777298da096244576f23aaf0ffd5d6bad064da344a9389a94bb698b88134c71420052ee39d566cfc8b72d1473db64d3e9d0073292092640761366ab108f3eac8b5a01b1f2f349ade6e01765aca10f208a3438c0cd4a065aaa194eeda3c5715f08a10dadf1d914191ef439c42ee418cca07254c6758a51facf6649f1721441cc3c6e147858326c382d8924a7a2a51b0e4f621e05d8bc739f88a05c521f681055c8da337c2d877148e07331ea6c47107224d17513deab084144390766636e23517ace0ff2fdd16bc518e26176595766087ff74d1c12fe17f85e4619fe50ca498f330446";
+const AGGREGATE_CAP: &str = "341f072a4bf59b044d04ae5cbab42b1ddefd3304547fac024f2c1753f36d3f6fab2966023bf73607c4e2061683df61415bcdd429a89b681125d457187f31502746253d2d6319333c06fd1c469290a036cab8800729530218d1af1269a3d19f4c77fa0912df9e73205ace82546cea6e0f16fc840d8c32a74dc8217349a0327710d7a84c44c914651e88094e1c2effa630097e64388878431138c7476d2a56862732cde26a6aae604f93ff442103953761e3a5cd0d8599f6060019805b5ff5e64041cceb250d6997303b67d51c4ec2ec31b1b3a65263f06677eb49d4698c32875426b5ad40f410e66a1bc2070666480a0ac6df06435d7d606f4f5f81209c1c9509b38e2e64f369891f0e40c630998b405493da8623512819394c88f975afe49a2196108512e00bcf2b9ddfcd04366bba43cfa0420c9ce13b65c0c6e76ce09cf818dceb3d6d38c9284ccbbfab6456fc19313b41b17142e2356cf6eae5056faabf74c301994db8fd1233223ce9749b9fae5e5e54a10e158d3e5dddf6a612553dd3514f250163f8777e332a378b21ac30d5543a5a972d35239e66871a237537718868ff3e74422f1fa23a92aa637309358b212740ca7540a52101b975cd16a3b96a6e03fcd96894e7c66acf7b360c12c9514a9a75120e8695055df83e103b77ecb422eb26c65d38fc6c3840398b7471dbc662901eb20712fa77175c363f3daa193e51e0fcd52891fea758693529525a4398703cd86136d1f1ec19c4499754c2ceba5201fce21a751853716b476421bafd2d240d835f45a413761799ba500e2768961570aa556bac005a688b21bf1e0874b55467b5a3345fe2fd4ef81cb83510fbcf31efb55623278c2a57dd0c1169c9cd14506df78435333dae5651867c4a5f8e4b114182851a9024c6311037880bfe8a6a2bf487191a4f247b5c84a70f25483b034da198c62837bec4736d5c2441159ba0267813770b3fc9946eeffda83bc33d3b2f24a6cc1dcb1299608bbd5430add34c02cdef1364aaf12e4fa293110f1d58c35ee246c52eb32b03180241c45cef4ae522d0c0f8035b61e257d505561fcf3fbd4ee32c5033a682675d9a0efd3ae6b67e4b7964f245ff5d956854390b088f4e3641f788e51885d8e550e99d372c8dc1b2599d733b14bc6da33f30088636ec1595715531a87122927071247afa3749331a0e0deb78435a2cbc2fff34ac38f8b8c807b5322047fbfe7220557eb9749dc4641790ba4e3667ad9b25545d5122b961e01d7c1ba8739e9f4c003c36a2055d43731a78461f4bb972ff75c5205148a10597681eaa5c63cd78d0166812570cbeea513b7dbe4f6ca0497d242c7b5c2699e2bd1b8ecf835fb80ca25f857a0a31852e0e4a48e8f543c4a8010787257f0aeeab90080859a920ed6e4a0191660103a22da13341cb2417126dbf1e6132461b07ac9f1d";
 
 fn cap_from_hex(hex: &str) -> Vec<[u8; 32]> {
     let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
@@ -238,8 +242,8 @@ fn cap_to_hex(cap: &[[u8; 32]]) -> String {
 }
 
 /// The dev network's verifying keys (`tree_keys` with `NETWORK=dev`).
-const DEV_WRAP_CAP: &str = "a37475460963475befa0991a2c074471d81aab23e43cef5fecdfa41ea2521a1871f0581d8c7283119638eb59602965309e7a893d10dfd620e5d9cc5bdbecc6483e034b1f05391006cea10e6ac037f319be87b15f69f0954a04d0025e5900ee1ef462c2038ac6b16c913daa683c108a4075d75a45822eed176a063f300d25d44d3e3de7530a42b41067659b054af2113f07dbb81bf9454876cac29e671921d76e11b4682d3e5e882fe424044197525765c8006b33b2691963ec3b866f72580028ec618209b82cf5578d0ac5628e4864753cc5de6d4aab115d9ce18350e933850896ddd52cce7e2b5aa21e590e226e7501d0e1250eb636c82c0d6aae066ff90477fc5db64c61e460770ba1bf6401162c74ba56e00299bcd716f7dcfe2a926ad5476d958a5bf2d015562ea0103048e2b115893bd80b83c3ac56fbe2bf3362d806628de8930ca3a7bb597490e06456e78666b86950079e253618ef0507374460f55a0cb3d75fa00c7a06a27d0420bd18bf47780d141811c86417b072a05c8e429e073a1f205d17508324fc116d0ccfa4c10068b33544389b8c4c836b90120c54ae4add4b1242fc8f2b226829a64ff43a3147e1954a5ca6c1e205736ad15f1e58e028b676130ff589ce2d32fb75553a51805807e1f271cd49722a4f929b69e8228409acda601d58e9815878a67d1a3891f53d643a973535aeae0898ddc96b995b175876186d6dde5c5d6046319669ac154461076bfb5206f3363d82c4dc60b08f2815e5c5760f7489176e1746711e18de0b6ccc61be50b168c00ef82530032fbc6100c25e832ceb59e90a52345712819182304e7a1c33fc417c541f55e631168f90047ba9a46bd7067b16bb7d1135ce6dc20bdd64ba1d3f3dc300bdfd1e73651dd91ff6ca425717d3360efe80f6263c3a74114331bf374c47f9434916822c8fc7122d07c38d6952cac861b2f18215cdf1e53ffec86024ed24ac2424421f598d453211d6af676d95404541a632646e6e747d26424d276d2fd9781117b05b1b8f47c2500a4a1026048e6318f4b9d224cc4df83da4e9df72278f0003c7470a595aa0ca0098b4bc21ff22ee4a99638b095ac7bc6dd7418055071d341bb046fc33754ee729706273025f9909691603de3c04a9295f4e42474f2dd0686869f39e107a88e30e7a99691490100e5be189c613c16cb04a67396d1104f93c2dd0304226f5c00e736e782a23c405cf17feff7c5c9492f26c0b4e0a722199054d321c8c018d42f57701359e136d5acb30f5cec918e0015137d82fbc6ee8d52a1b0b574101c5d12f2bb824b7375558492f431e321cbb960810654bb84699d8bd5ffc60df50e7eb70570b40b848dfcc8a2246199d1cc76b95765f701631ceb4eb073285782478589e4075bf106217412a25a4f1dc081b36110309ff0a679a266c188b0aea22f4319709";
-const DEV_AGGREGATE_CAP: &str = "434c8d11d75dcb42c173095173a59e7657849a1cc4ecd71901ad0d3b5665f00ace3bc84005d68b40bc95fc554ca8735bdad5460c85bb5024669b270bb79dad4afa9db147ab47ac33b628d145cf6bca53cc7f5b2af41e940194edb30bd86d7960020e6469024e305fd7b93053bcc59b07d5f97a08c901fd0957171b226de39d2167cb8a6d117c83379f3e224515618558c9f53d3ffb0be30949446d60ed9650466a62b03bde84ec41a9ded60177b7095e41fd9403df53411e7f6de35cd89d0e27e6342712f859f02b0dd59802a4dd2f400b6bed5bef8ed162c90088767c54166f01db11387179e357359a8f5754208d7106700608564f607132c36b5ba86d4e718f223440465ae44545c12f4c04e6163eff591b53563dd237fe708454c0652f6895539653ada79f44eed4e8287373406b2db66f0acbb74700c8372e6fd1dfa95ff06b9f5a1f6c2b3ab96a640901463a13d88d8e05515f490db4ec680eb982bd50e64cbd478107a63b48d7f56ecda1af450bafe146b404eb25155bdc3eebbe084e4220be516a27a41e0f0f350366e6376ef92ae357b4f03b42d29923121cef214f0f9f522443988d437b57d15fe83c03258ef76773a418ba42d155432ef761af6a39c1426e1bf6c05ab32c0472325f9552d3d2691dfc48d34092ff8e046350f305ee218f3f5817695e160ad52a07c6914576cbba3986669e5c7350a334063f54154bddd500e6d0a0427833a170ff4fc910b396ef6340443d36f997ef69f370d042a807ac72ec84304d1dfe7a20262baf2bf428c41196989b48f36fcc411d077b6c71c5ec72578ffb2c972abf447b4fb20020d96d1c85bea6639a53a90b240bfe16ae8ca15701a52f38cac9c71903ee49645579862f8426de33a3595f21f32fc86380438b516168ab4cc2091045cb428e4adafd1541c6b6db412462cd69ef60922e7bc6af34d3982713be2cef6ba24c3c74bc075475c7669e2785711568ff84df2e90fe530551e70d5351f4c564f0d8dd737882ec61b572a26a04e8a6201abb924bf409d3620e64ee26888ad874ab7108082242c06775252b3699533b289c4fc40a2c33aa37ba967959f522fd36fe1ff836f9f0043043128b5ca6596451ccda386ab026a9074e7e2c49c6054e40c6a16e08c920d65604a8a22f642bda64c2b7935dd0beab2500cc060ad7936f6c444bd04b62f1765901c40d39f03af807e6a9e42ac66ca13a6ecb57371c696415d0d8d069f5f25659cb77fd5d2637b774cce3cd1374563b27dc098d600de8843a86c7da45b48cf1619b788250ce80043de3338f64806bb012b5390c38da11166acaddf819606619521c6b6261e2a65f01f030693ea25a7544e30acc411d8b3c4800be840504c4ff63b999916943d0e617f2bc9f0928e5ad515f7d7c0ba5ddff7345e07449a39a515bfefaf837861a675069512b26";
+const DEV_WRAP_CAP: &str = "8c8f3047b02e2c5a47085c182fa25370dbe7a4218e14c33fc70dd477b3a5ef659e16962f29e0df3573b73c2ab8056a0629baa55158e08875ebd7c72778183d698d2db5184fe50728ae0b52693b712839bb97f0516d65fc3d34702635ca014d6d7f0436249f277a64c1206312e7c31f1db8634606755c1d52e9d89e16f8adcf5c20f8674badd30825b91a87111e2034079d5c791a865c114d351e3f55699f0663c89dd46aa107e5175b8127563fb2c50570429a709365a906d88b7a6a242f272c568c8d1affd4b355ae6ef907fb878f55d943da52c3ddcc59ebbd392b5cf7d46c5c99d30a88c73464b6db74172778305cf2f4722f6313583e365b1c59b5b7e0138aea932151d1c2362da10920abf56f45252e1e6e92dca45587b18b38155ec256bd002363a83f041540f00e15787dc51fa3ece577e9647c5805a68a50184da5170070e92e19ac141628a4674fe4c025579689e63192c2e26c8e384d2ee48c252424790a12506a6f0659f2853aa7c2a51a0a4c7d2eafad03101af216178ea0e540b5f99c5c4e2c0402f2ca091806b8271754c4422a8b22452ad8027d083940863c90028407016c942ffbb22f0dc8ed816c06e7b03352be9c1889dddb0f010a813153a2226b87a97165892ac42d36b7270bdb3c6422c065e20d10a0255060386867368ea060571c903a5a8bd80a93674225d78c3b0904c06e454510a0571419d51c08a76045d885164c5304df48e51f6423769e186e9eafa630ac882c1febd5dc1982f5270471b4d10896c0482436f7794875765b3689a07e3138682564cc790f4cac954009e0dceb10c1e3a23504a81f59dffeec49043b20145a81134146a3352e5cd0217493b3d326fc7d9a3129ef783ddeb7172df83f723dc78b7022d46f78493a235645a39eee650269e371595e6a75e5e96d16197118134e2a7115b35b8069d5256f6e1338215d33b71c69da58947489c2ee0a2a8a8511afefef6793b1e021004a9f5b134deb1a17dff603713d6870b4d8c93e3cc56428ffbd3109e4b376611bd4514fbd9fc43f29c6a06ac021b41bc47e2b04eda6b9088663cc19dfe54e4e7893fb2b968b786281dc5f5eb0376d0bafba241c4fee272f9930572c80504928d2325a60506435651fab6b6cc71978544be0af2a79d346640d744d171675be640aa8b02ce213724e048f4f4edab91d2fbf111660c3bdc3005b6f3051da8008145e7bd743ae714a20d1b0fb328f5fc7469e16747633b7f24e8521a07354c10f5c281f425798aa382b06a55c57e6d61e0a2c238a5593068366bf1db0729848080d0f174a5cbd78760b0096b4266ec73a12eda3c358910f890e66aa9f016190736c8547f060ec689b01f69ade1c9f76503a9cd2ce6c88106f1a1e61a025ef61da62b78063129adea81ad7a12d59af1c7603d2366b0805e79a0608c14646cbfd2338";
+const DEV_AGGREGATE_CAP: &str = "545e8c2c2fb0a410321ef75df1d2107175b21b42b579034cec67790d9329c65340a7423d222cbd317b7a1d194fc6e84cbc5ece4ccda205614b9d5250e3940b505802181a4a78b83245ec143386d2130be685077721313d1007199140e34d296d7ef3e51ae8324a024f972a5344011d4480703b04aa03da744eeb75216513a21978361d175e6ac9536cdd43314b1c153aa881ca12f55eb6376f9fe50a94cd755ed16b230c4378346b8d713a51c51a99078ddedc35db019d683c2eb50f40a1d527af0f2a57b3610a2223996421a8a26610c0b29c42791be414704e111ecf67df69418f2652567bcf20f3614a568298e25343aaca2539900125e2e02f03de7a2f3c855e0618c1e1c15e3966066d8d06a02f9c360301481aa85d7651e21bc7631724ec0b692bdb0e874e04b7bc5073a20e02961a7b3ad21ac004279810532510485e6995061292930b56715bf5499c461a521fb4716dad105c6c439b8c203ce3883f53880f53604f3e0ed45a3e49b1ba5317ddb789680ddcbf0139575e1dd9464e0a2e850101581bf83af8c5a959da459628d262e43e9724955c40f8cb59ff2d533440e7811fb3b7396d3fa9e27099edde65d4e4af3913ac3d6cce589c39329e4628996e7c0ca3c07e506a1371386e3d3f2608e3b75c77db3e6b99307d12cd023c676283f55e430a4b2bdfd9e05cfbdf1941be4e5b659d95244fa73906042a4285723261de05c6c68e5b71fdad191e5a9b65dc331430bc3e9b3a7b90ee4fb2721c465632dc0454a7b75224ed4d5011125417ab847714bc22a3164cb1dc63b683575ad450360c3c885b157b223d4133aa8e12495c9e448596e557dd54426c70c4d525039d1237fcfef82fc9fd7719ea559d1ea308b045e0e12a478a634728ba96e837a0da8f74b786232ae4e23142ba292d507125555f4b64c3476907291875edf12be8b0a2625a5d1c3a4cc1ff0ab8171f6351b8aa1a65da0a6f32ea6948ac191b619fb47307f8a7d81a33bc8258834bdd5c2f4127755444cf4e8d8406170760874da5a485249a8dd834a9fd9c413a955518c66a4c00fc665a196859851ae2cc1054c04590137836d10408688719fd50ee4c4814ac2fb1dd517100ce4d3e867061350cd2155406c52c72c347bf4d6b42074df646403a035d3708b64164206b59c51b1dcb28476387de5ed40b966d106cb75cfd188b3a8e149059a5113725beedb829ccbf206176b43432564d54178b57120f245f5f0fff68095b4743651ba2232a641926e06aeb186925cff4a42c06074648bfdc106b013f1f226a80de0d3b12dc62a38a806291227d0aebeb181634fde14714b4b6761b85282661bce93fd7f12e7640eb4f4c0c6d5b471c0639183a4c533717acd55cf231c87188b3044108e5ef41cf82bb197bbbac50274ec66db6f7dc655579ee29ba497a31453eac7510e4b931";
 
 /// This network's verifying key for tree proofs.
 pub fn tree_verifying_key() -> VerifyingKey {
@@ -312,12 +316,12 @@ impl Proof {
     /// Whether this proves the block statement for exactly these public
     /// commitment lists and outputs' recovery nonces (`nonces[i]` is
     /// `outputs[i]`'s), claiming `reward`, with the state moving as
-    /// `state` says.
-    pub fn verify(&self, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange, reward: u64) -> bool {
+    /// `state` says for a block at `height`.
+    pub fn verify(&self, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange, height: u32, reward: u64) -> bool {
         if !inputs.iter().chain(outputs).all(is_canonical) || nonces.len() != outputs.len() {
             return false;
         }
-        verify_tree(&self.bytes, inputs, outputs, nonces, state, reward)
+        verify_tree(&self.bytes, inputs, outputs, nonces, state, height, reward)
     }
 }
 
@@ -340,14 +344,15 @@ fn parse_header_and_rest(bytes: &[u8]) -> Option<Header<'_>> {
     is_canonical(&data).then_some((amounts, aggregated, data, r.0))
 }
 
-/// What a root proof is checked against, for this body and state change;
-/// `None` if the proof's header doesn't parse.
-fn claim(bytes: &[u8], inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange) -> Option<(RootClaim, stark::Proof)> {
+/// What a root proof is checked against, for this body, state change and
+/// height; `None` if the proof's header doesn't parse.
+fn claim(bytes: &[u8], inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange, height: u32) -> Option<(RootClaim, stark::Proof)> {
     let (amounts, aggregated, data, rest) = parse_header_and_rest(bytes)?;
     let claim = RootClaim {
         inputs: elements(inputs),
         outputs: elements(outputs).into_iter().zip(nonce_elements(nonces)).collect(),
         state: *state,
+        height,
         aggregated,
         data: digest_from_bytes(&data),
         amounts,
@@ -356,18 +361,18 @@ fn claim(bytes: &[u8], inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8;
 }
 
 /// A block proof's tree root, as a chain step verifies it
-/// (`chain_step`): for this body and state change. `None` if the proof
-/// doesn't parse; whether it verifies is `Proof::verify`'s question.
-pub fn block_root(proof: &Proof, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange) -> Option<aggregate::Node> {
-    let (claim, root) = claim(&proof.bytes, inputs, outputs, nonces, state)?;
+/// (`chain_step`): for this body, state change and height. `None` if the
+/// proof doesn't parse; whether it verifies is `Proof::verify`'s question.
+pub fn block_root(proof: &Proof, inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange, height: u32) -> Option<aggregate::Node> {
+    let (claim, root) = claim(&proof.bytes, inputs, outputs, nonces, state, height)?;
     Some(tree_verifying_key().root(&claim, root))
 }
 
-fn verify_tree(bytes: &[u8], inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange, reward: u64) -> bool {
+fn verify_tree(bytes: &[u8], inputs: &[[u8; 32]], outputs: &[[u8; 32]], nonces: &[[u8; NONCE_LEN]], state: &StateChange, height: u32, reward: u64) -> bool {
     if state.count_out.checked_sub(state.count_in) != Some(outputs.len() as u64) {
         return false;
     }
-    match claim(bytes, inputs, outputs, nonces, state) {
+    match claim(bytes, inputs, outputs, nonces, state, height) {
         Some((claim, root)) => tree_verifying_key().verify_block(&claim, reward, &root),
         None => false,
     }
@@ -383,25 +388,28 @@ pub struct BlockPlan {
     pub transitions: Vec<ChunkTransition>,
     /// The reward the block claims, at its height (`Schedule::reward`).
     pub reward: u64,
+    /// The block's height and its inputs' creation heights.
+    pub heights: block_air::Heights,
 }
 
-/// Group transactions, in order, into chunks that fit `CHUNK_SHAPE`, as
-/// indices; `None` if one doesn't fit even alone (consensus: no
-/// transaction may have more inputs or outputs than a chunk holds).
+/// Group transactions, in order, into chunks that fit `CHUNK_SHAPE` and
+/// `CHUNK_SIGNATURES`, as indices; `None` if one doesn't fit even alone
+/// (consensus: no transaction may have more inputs, outputs or signatures
+/// than a chunk holds).
 pub fn plan_chunks(transactions: &[Transaction]) -> Option<Vec<Vec<usize>>> {
     let mut chunks: Vec<Vec<usize>> = Vec::new();
-    let (mut ins, mut outs) = (usize::MAX, usize::MAX);
+    let (mut ins, mut outs, mut sigs) = (usize::MAX, usize::MAX, usize::MAX);
     for (t, tx) in transactions.iter().enumerate() {
-        let (i, o) = (tx.inputs.len(), tx.outputs.len());
-        if i > CHUNK_SHAPE.inputs || o > CHUNK_SHAPE.outputs {
+        let (i, o, s) = (tx.inputs.len(), tx.outputs.len(), tx.signature_count());
+        if i > CHUNK_SHAPE.inputs || o > CHUNK_SHAPE.outputs || s > CHUNK_SIGNATURES {
             return None;
         }
-        if chunks.is_empty() || ins + i > CHUNK_SHAPE.inputs || outs + o > CHUNK_SHAPE.outputs {
+        if chunks.is_empty() || ins + i > CHUNK_SHAPE.inputs || outs + o > CHUNK_SHAPE.outputs || sigs + s > CHUNK_SIGNATURES {
             chunks.push(Vec::new());
-            (ins, outs) = (0, 0);
+            (ins, outs, sigs) = (0, 0, 0);
         }
         chunks.last_mut().unwrap().push(t);
-        (ins, outs) = (ins + i, outs + o);
+        (ins, outs, sigs) = (ins + i, outs + o, sigs + s);
     }
     Some(chunks)
 }
@@ -467,7 +475,7 @@ pub fn prove_block_with_root(
             (0, u64::try_from(spent - created).ok()?)
         };
         totals = (totals.0 + net.0 as u128, totals.1 + net.1 as u128);
-        witnesses.push(block_air::build_chunk(&txs, net, CHUNK_SHAPE).ok()?);
+        witnesses.push(block_air::build_chunk(&txs, net, CHUNK_SHAPE, &plan.heights).ok()?);
     }
     // The block must claim exactly the reward (plus fees, which cancel).
     if totals.0.checked_sub(totals.1) != Some(plan.reward as u128) {
@@ -541,7 +549,7 @@ pub fn prove_block_with_root(
         root_out: plan.transitions.last().unwrap().change.root_out,
         count_out: plan.transitions.last().unwrap().change.count_out,
     };
-    proof.verify(inputs, outputs, nonces, &state, plan.reward).then_some((proof, root))
+    proof.verify(inputs, outputs, nonces, &state, plan.transitions[0].height, plan.reward).then_some((proof, root))
 }
 
 /// This network's tree circuits' verifying keys (`aggregate::vk_digest` of
@@ -584,6 +592,17 @@ mod tests {
         txs: Vec<Transaction>,
         plan: BlockPlan,
         state: StateChange,
+        height: u32,
+    }
+
+    /// The test blocks' height, and their inputs' creation height.
+    const HEIGHT: u32 = 5;
+    const CREATED: u32 = 2;
+
+    /// `HEIGHT`, every input of `txs` created at `CREATED`.
+    fn heights_of(txs: &[Transaction]) -> block_air::Heights {
+        let created = txs.iter().flat_map(|t| &t.inputs).map(|i| (i.commitment(), CREATED)).collect();
+        block_air::Heights { block: HEIGHT, created }
     }
 
     fn block(txs: Vec<Transaction>) -> TestBlock {
@@ -592,17 +611,17 @@ mod tests {
         let body = BlockBody::from_transactions(&txs).unwrap();
         let chunks = plan_chunks(&txs).unwrap();
         let zero = [0; NONCE_LEN];
-        let leaf = |c: &[u8; 32], n: &[u8; NONCE_LEN]| compress_leaf(&digest_from_bytes(c), &crate::output::nonce_limbs(n));
+        let leaf = |c: &[u8; 32], n: &[u8; NONCE_LEN], h: u32| compress_leaf(&digest_from_bytes(c), &crate::output::nonce_limbs(n), h);
         let mut tree = MemTree::default();
         for c in &body.inputs {
-            tree.append(leaf(c, &zero));
+            tree.append(leaf(c, &zero, CREATED));
         }
         let (root_in, base) = (tree.root(), tree.count());
         let end = base + body.outputs.len() as u64;
         let mut transitions = Vec::new();
         let mut count = base;
         for indices in &chunks {
-            let mut ins: Vec<[u8; 32]> = indices.iter().flat_map(|&t| &txs[t].inputs).map(|i| Output::new(&i.pubkey, i.amount).commitment()).collect();
+            let mut ins: Vec<[u8; 32]> = indices.iter().flat_map(|&t| &txs[t].inputs).map(|i| i.commitment()).collect();
             let mut outs: Vec<[u8; 32]> = indices.iter().flat_map(|&t| &txs[t].outputs).map(|o| o.commitment()).collect();
             ins.sort();
             outs.sort();
@@ -611,11 +630,11 @@ mod tests {
             for slot in 0..CHUNK_SHAPE.inputs {
                 match ins.get(slot) {
                     Some(c) => {
-                        let p = tree.position_of(&leaf(c, &zero)).unwrap();
-                        t_inputs.push((p, zero, tree.path(p)));
-                        tree.spend(&leaf(c, &zero));
+                        let p = tree.position_of(&leaf(c, &zero, CREATED)).unwrap();
+                        t_inputs.push((p, zero, CREATED, tree.path(p)));
+                        tree.spend(&leaf(c, &zero, CREATED));
                     }
-                    None => t_inputs.push((end, zero, tree.path(end))),
+                    None => t_inputs.push((end, zero, 0, tree.path(end))),
                 }
             }
             let mut t_outputs = Vec::new();
@@ -625,7 +644,7 @@ mod tests {
                         let o = body.outputs.binary_search(c).unwrap();
                         let p = base + o as u64;
                         t_outputs.push((p, tree.path(p)));
-                        tree.place(p, leaf(c, &body.nonces[o]));
+                        tree.place(p, leaf(c, &body.nonces[o], HEIGHT));
                         count += 1;
                     }
                     None => t_outputs.push((end, tree.path(end))),
@@ -634,17 +653,20 @@ mod tests {
             transitions.push(ChunkTransition {
                 change: StateChange { root_in: root, count_in, root_out: tree.root(), count_out: count },
                 window: (base, end),
+                height: HEIGHT,
                 inputs: t_inputs,
                 outputs: t_outputs,
             });
         }
+        let heights = heights_of(&txs);
         TestBlock {
             inputs: body.inputs.clone(),
             outputs: body.outputs,
             nonces: body.nonces,
             txs,
-            plan: BlockPlan { chunks, transitions, reward: REWARD },
+            plan: BlockPlan { chunks, transitions, reward: REWARD, heights },
             state: StateChange { root_in, count_in: base, root_out: tree.root(), count_out: end },
+            height: HEIGHT,
         }
     }
 
@@ -692,7 +714,7 @@ mod tests {
     fn garbage_and_placeholder_proofs_dont_verify() {
         let b = block(vec![reward_tx(REWARD)]);
         for proof in [Proof::placeholder(), Proof::from_bytes(vec![4, 0, 0, 0, 1, 2, 3]), Proof::from_bytes(vec![0, 0, 0, 0])] {
-            assert!(!proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, REWARD));
+            assert!(!proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, b.height, REWARD));
         }
     }
 
@@ -716,7 +738,7 @@ mod tests {
         good.push(1);
         good.extend([0; 32]);
         assert!(parse_header_and_rest(&good).is_some());
-        assert!(!Proof::from_bytes(good).verify(&b.inputs, &b.outputs, &b.nonces, &b.state, REWARD));
+        assert!(!Proof::from_bytes(good).verify(&b.inputs, &b.outputs, &b.nonces, &b.state, b.height, REWARD));
     }
 
     #[test]
@@ -766,27 +788,66 @@ mod tests {
         let proof = proof.expect("a tree proof that verifies");
         println!("tree proof: {} KB", proof.len() / 1024);
         let start = std::time::Instant::now();
-        assert!(proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, REWARD));
+        assert!(proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, b.height, REWARD));
         println!("verified in {:.2?}", start.elapsed());
         // Other lists, a different claimed split of the totals, or another
         // state change.
         let mut other = b.outputs.clone();
         other.swap(0, 1);
-        assert!(!proof.verify(&b.inputs, &other, &b.nonces, &b.state, REWARD));
+        assert!(!proof.verify(&b.inputs, &other, &b.nonces, &b.state, b.height, REWARD));
         let mut bytes = proof.as_bytes().to_vec();
         bytes[1] ^= 1; // A
         bytes[9] ^= 1; // B, keeping A - B
-        assert!(!Proof::from_bytes(bytes).verify(&b.inputs, &b.outputs, &b.nonces, &b.state, REWARD));
+        assert!(!Proof::from_bytes(bytes).verify(&b.inputs, &b.outputs, &b.nonces, &b.state, b.height, REWARD));
         let mut state = b.state;
         state.count_out += 1;
-        assert!(!proof.verify(&b.inputs, &b.outputs, &b.nonces, &state, REWARD));
+        assert!(!proof.verify(&b.inputs, &b.outputs, &b.nonces, &state, b.height, REWARD));
+        // Another height (its outputs' leaves would differ).
+        assert!(!proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, b.height + 1, REWARD));
         let mut nonces = b.nonces.clone();
         nonces[0][0] ^= 1;
-        assert!(!proof.verify(&b.inputs, &b.outputs, &nonces, &b.state, REWARD));
+        assert!(!proof.verify(&b.inputs, &b.outputs, &nonces, &b.state, b.height, REWARD));
         // A one-chunk block: its root is the wrap.
         let small = block(vec![reward_tx(REWARD)]);
         let proof = prove_block(&small.inputs, &small.outputs, &small.nonces, &small.txs, &small.plan, [5; 32]).unwrap();
-        assert!(proof.verify(&small.inputs, &small.outputs, &small.nonces, &small.state, REWARD));
+        assert!(proof.verify(&small.inputs, &small.outputs, &small.nonces, &small.state, small.height, REWARD));
+    }
+
+    /// A block spending a policy output -- by the 2-of-3, hash-locked
+    /// branch of a two-branch policy -- proves and verifies with this
+    /// network's parameters, through chunk, wrap and aggregation. Slow:
+    /// `[NETWORK=dev] cargo test --release -- --ignored --nocapture
+    /// a_policy_spend_proves`.
+    #[test]
+    #[ignore]
+    fn a_policy_spend_proves() {
+        use crate::policy::{Branch, Policy};
+        use crate::poseidon2::digest_to_bytes;
+        let key = |k: u8| digest_to_bytes(wots::keygen(&[k; 32]).1.hash());
+        let preimage = digest_to_bytes([BabyBear::new(7); 8]);
+        let pay = Branch { threshold: 2, keys: vec![key(11), key(12), key(13)], after_height: 0, after_age: 0, hashlock: crate::policy::hashlock(&preimage), rebind: None };
+        let refund = Branch { threshold: 1, keys: vec![key(14)], after_height: 1_000, after_age: 0, hashlock: None, rebind: None };
+        let policy = Policy { branches: vec![refund, pay.clone()] };
+        let mut spend = Transaction::new();
+        let path = policy.path(1).iter().map(|h| digest_to_bytes(*h)).collect();
+        spend.add_policy_input(pay, 1, path, Some(preimage), 300).unwrap();
+        spend.add_output(Output::new(&wots::keygen(&[15; 32]).1, 300)).unwrap();
+        let commitment = Output::locked(policy.lock(), 300).commitment();
+        for k in [0u8, 2] {
+            let (sk, pk) = wots::keygen(&[11 + k; 32]);
+            assert!(spend.sign_policy_input(&commitment, k, &pk, crate::keytree::KeyProof::one_time(), &sk));
+        }
+        assert!(spend.verify());
+        // Two chunks (the spend's three signatures don't fit beside the
+        // spends), so an aggregation too.
+        let mut txs = spends(10);
+        txs.push(spend);
+        let b = block(txs);
+        assert!(b.plan.chunks.len() > 1);
+        let start = std::time::Instant::now();
+        let proof = prove_block(&b.inputs, &b.outputs, &b.nonces, &b.txs, &b.plan, [7; 32]).expect("a policy spend proves");
+        println!("proved in {:.2?}", start.elapsed());
+        assert!(proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, b.height, REWARD));
     }
 
     /// The wrap circuit's size for a full chunk (verifying its proof and
@@ -800,7 +861,7 @@ mod tests {
         let txs: Vec<Transaction> = b.plan.chunks[k].iter().map(|&i| b.txs[i].clone()).collect();
         let spent: u64 = txs.iter().flat_map(|t| &t.inputs).map(|i| i.amount).sum();
         let created: u64 = txs.iter().flat_map(|t| &t.outputs).map(|o| o.amount).sum();
-        let chunk = block_air::build_chunk(&txs, (created - spent, 0), CHUNK_SHAPE).unwrap();
+        let chunk = block_air::build_chunk(&txs, (created - spent, 0), CHUNK_SHAPE, &heights_of(&txs)).unwrap();
         let start = std::time::Instant::now();
         let proof = stark::prove(&chunk.air, &chunk.trace, &chunk_params(), [1; 32]).unwrap();
         println!("chunk proof: {:.2?}", start.elapsed());
@@ -825,7 +886,7 @@ mod tests {
         let time = std::time::Instant::now;
         match case.as_str() {
             "chunk" => {
-                let chunk = block_air::build_chunk(&b.txs, (REWARD, 0), CHUNK_SHAPE).unwrap();
+                let chunk = block_air::build_chunk(&b.txs, (REWARD, 0), CHUNK_SHAPE, &heights_of(&b.txs)).unwrap();
                 let start = time();
                 let proof = stark::prove(&chunk.air, &chunk.trace, &chunk_params(), [1; 32]).unwrap();
                 println!(
@@ -840,7 +901,7 @@ mod tests {
                 let proof = prove_block(&b.inputs, &b.outputs, &b.nonces, &b.txs, &b.plan, [1; 32]).unwrap();
                 let proving = start.elapsed();
                 let start = time();
-                assert!(proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, REWARD));
+                assert!(proof.verify(&b.inputs, &b.outputs, &b.nonces, &b.state, b.height, REWARD));
                 println!(
                     "{count} inputs, {} chunk(s): prove {proving:.2?} (keys included); {:.1} KB; verify {:.2?}",
                     b.plan.chunks.len(),
