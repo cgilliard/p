@@ -1,0 +1,140 @@
+#!/bin/sh
+# Run an RV32I binary in QEMU virt.
+#
+# Usage: q32 [options] <binary>
+#   --cpu=CPU     CPU model (default: rv32i strict)
+#   --net         Enable virtio-net (user-mode NAT)
+#   --disk=FILE   Attach FILE as virtio-blk disk
+#   --in=FILE     serial input from FILE  ┐ file-backed serial instead of stdio:
+#   --out=FILE    serial output to FILE   ┘ byte-exact on every platform (QEMU's
+#                 win32 stdio chardev loses bytes on piped stdin); used by
+#                 tools/fam for the compile step.  --out required with --in.
+#
+# Examples:
+#   q32 program.bin
+#   q32 --net bin/tabernacle
+#   q32 --net --disk=node.bin bin/tabernacle
+#   printf '10.0.2.2:3737\004' | q32 --net bin/tabernacle
+
+CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
+zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
+zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
+FILE=""
+NET=0
+DISK=""
+HOSTFWD=""
+NETDEV=""
+MAC=""
+SERIN=""
+SEROUT=""
+
+for arg in "$@"; do
+	case "$arg" in
+		--cpu=*) CPU="${arg#--cpu=}" ;;
+		--net) NET=1 ;;
+		--disk=*) DISK="${arg#--disk=}" ;;
+		--hostfwd=*) HOSTFWD="${arg#--hostfwd=}" ;;
+		--netdev=*) NETDEV="${arg#--netdev=}" ;;
+		--mac=*) MAC="${arg#--mac=}" ;;
+		--in=*) SERIN="${arg#--in=}" ;;
+		--out=*) SEROUT="${arg#--out=}" ;;
+		--help|-h)
+			echo "Usage: $0 [--cpu=CPU] [--net] [--disk=FILE] [--hostfwd=SPEC] [--netdev=SPEC] [--mac=ADDR] <binary>"
+			echo "  --hostfwd=udp::HOST_PORT-:GUEST_PORT  expose guest UDP port to host"
+			echo "  --netdev=SPEC  raw -netdev string (must include id=n0); e.g. for two VMs:"
+			echo "                 --netdev=socket,id=n0,listen=:1234  /  socket,id=n0,connect=127.0.0.1:1234"
+			echo "  --mac=ADDR     set the virtio-net MAC (give each VM a distinct one)"
+			exit 0 ;;
+		--*) echo "Unknown option: $arg"; exit 1 ;;
+		*) FILE="$arg" ;;
+	esac
+done
+
+if [ -z "$FILE" ]; then
+	echo "Usage: $0 [--cpu=CPU] [--net] [--disk=FILE] <binary>"
+	exit 1
+fi
+
+if [ ! -e "$FILE" ]; then
+	echo "Error: $FILE not found"
+	exit 1
+fi
+
+MAGIC=$(head -c 4 "$FILE" | xxd -p)
+if [ "$MAGIC" != "13000000" ]; then
+	echo "Error: $FILE is not a valid binary (bad magic)"
+	exit 1
+fi
+
+if [ -n "$SERIN" ] && [ -z "$SEROUT" ]; then
+	echo "Error: --in requires --out (file chardev needs an output path)"
+	exit 1
+fi
+
+# --in/--out transport: POSIX uses the file chardev (byte-exact, no deps);
+# Windows QEMU rejects input-path, so use a loopback TCP chardev + the
+# tools/serial_pump (pure bash) instead.  FAM_SERIAL=socket forces the socket
+# path (lets the Windows transport be tested on Linux).
+SOCKMODE=0
+case "$(uname -s)" in MINGW*|MSYS*) SOCKMODE=1 ;; esac
+[ "$FAM_SERIAL" = "socket" ] && SOCKMODE=1
+
+# Build QEMU arguments
+ARGS="-machine virt -cpu $CPU -nographic -bios none"
+ARGS="$ARGS -device loader,file=$FILE,addr=0x80000000"
+SERPORT=""
+if [ -n "$SEROUT" ]; then
+	if [ "$SOCKMODE" = 1 ]; then
+		SERPORT=$((20000 + $$ % 20000))
+		CHR="-chardev socket,id=ser0,host=127.0.0.1,port=$SERPORT,server=on,wait=on"
+	else
+		CHR="-chardev file,id=ser0,path=$SEROUT"
+		[ -n "$SERIN" ] && CHR="$CHR,input-path=$SERIN"
+	fi
+	ARGS="$ARGS $CHR -serial chardev:ser0 -monitor none"
+else
+	ARGS="$ARGS -serial stdio -monitor none"
+fi
+
+if [ -n "$NETDEV" ] || [ "$NET" = "1" ]; then
+	ARGS="$ARGS -global virtio-mmio.force-legacy=true"
+	if [ -n "$NETDEV" ]; then
+		ARGS="$ARGS -netdev $NETDEV"
+	elif [ -n "$HOSTFWD" ]; then
+		ARGS="$ARGS -netdev user,id=n0,hostfwd=$HOSTFWD"
+	else
+		ARGS="$ARGS -netdev user,id=n0"
+	fi
+	NETDEV_DEV="-device virtio-net-device,netdev=n0"
+	if [ -n "$MAC" ]; then
+		NETDEV_DEV="$NETDEV_DEV,mac=$MAC"
+	fi
+	ARGS="$ARGS $NETDEV_DEV"
+fi
+
+if [ -n "$DISK" ]; then
+	if [ ! -e "$DISK" ]; then
+		echo "Error: disk image $DISK not found"
+		exit 1
+	fi
+	ARGS="$ARGS -global virtio-mmio.force-legacy=true"
+	ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0"
+	ARGS="$ARGS -device virtio-blk-device,drive=d0"
+fi
+
+if [ -n "$SERPORT" ]; then
+	# socket serial: qemu in the background, the pump in the foreground;
+	# qemu's exit code (guest finisher) is the verdict.
+	SCRIPT=$(readlink -f "$0" 2>/dev/null || echo "$0")
+	TOOLS=$(dirname "$SCRIPT")
+	IN="${SERIN:--}"   # "-" tells serial_pump there is no input stream
+	qemu-system-riscv32 $ARGS 2>/dev/null &
+	QPID=$!
+	"$TOOLS/serial_pump" "$SERPORT" "$IN" "$SEROUT" || { kill $QPID 2>/dev/null; exit 1; }
+	wait $QPID
+	exit $?
+fi
+
+# exec so signals (and `timeout`) reach qemu directly and `$!` is the qemu pid
+# (no orphaned qemu on kill/timeout — qemu is the direct child, not a grandchild).
+exec qemu-system-riscv32 $ARGS 2>/dev/null
