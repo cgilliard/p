@@ -1,0 +1,285 @@
+\ gen_hash.fam — Gimli-Hash a payload, emit 8 hex digest words.
+\
+\ Input: memory-mapped at 0x80800000 via QEMU `-device loader`:
+\   [4 B LE: N] [N bytes data]
+\
+\ Output (UART): eight lines, each an uppercase hex u32 (MSB-first),
+\ followed by a newline.  scripts/build.sh (patch_config) converts them
+\ to LE bytes and patches the digest into the tabernacle image.
+\
+\ Hot-path words (sp_box, absorb, swsm, swbg, clearst) use direct
+\ RV32I encoding — no nested `:` calls in the inner kernel.
+\
+\ NOTE on number format (this fam dialect):
+\   * Literals are UPPERCASE hex, no `0x` prefix (e.g. `1C lit`, `F lit`).
+\   * `,` emits its operand BIG-ENDIAN (MSB first), so a raw instruction
+\     word is written byte-reversed: `lw s7,0(sp)` (0x00012B83) -> `832B0100 ,`.
+\
+\ Register pinning:
+\   s8  = data ptr (advances by 16 each absorb)
+\   s9  = state base (48 bytes, 12 words)
+\   s7  = remaining length
+
+:M tos>s7   832B0100 , 13014100 , ;    \ lw s7,0(sp) ; addi sp,sp,4
+:M tos>s8   032C0100 , 13014100 , ;    \ lw s8,0(sp) ; addi sp,sp,4
+:M tos>s9   832C0100 , 13014100 , ;    \ lw s9,0(sp) ; addi sp,sp,4
+:M s7>tos   1301C1FF , 23207101 , ;    \ addi sp,sp,-4 ; sw s7,0(sp)
+:M s8>tos   1301C1FF , 23208101 , ;    \ addi sp,sp,-4 ; sw s8,0(sp)
+:M s9>tos   1301C1FF , 23209101 , ;    \ addi sp,sp,-4 ; sw s9,0(sp)
+
+\ ── Local asm extensions (not in lib/asm.fam) ──
+\ R-type encoders, identical to lib/asm.fam's `_or` except the funct3 lui:
+\ read 3 reg operands from the cstack (tp), emit one R-type word to gp.
+\   and = funct3 7  (lui t1,0x7)   xor = funct3 4  (lui t1,0x4)
+
+:I _and
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+93F3F301 ,   \ andi t2,t2,31
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37730000 ,   \ lui t1,0x7
+13033303 ,   \ addi t1,t1,51
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I _xor
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+93F3F301 ,   \ andi t2,t2,31
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37430000 ,   \ lui t1,0x4
+13033303 ,   \ addi t1,t1,51
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+
+\ ── I/O (cold path) ──
+
+: putnib
+    dup A lit < if 30 lit + else 37 lit + then putc
+;
+
+: puthx8
+    dup 1C lit rshift F lit and putnib
+    dup 18 lit rshift F lit and putnib
+    dup 14 lit rshift F lit and putnib
+    dup 10 lit rshift F lit and putnib
+    dup C  lit rshift F lit and putnib
+    dup 8  lit rshift F lit and putnib
+    dup 4  lit rshift F lit and putnib
+    F lit and putnib
+;
+
+
+\ ── State accessors (cold path only — hot paths use raw asm) ──
+: state@  s9>tos + @ ;
+: state!  s9>tos + ! ;
+
+
+\ ── Hot-path Gimli kernel ──
+
+: sp_box
+    0    sp   t0   lw
+    4    sp   sp   addi
+    s9   t0   t0   add
+
+    0    t0   a0   lw
+    10   t0   a1   lw
+    20   t0   a2   lw
+
+    18   a0   a3   slli
+    8    a0   a0   srli
+    a3   a0   a0   _or
+
+    9    a1   a3   slli
+    17   a1   a1   srli
+    a3   a1   a1   _or
+
+    a1   a0   a3   _and
+    3    a3   a3   slli
+    a2   a3   a3   _xor
+    a1   a3   a3   _xor
+    0    a3   t0   sw
+
+    a2   a0   a3   _or
+    1    a3   a3   slli
+    a1   a3   a3   _xor
+    a0   a3   a3   _xor
+    10   a3   t0   sw
+
+    a2   a1   a3   _and
+    2    a3   a3   slli
+    1    a2   a2   slli
+    a2   a3   a3   _xor
+    a0   a3   a3   _xor
+    20   a3   t0   sw
+;
+
+
+: swsm
+    0    s9   a0   lw
+    4    s9   a1   lw
+    4    a0   s9   sw
+    0    a1   s9   sw
+    8    s9   a0   lw
+    C    s9   a1   lw
+    C    a0   s9   sw
+    8    a1   s9   sw
+;
+
+
+: swbg
+    0    s9   a0   lw
+    8    s9   a1   lw
+    8    a0   s9   sw
+    0    a1   s9   sw
+    4    s9   a0   lw
+    C    s9   a1   lw
+    C    a0   s9   sw
+    4    a1   s9   sw
+;
+
+
+: clearst
+    0    zr   s9   sw
+    4    zr   s9   sw
+    8    zr   s9   sw
+    C    zr   s9   sw
+    10   zr   s9   sw
+    14   zr   s9   sw
+    18   zr   s9   sw
+    1C   zr   s9   sw
+    20   zr   s9   sw
+    24   zr   s9   sw
+    28   zr   s9   sw
+    2C   zr   s9   sw
+;
+
+
+: absorb
+    0    s8   a0   lw
+    0    s9   a1   lw
+    a0   a1   a1   _xor
+    0    a1   s9   sw
+    4    s8   a0   lw
+    4    s9   a1   lw
+    a0   a1   a1   _xor
+    4    a1   s9   sw
+    8    s8   a0   lw
+    8    s9   a1   lw
+    a0   a1   a1   _xor
+    8    a1   s9   sw
+    C    s8   a0   lw
+    C    s9   a1   lw
+    a0   a1   a1   _xor
+    C    a1   s9   sw
+    10   s8   s8   addi
+;
+
+
+: permute
+    18 lit
+    begin
+        0 lit sp_box  4 lit sp_box  8 lit sp_box  C lit sp_box
+
+        dup 3 lit and
+        dup 0= if
+            drop
+            swsm
+            0       sp   a0   lw
+            9E378   a1   lui
+            F900    a1   a1   addi
+            a0      a1   a1   _or
+            0       s9   a2   lw
+            a1      a2   a2   _xor
+            0       a2   s9   sw
+        else 2 lit = if
+            swbg
+        then then
+
+        1 lit - dup 0=
+    until
+    drop
+;
+
+
+\ ── gimli_hash ──
+
+: do_hash ( data_ptr len -- )
+    tos>s7
+    tos>s8
+
+    clearst
+
+    begin
+        s7>tos 10 lit u<
+        0= while
+            absorb
+            permute
+            s7>tos 10 lit - tos>s7
+    repeat
+
+    \ XOR remaining bytes directly into state.
+    0 lit
+    begin
+        dup s7>tos u<
+    while
+        dup s8>tos + c@
+        over s9>tos + dup c@ rot xor swap c!
+        1 lit +
+    repeat
+    drop
+
+    \ Padding: state_byte[remaining] ^= 0x01
+    s7>tos s9>tos + dup c@ 1 lit xor swap c!
+    \ Padding: state_byte[15] ^= 0x80
+    s9>tos F lit + dup c@ 80 lit xor swap c!
+    \ Domain separator: state_byte[47] ^= 0x01
+    2C lit state@ 1000000 lit xor 2C lit state!
+
+    permute
+;
+
+
+\ ── Main ──
+
+30 lit alloc tos>s9
+
+80800000 lit @ tos>s7
+80800004 lit tos>s8
+
+s8>tos s7>tos do_hash
+
+0 lit state@ puthx8 A lit putc
+4 lit state@ puthx8 A lit putc
+8 lit state@ puthx8 A lit putc
+C lit state@ puthx8 A lit putc
+
+permute
+
+0 lit state@ puthx8 A lit putc
+4 lit state@ puthx8 A lit putc
+8 lit state@ puthx8 A lit putc
+C lit state@ puthx8 A lit putc
+
+bye

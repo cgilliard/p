@@ -1,0 +1,13 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/fence.fam — shared RISC-V fence macros for the device modules.
+\
+\ The node has no zicsr (no interrupts); every device is polled, and correctness
+\ depends on ordering MMIO writes before a QueueNotify and ordering used-ring/DMA
+\ reads after the device completes.  Both src/disk.fam and src/net.fam need these,
+\ and `:M` redefinition is rejected by the compiler, so they live here once and are
+\ compiled FIRST.  Each module is then independently testable by prepending this
+\ file, e.g.  ./tools/fam --test src/fence.fam src/net.fam
+\ ──────────────────────────────────────────────────────────────────────────────
+
+:M fence_io 0F00500F , ;           \ fence iorw,ow   (order MMIO writes before QueueNotify)
+:M fence_r  0F002002 , ;           \ fence r,r       (order reads after device DMA)

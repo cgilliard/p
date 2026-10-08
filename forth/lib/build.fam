@@ -1,0 +1,55 @@
+\ ============================================================
+\ lib/build.fam — default (non-test) test-harness header.
+\ Prepended by ./tools/fam AFTER the stdlib, BEFORE the user
+\ source, for ordinary builds. Its only job: make a trailing
+\   Test { ... }
+\ block VANISH so a testable source still builds as a normal
+\ program. (./tools/fam --test swaps in lib/test.fam instead,
+\ which RUNS the block.) stdlib is never touched.
+\ ============================================================
+
+\ Test  ( C: -- )  COMPILE-TIME: consume the following `{ ... }`
+\        brace group (depth-counted, nests, spans newlines;
+\        unterminated -> abort). Emits nothing. Modeled exactly on
+\        stdlib's `(` block-comment word, matching {/} instead of ().
+:I Test
+93030000 ,   \ addi t2, x0, 0           ( depth = 0 )
+nxchar       \ tloop: push next char (0x04 at EOF), advance s1
+83220200 ,   \ lw   t0, 0(tp)
+13024200 ,   \ addi tp, tp, 4
+13034000 ,   \ addi t1, x0, 0x04        ( EOT )
+63846202 ,   \ beq  t0, t1, abort       ( EOF -> unterminated )
+1303B007 ,   \ addi t1, x0, 0x7B        ( '{' )
+63966200 ,   \ bne  t0, t1, tclose
+93831300 ,   \ addi t2, t2, 1           ( '{' -> depth++ )
+6FF09FFC ,   \ jal  x0, tloop
+1303D007 ,   \ addi t1, x0, 0x7D        ( tclose: '}' )
+E39062FC ,   \ bne  t0, t1, tloop
+9383F3FF ,   \ addi t2, t2, -1          ( '}' -> depth-- )
+E39C03FA ,   \ bnez t2, tloop
+6F004004 ,   \ jal  x0, done            ( depth 0 -> matched close )
+abort        \ unterminated: print '?' and halt the compiler
+;
+
+\ Bench ( C: -- )  COMPILE-TIME: consume a `Bench { ... }` brace group the
+\ same way `Test` is consumed above/in lib/build.fam, so benched sources
+\ still build (and test) as normal programs.  ./tools/fam --bench swaps in
+\ lib/bench.fam, which RUNS the block instead.
+:I Bench
+93030000 ,   \ addi t2, x0, 0           ( depth = 0 )
+nxchar       \ tloop: push next char (0x04 at EOF), advance s1
+83220200 ,   \ lw   t0, 0(tp)
+13024200 ,   \ addi tp, tp, 4
+13034000 ,   \ addi t1, x0, 0x04        ( EOT )
+63846202 ,   \ beq  t0, t1, abort       ( EOF -> unterminated )
+1303B007 ,   \ addi t1, x0, 0x7B        ( '{' )
+63966200 ,   \ bne  t0, t1, tclose
+93831300 ,   \ addi t2, t2, 1           ( '{' -> depth++ )
+6FF09FFC ,   \ jal  x0, tloop
+1303D007 ,   \ addi t1, x0, 0x7D        ( tclose: '}' )
+E39062FC ,   \ bne  t0, t1, tloop
+9383F3FF ,   \ addi t2, t2, -1          ( '}' -> depth-- )
+E39C03FA ,   \ bnez t2, tloop
+6F004004 ,   \ jal  x0, done            ( depth 0 -> matched close )
+abort        \ unterminated: print '?' and halt the compiler
+;

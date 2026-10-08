@@ -1,0 +1,2952 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# src/tabernacle.S — sealed bootstrap loader for famchain.
+#
+# Built via:
+#     python3 tools/s2fam0_tabernacle.py src/tabernacle.S src/tabernacle.fam0
+#     run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
+# (src/tabernacle.fam0 is checked in; scripts/build.sh runs only the second
+#  step — rerun the generator after editing this file.)
+#
+# Boot ABI (we set up our own gp via auto-prologue below):
+#     PC = 0x80000000     entry of this binary
+#     gp = end_marker     byte just past tabernacle.bin
+#                         (full_node.bin is concatenated after, so
+#                          gp = full_node base; gp-40 = config [nchunks,bin_size,hash].)
+#
+# Calling convention — NO JALR.  Subroutines are reached via direct `j`
+# with a per-call-site dispatch tag.  Mirrors the CALL/BST macros in
+# src/fam.S; pinned registers:
+#     s11 = current return ID (set by CALL)
+#     s10 = RID-stack ptr     (decreases on push)
+#     s9  = RID-stack bottom  (bounds check)
+#     s7  = full_node base    (page-aligned, persists for handoff)
+# Callee saves nothing on RID stack itself; CALL pushes/pops s11.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 	.text
+# 	.globl _start
+
+# ── Constants ─────────────────────────────────────────────────────────────
+# 	.equ UART_BASE,         0x10000000
+# 	.equ UART_LSR,                 0x5
+# 	.equ UART_RX_READY,            0x1
+# 	.equ SHUTDOWN_ADDR,       0x100000
+# 	.equ SHUTDOWN_PASS,         0x5555
+# 	.equ SHUTDOWN_FAIL,        0x13333
+
+# 	.equ STACK_SIZE,         0x100000      # 1 MiB data stack
+# 	.equ RID_BASE_OFF,       0x100000      # RID stack lives just above sp top
+# 	.equ RID_SIZE,             0x1000      # 256 frames × 16 B header (overkill)
+# 	.equ PAGE_SIZE,             0x1000
+# 	.equ NEG_PAGE_SIZE,     0xFFFFF000
+# 	.equ PAGE_MASK,              0xFFF
+
+	# BIN_SIZE and NCHUNKS are data words at gp-36 and gp-40,
+	# patched by scripts/build.sh after compiling tabernacle.fam0.
+
+# 	.equ SEED_LIST_OFFSET,      0xA000
+# 	.equ TIMETIK,               0x9FFC
+# 	.equ BPSAVE,                0x9FF8
+# 	.equ NS_RTRY,               0x9FE8      # last retry-send mtime (4 B)
+# 	.equ NP_CNT,                0x9FE4      # no-progress poll counter (4 B, transitional)
+# 	.equ WD_TICK,               0x9FE0      # watchdog: last-progress mtime (4 B)
+# 	.equ RND_START,             0x9FDC      # random probe-iteration start (1 B), set once
+# 	.equ DBGFLAG,               0x9FD8      # debug flag (4 B): 0=quiet, 1=verbose
+# 	.equ BATCH_START,           0x9FDA      # current batch start chunk (2 B)
+# 	.equ NB_SIZE,                  64       # chunks per batch
+# 	.equ NF_CNT,                0x9FF2      # blacklist fail count (2 B)
+# 	.equ NF_MASK,               0x9FF4      # blacklist bitmask, bit i = seed i failed
+# 	.equ MAX_SEEDS,                 16
+# 	.equ DEFAULT_TIMEOUT_TK, 0x05F5E100
+# 	.equ MTIME_ADDR,         0x200BFF8      # CLINT mtime (RV virt machine)
+# 	.equ MT_KHZ,                 10000      # mtime frequency in kHz (10 MHz)
+# 	.equ IPS_TICKS,           0x7A120      # 500000 ticks = 50 ms inter-probe spacing
+# 	.equ NRTRY_TK,           0x1E8480      # 2,000,000 ticks = 200 ms min retry interval
+	# NB_BMAP — chunk-received bitmap.  ceil(NCHUNKS / 8) bytes.
+	# At 8 KB max NCHUNKS supported (= 64K bits).
+# 	.equ NB_BMAP,               0xA080
+# 	.equ NB_BMAP_BYTES,           1024
+
+
+# ── Static-dispatch macros (no JALR), lifted from src/fam.S ───────────────
+# 	.altmacro
+# 	.set _CSN, 0
+
+# .macro CALL target
+# 	.set _CSN, _CSN + 1
+# 	addi    s10, s10, -4
+# 	bgeu    s10, s9, .L_call_ok_\@
+# 	j       panic
+# .L_call_ok_\@:
+# 	sw      s11, 0(s10)
+# 	li      s11, _CSN
+# 	j       \target
+# 	EMIT_LABEL %_CSN
+# 	lw      s11, 0(s10)
+# 	addi    s10, s10, 4
+# .endm
+
+# .macro EMIT_LABEL n
+# .L_csret_\n:
+# .endm
+
+# .macro BST lo, hi
+# 	BST_R %\lo, %\hi
+# .endm
+# .macro BST_R lo, hi
+# 	.if \hi == \lo
+# .L_bst_\lo\()_\hi:
+# 		j .L_csret_\lo
+# 	.else
+# 		.set _BST_MID, (\lo + \hi) / 2
+# 		BST_NODE %\lo, %\hi, %_BST_MID, %(_BST_MID - 1), %(_BST_MID + 1)
+# 	.endif
+# .endm
+# .macro BST_NODE lo, hi, mid, lhi, rlo
+# .L_bst_\lo\()_\hi:
+# 	li      t0, \mid
+# 	.if \lhi >= \lo
+# 		bge s11, t0, .L_bst_\lo\()_\hi\()_R
+# 		j   .L_bst_\lo\()_\lhi
+# .L_bst_\lo\()_\hi\()_R:
+# 	.endif
+# 	.if \rlo <= \hi
+# 		ble s11, t0, .L_bst_\lo\()_\hi\()_E
+# 		j   .L_bst_\rlo\()_\hi
+# .L_bst_\lo\()_\hi\()_E:
+# 	.endif
+# 	j       .L_csret_\mid
+# 	.if \lhi >= \lo
+# 		BST_R %\lo, %\lhi
+# 	.endif
+# 	.if \rlo <= \hi
+# 		BST_R %\rlo, %\hi
+# 	.endif
+# .endm
+
+# PC-relative load-address (avoids `la` which doesn't relax under -march=rv32i).
+# .macro LOAD_ADDRESS reg, label
+# _base\@:
+# 	.equ _offset\@, (\label - _base\@)
+# 	auipc   \reg, %pcrel_hi(\label)
+# 	addi    \reg, \reg, %pcrel_lo(_base\@)
+# .endm
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _start
+# ──────────────────────────────────────────────────────────────────────────────
+
+# _start:
+	# ── §0 Auto-prologue (NOP magic + gp = end_marker). ──────────────
+# 	addi    zero, zero, 0
+13 00 00 00	# nop
+# 	LOAD_ADDRESS gp, end_marker
+97 11 00 00	# auipc gp,0x1
+93 81 81 38	# addi gp,gp,904 # 8000138c <end_marker>
+
+	# ── §1 Page-align s7, then carve sp / s10 / s9 above it. ─────────
+	# s7 = full_node base (page-aligned).
+	# sp     = s7 + STACK_SIZE              (data stack top, grows down)
+	# s10    = s7 + STACK_SIZE + RID_SIZE   (RID stack top, grows down)
+	# s9     = s7 + STACK_SIZE              (RID stack bottom — when s10
+	#                                        reaches s9 we're full)
+# 	mv      s7, gp
+93 8B 01 00	# mv s7,gp
+# 	lw      t0, -36(gp)
+83 A2 C1 FD	# lw t0,-36(gp) # 80002b68 <__BSS_END__+0x7dc>
+# 	add     s7, s7, t0
+B3 8B 5B 00	# add s7,s7,t0
+# 	li      t0, PAGE_MASK
+B7 12 00 00	# lui t0,0x1
+93 82 F2 FF	# addi t0,t0,-1 # fff <PAGE_MASK>
+# 	add     s7, s7, t0
+B3 8B 5B 00	# add s7,s7,t0
+# 	li      t0, NEG_PAGE_SIZE
+B7 F2 FF FF	# lui t0,0xfffff
+# 	and     s7, s7, t0
+B3 FB 5B 00	# and s7,s7,t0
+
+# 	li      t0, STACK_SIZE
+B7 02 10 00	# lui t0,0x100
+# 	add     sp, s7, t0
+33 81 5B 00	# add sp,s7,t0
+# 	mv      s9, sp                          # RID bottom = sp top
+93 0C 01 00	# mv s9,sp
+# 	li      t0, RID_SIZE
+B7 12 00 00	# lui t0,0x1
+# 	add     s10, s9, t0                     # RID top
+33 8D 5C 00	# add s10,s9,t0
+	# Per fam.S convention, s11 starts at 0 (no enclosing call frame).
+# 	li      s11, 0
+93 0D 00 00	# li s11,0
+
+	# ── §2 Zero 0xB000 bytes at s7 (covers virtio queues + buffers + the
+	#     control / seed-list / chunk-bitmap region around 0xA000). ──
+# 	mv      t0, s7
+93 82 0B 00	# mv t0,s7
+# 	li      t1, 0x2C00                     # 0xB000 / 4 = 0x2C00 words
+37 33 00 00	# lui t1,0x3
+13 03 03 C0	# addi t1,t1,-1024 # 2c00 <MT_KHZ+0x4f0>
+# zero_top:
+# 	sw      zero, 0(t0)
+23 A0 02 00	# sw zero,0(t0) # 1000 <PAGE_SIZE>
+# 	addi    t0, t0, 4
+93 82 42 00	# addi t0,t0,4
+# 	addi    t1, t1, -1
+13 03 F3 FF	# addi t1,t1,-1
+# 	bne     t1, zero, zero_top
+E3 1A 03 FE	# bnez t1,80000050 <zero_top>
+
+	# UART base in s8 (callee-saved across CALL).
+# 	lui     s8, %hi(UART_BASE)
+37 0C 00 10	# lui s8,0x10000
+# 	li      t3, 0                           # skip_phase2 flag
+13 0E 00 00	# li t3,0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UART config parser — reads "<bind_port> <debug> <timeout_ms> <ip:port> ...\004"
+# Storing parsed state at:
+#   s4               = bind_port
+#   s7 + DBGFLAG     = debug flag (0=quiet, 1=verbose)
+#   s7 + TIMETIK     = timeout in MTIME ticks
+#   s7 + BPSAVE      = bind_port (mirror)
+#   s7 + SEED_LIST_OFFSET = [u8 count][N × 6 B (4 IP + 2 LE port)]
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Phase 1: bind_port ────────────────────────────────────────────────────
+# 	li      s6, 0
+13 0B 00 00	# li s6,0
+# ph1_top:
+# 	lbu     t0, UART_LSR(s8)
+83 42 5C 00	# lbu t0,5(s8) # 10000005 <UART_BASE+0x5>
+# 	andi    t0, t0, UART_RX_READY
+93 F2 12 00	# andi t0,t0,1
+# 	beqz    t0, ph1_top
+E3 8C 02 FE	# beqz t0,8000006c <ph1_top>
+# 	lbu     t6, 0(s8)
+83 4F 0C 00	# lbu t6,0(s8)
+
+# 	li      t0, 4
+93 02 40 00	# li t0,4
+# 	bne     t6, t0, 1f
+63 96 5F 00	# bne t6,t0,8000008c <ph1_top+0x20>
+# 	li      t3, 1
+13 0E 10 00	# li t3,1
+# 	j       ph1_done
+6F 00 40 02	# j 800000ac <ph1_done>
+# 1:	addi    t0, t6, -'0'
+93 82 0F FD	# addi t0,t6,-48
+# 	li      t1, 10
+13 03 A0 00	# li t1,10
+# 	bgeu    t0, t1, ph1_done
+63 FC 62 00	# bgeu t0,t1,800000ac <ph1_done>
+
+# 	slli    t1, s6, 3
+13 13 3B 00	# slli t1,s6,0x3
+# 	slli    t4, s6, 1
+93 1E 1B 00	# slli t4,s6,0x1
+# 	add     s6, t1, t4
+33 0B D3 01	# add s6,t1,t4
+# 	add     s6, s6, t0
+33 0B 5B 00	# add s6,s6,t0
+# 	j       ph1_top
+6F F0 5F FC	# j 8000006c <ph1_top>
+# ph1_done:
+# 	mv      s4, s6
+13 0A 0B 00	# mv s4,s6
+
+# ── Phase 1a: debug flag ─────────────────────────────────────────────────
+# 	bnez    t3, ph1a_skip
+63 14 0E 04	# bnez t3,800000f8 <ph1a_done>
+# 	li      s6, 0
+13 0B 00 00	# li s6,0
+# ph1a_top:
+# 	lbu     t0, UART_LSR(s8)
+83 42 5C 00	# lbu t0,5(s8)
+# 	andi    t0, t0, UART_RX_READY
+93 F2 12 00	# andi t0,t0,1
+# 	beqz    t0, ph1a_top
+E3 8C 02 FE	# beqz t0,800000b8 <ph1a_top>
+# 	lbu     t6, 0(s8)
+83 4F 0C 00	# lbu t6,0(s8)
+
+# 	li      t0, 4
+93 02 40 00	# li t0,4
+# 	bne     t6, t0, 1f
+63 96 5F 00	# bne t6,t0,800000d8 <ph1a_top+0x20>
+# 	li      t3, 1
+13 0E 10 00	# li t3,1
+# 	j       ph1a_done
+6F 00 40 02	# j 800000f8 <ph1a_done>
+# 1:	addi    t0, t6, -'0'
+93 82 0F FD	# addi t0,t6,-48
+# 	li      t1, 10
+13 03 A0 00	# li t1,10
+# 	bgeu    t0, t1, ph1a_done
+63 FC 62 00	# bgeu t0,t1,800000f8 <ph1a_done>
+
+# 	slli    t1, s6, 3
+13 13 3B 00	# slli t1,s6,0x3
+# 	slli    t4, s6, 1
+93 1E 1B 00	# slli t4,s6,0x1
+# 	add     s6, t1, t4
+33 0B D3 01	# add s6,t1,t4
+# 	add     s6, s6, t0
+33 0B 5B 00	# add s6,s6,t0
+# 	j       ph1a_top
+6F F0 5F FC	# j 800000b8 <ph1a_top>
+# ph1a_done:
+# ph1a_skip:
+# 	li      t0, DBGFLAG
+B7 A2 00 00	# lui t0,0xa
+93 82 82 FD	# addi t0,t0,-40 # 9fd8 <DBGFLAG>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      s6, 0(t0)
+23 A0 62 01	# sw s6,0(t0)
+
+# ── Phase 1b: timeout_ms ──────────────────────────────────────────────────
+# 	bnez    t3, ph1b_skip
+63 14 0E 04	# bnez t3,80000150 <ph1b_done>
+# 	li      s6, 0
+13 0B 00 00	# li s6,0
+# ph1b_top:
+# 	lbu     t0, UART_LSR(s8)
+83 42 5C 00	# lbu t0,5(s8)
+# 	andi    t0, t0, UART_RX_READY
+93 F2 12 00	# andi t0,t0,1
+# 	beqz    t0, ph1b_top
+E3 8C 02 FE	# beqz t0,80000110 <ph1b_top>
+# 	lbu     t6, 0(s8)
+83 4F 0C 00	# lbu t6,0(s8)
+
+# 	li      t0, 4
+93 02 40 00	# li t0,4
+# 	bne     t6, t0, 1f
+63 96 5F 00	# bne t6,t0,80000130 <ph1b_top+0x20>
+# 	li      t3, 1
+13 0E 10 00	# li t3,1
+# 	j       ph1b_done
+6F 00 40 02	# j 80000150 <ph1b_done>
+# 1:	addi    t0, t6, -'0'
+93 82 0F FD	# addi t0,t6,-48
+# 	li      t1, 10
+13 03 A0 00	# li t1,10
+# 	bgeu    t0, t1, ph1b_done
+63 FC 62 00	# bgeu t0,t1,80000150 <ph1b_done>
+
+# 	slli    t1, s6, 3
+13 13 3B 00	# slli t1,s6,0x3
+# 	slli    t4, s6, 1
+93 1E 1B 00	# slli t4,s6,0x1
+# 	add     s6, t1, t4
+33 0B D3 01	# add s6,t1,t4
+# 	add     s6, s6, t0
+33 0B 5B 00	# add s6,s6,t0
+# 	j       ph1b_top
+6F F0 5F FC	# j 80000110 <ph1b_top>
+# ph1b_done:
+# ph1b_skip:
+
+
+# ── Compute timeout in MTIME ticks → mem[s7 + TIMETIK] ───────────────────
+# 	beqz    s6, timeout_default
+63 02 0B 02	# beqz s6,80000174 <timeout_default>
+# 	slli    t0, s6, 13
+93 12 DB 00	# slli t0,s6,0xd
+# 	slli    t1, s6, 11;  add t0, t0, t1
+13 13 BB 00	# slli t1,s6,0xb
+B3 82 62 00	# add t0,t0,t1
+# 	slli    t1, s6, 8;   sub t0, t0, t1
+13 13 8B 00	# slli t1,s6,0x8
+B3 82 62 40	# sub t0,t0,t1
+# 	slli    t1, s6, 4;   add t0, t0, t1
+13 13 4B 00	# slli t1,s6,0x4
+B3 82 62 00	# add t0,t0,t1
+# 	j       timeout_store
+6F 00 C0 00	# j 8000017c <timeout_store>
+# timeout_default:
+# 	li      t0, DEFAULT_TIMEOUT_TK
+B7 E2 F5 05	# lui t0,0x5f5e
+93 82 02 10	# addi t0,t0,256 # 5f5e100 <DEFAULT_TIMEOUT_TK>
+# timeout_store:
+# 	li      t1, TIMETIK
+37 A3 00 00	# lui t1,0xa
+13 03 C3 FF	# addi t1,t1,-4 # 9ffc <TIMETIK>
+# 	add     t1, s7, t1
+33 83 6B 00	# add t1,s7,t1
+# 	sw      t0, 0(t1)
+23 20 53 00	# sw t0,0(t1)
+
+
+# ── Phase 2: seed list ────────────────────────────────────────────────────
+# 	li      s5, 0                           # seed count
+93 0A 00 00	# li s5,0
+# 	bnez    t3, ph2_skip
+63 16 0E 0C	# bnez t3,8000025c <ph2_done>
+
+# 	li      t2, SEED_LIST_OFFSET
+B7 A3 00 00	# lui t2,0xa
+# 	add     t2, s7, t2
+B3 83 7B 00	# add t2,s7,t2
+# 	addi    t2, t2, 1                       # entries base (skip count byte)
+93 83 13 00	# addi t2,t2,1 # a001 <SEED_LIST_OFFSET+0x1>
+# 	li      s6, 0                           # accumulator
+13 0B 00 00	# li s6,0
+# 	li      t3, 0                           # field 0..3 = octets, 4 = port
+13 0E 00 00	# li t3,0
+
+# ph2_top:
+# 	lbu     t0, UART_LSR(s8)
+83 42 5C 00	# lbu t0,5(s8)
+# 	andi    t0, t0, UART_RX_READY
+93 F2 12 00	# andi t0,t0,1
+# 	beqz    t0, ph2_top
+E3 8C 02 FE	# beqz t0,800001a8 <ph2_top>
+# 	lbu     t6, 0(s8)
+83 4F 0C 00	# lbu t6,0(s8)
+
+# 	li      t0, 4
+93 02 40 00	# li t0,4
+# 	bne     t6, t0, ph2_not_eot
+63 90 5F 02	# bne t6,t0,800001dc <ph2_not_eot>
+# 	li      t0, 4
+93 02 40 00	# li t0,4
+# 	bne     t3, t0, ph2_done
+63 1C 5E 08	# bne t3,t0,8000025c <ph2_done>
+# 	li      t0, MAX_SEEDS
+93 02 00 01	# li t0,16
+# 	bge     s5, t0, ph2_done
+63 D8 5A 08	# bge s5,t0,8000025c <ph2_done>
+# 	sh      s6, 4(t2)
+23 92 63 01	# sh s6,4(t2)
+# 	addi    s5, s5, 1
+93 8A 1A 00	# addi s5,s5,1
+# 	j       ph2_done
+6F 00 40 08	# j 8000025c <ph2_done>
+
+# ph2_not_eot:
+# 	addi    t0, t6, -'0'
+93 82 0F FD	# addi t0,t6,-48
+# 	li      t1, 10
+13 03 A0 00	# li t1,10
+# 	bgeu    t0, t1, ph2_sep
+63 FC 62 00	# bgeu t0,t1,800001fc <ph2_sep>
+# 	slli    t1, s6, 3
+13 13 3B 00	# slli t1,s6,0x3
+# 	slli    t4, s6, 1
+93 1E 1B 00	# slli t4,s6,0x1
+# 	add     s6, t1, t4
+33 0B D3 01	# add s6,t1,t4
+# 	add     s6, s6, t0
+33 0B 5B 00	# add s6,s6,t0
+# 	j       ph2_top
+6F F0 1F FB	# j 800001a8 <ph2_top>
+
+# ph2_sep:
+# 	li      t0, '.'
+93 02 E0 02	# li t0,46
+# 	bne     t6, t0, ph2_not_dot
+63 98 5F 00	# bne t6,t0,80000210 <ph2_not_dot>
+# 	li      t0, 3
+93 02 30 00	# li t0,3
+# 	bge     t3, t0, ph2_top
+E3 50 5E FA	# bge t3,t0,800001a8 <ph2_top>
+# 	j       ph2_store_advance
+6F 00 40 01	# j 80000220 <ph2_store_advance>
+# ph2_not_dot:
+# 	li      t0, ':'
+93 02 A0 03	# li t0,58
+# 	bne     t6, t0, ph2_space
+63 90 5F 02	# bne t6,t0,80000234 <ph2_space>
+# 	li      t0, 3
+93 02 30 00	# li t0,3
+# 	bne     t3, t0, ph2_top
+E3 16 5E F8	# bne t3,t0,800001a8 <ph2_top>
+# ph2_store_advance:
+# 	add     t4, t2, t3
+B3 8E C3 01	# add t4,t2,t3
+# 	sb      s6, 0(t4)
+23 80 6E 01	# sb s6,0(t4)
+# 	addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+# 	li      s6, 0
+13 0B 00 00	# li s6,0
+# 	j       ph2_top
+6F F0 9F F7	# j 800001a8 <ph2_top>
+# ph2_space:
+# 	li      t0, 4
+93 02 40 00	# li t0,4
+# 	bne     t3, t0, ph2_reset
+63 1C 5E 00	# bne t3,t0,80000250 <ph2_reset>
+# 	li      t0, MAX_SEEDS
+93 02 00 01	# li t0,16
+# 	bge     s5, t0, ph2_reset
+63 D8 5A 00	# bge s5,t0,80000250 <ph2_reset>
+# 	sh      s6, 4(t2)
+23 92 63 01	# sh s6,4(t2)
+# 	addi    s5, s5, 1
+93 8A 1A 00	# addi s5,s5,1
+# 	addi    t2, t2, 6
+93 83 63 00	# addi t2,t2,6
+# ph2_reset:
+# 	li      s6, 0
+13 0B 00 00	# li s6,0
+# 	li      t3, 0
+13 0E 00 00	# li t3,0
+# 	j       ph2_top
+6F F0 1F F5	# j 800001a8 <ph2_top>
+
+# ph2_done:
+# ph2_skip:
+
+# 	li      t0, SEED_LIST_OFFSET
+B7 A2 00 00	# lui t0,0xa
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sb      s5, 0(t0)
+23 80 52 01	# sb s5,0(t0) # a000 <SEED_LIST_OFFSET>
+# 	li      t0, BPSAVE
+B7 A2 00 00	# lui t0,0xa
+93 82 82 FF	# addi t0,t0,-8 # 9ff8 <BPSAVE>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      s4, 0(t0)
+23 A0 42 01	# sw s4,0(t0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# §3 Disk boot:
+#     scan_disk → init virtio-blk → read full_node into [s7..s7+BIN_SIZE)
+#     → gimli_hash → compare to hash_data → handoff.
+# A missing block device or a read error halts (halt_no_disk); a successful
+# read whose hash does not match falls through to §5 net boot.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 	CALL    scan_disk                       # → s3 = disk MMIO base, or fall to halt_d
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000284 <ph2_done+0x28>
+6F 00 D0 1D	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 10 00	# li s11,1
+6F 00 50 20	# j 80000c90 <scan_disk>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+	# ── Virtio-blk handshake (legacy MMIO) ──
+# 	sw      zero, 0x70(s3)                  # status = 0
+23 A8 09 06	# sw zero,112(s3)
+# 	li      t1, 1
+13 03 10 00	# li t1,1
+# 	sw      t1, 0x70(s3)                    # status = 1 (ACKNOWLEDGE)
+23 A8 69 06	# sw t1,112(s3)
+# 	lw      t1, 0x70(s3)
+03 A3 09 07	# lw t1,112(s3)
+# 	ori     t1, t1, 2
+13 63 23 00	# ori t1,t1,2
+# 	sw      t1, 0x70(s3)                    # status |= 2 (DRIVER)
+23 A8 69 06	# sw t1,112(s3)
+# 	sw      zero, 0x20(s3)                  # driver_features = 0
+23 A0 09 02	# sw zero,32(s3)
+# 	lw      t1, 0x70(s3)
+03 A3 09 07	# lw t1,112(s3)
+# 	ori     t1, t1, 8
+13 63 83 00	# ori t1,t1,8
+# 	sw      t1, 0x70(s3)                    # status |= 8 (FEATURES_OK)
+23 A8 69 06	# sw t1,112(s3)
+# 	lw      t1, 0x70(s3)
+03 A3 09 07	# lw t1,112(s3)
+# 	andi    t2, t1, 8
+93 73 83 00	# andi t2,t1,8
+# 	beqz    t2, halt_no_disk                # FEATURES_OK didn't stick
+E3 8A 03 18	# beqz t2,80000c5c <halt_no_disk>
+
+# 	li      t1, PAGE_SIZE
+37 13 00 00	# lui t1,0x1
+# 	sw      t1, 0x28(s3)                    # V_GPS = 0x1000
+23 A4 69 02	# sw t1,40(s3)
+# 	sw      zero, 0x30(s3)                  # V_QSEL = 0
+23 A8 09 02	# sw zero,48(s3)
+# 	sw      t1, 0x3C(s3)                    # V_QALGN = 0x1000
+23 AE 69 02	# sw t1,60(s3)
+# 	li      t1, 16
+13 03 00 01	# li t1,16
+# 	sw      t1, 0x38(s3)                    # V_QNUM = 16
+23 AC 69 02	# sw t1,56(s3)
+# 	srli    t1, s7, 12
+13 D3 CB 00	# srli t1,s7,0xc
+# 	sw      t1, 0x40(s3)                    # V_QPFN = s7 >> 12
+23 A0 69 04	# sw t1,64(s3)
+# 	lw      t1, 0x70(s3)
+03 A3 09 07	# lw t1,112(s3)
+# 	ori     t1, t1, 4
+13 63 43 00	# ori t1,t1,4
+# 	sw      t1, 0x70(s3)                    # status |= 4 (DRIVER_OK)
+23 A8 69 06	# sw t1,112(s3)
+
+
+# ── Read loop: load BIN_SIZE bytes from disk into [gp..gp+BIN_SIZE). ─────
+# gp = full_node base (where the bin gets loaded); s7 = queue/stack base
+# (post-full_node, page-aligned).  We mustn't write disk data into s7's
+# region or we'd clobber descriptors / status / stack.
+# 	mv      s0, gp                          # dest walker = full_node base
+13 84 01 00	# mv s0,gp
+# 	lw      t0, -36(gp)
+83 A2 C1 FD	# lw t0,-36(gp) # 80002b68 <__BSS_END__+0x7dc>
+# 	mv      s1, t0                          # bytes remaining
+93 84 02 00	# mv s1,t0
+# 	li      s2, 0                           # sector counter
+13 09 00 00	# li s2,0
+# 	li      s6, 0                           # avail idx (was s7 in old; conflict)
+13 0B 00 00	# li s6,0
+
+# read_loop_top:
+# 	beqz    s1, read_done
+63 8E 04 06	# beqz s1,80000388 <read_done>
+
+	# chunk = min(remaining, DSK_CHK), rounded up to sector (512 B).
+# 	li      t0, 0x10000                     # DSK_CHK = 64 KiB
+B7 02 01 00	# lui t0,0x10
+# 	mv      a3, t0
+93 86 02 00	# mv a3,t0
+# 	bge     s1, t0, 1f
+63 D8 54 00	# bge s1,t0,80000328 <read_loop_top+0x1c>
+# 	addi    a3, s1, 0x1FF                   # round up to 512
+93 86 F4 1F	# addi a3,s1,511
+# 	li      t0, 0xFFFFFE00                  # NEG_SECT
+93 02 00 E0	# li t0,-512
+# 	and     a3, a3, t0
+B3 F6 56 00	# and a3,a3,t0
+# 1:
+# 	mv      a0, s2                          # sector
+13 05 09 00	# mv a0,s2
+# 	addi    s6, s6, 1
+13 0B 1B 00	# addi s6,s6,1
+# 	mv      a1, s6                          # avail idx
+93 05 0B 00	# mv a1,s6
+# 	mv      a2, s0                          # dest
+13 06 04 00	# mv a2,s0
+
+	# disk_read clobbers a3; save chunk on stack.
+# 	addi    sp, sp, -4
+13 01 C1 FF	# addi sp,sp,-4
+# 	sw      a3, 0(sp)
+23 20 D1 00	# sw a3,0(sp)
+# 	CALL    disk_read
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,8000034c <read_loop_top+0x40>
+6F 00 50 11	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 20 00	# li s11,2
+6F 00 D0 16	# j 80000cc0 <disk_read>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	lw      t0, 0(sp)
+83 22 01 00	# lw t0,0(sp)
+# 	addi    sp, sp, 4
+13 01 41 00	# addi sp,sp,4
+
+	# disk_read returns a0 = status byte (0 = success).
+# 	bnez    a0, halt_no_disk
+E3 1A 05 0E	# bnez a0,80000c5c <halt_no_disk>
+
+# 	srli    t1, t0, 9                       # chunk / 512
+13 D3 92 00	# srli t1,t0,0x9
+# 	add     s2, s2, t1
+33 09 69 00	# add s2,s2,t1
+
+	# s0 += min(t0, s1); s1 -= min(t0, s1).
+# 	bge     s1, t0, 1f
+63 D4 54 00	# bge s1,t0,8000037c <read_loop_top+0x70>
+# 	mv      t0, s1
+93 82 04 00	# mv t0,s1
+# 1:	add     s0, s0, t0
+33 04 54 00	# add s0,s0,t0
+# 	sub     s1, s1, t0
+B3 84 54 40	# sub s1,s1,t0
+# 	j       read_loop_top
+6F F0 9F F8	# j 8000030c <read_loop_top>
+
+# read_done:
+
+# ── Hash + check ─────────────────────────────────────────────────────────
+	# Allocate 32-B scratch on stack for computed hash.
+# 	addi    sp, sp, -32
+13 01 01 FE	# addi sp,sp,-32
+# 	mv      a2, sp                          # output buf
+13 06 01 00	# mv a2,sp
+# 	mv      a0, gp                          # data = full_node base
+13 85 01 00	# mv a0,gp
+# 	lw      a1, -36(gp)
+83 A5 C1 FD	# lw a1,-36(gp) # 80002b68 <__BSS_END__+0x7dc>
+# 	CALL    gimli_hash
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,800003a4 <read_done+0x1c>
+6F 00 D0 0B	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 30 00	# li s11,3
+6F 00 D0 2C	# j 80000e78 <gimli_hash>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+	# Compare 32 bytes at sp vs hash_data (= gp − 32).
+# 	mv      t0, sp
+93 02 01 00	# mv t0,sp
+# 	addi    t1, gp, -32
+13 83 01 FE	# addi t1,gp,-32 # 80002b6c <__BSS_END__+0x7e0>
+# 	li      t2, 8                           # 8 words
+93 03 80 00	# li t2,8
+# hash_cmp:
+# 	lw      t3, 0(t0)
+03 AE 02 00	# lw t3,0(t0) # 10000 <NB_BMAP+0x5f80>
+# 	lw      t4, 0(t1)
+83 2E 03 00	# lw t4,0(t1) # 1000 <PAGE_SIZE>
+# 	bne     t3, t4, hash_mismatch
+63 1E DE 03	# bne t3,t4,80000408 <hash_mismatch>
+# 	addi    t0, t0, 4
+93 82 42 00	# addi t0,t0,4
+# 	addi    t1, t1, 4
+13 03 43 00	# addi t1,t1,4
+# 	addi    t2, t2, -1
+93 83 F3 FF	# addi t2,t2,-1
+# 	bnez    t2, hash_cmp
+E3 94 03 FE	# bnez t2,800003c4 <hash_cmp>
+
+	# Match!  Free scratch, set handoff regs, jal over hash data to gp.
+# 	addi    sp, sp, 32
+13 01 01 02	# addi sp,sp,32
+
+# 	li      t0, SEED_LIST_OFFSET
+B7 A2 00 00	# lui t0,0xa
+# 	add     a0, s7, t0                      # a0 = seed list ptr
+33 85 5B 00	# add a0,s7,t0
+# 	li      a1, 0                           # a1 = boot source (0 = disk)
+93 05 00 00	# li a1,0
+# 	mv      a2, s4                          # a2 = bind_port
+13 06 0A 00	# mv a2,s4
+# 	addi    t0, a0, DBGFLAG - SEED_LIST_OFFSET   # t0 = s7 + DBGFLAG (= a0 - 40)
+93 02 85 FD	# addi t0,a0,-40
+# 	lw      a3, 0(t0)                       # a3 = debug flag
+83 A6 02 00	# lw a3,0(t0) # a000 <SEED_LIST_OFFSET>
+# 	mv      a4, gp                          # a4 = full_node base address (handoff arg)
+13 87 01 00	# mv a4,gp
+# 	nop                                     # layout pad
+13 00 00 00	# nop
+# 	j       end_marker                      # gp = end_marker = full_node entry
+6F 00 90 78	# j 8000138c <end_marker>
+
+
+# hash_mismatch:
+# 	addi    sp, sp, 32
+13 01 01 02	# addi sp,sp,32
+# 	li      t6, 'H'
+93 0F 80 04	# li t6,72
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+# 	li      t6, '\n'
+93 0F A0 00	# li t6,10
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+	# Fall through to scan_net.
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# §5 Net boot.
+#   scan_net → (or halt if no virtio-net) → handshake → RX/TX queue setup
+#   → mark DRIVER_OK → kick RX → enter the REQ_RANGE seed-fetch loop
+#   (probe → lock → batch-fetch via chunk bitmap → gimli_hash → handoff).
+# Layout in s7's region:
+#     s7 + 0x0000  RX queue 0 page (descriptors, avail, used)
+#     s7 + 0x2000  16 × 1536 B RX buffers (= 0x6000 B)
+#     s7 + 0x8000  TX queue 1 page
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 	CALL    scan_net                        # → s3 = virtio-net MMIO base
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000428 <hash_mismatch+0x20>
+6F 00 90 03	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 40 00	# li s11,4
+6F 00 90 06	# j 80000c98 <scan_net>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+	# ── Reset used.idx after disk path. ────────────────────────────────
+	# disk_read uses the same V_QPFN = s7 (legacy MMIO 1-page-per-queue
+	# layout) as the net RX queue.  Each disk read bumps the device's
+	# used.idx at s7+0x1002 and writes a status entry at s7+0x1004.
+	# After the 48 disk reads needed to load a 3 MiB full_node.bin,
+	# used.idx = 48; net rx_loop would then walk through 48 phantom
+	# 1-byte "packets" pointing into zero-filled buffers, never see a
+	# real BIN0 reply in time, and halt 'N'.  Just zero used.flags +
+	# used.idx (4 B) — stale used.ring[] entries are harmless since the
+	# device overwrites them as it processes new packets.  Don't touch
+	# the FSM control region at s7+0x9FDA..0x9FFF (TIMETIK lives there)
+	# nor the seed list at s7+0xA000.
+# 	li      t0, 0x1000
+B7 12 00 00	# lui t0,0x1
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      zero, 0(t0)                     # used.flags = used.idx = 0
+23 A0 02 00	# sw zero,0(t0) # 1000 <PAGE_SIZE>
+
+	# ── Virtio-net handshake (legacy MMIO) ─────────────────────────────
+# 	sw      zero, 0x70(s3)                  # status = 0
+23 A8 09 06	# sw zero,112(s3)
+# 	li      t1, 1
+13 03 10 00	# li t1,1
+# 	sw      t1, 0x70(s3)                    # status = 1 (ACK)
+23 A8 69 06	# sw t1,112(s3)
+# 	lw      t1, 0x70(s3)
+03 A3 09 07	# lw t1,112(s3)
+# 	ori     t1, t1, 2
+13 63 23 00	# ori t1,t1,2
+# 	sw      t1, 0x70(s3)                    # status |= 2 (DRIVER)
+23 A8 69 06	# sw t1,112(s3)
+# 	li      t1, 0x8020                      # negotiate F_MAC | F_MRG_RXBUF
+37 83 00 00	# lui t1,0x8
+13 03 03 02	# addi t1,t1,32 # 8020 <SHUTDOWN_PASS+0x2acb>
+# 	sw      t1, 0x20(s3)                    # V_DRVF
+23 A0 69 02	# sw t1,32(s3)
+# 	lw      t1, 0x70(s3)
+03 A3 09 07	# lw t1,112(s3)
+# 	ori     t1, t1, 8
+13 63 83 00	# ori t1,t1,8
+# 	sw      t1, 0x70(s3)                    # status |= 8 (FEATURES_OK)
+23 A8 69 06	# sw t1,112(s3)
+# 	li      t1, PAGE_SIZE
+37 13 00 00	# lui t1,0x1
+# 	sw      t1, 0x28(s3)                    # V_GPS = 0x1000
+23 A4 69 02	# sw t1,40(s3)
+
+	# ── RX queue (queue 0, 16 entries × 1536 B buffers) ───────────────
+# 	sw      zero, 0x30(s3)                  # V_QSEL = 0
+23 A8 09 02	# sw zero,48(s3)
+# 	li      t1, 16
+13 03 00 01	# li t1,16
+# 	sw      t1, 0x38(s3)                    # V_QNUM = 16
+23 AC 69 02	# sw t1,56(s3)
+# 	li      t1, PAGE_SIZE
+37 13 00 00	# lui t1,0x1
+# 	sw      t1, 0x3C(s3)                    # V_QALGN
+23 AE 69 02	# sw t1,60(s3)
+# 	srli    t1, s7, 12
+13 D3 CB 00	# srli t1,s7,0xc
+# 	sw      t1, 0x40(s3)                    # V_QPFN = s7 >> 12 (RX queue at s7)
+23 A0 69 04	# sw t1,64(s3)
+
+	# Populate 16 RX descriptors.  desc base = s7; buffer base = s7+0x2000.
+# 	mv      t0, s7                          # descriptor walker
+93 82 0B 00	# mv t0,s7
+# 	li      t6, 0x2000
+B7 2F 00 00	# lui t6,0x2
+# 	add     t2, s7, t6                      # buffer walker = s7 + 0x2000
+B3 83 FB 01	# add t2,s7,t6
+# 	li      t3, 0                           # i
+13 0E 00 00	# li t3,0
+# 	li      t5, 1536
+13 0F 00 60	# li t5,1536
+# rx_desc_top:
+# 	li      t6, 16
+93 0F 00 01	# li t6,16
+# 	bge     t3, t6, rx_desc_done
+63 5E FE 03	# bge t3,t6,800004f0 <rx_desc_done>
+# 	sw      t2, 0(t0)                       # desc[i].addr = buffer
+23 A0 72 00	# sw t2,0(t0)
+# 	sw      zero, 4(t0)                     # addr_hi = 0
+23 A2 02 00	# sw zero,4(t0)
+# 	sw      t5, 8(t0)                       # desc[i].len = 1536
+23 A4 E2 01	# sw t5,8(t0)
+# 	li      t6, 2
+93 0F 20 00	# li t6,2
+# 	sh      t6, 12(t0)                      # flags = WRITE
+23 96 F2 01	# sh t6,12(t0)
+# 	sh      zero, 14(t0)                    # next = 0
+23 97 02 00	# sh zero,14(t0)
+	# avail.ring[i] = i  (avail ring at s7 + 256+4)
+# 	addi    t6, s7, 260                     # &avail.ring[0]
+93 8F 4B 10	# addi t6,s7,260
+# 	slli    t4, t3, 1                       # i*2
+93 1E 1E 00	# slli t4,t3,0x1
+# 	add     t4, t6, t4                      # &avail.ring[i]
+B3 8E DF 01	# add t4,t6,t4
+# 	sh      t3, 0(t4)
+23 90 CE 01	# sh t3,0(t4)
+	# advance
+# 	addi    t0, t0, 16                      # next descriptor
+93 82 02 01	# addi t0,t0,16
+# 	add     t2, t2, t5                      # next buffer
+B3 83 E3 01	# add t2,t2,t5
+# 	addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+# 	j       rx_desc_top
+6F F0 5F FC	# j 800004b0 <rx_desc_top>
+# rx_desc_done:
+# 	li      t1, 16
+13 03 00 01	# li t1,16
+# 	addi    t6, s7, 258                     # avail.idx
+93 8F 2B 10	# addi t6,s7,258
+# 	sh      t1, 0(t6)
+23 90 6F 00	# sh t1,0(t6) # 2000 <_offset0+0xc78>
+
+	# ── TX queue (queue 1, SIZE = 1) ──────────────────────────────────
+	# V_QNUM = 1 forces every TX to drain before the next is posted.
+	# With V_QNUM = 16, repeated tx_req_range calls let avail.idx run
+	# 16+ entries ahead of used.idx whenever slirp couldn't deliver
+	# responses (e.g., non-loopback IPs while ARP is pending), tripping
+	# QEMU's "Guest moved used index" virtio violation and wedging the
+	# device.  Hence V_QNUM = 1.
+# 	li      t1, 1
+13 03 10 00	# li t1,1
+# 	sw      t1, 0x30(s3)                    # V_QSEL = 1
+23 A8 69 02	# sw t1,48(s3)
+# 	sw      t1, 0x38(s3)                    # V_QNUM = 1
+23 AC 69 02	# sw t1,56(s3)
+# 	li      t1, PAGE_SIZE
+37 13 00 00	# lui t1,0x1
+# 	sw      t1, 0x3C(s3)
+23 AE 69 02	# sw t1,60(s3)
+# 	li      t6, 0x8000
+B7 8F 00 00	# lui t6,0x8
+# 	add     t1, s7, t6
+33 83 FB 01	# add t1,s7,t6
+# 	srli    t1, t1, 12
+13 53 C3 00	# srli t1,t1,0xc
+# 	sw      t1, 0x40(s3)                    # V_QPFN = (s7+0x8000) >> 12
+23 A0 69 04	# sw t1,64(s3)
+
+	# ── Driver ready + kick RX ────────────────────────────────────────
+# 	fence   iorw, ow
+0F 00 50 0F	# fence iorw,ow
+# 	lw      t1, 0x70(s3)
+03 A3 09 07	# lw t1,112(s3)
+# 	ori     t1, t1, 4
+13 63 43 00	# ori t1,t1,4
+# 	sw      t1, 0x70(s3)                    # status |= 4 (DRIVER_OK)
+23 A8 69 06	# sw t1,112(s3)
+# 	fence   iorw, ow
+0F 00 50 0F	# fence iorw,ow
+# 	sw      zero, 0x50(s3)                  # notify queue 0 (RX)
+23 A8 09 04	# sw zero,80(s3)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# §6 Net seed-fetch state machine.
+#
+# Probe → lock → batch with bitmap retry, MTIME watchdog, blacklist+reprobe.
+#
+# Layout in s7's region used here:
+#     +0x8000  TX queue page (desc @ +0..+32, avail @ +256, used @ +0x1000)
+#     +0x8200  REQ_RANGE vnet hdr (12 B) + frame (51 B)
+#     +0x8400  ARP reply  vnet hdr (12 B) + frame (54 B)
+#     +0xA000  seed list (count + 6 × N entries)
+#     +0xA080  chunk-received bitmap (NB_BMAP_BYTES)
+#     +0x9FF4  fail mask (2 B), +0x9FF2 fail count (2 B)
+#
+# Pinned regs (across reprobe):
+#     s0 = consumed RX used.idx
+#     s1 = received chunk count
+#     s2 = NCHUNKS
+#     s3 = virtio-net MMIO base
+#     s4 = bind_port
+#     s5 = seed count (parsed)
+#     s6 = locked seed idx (0xFF = not locked yet)
+#     s7 = data region base
+#     s8 = UART base
+#     gp = full_node base (write target)
+# ──────────────────────────────────────────────────────────────────────────────
+
+	# Select TX queue once for V_QSEL config (not needed for V_QNTFY).
+# 	li      t1, 1
+13 03 10 00	# li t1,1
+# 	sw      t1, 0x30(s3)                    # V_QSEL = 1
+23 A8 69 02	# sw t1,48(s3)
+# 	fence   iorw, ow
+0F 00 50 0F	# fence iorw,ow
+
+	# ── Init FSM state: fail_mask=0, fail_count=0, RX consumed=0,
+	#    random probe-iteration start (WD_TICK is refreshed inside
+	#    reprobe_entry after the post-reprobe RX drain + wait).
+# 	li      t0, NF_CNT
+B7 A2 00 00	# lui t0,0xa
+93 82 22 FF	# addi t0,t0,-14 # 9ff2 <NF_CNT>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sh      zero, 0(t0)
+23 90 02 00	# sh zero,0(t0)
+# 	sh      zero, 2(t0)
+23 91 02 00	# sh zero,2(t0)
+# 	li      s0, 0                           # consumed used.idx (one-time)
+13 04 00 00	# li s0,0
+# 	li      t0, MTIME_ADDR
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME_ADDR>
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+	# Random probe-iteration start: r = mtime mod s5.  Picked once on
+	# startup so different clients hit seeds in different orders, spreading
+	# the load.  Reused on every reprobe — no need to re-randomize.
+	#
+	# If s5 == 0 (no seeds parsed), skip the mod loop entirely — `bltu
+	# t2, 0` is always false, so the unguarded loop never terminates.
+	# RND_START stays whatever it was zeroed to, but reprobe_entry's
+	# all-failed check (`bge NF_CNT, s5` with NF_CNT=0, s5=0) halts
+	# immediately so we never read it.
+# 	beqz    s5, 2f
+63 8A 0A 00	# beqz s5,8000057c <rx_desc_done+0x8c>
+# 	andi    t2, t1, 0x1F                    # mtime low 5 bits
+93 73 F3 01	# andi t2,t1,31
+# 1:	bltu    t2, s5, 2f
+63 E6 53 01	# bltu t2,s5,8000057c <rx_desc_done+0x8c>
+# 	sub     t2, t2, s5
+B3 83 53 41	# sub t2,t2,s5
+# 	j       1b
+6F F0 9F FF	# j 80000570 <rx_desc_done+0x80>
+# 2:	li      t0, RND_START
+B7 A2 00 00	# lui t0,0xa
+93 82 C2 FD	# addi t0,t0,-36 # 9fdc <RND_START>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sb      t2, 0(t0)
+23 80 72 00	# sb t2,0(t0)
+
+# reprobe_entry:
+	# All-failed check: if every seed is blacklisted, halt 'N'.
+# 	li      t0, NF_CNT
+B7 A2 00 00	# lui t0,0xa
+93 82 22 FF	# addi t0,t0,-14 # 9ff2 <NF_CNT>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lhu     t1, 0(t0)
+03 D3 02 00	# lhu t1,0(t0)
+# 	bge     t1, s5, halt_no_net
+63 54 53 6D	# bge t1,s5,80000c64 <halt_no_net>
+	# Reset per-attempt state: locked_idx, received count, bitmap.
+# 	li      s6, 0xFF
+13 0B F0 0F	# li s6,255
+# 	li      s1, 0
+93 04 00 00	# li s1,0
+# 	lw      s2, -40(gp)
+03 A9 81 FD	# lw s2,-40(gp) # 80002b64 <__BSS_END__+0x7d8>
+	# Zero the bitmap (NB_BMAP_BYTES = 1024 → 256 words).
+# 	li      t0, NB_BMAP
+B7 A2 00 00	# lui t0,0xa
+93 82 02 08	# addi t0,t0,128 # a080 <NB_BMAP>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	li      t1, NB_BMAP_BYTES / 4
+13 03 00 10	# li t1,256
+# 1:	sw      zero, 0(t0)
+23 A0 02 00	# sw zero,0(t0)
+# 	addi    t0, t0, 4
+93 82 42 00	# addi t0,t0,4
+# 	addi    t1, t1, -1
+13 03 F3 FF	# addi t1,t1,-1 # fff <PAGE_MASK>
+# 	bnez    t1, 1b
+E3 1A 03 FE	# bnez t1,800005bc <reprobe_entry+0x30>
+	# BATCH_START = 0 (bitmap in REQ_RANGE lets server skip chunk 0).
+# 	li      t0, BATCH_START
+B7 A2 00 00	# lui t0,0xa
+93 82 A2 FD	# addi t0,t0,-38 # 9fda <BATCH_START>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	li      t1, 0
+13 03 00 00	# li t1,0
+# 	sh      t1, 0(t0)
+23 90 62 00	# sh t1,0(t0)
+
+	# ── Drain RX queue: consume any in-flight packets from the previous
+	# seed by syncing s0 = used.idx.  Stale chunks would otherwise reset
+	# NP_CNT each iteration and starve the watchdog.
+# 	li      t0, 0x1000
+B7 12 00 00	# lui t0,0x1
+# 	add     t0, s7, t0                      # RX used ring base
+B3 82 5B 00	# add t0,s7,t0
+# 	lhu     s0, 2(t0)                       # s0 = used.idx
+03 D4 22 00	# lhu s0,2(t0) # 1002 <PAGE_SIZE+0x2>
+
+	# Refresh WD_TICK so the watchdog budget for the new attempt starts
+	# at this point in time (not when the previous attempt entered).
+# 	li      t0, MTIME_ADDR
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME_ADDR>
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+# 	li      t0, WD_TICK
+B7 A2 00 00	# lui t0,0xa
+93 82 02 FE	# addi t0,t0,-32 # 9fe0 <WD_TICK>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0)
+
+	# ── Probe phase: REQ_RANGE 0..0 to every non-failed seed, IPS_TICKS
+	#    apart, walked starting at the per-client random index from RND_START.
+# 	li      t0, RND_START
+B7 A2 00 00	# lui t0,0xa
+93 82 C2 FD	# addi t0,t0,-36 # 9fdc <RND_START>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lbu     a3, 0(t0)                       # a3 = random start
+83 C6 02 00	# lbu a3,0(t0)
+# 	li      t6, 0                           # i = 0..s5-1
+93 0F 00 00	# li t6,0
+# probe_top:
+# 	bge     t6, s5, probe_done
+63 DC 5F 09	# bge t6,s5,800006b4 <probe_done>
+	# actual_idx = (a3 + t6) mod s5  (single-wrap suffices; both terms < s5)
+# 	add     a0, a3, t6
+33 85 F6 01	# add a0,a3,t6
+# 	bltu    a0, s5, 1f
+63 64 55 01	# bltu a0,s5,8000062c <probe_top+0x10>
+# 	sub     a0, a0, s5
+33 05 55 41	# sub a0,a0,s5
+# 1:	# Skip if blacklisted: fail_mask & (1 << a0).
+# 	li      t0, NF_MASK
+B7 A2 00 00	# lui t0,0xa
+93 82 42 FF	# addi t0,t0,-12 # 9ff4 <NF_MASK>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lhu     t1, 0(t0)
+03 D3 02 00	# lhu t1,0(t0)
+# 	li      t2, 1
+93 03 10 00	# li t2,1
+# 	sll     t2, t2, a0
+B3 93 A3 00	# sll t2,t2,a0
+# 	and     t2, t1, t2
+B3 73 73 00	# and t2,t1,t2
+# 	bnez    t2, probe_advance
+63 92 03 06	# bnez t2,800006ac <probe_advance>
+	# a0 already = seed idx; fill the rest of the call args.
+# 	li      a1, 0
+93 05 00 00	# li a1,0
+# 	li      a2, 0
+13 06 00 00	# li a2,0
+	# Save iter idx + random start across CALL.
+# 	addi    sp, sp, -8
+13 01 81 FF	# addi sp,sp,-8
+# 	sw      t6, 0(sp)
+23 20 F1 01	# sw t6,0(sp)
+# 	sw      a3, 4(sp)
+23 22 D1 00	# sw a3,4(sp)
+# 	CALL    tx_req_range
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,8000066c <probe_top+0x50>
+6F 00 40 5F	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 50 00	# li s11,5
+6F 00 D0 19	# j 80001010 <tx_req_range>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	lw      t6, 0(sp)
+83 2F 01 00	# lw t6,0(sp)
+# 	lw      a3, 4(sp)
+83 26 41 00	# lw a3,4(sp)
+# 	addi    sp, sp, 8
+13 01 81 00	# addi sp,sp,8
+	# Inter-probe spacing.
+# 	li      t0, MTIME_ADDR
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME_ADDR>
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+# 2:	lw      t2, 0(t0)
+83 A3 02 00	# lw t2,0(t0)
+# 	sub     t2, t2, t1
+B3 83 63 40	# sub t2,t2,t1
+# 	li      t3, IPS_TICKS
+37 AE 07 00	# lui t3,0x7a
+13 0E 0E 12	# addi t3,t3,288 # 7a120 <IPS_TICKS>
+# 	blt     t2, t3, 2b
+E3 C8 C3 FF	# blt t2,t3,80000698 <probe_top+0x7c>
+# probe_advance:
+# 	addi    t6, t6, 1
+93 8F 1F 00	# addi t6,t6,1 # 8001 <SHUTDOWN_PASS+0x2aac>
+# 	j       probe_top
+6F F0 DF F6	# j 8000061c <probe_top>
+# probe_done:
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RX poll loop — wait for RSP_CHUNK packets, copy into [gp + seq*1400 ..)
+# until all NCHUNKS have arrived.  Locks onto first responder via s6.
+#
+# RX queue layout (NRX=16, QALGN=PAGE_SIZE):
+#     s7 + 0x000   descriptor table (16 × 16 = 256 B)
+#     s7 + 0x100   avail ring
+#     s7 + 0x1000  used ring
+# ──────────────────────────────────────────────────────────────────────────────
+
+	# Reset no-progress counter (watchdog is initialized once before
+	# reprobe_entry and refreshed only on actual progress).
+# 	li      t0, NP_CNT
+B7 A2 00 00	# lui t0,0xa
+93 82 42 FE	# addi t0,t0,-28 # 9fe4 <NP_CNT>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      zero, 0(t0)
+23 A0 02 00	# sw zero,0(t0)
+
+# rx_loop:
+# 	bge     s1, s2, rx_done
+63 DA 24 4D	# bge s1,s2,80000b98 <rx_done>
+
+	# Brief delay between RX polls so slirp can deliver.  500K iters
+	# ≈ 5–10 ms at QEMU's RV32 emulation speed.
+# 	li      t6, 500000
+B7 AF 07 00	# lui t6,0x7a
+93 8F 0F 12	# addi t6,t6,288 # 7a120 <IPS_TICKS>
+# 1:	addi    t6, t6, -1
+93 8F FF FF	# addi t6,t6,-1
+# 	bnez    t6, 1b
+E3 9E 0F FE	# bnez t6,800006d0 <rx_loop+0xc>
+# 	fence   iorw, iorw
+0F 00 F0 0F	# fence
+# 	li      t6, 0x1000
+B7 1F 00 00	# lui t6,0x1
+# 	add     t0, s7, t6                      # t0 = used ring base
+B3 82 FB 01	# add t0,s7,t6
+# 	lhu     t1, 2(t0)                       # device's used.idx
+03 D3 22 00	# lhu t1,2(t0)
+# 	beq     t1, s0, rx_no_progress          # nothing new
+63 0A 83 32	# beq t1,s0,80000a1c <rx_no_progress>
+	# Progress: reset NP_CNT.
+# 	li      t5, NP_CNT
+37 AF 00 00	# lui t5,0xa
+13 0F 4F FE	# addi t5,t5,-28 # 9fe4 <NP_CNT>
+# 	add     t5, s7, t5
+33 8F EB 01	# add t5,s7,t5
+# 	sw      zero, 0(t5)
+23 20 0F 00	# sw zero,0(t5)
+
+	# used.ring[s0 % 16] at t0 + 4 + (s0 % 16) * 8.
+# 	andi    t2, s0, 15
+93 73 F4 00	# andi t2,s0,15
+# 	slli    t2, t2, 3
+93 93 33 00	# slli t2,t2,0x3
+# 	add     t2, t0, t2
+B3 83 72 00	# add t2,t0,t2
+# 	lw      a0, 4(t2)                       # desc_idx
+03 A5 43 00	# lw a0,4(t2)
+# 	lw      a1, 8(t2)                       # bytes written
+83 A5 83 00	# lw a1,8(t2)
+
+	# Buffer = desc[desc_idx].addr (at s7 + desc_idx * 16, offset 0).
+# 	slli    t3, a0, 4
+13 1E 45 00	# slli t3,a0,0x4
+# 	add     t3, s7, t3
+33 8E CB 01	# add t3,s7,t3
+# 	lw      a2, 0(t3)                       # buffer ptr
+03 26 0E 00	# lw a2,0(t3)
+
+	# Check ethertype at offset 24..25 (LE halfword).
+# 	lhu     t4, 24(a2)
+83 5E 86 01	# lhu t4,24(a2)
+# 	li      t5, 0x0608
+13 0F 80 60	# li t5,1544
+# 	beq     t4, t5, arp_reply               # 0x0806 → ARP
+63 8A EE 1D	# beq t4,t5,800008f8 <arp_reply>
+# 	li      t5, 0x0008
+13 0F 80 00	# li t5,8
+# 	bne     t4, t5, rx_refill               # not 0x0800 → drop
+63 90 EE 2D	# bne t4,t5,800009ec <rx_refill>
+
+	# Check UDP dst port matches bind_port (s4).
+# 	lbu     t4, 48(a2)
+83 4E 06 03	# lbu t4,48(a2)
+# 	slli    t4, t4, 8
+93 9E 8E 00	# slli t4,t4,0x8
+# 	lbu     t5, 49(a2)
+03 4F 16 03	# lbu t5,49(a2)
+# 	or      t4, t4, t5
+B3 EE EE 01	# or t4,t4,t5
+# 	bne     t4, s4, rx_refill
+63 96 4E 2B	# bne t4,s4,800009ec <rx_refill>
+
+	# IPv4: validate BIN0 magic at a2 + 54 (LE halfwords).
+# 	lhu     t4, 54(a2)
+83 5E 66 03	# lhu t4,54(a2)
+# 	li      t5, 0x4942                      # "BI" LE
+37 5F 00 00	# lui t5,0x5
+13 0F 2F 94	# addi t5,t5,-1726 # 4942 <MT_KHZ+0x2232>
+# 	bne     t4, t5, rx_refill
+63 9E EE 29	# bne t4,t5,800009ec <rx_refill>
+# 	lhu     t4, 56(a2)
+83 5E 86 03	# lhu t4,56(a2)
+# 	li      t5, 0x304E                      # "N0" LE
+37 3F 00 00	# lui t5,0x3
+13 0F EF 04	# addi t5,t5,78 # 304e <MT_KHZ+0x93e>
+# 	bne     t4, t5, rx_refill
+63 96 EE 29	# bne t4,t5,800009ec <rx_refill>
+# 	lbu     t4, 58(a2)
+83 4E A6 03	# lbu t4,58(a2)
+# 	li      t5, 0x82                        # RSP_CHUNK
+13 0F 20 08	# li t5,130
+# 	bne     t4, t5, rx_refill
+63 90 EE 29	# bne t4,t5,800009ec <rx_refill>
+
+	# ── Source-seed match ──
+	# If s6 == 0xFF (unlocked), scan all non-failed seeds for first match
+	#   on (src IP, src UDP port).  On match, lock s6 = idx.
+	# If s6 != 0xFF (locked), accept only if (src IP, src UDP port) ==
+	#   seed[s6]; otherwise drop.
+	# Packet src IP at a2+38..41 (BE), src UDP port at a2+46..47 (BE).
+	# Seed[idx] base = s7 + SEED_LIST_OFFSET + 1 + idx*6 with layout
+	#   [4 IP bytes][LE u16 port].
+# 	li      t6, 0xFF
+93 0F F0 0F	# li t6,255
+# 	beq     s6, t6, sm_unlocked
+63 06 FB 01	# beq s6,t6,80000780 <sm_unlocked>
+	# Locked: only accept from seed[s6].
+# 	mv      t3, s6
+13 0E 0B 00	# mv t3,s6
+# 	j       sm_compare
+6F 00 C0 02	# j 800007a8 <sm_compare>
+# sm_unlocked:
+# 	li      t3, 0
+13 0E 00 00	# li t3,0
+# sm_scan_top:
+# 	bge     t3, s5, rx_refill               # past end, no match → drop
+63 54 5E 27	# bge t3,s5,800009ec <rx_refill>
+	# Skip blacklisted seeds during scan.
+# 	li      t0, NF_MASK
+B7 A2 00 00	# lui t0,0xa
+93 82 42 FF	# addi t0,t0,-12 # 9ff4 <NF_MASK>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lhu     t1, 0(t0)
+03 D3 02 00	# lhu t1,0(t0)
+# 	li      t2, 1
+93 03 10 00	# li t2,1
+# 	sll     t2, t2, t3
+B3 93 C3 01	# sll t2,t2,t3
+# 	and     t2, t1, t2
+B3 73 73 00	# and t2,t1,t2
+# 	bnez    t2, sm_scan_next
+63 90 03 08	# bnez t2,80000824 <sm_scan_next>
+# sm_compare:
+	# Compute &seed[t3].
+# 	li      t0, SEED_LIST_OFFSET
+B7 A2 00 00	# lui t0,0xa
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	addi    t0, t0, 1
+93 82 12 00	# addi t0,t0,1 # a001 <SEED_LIST_OFFSET+0x1>
+# 	slli    t1, t3, 2
+13 13 2E 00	# slli t1,t3,0x2
+# 	add     t0, t0, t1
+B3 82 62 00	# add t0,t0,t1
+# 	slli    t1, t3, 1
+13 13 1E 00	# slli t1,t3,0x1
+# 	add     t0, t0, t1                      # t0 = seed[t3] base
+B3 82 62 00	# add t0,t0,t1
+	# Compare 4 IP bytes.
+	# Compare 4 IP bytes.
+# 	lbu     t1, 0(t0); lbu t2, 38(a2); bne t1, t2, sm_mismatch
+03 C3 02 00	# lbu t1,0(t0)
+83 43 66 02	# lbu t2,38(a2)
+63 18 73 04	# bne t1,t2,8000081c <sm_mismatch>
+# 	lbu     t1, 1(t0); lbu t2, 39(a2); bne t1, t2, sm_mismatch
+03 C3 12 00	# lbu t1,1(t0)
+83 43 76 02	# lbu t2,39(a2)
+63 12 73 04	# bne t1,t2,8000081c <sm_mismatch>
+# 	lbu     t1, 2(t0); lbu t2, 40(a2); bne t1, t2, sm_mismatch
+03 C3 22 00	# lbu t1,2(t0)
+83 43 86 02	# lbu t2,40(a2)
+63 1C 73 02	# bne t1,t2,8000081c <sm_mismatch>
+# 	lbu     t1, 3(t0); lbu t2, 41(a2); bne t1, t2, sm_mismatch
+03 C3 32 00	# lbu t1,3(t0)
+83 43 96 02	# lbu t2,41(a2)
+63 16 73 02	# bne t1,t2,8000081c <sm_mismatch>
+	# Compare port: seed[5]=BE-hi==pkt[46], seed[4]=BE-lo==pkt[47].
+# 	lbu     t1, 5(t0); lbu t2, 46(a2); bne t1, t2, sm_mismatch
+03 C3 52 00	# lbu t1,5(t0)
+83 43 E6 02	# lbu t2,46(a2)
+63 10 73 02	# bne t1,t2,8000081c <sm_mismatch>
+# 	lbu     t1, 4(t0); lbu t2, 47(a2); bne t1, t2, sm_mismatch
+03 C3 42 00	# lbu t1,4(t0)
+83 43 F6 02	# lbu t2,47(a2)
+63 1A 73 00	# bne t1,t2,8000081c <sm_mismatch>
+	# Match.
+# 	li      t6, 0xFF
+93 0F F0 0F	# li t6,255
+# 	bne     s6, t6, sm_done                 # already locked, no change
+63 1E FB 01	# bne s6,t6,8000082c <sm_done>
+# 	mv      s6, t3                          # lock!
+13 0B 0E 00	# mv s6,t3
+# 	j       sm_done
+6F 00 40 01	# j 8000082c <sm_done>
+# sm_mismatch:
+	# Locked path: any mismatch → drop.
+# 	li      t6, 0xFF
+93 0F F0 0F	# li t6,255
+# 	bne     s6, t6, rx_refill
+63 16 FB 1D	# bne s6,t6,800009ec <rx_refill>
+	# Unlocked path: try next seed.
+# sm_scan_next:
+# 	addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+# 	j       sm_scan_top
+6F F0 DF F5	# j 80000784 <sm_scan_top>
+# sm_done:
+
+	# seq = BE u16 at a2 + 59..60.
+# 	lbu     t4, 59(a2)
+83 4E B6 03	# lbu t4,59(a2)
+# 	slli    t4, t4, 8
+93 9E 8E 00	# slli t4,t4,0x8
+# 	lbu     t5, 60(a2)
+03 4F C6 03	# lbu t5,60(a2)
+# 	or      t4, t4, t5                      # t4 = seq
+B3 EE EE 01	# or t4,t4,t5
+
+	# Bounds: drop seq >= NCHUNKS (corrupt/replay).
+# 	lw      t6, -40(gp)
+83 AF 81 FD	# lw t6,-40(gp) # 80002b64 <__BSS_END__+0x7d8>
+# 	bge     t4, t6, rx_refill
+63 D6 FE 1B	# bge t4,t6,800009ec <rx_refill>
+
+	# Bitmap test/set: byte = bitmap[seq>>3], bit = 1 << (seq & 7).
+	# Already-received chunks (duplicates) are dropped without copy and
+	# without bumping the received counter.
+# 	srli    t6, t4, 3                       # byte index
+93 DF 3E 00	# srli t6,t4,0x3
+# 	li      t3, NB_BMAP
+37 AE 00 00	# lui t3,0xa
+13 0E 0E 08	# addi t3,t3,128 # a080 <NB_BMAP>
+# 	add     t3, s7, t3
+33 8E CB 01	# add t3,s7,t3
+# 	add     t3, t3, t6                      # &bitmap[byte]
+33 0E FE 01	# add t3,t3,t6
+# 	lbu     t6, 0(t3)                       # current byte
+83 4F 0E 00	# lbu t6,0(t3)
+# 	andi    t2, t4, 7
+93 F3 7E 00	# andi t2,t4,7
+# 	li      t1, 1
+13 03 10 00	# li t1,1
+# 	sll     t1, t1, t2                      # 1 << (seq & 7)
+33 13 73 00	# sll t1,t1,t2
+# 	and     t2, t6, t1
+B3 F3 6F 00	# and t2,t6,t1
+# 	bnez    t2, rx_refill                   # already received → drop
+63 90 03 18	# bnez t2,800009ec <rx_refill>
+# 	or      t6, t6, t1
+B3 EF 6F 00	# or t6,t6,t1
+# 	sb      t6, 0(t3)                       # mark received
+23 00 FE 01	# sb t6,0(t3)
+
+	# dst = gp + seq * 1400
+	#     1400 = 0x578 = 1024 + 256 + 128 - 8
+# 	slli    t5, t4, 10
+13 9F AE 00	# slli t5,t4,0xa
+# 	slli    t6, t4, 8;  add t5, t5, t6
+93 9F 8E 00	# slli t6,t4,0x8
+33 0F FF 01	# add t5,t5,t6
+# 	slli    t6, t4, 7;  add t5, t5, t6
+93 9F 7E 00	# slli t6,t4,0x7
+33 0F FF 01	# add t5,t5,t6
+# 	slli    t6, t4, 3;  sub t5, t5, t6
+93 9F 3E 00	# slli t6,t4,0x3
+33 0F FF 41	# sub t5,t5,t6
+# 	add     t5, gp, t5                      # dst pointer
+33 8F E1 01	# add t5,gp,t5
+
+	# src = a2 + 61, length = a1 - 61.
+# 	addi    a2, a2, 61
+13 06 D6 03	# addi a2,a2,61
+# 	addi    a1, a1, -61
+93 85 35 FC	# addi a1,a1,-61
+# 	bltz    a1, rx_refill                   # runt packet (< 61 B) → drop
+63 C6 05 14	# bltz a1,800009ec <rx_refill>
+# 	beqz    a1, rx_done_chunk
+63 88 05 02	# beqz a1,800008d4 <rx_done_chunk>
+	# Clamp copy length so last chunk can't overflow past BIN_SIZE.
+# 	lw      t6, -36(gp)
+83 AF C1 FD	# lw t6,-36(gp) # 80002b68 <__BSS_END__+0x7dc>
+# 	add     t6, gp, t6                      # end of valid region
+B3 8F F1 01	# add t6,gp,t6
+# 	sub     t6, t6, t5                      # remaining = end - dst
+B3 8F EF 41	# sub t6,t6,t5
+# 	blt     a1, t6, rx_copy
+63 C4 F5 01	# blt a1,t6,800008bc <rx_copy>
+# 	mv      a1, t6
+93 85 0F 00	# mv a1,t6
+# rx_copy:
+# 	lbu     t6, 0(a2)
+83 4F 06 00	# lbu t6,0(a2)
+# 	sb      t6, 0(t5)
+23 00 FF 01	# sb t6,0(t5)
+# 	addi    a2, a2, 1
+13 06 16 00	# addi a2,a2,1
+# 	addi    t5, t5, 1
+13 0F 1F 00	# addi t5,t5,1
+# 	addi    a1, a1, -1
+93 85 F5 FF	# addi a1,a1,-1
+# 	bnez    a1, rx_copy
+E3 96 05 FE	# bnez a1,800008bc <rx_copy>
+# rx_done_chunk:
+# 	addi    s1, s1, 1                       # received++
+93 84 14 00	# addi s1,s1,1
+	# Refresh watchdog: WD_TICK = current mtime.
+# 	li      t0, MTIME_ADDR
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME_ADDR>
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+# 	li      t0, WD_TICK
+B7 A2 00 00	# lui t0,0xa
+93 82 02 FE	# addi t0,t0,-32 # 9fe0 <WD_TICK>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0)
+# 	j       rx_refill
+6F 00 80 0F	# j 800009ec <rx_refill>
+
+# arp_reply:
+	# Build ARP reply directly into the shared TX buffer at s7+0x820C
+	# (vnet hdr at s7+0x8200, 12 B).  tx_req_range rebuilds the REQ_RANGE
+	# from scratch on each call, so overwriting it here is safe.
+	# Single NTX_BUF at +0x8200.  42-byte frame.
+# 	li      t6, 0x820C
+B7 8F 00 00	# lui t6,0x8
+93 8F CF 20	# addi t6,t6,524 # 820c <SHUTDOWN_PASS+0x2cb7>
+# 	add     a3, s7, t6                      # frame base
+B3 86 FB 01	# add a3,s7,t6
+	# Ethernet: dst = sender of ARP req (a2+18, 6 bytes) via halfwords.
+# 	lhu     t4, 18(a2); sh t4, 0(a3)
+83 5E 26 01	# lhu t4,18(a2)
+23 90 D6 01	# sh t4,0(a3)
+# 	lhu     t4, 20(a2); sh t4, 2(a3)
+83 5E 46 01	# lhu t4,20(a2)
+23 91 D6 01	# sh t4,2(a3)
+# 	lhu     t4, 22(a2); sh t4, 4(a3)
+83 5E 66 01	# lhu t4,22(a2)
+23 92 D6 01	# sh t4,4(a3)
+	# src MAC = 52:54:00:12:34:56 via halfwords
+# 	li      t4, 0x5452; sh t4, 6(a3)
+B7 5E 00 00	# lui t4,0x5
+93 8E 2E 45	# addi t4,t4,1106 # 5452 <MT_KHZ+0x2d42>
+23 93 D6 01	# sh t4,6(a3)
+# 	li      t4, 0x1200; sh t4, 8(a3)
+B7 1E 00 00	# lui t4,0x1
+93 8E 0E 20	# addi t4,t4,512 # 1200 <PAGE_SIZE+0x200>
+23 94 D6 01	# sh t4,8(a3)
+# 	li      t4, 0x5634; sh t4, 10(a3)
+B7 5E 00 00	# lui t4,0x5
+93 8E 4E 63	# addi t4,t4,1588 # 5634 <SHUTDOWN_PASS+0xdf>
+23 95 D6 01	# sh t4,10(a3)
+	# ethertype 0x0806 (LE: {06,08})
+# 	li      t4, 0x0608; sh t4, 12(a3)
+93 0E 80 60	# li t4,1544
+23 96 D6 01	# sh t4,12(a3)
+	# ARP body: HW type, proto, lengths (6 B) via halfwords.
+# 	lhu     t4, 26(a2); sh t4, 14(a3)
+83 5E A6 01	# lhu t4,26(a2)
+23 97 D6 01	# sh t4,14(a3)
+# 	lhu     t4, 28(a2); sh t4, 16(a3)
+83 5E C6 01	# lhu t4,28(a2)
+23 98 D6 01	# sh t4,16(a3)
+# 	lhu     t4, 30(a2); sh t4, 18(a3)
+83 5E E6 01	# lhu t4,30(a2)
+23 99 D6 01	# sh t4,18(a3)
+	# op = 2 (reply) BE: {00,02} → LE halfword 0x0200
+# 	li      t4, 0x0200; sh t4, 20(a3)
+93 0E 00 20	# li t4,512
+23 9A D6 01	# sh t4,20(a3)
+	# sender (us): MAC copied from Ethernet src (offset 6), IP 10.0.2.15
+# 	lhu     t4, 6(a3);  sh t4, 22(a3)
+83 DE 66 00	# lhu t4,6(a3)
+23 9B D6 01	# sh t4,22(a3)
+# 	lhu     t4, 8(a3);  sh t4, 24(a3)
+83 DE 86 00	# lhu t4,8(a3)
+23 9C D6 01	# sh t4,24(a3)
+# 	lhu     t4, 10(a3); sh t4, 26(a3)
+83 DE A6 00	# lhu t4,10(a3)
+23 9D D6 01	# sh t4,26(a3)
+# 	li      t4, 0x000A; sh t4, 28(a3)
+93 0E A0 00	# li t4,10
+23 9E D6 01	# sh t4,28(a3)
+# 	li      t4, 0x0F02; sh t4, 30(a3)
+B7 1E 00 00	# lui t4,0x1
+93 8E 2E F0	# addi t4,t4,-254 # f02 <NB_BMAP_BYTES+0xb02>
+23 9F D6 01	# sh t4,30(a3)
+	# target = incoming sender MAC (pkt+34) + IP (pkt+40) via halfwords.
+# 	lhu     t4, 34(a2); sh t4, 32(a3)
+83 5E 26 02	# lhu t4,34(a2)
+23 90 D6 03	# sh t4,32(a3)
+# 	lhu     t4, 36(a2); sh t4, 34(a3)
+83 5E 46 02	# lhu t4,36(a2)
+23 91 D6 03	# sh t4,34(a3)
+# 	lhu     t4, 38(a2); sh t4, 36(a3)
+83 5E 66 02	# lhu t4,38(a2)
+23 92 D6 03	# sh t4,36(a3)
+# 	lhu     t4, 40(a2); sh t4, 38(a3)
+83 5E 86 02	# lhu t4,40(a2)
+23 93 D6 03	# sh t4,38(a3)
+# 	lhu     t4, 42(a2); sh t4, 40(a3)
+83 5E A6 02	# lhu t4,42(a2)
+23 94 D6 03	# sh t4,40(a3)
+
+# 	mv      a1, a0                          # save desc_idx for rx_refill
+93 05 05 00	# mv a1,a0
+# 	li      a0, 54                          # 12 vnet + 42 ARP frame
+13 05 60 03	# li a0,54
+# 	CALL    tx_submit
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,800009d0 <arp_reply+0xd8>
+6F 00 00 29	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 60 00	# li s11,6
+6F 00 10 06	# j 80001238 <tx_submit>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	mv      a0, a1                          # restore desc_idx
+13 85 05 00	# mv a0,a1
+# 	j       rx_refill
+6F 00 40 00	# j 800009ec <rx_refill>
+
+# rx_refill:
+	# Repost the consumed descriptor.  a0 = desc_idx from used.ring entry.
+# 	addi    t0, s7, 256                     # RX avail base
+93 82 0B 10	# addi t0,s7,256
+# 	lhu     t1, 2(t0)                       # avail.idx
+03 D3 22 00	# lhu t1,2(t0)
+# 	andi    t2, t1, 15
+93 73 F3 00	# andi t2,t1,15
+# 	slli    t2, t2, 1
+93 93 13 00	# slli t2,t2,0x1
+# 	add     t2, t0, t2
+B3 83 72 00	# add t2,t0,t2
+# 	sh      a0, 4(t2)                       # ring[idx%16] = desc_idx
+23 92 A3 00	# sh a0,4(t2)
+# 	addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+# 	sh      t1, 2(t0)                       # avail.idx += 1
+23 91 62 00	# sh t1,2(t0)
+# 	fence   iorw, ow
+0F 00 50 0F	# fence iorw,ow
+# 	sw      zero, 0x50(s3)                  # notify RX queue 0
+23 A8 09 04	# sw zero,80(s3)
+
+# 	addi    s0, s0, 1                       # consumed++
+13 04 14 00	# addi s0,s0,1
+# 	j       rx_loop
+6F F0 DF CA	# j 800006c4 <rx_loop>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# rx_no_progress — bumps a stall counter; once the threshold is hit, scans the
+# chunk bitmap for the first un-received seq and re-sends REQ_RANGE
+# [first_missing .. NCHUNKS-1] to the same seed.  The bitmap drops the
+# duplicates the server re-bursts, so we converge on the missing tail.
+# ──────────────────────────────────────────────────────────────────────────────
+# rx_no_progress:
+	# Increment NP_CNT; bail back to rx_loop until threshold.
+# 	li      t0, NP_CNT
+B7 A2 00 00	# lui t0,0xa
+93 82 42 FE	# addi t0,t0,-28 # 9fe4 <NP_CNT>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+# 	addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+# 	sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0)
+# 	li      t6, 10                          # poll threshold
+93 0F A0 00	# li t6,10
+# 	blt     t1, t6, rx_loop
+E3 46 F3 C9	# blt t1,t6,800006c4 <rx_loop>
+# 	sw      zero, 0(t0)                     # reset
+23 A0 02 00	# sw zero,0(t0)
+
+	# ── Watchdog: check elapsed since last progress against TIMETIK ──
+# 	li      t0, MTIME_ADDR
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME_ADDR>
+# 	lw      t1, 0(t0)                       # current mtime
+03 A3 02 00	# lw t1,0(t0)
+# 	li      t0, WD_TICK
+B7 A2 00 00	# lui t0,0xa
+93 82 02 FE	# addi t0,t0,-32 # 9fe0 <WD_TICK>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lw      t2, 0(t0)
+83 A3 02 00	# lw t2,0(t0)
+# 	sub     t2, t1, t2                      # elapsed
+B3 03 73 40	# sub t2,t1,t2
+# 	li      t0, TIMETIK
+B7 A2 00 00	# lui t0,0xa
+93 82 C2 FF	# addi t0,t0,-4 # 9ffc <TIMETIK>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lw      t3, 0(t0)
+03 AE 02 00	# lw t3,0(t0)
+# 	blt     t2, t3, wd_ok
+63 C0 C3 03	# blt t2,t3,80000a90 <wd_ok>
+	# Timeout!  Either blacklist + reprobe or halt.
+# 	li      t6, 0xFF
+93 0F F0 0F	# li t6,255
+# 	beq     s6, t6, halt_no_net             # never locked → halt
+63 06 FB 1F	# beq s6,t6,80000c64 <halt_no_net>
+	# Locked seed went silent.  Blacklist and reprobe.
+# 	li      t6, 'T'
+93 0F 40 05	# li t6,84
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+# 	li      t6, '\n'
+93 0F A0 00	# li t6,10
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+# 	j       blacklist_reprobe
+6F 00 00 1A	# j 80000c2c <blacklist_reprobe>
+# wd_ok:
+
+	# Without a lock yet, do NOT reprobe automatically.  The watchdog
+	# will fire after TIMETIK and either halt N (if still unlocked) or
+	# blacklist + reprobe (if locked): probe-poll just waits until lock
+	# or timeout.
+# 	li      t6, 0xFF
+93 0F F0 0F	# li t6,255
+# 	beq     s6, t6, rx_loop
+E3 08 FB C3	# beq s6,t6,800006c4 <rx_loop>
+
+	# Rate-limit batch retries: skip if NS_RTRY (last retry-send mtime)
+	# was less than NRTRY_TK ago.  Without this, a partial-data attacker
+	# (or undersized seed) makes us spam the wire as we keep asking for
+	# chunks that won't come.  WD_TICK still ticks toward TIMETIK based
+	# on accepted-chunk freshness, so we'll blacklist after the watchdog
+	# fires regardless.
+# 	li      t0, MTIME_ADDR
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME_ADDR>
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+# 	li      t0, NS_RTRY
+B7 A2 00 00	# lui t0,0xa
+93 82 82 FE	# addi t0,t0,-24 # 9fe8 <NS_RTRY>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lw      t2, 0(t0)
+83 A3 02 00	# lw t2,0(t0)
+# 	sub     t3, t1, t2
+33 0E 73 40	# sub t3,t1,t2
+# 	li      t4, NRTRY_TK
+B7 8E 1E 00	# lui t4,0x1e8
+93 8E 0E 48	# addi t4,t4,1152 # 1e8480 <NRTRY_TK>
+# 	blt     t3, t4, rx_loop                 # too soon since last retry
+E3 42 DE C1	# blt t3,t4,800006c4 <rx_loop>
+
+	# Batch logic:
+	#   1. Re-send REQ_RANGE for [BATCH_START..BATCH_START+63] with bitmap
+	#      every NRTRY_TK ms (gated by NS_RTRY) until all 64 land.
+	#   2. When the current batch is fully received, advance BATCH_START by 64.
+	#   3. Watchdog (TIMETIK on no-new-chunk) handles seed-died blacklist.
+# 	li      t0, BATCH_START
+B7 A2 00 00	# lui t0,0xa
+93 82 A2 FD	# addi t0,t0,-38 # 9fda <BATCH_START>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lhu     t2, 0(t0)                       # t2 = batch start
+83 D3 02 00	# lhu t2,0(t0)
+	# Done?
+# 	lw      t6, -40(gp)
+83 AF 81 FD	# lw t6,-40(gp) # 80002b64 <__BSS_END__+0x7d8>
+# 	bge     t2, t6, rx_loop                 # batch start past end → nothing left
+E3 D6 F3 BF	# bge t2,t6,800006c4 <rx_loop>
+
+	# Compute batch end = min(start + NB_SIZE-1, NCHUNKS - 1).
+# batch_clamp:
+# 	addi    t1, t2, NB_SIZE - 1             # candidate end
+13 83 F3 03	# addi t1,t2,63
+# 	lw      t6, -40(gp)
+83 AF 81 FD	# lw t6,-40(gp) # 80002b64 <__BSS_END__+0x7d8>
+# 	addi    t6, t6, -1
+93 8F FF FF	# addi t6,t6,-1
+# 	blt     t1, t6, 1f
+63 44 F3 01	# blt t1,t6,80000af0 <batch_clamp+0x14>
+# 	mv      t1, t6                          # clamp
+13 83 0F 00	# mv t1,t6
+# 1:
+	# Check whether the current batch is fully filled in the bitmap.
+	# Walk seq from t2 to t1 inclusive; if any bit is 0, batch incomplete.
+# 	mv      t3, t2                          # walker
+13 8E 03 00	# mv t3,t2
+# batch_check:
+# 	bgt     t3, t1, batch_advance           # walked past end → all set
+63 4C C3 03	# blt t1,t3,80000b2c <batch_advance>
+# 	srli    t4, t3, 3                       # byte index
+93 5E 3E 00	# srli t4,t3,0x3
+# 	li      t5, NB_BMAP
+37 AF 00 00	# lui t5,0xa
+13 0F 0F 08	# addi t5,t5,128 # a080 <NB_BMAP>
+# 	add     t5, s7, t5
+33 8F EB 01	# add t5,s7,t5
+# 	add     t5, t5, t4
+33 0F DF 01	# add t5,t5,t4
+# 	lbu     t4, 0(t5)
+83 4E 0F 00	# lbu t4,0(t5)
+# 	andi    t6, t3, 7
+93 7F 7E 00	# andi t6,t3,7
+# 	li      t5, 1
+13 0F 10 00	# li t5,1
+# 	sll     t5, t5, t6
+33 1F FF 01	# sll t5,t5,t6
+# 	and     t6, t4, t5
+B3 FF EE 01	# and t6,t4,t5
+# 	beqz    t6, batch_send                  # bit clear → re-request same range
+63 86 0F 02	# beqz t6,80000b4c <batch_send>
+# 	addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+# 	j       batch_check
+6F F0 DF FC	# j 80000af4 <batch_check>
+
+# batch_advance:
+	# All chunks in [t2..t1] received.  Advance BATCH_START past this batch.
+# 	addi    t2, t1, 1
+93 03 13 00	# addi t2,t1,1
+# 	li      t0, BATCH_START
+B7 A2 00 00	# lui t0,0xa
+93 82 A2 FD	# addi t0,t0,-38 # 9fda <BATCH_START>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sh      t2, 0(t0)
+23 90 72 00	# sh t2,0(t0)
+	# Are we done?
+# 	lw      t6, -40(gp)
+83 AF 81 FD	# lw t6,-40(gp) # 80002b64 <__BSS_END__+0x7d8>
+# 	bge     t2, t6, rx_loop
+E3 D0 F3 B9	# bge t2,t6,800006c4 <rx_loop>
+# 	j       batch_clamp
+6F F0 5F F9	# j 80000adc <batch_clamp>
+# batch_send:
+	# Send REQ_RANGE [t2..t1] to locked seed s6.
+# 	mv      a0, s6
+13 05 0B 00	# mv a0,s6
+# 	mv      a1, t2
+93 85 03 00	# mv a1,t2
+# 	mv      a2, t1
+13 06 03 00	# mv a2,t1
+# 	CALL    tx_req_range
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000b64 <batch_send+0x18>
+6F 00 C0 0F	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 70 00	# li s11,7
+6F 00 40 4A	# j 80001010 <tx_req_range>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+	# Stamp NS_RTRY = current mtime to gate the next batch retry.
+# 	li      t0, MTIME_ADDR
+B7 C2 00 02	# lui t0,0x200c
+93 82 82 FF	# addi t0,t0,-8 # 200bff8 <MTIME_ADDR>
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+# 	li      t0, NS_RTRY
+B7 A2 00 00	# lui t0,0xa
+93 82 82 FE	# addi t0,t0,-24 # 9fe8 <NS_RTRY>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0)
+# 	j       rx_loop
+6F F0 1F B3	# j 800006c4 <rx_loop>
+
+# rx_done:
+	# Now run the existing hash check by jumping back to it.  The hash
+	# check expects: gp..gp+BIN_SIZE = candidate full_node bytes;
+	# scratch buf gets gimli_hash output, compared to hash_data.
+# 	addi    sp, sp, -32
+13 01 01 FE	# addi sp,sp,-32
+# 	mv      a2, sp
+13 06 01 00	# mv a2,sp
+# 	mv      a0, gp
+13 85 01 00	# mv a0,gp
+# 	lw      a1, -36(gp)
+83 A5 C1 FD	# lw a1,-36(gp) # 80002b68 <__BSS_END__+0x7dc>
+# 	CALL    gimli_hash
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000bb4 <rx_done+0x1c>
+6F 00 C0 0A	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 80 00	# li s11,8
+6F 00 C0 2B	# j 80000e78 <gimli_hash>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+# 	mv      t0, sp
+93 02 01 00	# mv t0,sp
+# 	addi    t1, gp, -32
+13 83 01 FE	# addi t1,gp,-32 # 80002b6c <__BSS_END__+0x7e0>
+# 	li      t2, 8
+93 03 80 00	# li t2,8
+# net_hash_cmp:
+# 	lw      t3, 0(t0)
+03 AE 02 00	# lw t3,0(t0)
+# 	lw      t4, 0(t1)
+83 2E 03 00	# lw t4,0(t1)
+# 	bne     t3, t4, net_hash_mismatch
+63 1E DE 03	# bne t3,t4,80000c18 <net_hash_mismatch>
+# 	addi    t0, t0, 4
+93 82 42 00	# addi t0,t0,4
+# 	addi    t1, t1, 4
+13 03 43 00	# addi t1,t1,4
+# 	addi    t2, t2, -1
+93 83 F3 FF	# addi t2,t2,-1
+# 	bnez    t2, net_hash_cmp
+E3 94 03 FE	# bnez t2,80000bd4 <net_hash_cmp>
+
+	# Match!
+# 	addi    sp, sp, 32
+13 01 01 02	# addi sp,sp,32
+# 	li      t0, SEED_LIST_OFFSET
+B7 A2 00 00	# lui t0,0xa
+# 	add     a0, s7, t0
+33 85 5B 00	# add a0,s7,t0
+# 	li      a1, 1                           # boot source = net
+93 05 10 00	# li a1,1
+# 	mv      a2, s4
+13 06 0A 00	# mv a2,s4
+# 	addi    t0, a0, DBGFLAG - SEED_LIST_OFFSET   # t0 = s7 + DBGFLAG (= a0 - 40)
+93 02 85 FD	# addi t0,a0,-40
+# 	lw      a3, 0(t0)                       # a3 = debug flag
+83 A6 02 00	# lw a3,0(t0) # a000 <SEED_LIST_OFFSET>
+# 	mv      a4, gp                          # a4 = full_node base address (handoff arg)
+13 87 01 00	# mv a4,gp
+# 	nop                                     # layout pad
+13 00 00 00	# nop
+# 	j       end_marker
+6F 00 80 77	# j 8000138c <end_marker>
+
+# net_hash_mismatch:
+# 	addi    sp, sp, 32
+13 01 01 02	# addi sp,sp,32
+# 	li      t6, 'H'
+93 0F 80 04	# li t6,72
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+# 	li      t6, '\n'
+93 0F A0 00	# li t6,10
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+	# Blacklist the locked seed and reprobe.  s6 holds the locked idx.
+# blacklist_reprobe:
+# 	li      t0, NF_CNT
+B7 A2 00 00	# lui t0,0xa
+93 82 22 FF	# addi t0,t0,-14 # 9ff2 <NF_CNT>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lhu     t1, 2(t0)
+03 D3 22 00	# lhu t1,2(t0)
+# 	li      t2, 1
+93 03 10 00	# li t2,1
+# 	sll     t2, t2, s6
+B3 93 63 01	# sll t2,t2,s6
+# 	or      t1, t1, t2
+33 63 73 00	# or t1,t1,t2
+# 	sh      t1, 2(t0)
+23 91 62 00	# sh t1,2(t0)
+# 	lhu     t1, 0(t0)
+03 D3 02 00	# lhu t1,0(t0)
+# 	addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+# 	sh      t1, 0(t0)
+23 90 62 00	# sh t1,0(t0)
+# 	j       reprobe_entry
+6F F0 5F 93	# j 8000058c <reprobe_entry>
+
+
+# halt_no_disk:
+# panic:
+# 	li      t6, 'N'
+93 0F E0 04	# li t6,78
+# 	j       halt_tail
+6F 00 00 01	# j 80000c70 <halt_tail>
+
+# halt_no_net:
+# 	li      t6, 'N'
+93 0F E0 04	# li t6,78
+# 	beqz    s1, halt_tail
+63 84 04 00	# beqz s1,80000c70 <halt_tail>
+# 	li      t6, 'H'
+93 0F 80 04	# li t6,72
+# halt_tail:
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+# 	li      t6, '\n'
+93 0F A0 00	# li t6,10
+# 	sb      t6, 0(s8)
+23 00 FC 01	# sb t6,0(s8)
+# 	lui     t0, %hi(SHUTDOWN_ADDR)
+B7 02 10 00	# lui t0,0x100
+# 	li      t1, SHUTDOWN_FAIL
+37 33 01 00	# lui t1,0x13
+13 03 33 33	# addi t1,t1,819 # 13333 <SHUTDOWN_FAIL>
+# 	sw      t1, 0(t0)
+23 A0 62 00	# sw t1,0(t0) # 100000 <RID_BASE_OFF>
+# 1:	j       1b
+6F 00 00 00	# j 80000c8c <halt_tail+0x1c>
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# scan_disk — walk virtio MMIO from V_SCAN_S down to V_SCAN_E looking for
+#             a device with magic = 'virt' and device_id = 2 (block).
+# Out:    s3 = MMIO base of the found device.
+# Trashes: t0..t2.  Returns via dispatch.
+# Falls through to caller's halt_no_disk path if no device found (back-jumps
+# via `j halt_no_disk` instead of dispatching, so we don't pollute the BST).
+# ──────────────────────────────────────────────────────────────────────────────
+
+# scan_disk:
+# 	li      t1, 2                           # device_id we want (virtio-blk)
+13 03 20 00	# li t1,2
+# 	j       scan_common
+6F 00 80 00	# j 80000c9c <scan_common>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# scan_net — same as scan_disk but looking for device_id=1 (virtio-net).
+# ──────────────────────────────────────────────────────────────────────────────
+
+# scan_net:
+# 	li      t1, 1                           # virtio-net
+13 03 10 00	# li t1,1
+
+# scan_common:
+# 	lui     s3, 0x10008                     # start at top virtio-mmio slot
+B7 89 00 10	# lui s3,0x10008
+# 	lui     t2, 0x10001                     # lower bound (s3 >= t2)
+B7 13 00 10	# lui t2,0x10001
+# 	lui     t3, 0xFFFFF                     # -PAGE_SIZE (sign-extended u20<<12)
+37 FE FF FF	# lui t3,0xfffff
+# 1:	bge     s3, t2, 2f
+63 D4 79 00	# bge s3,t2,80000cb0 <scan_common+0x14>
+# 	j       halt_no_disk
+6F F0 1F FB	# j 80000c5c <halt_no_disk>
+# 2:	lw      t0, 8(s3)                       # device_id
+83 A2 89 00	# lw t0,8(s3) # 10008008 <UART_BASE+0x8008>
+# 	beq     t0, t1, dispatch                # found → return
+63 86 62 60	# beq t0,t1,800012c0 <dispatch>
+# 	add     s3, s3, t3                      # next slot down
+B3 89 C9 01	# add s3,s3,t3
+# 	j       1b
+6F F0 DF FE	# j 80000ca8 <scan_common+0xc>
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# disk_read — issue a virtio-blk READ for one chunk.
+#   In:   a0 = sector,  a1 = avail idx,  a2 = dest,  a3 = byte count.
+#         s3 = MMIO base, s7 = queue base (page-aligned).
+#   Out:  a0 = status byte (0 = success, nonzero = failure).
+#   Trashes: t0..t6.  Returns via dispatch.
+# Layout (offsets from s7):
+#   0x000..0x180  descriptor table (3 descs × 16 B = 48 B used)
+#   0x100..       available ring   (offset 256 from descriptor table)
+#   0x1200        status byte   (1 B)
+#   0x1202        request header (16 B)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# disk_read:
+# 	mv      t1, s7                          # t1 = queue base
+13 83 0B 00	# mv t1,s7
+# 	li      t3, 0x1200
+37 1E 00 00	# lui t3,0x1
+13 0E 0E 20	# addi t3,t3,512 # 1200 <PAGE_SIZE+0x200>
+# 	add     t3, s7, t3                      # t3 = status byte addr
+33 8E CB 01	# add t3,s7,t3
+# 	addi    t2, t3, 2                       # t2 = req hdr addr
+93 03 2E 00	# addi t2,t3,2
+
+	# Request header (16 B at t2): type=READ(0), reserved=0, sector(lo,hi).
+# 	sw      zero, 0(t2)
+23 A0 03 00	# sw zero,0(t2) # 10001000 <UART_BASE+0x1000>
+# 	sw      zero, 4(t2)
+23 A2 03 00	# sw zero,4(t2)
+# 	sw      a0, 8(t2)
+23 A4 A3 00	# sw a0,8(t2)
+# 	sw      zero, 12(t2)
+23 A6 03 00	# sw zero,12(t2)
+
+	# Descriptor[0]: req hdr.
+# 	sw      t2, 0(t1)
+23 20 73 00	# sw t2,0(t1)
+# 	sw      zero, 4(t1)
+23 22 03 00	# sw zero,4(t1)
+# 	li      t4, 16
+93 0E 00 01	# li t4,16
+# 	sw      t4, 8(t1)
+23 24 D3 01	# sw t4,8(t1)
+# 	li      t4, 1
+93 0E 10 00	# li t4,1
+# 	sh      t4, 12(t1)                      # flags = NEXT
+23 16 D3 01	# sh t4,12(t1)
+# 	sh      t4, 14(t1)                      # next  = 1
+23 17 D3 01	# sh t4,14(t1)
+# 	sw      t4, 0x28(t1)                    # desc[2].len = 1
+23 24 D3 03	# sw t4,40(t1)
+
+	# Descriptor[1]: data buffer.
+# 	sw      a2, 16(t1)
+23 28 C3 00	# sw a2,16(t1)
+# 	sw      zero, 20(t1)
+23 2A 03 00	# sw zero,20(t1)
+# 	sw      a3, 24(t1)
+23 2C D3 00	# sw a3,24(t1)
+# 	li      t4, 2
+93 0E 20 00	# li t4,2
+# 	sh      t4, 30(t1)                      # next  = 2
+23 1F D3 01	# sh t4,30(t1)
+# 	sh      t4, 0x2C(t1)                    # desc[2].flags = WRITE
+23 16 D3 03	# sh t4,44(t1)
+# 	li      t4, 3
+93 0E 30 00	# li t4,3
+# 	sh      t4, 28(t1)                      # desc[1].flags = NEXT|WRITE
+23 1E D3 01	# sh t4,28(t1)
+
+	# Descriptor[2]: status byte.
+# 	sw      t3, 32(t1)
+23 20 C3 03	# sw t3,32(t1)
+# 	sw      zero, 36(t1)
+23 22 03 02	# sw zero,36(t1)
+# 	sh      zero, 0x2E(t1)                  # next = 0
+23 17 03 02	# sh zero,46(t1)
+
+	# Available ring at t1+256.
+# 	addi    t4, t1, 256
+93 0E 03 10	# addi t4,t1,256
+# 	sh      zero, 0(t4)                     # avail.flags = 0
+23 90 0E 00	# sh zero,0(t4)
+# 	li      t5, 0xFF
+13 0F F0 0F	# li t5,255
+# 	sb      t5, 0(t3)                       # status byte = 0xFF (init)
+23 00 EE 01	# sb t5,0(t3)
+# 	sh      a1, 2(t4)                       # avail.ring[0]
+23 91 BE 00	# sh a1,2(t4)
+# 	sh      zero, 4(t4)                     # avail.idx (placeholder)
+23 92 0E 00	# sh zero,4(t4)
+
+# 	fence   iorw, ow
+0F 00 50 0F	# fence iorw,ow
+	# Notify device.
+# 	sw      zero, 0x50(s3)
+23 A8 09 04	# sw zero,80(s3)
+
+	# Poll status byte (no watchdog yet — virtio-blk under qemu always responds).
+# dr_poll:
+# 	lbu     t4, 0(t3)
+83 4E 0E 00	# lbu t4,0(t3)
+# 	li      t5, 0xFF
+13 0F F0 0F	# li t5,255
+# 	beq     t4, t5, dr_poll
+E3 8C EE FF	# beq t4,t5,80000d50 <dr_poll>
+
+# 	fence   ir, iorw
+0F 00 F0 0A	# fence ir,iorw
+# 	mv      a0, t4
+13 85 0E 00	# mv a0,t4
+# 	j       dispatch
+6F 00 C0 55	# j 800012c0 <dispatch>
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# gimli_permute — 384-bit Gimli permutation, 24 rounds.
+#   In/out:  state at a0 (12 × 32-bit LE words).
+#   Trashes: t0..t6, s0, s1.
+#   Returns via `j dispatch`.
+#
+# Per round (r descending 24..1):
+#   for col in 0..3:
+#       x = rotl(state[col],     24)
+#       y = rotl(state[col + 4],  9)
+#       z =       state[col + 8]
+#       state[col + 8] = x ^ (z << 1) ^ ((y & z) << 2)
+#       state[col + 4] = y ^ x        ^ ((x | z) << 1)
+#       state[col]     = z ^ y        ^ ((x & y) << 3)
+#   if r % 4 == 0: small-swap + state[0] ^= 0x9e377900 | r
+#   if r % 4 == 2: big-swap
+# ──────────────────────────────────────────────────────────────────────────────
+
+# gimli_permute:
+	# Save s0/s1 — callees must per RISC-V ABI; gimli_hash relies on s1.
+# 	addi    sp, sp, -8
+13 01 81 FF	# addi sp,sp,-8
+# 	sw      s0, 0(sp)
+23 20 81 00	# sw s0,0(sp)
+# 	sw      s1, 4(sp)
+23 22 91 00	# sw s1,4(sp)
+# 	mv      s0, a0                          # state base
+13 04 05 00	# mv s0,a0
+# 	li      s1, 24                          # round counter
+93 04 80 01	# li s1,24
+
+# gp_round:
+# 	mv      a0, s0
+13 05 04 00	# mv a0,s0
+# 	li      t6, 4
+93 0F 40 00	# li t6,4
+
+# gp_col:
+# 	lw      t3, 0(a0)
+03 2E 05 00	# lw t3,0(a0)
+# 	lw      t4, 16(a0)
+83 2E 05 01	# lw t4,16(a0)
+# 	lw      t5, 32(a0)
+03 2F 05 02	# lw t5,32(a0)
+
+	# x = rotl(t3, 24)
+# 	slli    t0, t3, 24
+93 12 8E 01	# slli t0,t3,0x18
+# 	srli    t1, t3, 8
+13 53 8E 00	# srli t1,t3,0x8
+# 	or      t0, t0, t1
+B3 E2 62 00	# or t0,t0,t1
+
+	# y = rotl(t4, 9)
+# 	slli    t1, t4, 9
+13 93 9E 00	# slli t1,t4,0x9
+# 	srli    t2, t4, 23
+93 D3 7E 01	# srli t2,t4,0x17
+# 	or      t1, t1, t2
+33 63 73 00	# or t1,t1,t2
+
+	# state[col]     = z ^ y ^ ((x & y) << 3)
+# 	and     t3, t0, t1
+33 FE 62 00	# and t3,t0,t1
+# 	slli    t3, t3, 3
+13 1E 3E 00	# slli t3,t3,0x3
+# 	xor     t3, t3, t5
+33 4E EE 01	# xor t3,t3,t5
+# 	xor     t3, t3, t1
+33 4E 6E 00	# xor t3,t3,t1
+# 	sw      t3, 0(a0)
+23 20 C5 01	# sw t3,0(a0)
+
+	# state[col + 4] = y ^ x ^ ((x | z) << 1)
+# 	or      t4, t0, t5
+B3 EE E2 01	# or t4,t0,t5
+# 	slli    t4, t4, 1
+93 9E 1E 00	# slli t4,t4,0x1
+# 	xor     t4, t4, t1
+B3 CE 6E 00	# xor t4,t4,t1
+# 	xor     t4, t4, t0
+B3 CE 5E 00	# xor t4,t4,t0
+# 	sw      t4, 16(a0)
+23 28 D5 01	# sw t4,16(a0)
+
+	# state[col + 8] = x ^ (z << 1) ^ ((y & z) << 2)
+# 	and     t2, t1, t5
+B3 73 E3 01	# and t2,t1,t5
+# 	slli    t2, t2, 2
+93 93 23 00	# slli t2,t2,0x2
+# 	slli    t5, t5, 1
+13 1F 1F 00	# slli t5,t5,0x1
+# 	xor     t5, t5, t0
+33 4F 5F 00	# xor t5,t5,t0
+# 	xor     t5, t5, t2
+33 4F 7F 00	# xor t5,t5,t2
+# 	sw      t5, 32(a0)
+23 20 E5 03	# sw t5,32(a0)
+
+# 	addi    a0, a0, 4
+13 05 45 00	# addi a0,a0,4
+# 	addi    t6, t6, -1
+93 8F FF FF	# addi t6,t6,-1
+# 	bnez    t6, gp_col
+E3 9A 0F F8	# bnez t6,80000d84 <gp_col>
+
+# 	andi    t0, s1, 3
+93 F2 34 00	# andi t0,s1,3
+# 	bnez    t0, gp_check_2
+63 90 02 04	# bnez t0,80000e38 <gp_check_2>
+	# Small swap.
+# 	lw      t0, 0(s0)
+83 22 04 00	# lw t0,0(s0)
+# 	lw      t1, 4(s0)
+03 23 44 00	# lw t1,4(s0)
+# 	sw      t1, 0(s0)
+23 20 64 00	# sw t1,0(s0)
+# 	sw      t0, 4(s0)
+23 22 54 00	# sw t0,4(s0)
+# 	lw      t0, 8(s0)
+83 22 84 00	# lw t0,8(s0)
+# 	lw      t1, 12(s0)
+03 23 C4 00	# lw t1,12(s0)
+# 	sw      t1, 8(s0)
+23 24 64 00	# sw t1,8(s0)
+# 	sw      t0, 12(s0)
+23 26 54 00	# sw t0,12(s0)
+	# Round constant.
+# 	li      t0, 0x9E377900
+B7 82 37 9E	# lui t0,0x9e378
+93 82 02 90	# addi t0,t0,-1792 # 9e377900 <__global_pointer$+0x1e374d74>
+# 	or      t0, t0, s1
+B3 E2 92 00	# or t0,t0,s1
+# 	lw      t1, 0(s0)
+03 23 04 00	# lw t1,0(s0)
+# 	xor     t1, t1, t0
+33 43 53 00	# xor t1,t1,t0
+# 	sw      t1, 0(s0)
+23 20 64 00	# sw t1,0(s0)
+# 	j       gp_next
+6F 00 C0 02	# j 80000e60 <gp_next>
+
+# gp_check_2:
+# 	li      t1, 2
+13 03 20 00	# li t1,2
+# 	bne     t0, t1, gp_next
+63 92 62 02	# bne t0,t1,80000e60 <gp_next>
+	# Big swap.
+# 	lw      t0, 0(s0)
+83 22 04 00	# lw t0,0(s0)
+# 	lw      t1, 8(s0)
+03 23 84 00	# lw t1,8(s0)
+# 	sw      t1, 0(s0)
+23 20 64 00	# sw t1,0(s0)
+# 	sw      t0, 8(s0)
+23 24 54 00	# sw t0,8(s0)
+# 	lw      t0, 4(s0)
+83 22 44 00	# lw t0,4(s0)
+# 	lw      t1, 12(s0)
+03 23 C4 00	# lw t1,12(s0)
+# 	sw      t1, 4(s0)
+23 22 64 00	# sw t1,4(s0)
+# 	sw      t0, 12(s0)
+23 26 54 00	# sw t0,12(s0)
+
+# gp_next:
+# 	addi    s1, s1, -1
+93 84 F4 FF	# addi s1,s1,-1
+# 	bnez    s1, gp_round
+E3 9C 04 F0	# bnez s1,80000d7c <gp_round>
+# 	lw      s0, 0(sp)
+03 24 01 00	# lw s0,0(sp)
+# 	lw      s1, 4(sp)
+83 24 41 00	# lw s1,4(sp)
+# 	addi    sp, sp, 8
+13 01 81 00	# addi sp,sp,8
+# 	j       dispatch
+6F 00 C0 44	# j 800012c0 <dispatch>
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# gimli_hash — sponge construction over gimli_permute.
+#   a0 = data ptr,  a1 = length,  a2 = 32-byte output buf.
+#   Uses s0..s3 internally; saves and restores all of them so callers'
+#   pinned values survive (s3 in particular is the virtio-net MMIO base,
+#   without which post-hash net I/O would silently target stack memory).
+#   Returns via `j dispatch`.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# gimli_hash:
+# 	addi    sp, sp, -64
+13 01 01 FC	# addi sp,sp,-64
+# 	sw      s0,  0(sp)                      # save callee-saved s-regs we
+23 20 81 00	# sw s0,0(sp)
+# 	sw      s1,  4(sp)                      # use as scratch (s3 in
+23 22 91 00	# sw s1,4(sp)
+# 	sw      s2,  8(sp)                      # particular is the virtio-net
+23 24 21 01	# sw s2,8(sp)
+# 	sw      s3, 12(sp)                      # MMIO base — must be preserved)
+23 26 31 01	# sw s3,12(sp)
+	# state base = sp + 16 (12 words = 48 bytes, fits in sp+16..sp+64)
+
+# 	li      t0, 12
+93 02 C0 00	# li t0,12
+# 	addi    t1, sp, 16
+13 03 01 01	# addi t1,sp,16
+# gh_zero:
+# 	sw      zero, 0(t1)
+23 20 03 00	# sw zero,0(t1)
+# 	addi    t1, t1, 4
+13 03 43 00	# addi t1,t1,4
+# 	addi    t0, t0, -1
+93 82 F2 FF	# addi t0,t0,-1
+# 	bnez    t0, gh_zero
+E3 9A 02 FE	# bnez t0,80000e94 <gh_zero>
+
+# 	addi    s0, sp, 16                      # state base
+13 04 01 01	# addi s0,sp,16
+# 	mv      s1, a0                          # data ptr
+93 04 05 00	# mv s1,a0
+# 	mv      s2, a1                          # remaining
+13 89 05 00	# mv s2,a1
+# 	mv      s3, a2                          # output buf
+93 09 06 00	# mv s3,a2
+
+# gh_absorb:
+# 	li      t0, 16
+93 02 00 01	# li t0,16
+# 	blt     s2, t0, gh_pad
+63 40 59 06	# blt s2,t0,80000f18 <gh_pad>
+
+# 	mv      t2, s0
+93 03 04 00	# mv t2,s0
+# 	mv      t3, s1
+13 8E 04 00	# mv t3,s1
+# 	li      t4, 4
+93 0E 40 00	# li t4,4
+# gh_xor_abs:
+# 	lw      t0, 0(t3)
+83 22 0E 00	# lw t0,0(t3)
+# 	lw      t1, 0(t2)
+03 A3 03 00	# lw t1,0(t2)
+# 	xor     t1, t1, t0
+33 43 53 00	# xor t1,t1,t0
+# 	sw      t1, 0(t2)
+23 A0 63 00	# sw t1,0(t2)
+# 	addi    t2, t2, 4
+93 83 43 00	# addi t2,t2,4
+# 	addi    t3, t3, 4
+13 0E 4E 00	# addi t3,t3,4
+# 	addi    t4, t4, -1
+93 8E FE FF	# addi t4,t4,-1
+# 	bnez    t4, gh_xor_abs
+E3 92 0E FE	# bnez t4,80000ec8 <gh_xor_abs>
+
+# 	mv      a0, s0
+13 05 04 00	# mv a0,s0
+# 	CALL    gimli_permute
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000ef8 <gh_xor_abs+0x30>
+6F F0 9F D6	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 90 00	# li s11,9
+6F F0 9F E6	# j 80000d68 <gimli_permute>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+# 	addi    s1, s1, 16
+93 84 04 01	# addi s1,s1,16
+# 	addi    s2, s2, -16
+13 09 09 FF	# addi s2,s2,-16
+# 	j       gh_absorb
+6F F0 1F FA	# j 80000eb4 <gh_absorb>
+
+# gh_pad:
+# 	beqz    s2, gh_pad_skipcopy
+63 08 09 02	# beqz s2,80000f48 <gh_pad_skipcopy>
+# 	mv      t2, s0
+93 03 04 00	# mv t2,s0
+# 	mv      t3, s1
+13 8E 04 00	# mv t3,s1
+# 	mv      t4, s2
+93 0E 09 00	# mv t4,s2
+# gh_pad_copy:
+# 	lbu     t0, 0(t3)
+83 42 0E 00	# lbu t0,0(t3)
+# 	lbu     t1, 0(t2)
+03 C3 03 00	# lbu t1,0(t2)
+# 	xor     t1, t1, t0
+33 43 53 00	# xor t1,t1,t0
+# 	sb      t1, 0(t2)
+23 80 63 00	# sb t1,0(t2)
+# 	addi    t2, t2, 1
+93 83 13 00	# addi t2,t2,1
+# 	addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+# 	addi    t4, t4, -1
+93 8E FE FF	# addi t4,t4,-1
+# 	bnez    t4, gh_pad_copy
+E3 92 0E FE	# bnez t4,80000f28 <gh_pad_copy>
+# gh_pad_skipcopy:
+
+# 	add     t0, s0, s2
+B3 02 24 01	# add t0,s0,s2
+# 	lbu     t1, 0(t0)
+03 C3 02 00	# lbu t1,0(t0)
+# 	xori    t1, t1, 0x01
+13 43 13 00	# xori t1,t1,1
+# 	sb      t1, 0(t0)
+23 80 62 00	# sb t1,0(t0)
+
+# 	lbu     t1, 15(s0)
+03 43 F4 00	# lbu t1,15(s0)
+# 	xori    t1, t1, 0x80
+13 43 03 08	# xori t1,t1,128
+# 	sb      t1, 15(s0)
+A3 07 64 00	# sb t1,15(s0)
+
+# 	lbu     t1, 47(s0)
+03 43 F4 02	# lbu t1,47(s0)
+# 	xori    t1, t1, 0x01
+13 43 13 00	# xori t1,t1,1
+# 	sb      t1, 47(s0)
+A3 07 64 02	# sb t1,47(s0)
+
+# 	mv      a0, s0
+13 05 04 00	# mv a0,s0
+# 	CALL    gimli_permute
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000f80 <gh_pad_skipcopy+0x38>
+6F F0 1F CE	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D A0 00	# li s11,10
+6F F0 1F DE	# j 80000d68 <gimli_permute>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+	# Squeeze first 16 B.
+# 	lw      t0, 0(s0)
+83 22 04 00	# lw t0,0(s0)
+# 	sw      t0, 0(s3)
+23 A0 59 00	# sw t0,0(s3)
+# 	lw      t0, 4(s0)
+83 22 44 00	# lw t0,4(s0)
+# 	sw      t0, 4(s3)
+23 A2 59 00	# sw t0,4(s3)
+# 	lw      t0, 8(s0)
+83 22 84 00	# lw t0,8(s0)
+# 	sw      t0, 8(s3)
+23 A4 59 00	# sw t0,8(s3)
+# 	lw      t0, 12(s0)
+83 22 C4 00	# lw t0,12(s0)
+# 	sw      t0, 12(s3)
+23 A6 59 00	# sw t0,12(s3)
+
+# 	mv      a0, s0
+13 05 04 00	# mv a0,s0
+# 	CALL    gimli_permute
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000fc4 <gh_pad_skipcopy+0x7c>
+6F F0 DF C9	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D B0 00	# li s11,11
+6F F0 DF D9	# j 80000d68 <gimli_permute>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+
+	# Squeeze second 16 B.
+# 	lw      t0, 0(s0)
+83 22 04 00	# lw t0,0(s0)
+# 	sw      t0, 16(s3)
+23 A8 59 00	# sw t0,16(s3)
+# 	lw      t0, 4(s0)
+83 22 44 00	# lw t0,4(s0)
+# 	sw      t0, 20(s3)
+23 AA 59 00	# sw t0,20(s3)
+# 	lw      t0, 8(s0)
+83 22 84 00	# lw t0,8(s0)
+# 	sw      t0, 24(s3)
+23 AC 59 00	# sw t0,24(s3)
+# 	lw      t0, 12(s0)
+83 22 C4 00	# lw t0,12(s0)
+# 	sw      t0, 28(s3)
+23 AE 59 00	# sw t0,28(s3)
+
+# 	lw      s0,  0(sp)
+03 24 01 00	# lw s0,0(sp)
+# 	lw      s1,  4(sp)
+83 24 41 00	# lw s1,4(sp)
+# 	lw      s2,  8(sp)
+03 29 81 00	# lw s2,8(sp)
+# 	lw      s3, 12(sp)
+83 29 C1 00	# lw s3,12(sp)
+# 	addi    sp, sp, 64
+13 01 01 04	# addi sp,sp,64
+# 	j       dispatch
+6F 00 40 2B	# j 800012c0 <dispatch>
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# tx_req_range — build a BIN0 REQ_RANGE [a1..a2] frame in the TX buffer at
+# s7+0x8200, addressed to seed[a0], and post + notify on TX queue 1.
+#
+# In:  a0 = seed index (0..MAX_SEEDS-1)
+#      a1 = start chunk seq
+#      a2 = end chunk seq
+# Trashes: t0..t6, a0..a4.
+# Uses pinned: s3 (net MMIO), s4 (bind_port), s7 (data region), s8 (UART)
+# ──────────────────────────────────────────────────────────────────────────────
+# tx_req_range:
+	# a3 = &seed[a0] = s7 + SEED_LIST_OFFSET + 1 + a0*6
+# 	li      t0, SEED_LIST_OFFSET
+B7 A2 00 00	# lui t0,0xa
+# 	add     a3, s7, t0
+B3 86 5B 00	# add a3,s7,t0
+# 	addi    a3, a3, 1
+93 86 16 00	# addi a3,a3,1
+# 	slli    t0, a0, 2                       # a0*4
+93 12 25 00	# slli t0,a0,0x2
+# 	add     a3, a3, t0
+B3 86 56 00	# add a3,a3,t0
+# 	slli    t0, a0, 1                       # a0*2
+93 12 15 00	# slli t0,a0,0x1
+# 	add     a3, a3, t0                      # a3 = seed[a0] base
+B3 86 56 00	# add a3,a3,t0
+
+	# a4 = frame base = s7 + 0x820C
+# 	li      t0, 0x820C
+B7 82 00 00	# lui t0,0x8
+93 82 C2 20	# addi t0,t0,524 # 820c <SHUTDOWN_PASS+0x2cb7>
+# 	add     a4, s7, t0
+33 87 5B 00	# add a4,s7,t0
+
+	# ── Ethernet (14 B): dst gateway MAC, src guest MAC, ethertype 0x0800 ──
+# 	li      t1, 0x52; sb t1, 0(a4)
+13 03 20 05	# li t1,82
+23 00 67 00	# sb t1,0(a4)
+# 	li      t1, 0x55; sb t1, 1(a4)
+13 03 50 05	# li t1,85
+A3 00 67 00	# sb t1,1(a4)
+# 	li      t1, 0x0A; sb t1, 2(a4)
+13 03 A0 00	# li t1,10
+23 01 67 00	# sb t1,2(a4)
+# 	sb      zero, 3(a4)
+A3 01 07 00	# sb zero,3(a4)
+# 	li      t1, 0x02; sb t1, 4(a4); sb t1, 5(a4)
+13 03 20 00	# li t1,2
+23 02 67 00	# sb t1,4(a4)
+A3 02 67 00	# sb t1,5(a4)
+# 	li      t1, 0x52; sb t1, 6(a4)
+13 03 20 05	# li t1,82
+23 03 67 00	# sb t1,6(a4)
+# 	li      t1, 0x54; sb t1, 7(a4)
+13 03 40 05	# li t1,84
+A3 03 67 00	# sb t1,7(a4)
+# 	sb      zero, 8(a4)
+23 04 07 00	# sb zero,8(a4)
+# 	li      t1, 0x12; sb t1, 9(a4)
+13 03 20 01	# li t1,18
+A3 04 67 00	# sb t1,9(a4)
+# 	li      t1, 0x34; sb t1, 10(a4)
+13 03 40 03	# li t1,52
+23 05 67 00	# sb t1,10(a4)
+# 	li      t1, 0x56; sb t1, 11(a4)
+13 03 60 05	# li t1,86
+A3 05 67 00	# sb t1,11(a4)
+# 	li      t1, 0x08; sb t1, 12(a4)
+13 03 80 00	# li t1,8
+23 06 67 00	# sb t1,12(a4)
+# 	sb      zero, 13(a4)
+A3 06 07 00	# sb zero,13(a4)
+
+	# ── IPv4 (20 B) at frame + 14 ──
+# 	addi    t0, a4, 14
+93 02 E7 00	# addi t0,a4,14
+# 	li      t1, 0x45; sb t1, 0(t0)
+13 03 50 04	# li t1,69
+23 80 62 00	# sb t1,0(t0)
+# 	sb      zero, 1(t0)
+A3 80 02 00	# sb zero,1(t0)
+# 	sb      zero, 2(t0)
+23 81 02 00	# sb zero,2(t0)
+# 	li      t1, 45; sb t1, 3(t0)             # total len = 20+8+9+8(bitmap)
+13 03 D0 02	# li t1,45
+A3 81 62 00	# sb t1,3(t0)
+# 	sh      zero, 4(t0)
+23 92 02 00	# sh zero,4(t0)
+# 	sh      zero, 6(t0)
+23 93 02 00	# sh zero,6(t0)
+# 	li      t1, 64; sb t1, 8(t0)
+13 03 00 04	# li t1,64
+23 84 62 00	# sb t1,8(t0)
+# 	li      t1, 17; sb t1, 9(t0)             # UDP
+13 03 10 01	# li t1,17
+A3 84 62 00	# sb t1,9(t0)
+# 	sh      zero, 10(t0)                     # checksum placeholder
+23 95 02 00	# sh zero,10(t0)
+# 	li      t1, 10; sb t1, 12(t0)
+13 03 A0 00	# li t1,10
+23 86 62 00	# sb t1,12(t0)
+# 	sb      zero, 13(t0)
+A3 86 02 00	# sb zero,13(t0)
+# 	li      t1, 2;  sb t1, 14(t0)
+13 03 20 00	# li t1,2
+23 87 62 00	# sb t1,14(t0)
+# 	li      t1, 15; sb t1, 15(t0)
+13 03 F0 00	# li t1,15
+A3 87 62 00	# sb t1,15(t0)
+	# dst IP from seed: bytes a3+0..a3+3
+# 	lbu     t1, 0(a3); sb t1, 16(t0)
+03 C3 06 00	# lbu t1,0(a3)
+23 88 62 00	# sb t1,16(t0)
+# 	lbu     t1, 1(a3); sb t1, 17(t0)
+03 C3 16 00	# lbu t1,1(a3)
+A3 88 62 00	# sb t1,17(t0)
+# 	lbu     t1, 2(a3); sb t1, 18(t0)
+03 C3 26 00	# lbu t1,2(a3)
+23 89 62 00	# sb t1,18(t0)
+# 	lbu     t1, 3(a3); sb t1, 19(t0)
+03 C3 36 00	# lbu t1,3(a3)
+A3 89 62 00	# sb t1,19(t0)
+
+	# IPv4 header checksum.
+# 	mv      t1, t0
+13 83 02 00	# mv t1,t0
+# 	li      t2, 10
+93 03 A0 00	# li t2,10
+# 	li      t3, 0
+13 0E 00 00	# li t3,0
+# 1:	lbu     t4, 0(t1)
+83 4E 03 00	# lbu t4,0(t1)
+# 	slli    t4, t4, 8
+93 9E 8E 00	# slli t4,t4,0x8
+# 	lbu     t5, 1(t1)
+03 4F 13 00	# lbu t5,1(t1)
+# 	or      t4, t4, t5
+B3 EE EE 01	# or t4,t4,t5
+# 	add     t3, t3, t4
+33 0E DE 01	# add t3,t3,t4
+# 	addi    t1, t1, 2
+13 03 23 00	# addi t1,t1,2
+# 	addi    t2, t2, -1
+93 83 F3 FF	# addi t2,t2,-1
+# 	bnez    t2, 1b
+E3 92 03 FE	# bnez t2,80001118 <tx_req_range+0x108>
+# 	srli    t4, t3, 16
+93 5E 0E 01	# srli t4,t3,0x10
+# 	li      t5, 0xFFFF
+37 0F 01 00	# lui t5,0x10
+13 0F FF FF	# addi t5,t5,-1 # ffff <NB_BMAP+0x5f7f>
+# 	and     t3, t3, t5
+33 7E EE 01	# and t3,t3,t5
+# 	add     t3, t3, t4
+33 0E DE 01	# add t3,t3,t4
+# 	srli    t4, t3, 16
+93 5E 0E 01	# srli t4,t3,0x10
+# 	add     t3, t3, t4
+33 0E DE 01	# add t3,t3,t4
+# 	and     t3, t3, t5
+33 7E EE 01	# and t3,t3,t5
+# 	xor     t3, t3, t5
+33 4E EE 01	# xor t3,t3,t5
+# 	srli    t1, t3, 8
+13 53 8E 00	# srli t1,t3,0x8
+# 	sb      t1, 10(t0)
+23 85 62 00	# sb t1,10(t0)
+# 	sb      t3, 11(t0)
+A3 85 C2 01	# sb t3,11(t0)
+
+	# ── UDP (8 B) at frame + 34 ──
+# 	addi    t0, a4, 34
+93 02 27 02	# addi t0,a4,34
+# 	srli    t1, s4, 8
+13 53 8A 00	# srli t1,s4,0x8
+# 	sb      t1, 0(t0)
+23 80 62 00	# sb t1,0(t0)
+# 	sb      s4, 1(t0)
+A3 80 42 01	# sb s4,1(t0)
+	# dst port = seed[a0].port (LE u16 at a3+4..5)
+# 	lbu     t1, 4(a3); sb t1, 3(t0)
+03 C3 46 00	# lbu t1,4(a3)
+A3 81 62 00	# sb t1,3(t0)
+# 	lbu     t1, 5(a3); sb t1, 2(t0)
+03 C3 56 00	# lbu t1,5(a3)
+23 81 62 00	# sb t1,2(t0)
+# 	sb      zero, 4(t0)
+23 82 02 00	# sb zero,4(t0)
+# 	li      t1, 25; sb t1, 5(t0)             # 8+9+8(bitmap)
+13 03 90 01	# li t1,25
+A3 82 62 00	# sb t1,5(t0)
+# 	sh      zero, 6(t0)                     # UDP csum (optional in IPv4)
+23 93 02 00	# sh zero,6(t0)
+
+	# ── BIN0 REQ_RANGE (9 B) + bitmap (8 B) at frame + 42 ──
+# 	addi    t0, a4, 42
+93 02 A7 02	# addi t0,a4,42
+# 	li      t1, 'B'; sb t1, 0(t0)
+13 03 20 04	# li t1,66
+23 80 62 00	# sb t1,0(t0)
+# 	li      t1, 'I'; sb t1, 1(t0)
+13 03 90 04	# li t1,73
+A3 80 62 00	# sb t1,1(t0)
+# 	li      t1, 'N'; sb t1, 2(t0)
+13 03 E0 04	# li t1,78
+23 81 62 00	# sb t1,2(t0)
+# 	li      t1, '0'; sb t1, 3(t0)
+13 03 00 03	# li t1,48
+A3 81 62 00	# sb t1,3(t0)
+# 	li      t1, 0x02; sb t1, 4(t0)
+13 03 20 00	# li t1,2
+23 82 62 00	# sb t1,4(t0)
+# 	srli    t1, a1, 8
+13 D3 85 00	# srli t1,a1,0x8
+# 	sb      t1, 5(t0)                       # start hi
+A3 82 62 00	# sb t1,5(t0)
+# 	sb      a1, 6(t0)                       # start lo
+23 83 B2 00	# sb a1,6(t0)
+# 	srli    t1, a2, 8
+13 53 86 00	# srli t1,a2,0x8
+# 	sb      t1, 7(t0)                       # end hi
+A3 83 62 00	# sb t1,7(t0)
+# 	sb      a2, 8(t0)                       # end lo
+23 84 C2 00	# sb a2,8(t0)
+
+	# ── Bitmap (8 B): copy NB_BMAP bytes for this batch so the server
+	#    can skip already-received chunks. ──
+# 	srli    t1, a1, 3                       # byte offset = start / 8
+13 D3 35 00	# srli t1,a1,0x3
+# 	li      t2, NB_BMAP
+B7 A3 00 00	# lui t2,0xa
+93 83 03 08	# addi t2,t2,128 # a080 <NB_BMAP>
+# 	add     t2, s7, t2
+B3 83 7B 00	# add t2,s7,t2
+# 	add     t1, t2, t1                      # t1 = &NB_BMAP[start/8]
+33 83 63 00	# add t1,t2,t1
+# 	addi    t0, t0, 9                       # t0 = frame + 51
+93 82 92 00	# addi t0,t0,9
+# 	li      t3, 8                           # counter
+13 0E 80 00	# li t3,8
+# 1:	lbu     t2, 0(t1)
+83 43 03 00	# lbu t2,0(t1)
+# 	sb      t2, 0(t0)
+23 80 72 00	# sb t2,0(t0)
+# 	addi    t1, t1, 1
+13 03 13 00	# addi t1,t1,1
+# 	addi    t0, t0, 1
+93 82 12 00	# addi t0,t0,1
+# 	addi    t3, t3, -1
+13 0E FE FF	# addi t3,t3,-1
+# 	bnez    t3, 1b
+E3 16 0E FE	# bnez t3,800011f8 <tx_req_range+0x1e8>
+
+# 	li      a0, 71                          # 12 vnet + 59 frame (9 BIN0 + 8 bitmap)
+13 05 70 04	# li a0,71
+# 	CALL    tx_submit
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80001220 <tx_req_range+0x210>
+6F F0 1F A4	# j 80000c5c <halt_no_disk>
+23 20 BD 01	# sw s11,0(s10)
+93 0D C0 00	# li s11,12
+6F 00 00 01	# j 80001238 <tx_submit>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	j       dispatch
+6F 00 C0 08	# j 800012c0 <dispatch>
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# tx_submit — post the shared TX buffer (s7+0x8200) as desc[0], bump
+# avail.idx, fence+notify, and spin-wait for the device to drain.
+#
+# In:  a0 = total frame length (vnet hdr + Ethernet frame)
+# Uses pinned: s3 (net MMIO), s7 (data region)
+# Trashes: t0..t5.  Returns via dispatch.
+# ──────────────────────────────────────────────────────────────────────────────
+# tx_submit:
+# 	li      t0, 0x8200
+B7 82 00 00	# lui t0,0x8
+93 82 02 20	# addi t0,t0,512 # 8200 <SHUTDOWN_PASS+0x2cab>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	sw      zero, 0(t0)                     # zero vnet hdr (12 B)
+23 A0 02 00	# sw zero,0(t0)
+# 	sw      zero, 4(t0)
+23 A2 02 00	# sw zero,4(t0)
+# 	sw      zero, 8(t0)
+23 A4 02 00	# sw zero,8(t0)
+# 	li      t1, 0x8000
+37 83 00 00	# lui t1,0x8
+# 	add     t1, s7, t1                      # TX queue base
+33 83 6B 00	# add t1,s7,t1
+# 	sw      t0, 0(t1)                       # desc[0].addr
+23 20 53 00	# sw t0,0(t1) # 8000 <SHUTDOWN_PASS+0x2aab>
+# 	sw      zero, 4(t1)
+23 22 03 00	# sw zero,4(t1)
+# 	sw      a0, 8(t1)                       # desc[0].len
+23 24 A3 00	# sw a0,8(t1)
+# 	sh      zero, 12(t1)
+23 16 03 00	# sh zero,12(t1)
+# 	sh      zero, 14(t1)
+23 17 03 00	# sh zero,14(t1)
+# 	addi    t2, t1, 16                      # avail ring (queue_size=1)
+93 03 03 01	# addi t2,t1,16
+# 	sh      zero, 4(t2)                     # ring[0] = desc 0
+23 92 03 00	# sh zero,4(t2)
+# 	lhu     t3, 2(t2)
+03 DE 23 00	# lhu t3,2(t2)
+# 	addi    t3, t3, 1
+13 0E 1E 00	# addi t3,t3,1
+# 	sh      t3, 2(t2)                       # avail.idx += 1
+23 91 C3 01	# sh t3,2(t2)
+# 	fence   iorw, ow
+0F 00 50 0F	# fence iorw,ow
+# 	li      t3, 1
+13 0E 10 00	# li t3,1
+# 	sw      t3, 0x50(s3)                    # V_QNTFY = 1 (TX queue)
+23 A8 C9 05	# sw t3,80(s3)
+# 	li      t5, 1000000
+37 4F 0F 00	# lui t5,0xf4
+13 0F 0F 24	# addi t5,t5,576 # f4240 <IPS_TICKS+0x7a120>
+# 	li      t3, 0x9000
+37 9E 00 00	# lui t3,0x9
+# 	add     t3, s7, t3                      # TX used ring base
+33 8E CB 01	# add t3,s7,t3
+# 	li      t4, 0x8010
+B7 8E 00 00	# lui t4,0x8
+93 8E 0E 01	# addi t4,t4,16 # 8010 <SHUTDOWN_PASS+0x2abb>
+# 	add     t4, s7, t4                      # TX avail ring base
+B3 8E DB 01	# add t4,s7,t4
+# 	lhu     t0, 2(t4)                       # avail.idx target
+83 D2 2E 00	# lhu t0,2(t4)
+# 1:	lhu     t1, 2(t3)                       # used.idx
+03 53 2E 00	# lhu t1,2(t3) # 9002 <SHUTDOWN_PASS+0x3aad>
+# 	beq     t1, t0, 2f
+63 06 53 00	# beq t1,t0,800012bc <tx_submit+0x84>
+# 	addi    t5, t5, -1
+13 0F FF FF	# addi t5,t5,-1
+# 	bnez    t5, 1b
+E3 1A 0F FE	# bnez t5,800012ac <tx_submit+0x74>
+# 2:	j       dispatch
+6F 00 40 00	# j 800012c0 <dispatch>
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# dispatch — single shared resume point.  Looks up s11 (return ID) in the
+# BST and jumps to the corresponding .L_csret_<N> label (which sits right
+# after each CALL site, where execution resumes).
+# ──────────────────────────────────────────────────────────────────────────────
+
+# dispatch:
+# 	BST 1, %_CSN
+93 02 60 00	# li t0,6
+63 D4 5D 00	# bge s11,t0,800012cc <dispatch+0xc>
+6F 00 00 01	# j 800012d8 <dispatch+0x18>
+63 D4 B2 01	# bge t0,s11,800012d4 <dispatch+0x14>
+6F 00 80 04	# j 80001318 <dispatch+0x58>
+6F F0 8F F0	# j 800009dc <arp_reply+0xe4>
+93 02 30 00	# li t0,3
+63 D4 5D 00	# bge s11,t0,800012e4 <dispatch+0x24>
+6F 00 00 01	# j 800012f0 <dispatch+0x30>
+63 D4 B2 01	# bge t0,s11,800012ec <dispatch+0x2c>
+6F 00 C0 01	# j 80001304 <dispatch+0x44>
+6F F0 4F 8C	# j 800003b0 <read_done+0x28>
+93 02 10 00	# li t0,1
+63 D4 B2 01	# bge t0,s11,800012fc <dispatch+0x3c>
+6F 00 80 00	# j 80001300 <dispatch+0x40>
+6F E0 5F F9	# j 80000290 <ph2_done+0x34>
+6F F0 8F 85	# j 80000358 <read_loop_top+0x4c>
+93 02 40 00	# li t0,4
+63 D4 B2 01	# bge t0,s11,80001310 <dispatch+0x50>
+6F 00 80 00	# j 80001314 <dispatch+0x54>
+6F F0 4F 92	# j 80000434 <hash_mismatch+0x2c>
+6F F0 4F B6	# j 80000678 <probe_top+0x5c>
+93 02 90 00	# li t0,9
+63 D4 5D 00	# bge s11,t0,80001324 <dispatch+0x64>
+6F 00 00 01	# j 80001330 <dispatch+0x70>
+63 D4 B2 01	# bge t0,s11,8000132c <dispatch+0x6c>
+6F 00 C0 01	# j 80001344 <dispatch+0x84>
+6F F0 9F BD	# j 80000f04 <gh_xor_abs+0x3c>
+93 02 70 00	# li t0,7
+63 D4 B2 01	# bge t0,s11,8000133c <dispatch+0x7c>
+6F 00 80 00	# j 80001340 <dispatch+0x80>
+6F F0 5F 83	# j 80000b70 <batch_send+0x24>
+6F F0 1F 88	# j 80000bc0 <rx_done+0x28>
+93 02 B0 00	# li t0,11
+63 D4 5D 00	# bge s11,t0,80001350 <dispatch+0x90>
+6F 00 00 01	# j 8000135c <dispatch+0x9c>
+63 D4 B2 01	# bge t0,s11,80001358 <dispatch+0x98>
+6F 00 C0 00	# j 80001360 <dispatch+0xa0>
+6F F0 9F C7	# j 80000fd0 <gh_pad_skipcopy+0x88>
+6F F0 1F C3	# j 80000f8c <gh_pad_skipcopy+0x44>
+6F F0 DF EC	# j 8000122c <tx_req_range+0x21c>
+00 00 00 00	# .word 0x00000000
+00 00 00 00	# .word 0x00000000
+15 36 62 B8	# .word 0xb8623615
+8B 57 1F 98	# .word 0x981f578b
+82 A1 CA CD	# .word 0xcdcaa182
+10 99 FD CF	# .word 0xcffd9910
+EB 60 FC C7	# .word 0xc7fc60eb
+53 5B BB 28	# .word 0x28bb5b53
+E9 F4 DB D9	# .word 0xd9dbf4e9
+D9 B2 20 C1	# .word 0xc120b2d9

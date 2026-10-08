@@ -1,0 +1,7 @@
+'h' lit  putc
+'e' lit  putc
+'l' lit  putc
+'l' lit  putc
+'o' lit  putc
+'\n' lit putc
+bye
