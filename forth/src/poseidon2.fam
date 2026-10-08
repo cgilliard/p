@@ -89,6 +89,33 @@ E39E0EFC ,   \ bnez t4,loop
 23206100 ,   \ sw   t1,0(sp)
 ;
 
+\ ── Memory helpers (shared by the modules after this one) ──
+
+\ lazy ( var n -- a )   var's buffer, allocating n bytes on first use
+\        (variables start at zero).
+: lazy ( var n -- a )
+	over @ dup if nip nip else drop alloc dup rot ! then
+;
+
+\ cpy ( src dst n -- )   copy n cells (n >= 1).
+: cpy ( src dst n -- )
+	0 lit do over i 2 lit lshift + @ over i 2 lit lshift + ! loop 2drop
+;
+
+\ zero ( a n -- )   zero n cells (n >= 1).
+: zero ( a n -- )   0 lit do 0 lit over i 2 lit lshift + ! loop drop ;
+
+\ ceq ( a b n -- flag )   whether the n cells at a and b are equal.
+: ceq ( a b n -- flag )
+	-1 lit swap 0 lit do
+		2 lit pick i 2 lit lshift + @ 2 lit pick i 2 lit lshift + @ = and
+	loop
+	nip nip
+;
+
+\ strlen ( s -- n )   a "..." string's length (they end in a zero byte).
+: strlen ( s -- n )   0 lit begin 2dup + c@ while 1 lit + repeat nip ;
+
 \ ── Constants ──
 \ Each table word pushes the address of its constants, which follow its
 \ prologue in the code (`,`-emitted, so read with `be@`).
@@ -412,6 +439,34 @@ E39E0EFC ,   \ bnez t4,loop
 	drop
 ;
 
+\ p2hashb ( st bytes n -- )   the Rust node's `hash_bytes`: the n bytes packed
+\        three to an element (little-endian, the last zero-padded), then the
+\        sponge with domain 3 and the *byte* length n in the capacity.  The
+\        digest is st's first 8 cells.
+: p2hbb variable ;   : p2hbn variable ;   : p2hm variable ;
+: p2bb ( i -- b )   dup p2hbn @ u< if p2hbb @ + c@ else drop 0 lit then ;
+: p2b3 ( k -- e )
+	3 lit * dup 2 lit + p2bb 8 lit lshift over 1 lit + p2bb or 8 lit lshift swap p2bb or
+;
+: p2hashb ( st bytes n -- )
+	p2hbn ! p2hbb ! dup p2hs !
+	18 lit zero
+	3 lit p2hs @ 40 lit + !                        \ cell 16 = DOMAIN_BYTES
+	p2hbn @ p2hs @ 44 lit + !                      \ cell 17 = the byte length
+	p2hbn @ 2 lit + 3 lit / p2hm !                 \ elements: ceil(n / 3)
+	p2hm @ 0= if p2hs @ p2perm then
+	0 lit begin dup p2hm @ u< while
+		p2hm @ over - dup 10 lit u> if drop 10 lit then
+		0 lit do
+			dup i + p2b3
+			p2hs @ i 2 lit lshift + dup @ rot fadd swap !
+		loop
+		p2hs @ p2perm
+		10 lit +
+	repeat
+	drop
+;
+
 \ ── Tests (./tools/fam --test src/poseidon2.fam) ──
 \ Vectors: Plonky3's known answer for width 24, and values printed by the Rust
 \ node's own poseidon2 module.
@@ -572,6 +627,81 @@ Test {
 		FFFFFFFF lit fred 268435453u lit asrt_eq       \ 2^32 - 1 - 2p
 		2013265921u lit fred 0 lit asrt_eq
 		2013265920u lit fred 2013265920u lit asrt_eq
+	}
+	bytes_empty {
+		60 lit alloc dup "" dup strlen p2hashb
+		dup 0 lit + @ 1133275667u lit asrt_eq
+		dup 4 lit + @ 461544711u lit asrt_eq
+		dup 8 lit + @ 1895306845u lit asrt_eq
+		dup C lit + @ 23423162u lit asrt_eq
+		dup 10 lit + @ 1276277755u lit asrt_eq
+		dup 14 lit + @ 1332227967u lit asrt_eq
+		dup 18 lit + @ 1947193451u lit asrt_eq
+		dup 1C lit + @ 1963375900u lit asrt_eq
+		drop
+	}
+	bytes_a {
+		60 lit alloc dup "a" dup strlen p2hashb
+		dup 0 lit + @ 1889643094u lit asrt_eq
+		dup 4 lit + @ 1373273231u lit asrt_eq
+		dup 8 lit + @ 620893968u lit asrt_eq
+		dup C lit + @ 1506356835u lit asrt_eq
+		dup 10 lit + @ 516852150u lit asrt_eq
+		dup 14 lit + @ 1138701170u lit asrt_eq
+		dup 18 lit + @ 1607852020u lit asrt_eq
+		dup 1C lit + @ 160297426u lit asrt_eq
+		drop
+	}
+	bytes_abc {
+		60 lit alloc dup "abc" dup strlen p2hashb
+		dup 0 lit + @ 1906578460u lit asrt_eq
+		dup 4 lit + @ 715912554u lit asrt_eq
+		dup 8 lit + @ 873204860u lit asrt_eq
+		dup C lit + @ 422016294u lit asrt_eq
+		dup 10 lit + @ 1747139437u lit asrt_eq
+		dup 14 lit + @ 551884475u lit asrt_eq
+		dup 18 lit + @ 872423606u lit asrt_eq
+		dup 1C lit + @ 1271547008u lit asrt_eq
+		drop
+	}
+	bytes_abcd {
+		60 lit alloc dup "abcd" dup strlen p2hashb
+		dup 0 lit + @ 564746774u lit asrt_eq
+		dup 4 lit + @ 334763755u lit asrt_eq
+		dup 8 lit + @ 1407702079u lit asrt_eq
+		dup C lit + @ 1699584720u lit asrt_eq
+		dup 10 lit + @ 1399393182u lit asrt_eq
+		dup 14 lit + @ 1069473343u lit asrt_eq
+		dup 18 lit + @ 22947011u lit asrt_eq
+		dup 1C lit + @ 1315866516u lit asrt_eq
+		drop
+	}
+	bytes_fifty {
+		60 lit alloc 40 lit alloc
+		32 lit 0 lit do i 7 lit * 1 lit + over i + c! loop
+		over swap 32 lit p2hashb
+		dup 0 lit + @ 1936706032u lit asrt_eq
+		dup 4 lit + @ 1418895020u lit asrt_eq
+		dup 8 lit + @ 571421219u lit asrt_eq
+		dup C lit + @ 1839519753u lit asrt_eq
+		dup 10 lit + @ 332337588u lit asrt_eq
+		dup 14 lit + @ 1317138386u lit asrt_eq
+		dup 18 lit + @ 1780501116u lit asrt_eq
+		dup 1C lit + @ 393480214u lit asrt_eq
+		drop
+	}
+	bytes_ff {
+		60 lit alloc 4 lit alloc FFFFFFFF lit over !
+		over swap 4 lit p2hashb
+		dup 0 lit + @ 393550291u lit asrt_eq
+		dup 4 lit + @ 726963407u lit asrt_eq
+		dup 8 lit + @ 75305392u lit asrt_eq
+		dup C lit + @ 1613094565u lit asrt_eq
+		dup 10 lit + @ 371798867u lit asrt_eq
+		dup 14 lit + @ 34873430u lit asrt_eq
+		dup 18 lit + @ 1389336456u lit asrt_eq
+		dup 1C lit + @ 1021951306u lit asrt_eq
+		drop
 	}
 	hash_0 {
 		60 lit alloc dup p2telems 0 lit 7 lit p2hash

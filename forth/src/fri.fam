@@ -1,0 +1,307 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/fri.fam — verifying a FRI proof (see ../rust/src/fri.rs, `Proof::verify`).
+\
+\ The first layer, over the coset shift * <g> of 2^log_size points, is never
+\ committed: the caller vouches for its two values at each query.  Every later
+\ round folds by 8 (fewer at the end), each leaf holding a coset of values
+\ folded with one challenge.  Folding stops at 2^log_blowup points, all of
+\ which must equal the proof's final value.
+\
+\ No indirect calls here, so the caller drives the queries:
+\   fbeg   ( tr log_size shift log_blowup queries grind_bits -- ok )
+\          reads the caps, final value and nonce (at the reader, `rinit`),
+\          replaying the transcript; checks the proof of work.
+\   then for each query:
+\   fqidx  ( -- low )          the query's index (from the transcript)
+\   fquery ( fx fnx low -- ok ) fx, fnx: the first layer's values (extension
+\          elements) at low and low + 2^(log_size - 1); reads and checks the
+\          query's openings.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ fgtab ( -- a )   generators of BabyBear's subgroups of order 2^k, k = 0..27
+\        (Plonky3's TWO_ADIC_GENERATORS, as in the Rust node).
+: fgtab ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004007 ,   \ jal   x0,+116          ( skip the 28 constants )
+1u ,   2013265920u ,   1728404513u ,   1592366214u ,   196396260u ,   760005850u ,   1721589904u ,
+397765732u ,   1732600167u ,   1753498361u ,   341742893u ,   1340477990u ,   1282623253u ,
+298008106u ,   1657000625u ,   2009781145u ,   1421947380u ,   1286330022u ,   1559589183u ,
+1049899240u ,   195061667u ,   414040701u ,   570250684u ,   1267047229u ,   1003846038u ,
+1149491290u ,   975630072u ,   440564289u ,
+;
+
+\ fgen ( k -- g )   the generator of order 2^k.
+: fgen ( k -- g )   2 lit lshift fgtab + be@ ;
+
+\ ── Folding ──
+
+: fpx variable ;   : fpch variable ;   : fpout variable ;
+: ftav variable ;  : fta ( -- a )   ftav 10 lit lazy ;
+: ftbv variable ;  : ftb ( -- a )   ftbv 10 lit lazy ;
+
+\ fpair ( fx fnx x ch out -- )   one binary fold: with f(x) = e(x^2) + x o(x^2),
+\        out = e + ch * o, where e = (f(x) + f(-x)) / 2, o = (f(x) - f(-x)) / 2x.
+\        out may be fx or fnx.
+: fpair ( fx fnx x ch out -- )
+	fpout ! fpch ! fpx !
+	2dup fta eadd  fta 1006632961u lit fta emulb       \ e  (1006632961 = 1/2)
+	ftb esub  ftb fpx @ finv 1006632961u lit fmul ftb emulb
+	fpch @ ftb ftb emul
+	fta ftb fpout @ eadd
+;
+
+\ fleaf ( vals n j shift log ch -- )   fold a leaf's n values (a coset at
+\        position j of a layer of 2^log points over shift * <g>) down to one,
+\        with ch, ch^2, ...; the result is vals' first value.
+: flv variable ;   : fln variable ;   : flj variable ;   : flsft variable ;
+: fllog variable ; : flbv variable ;  : flb ( -- a )   flbv 10 lit lazy ;
+: fleaf ( vals n j shift log ch -- )
+	flb 4 lit cpy  fllog ! flsft ! flj ! fln ! flv !
+	begin fln @ 1 lit u> while
+		fllog @ fgen                                   ( g )
+		fln @ 1 lit rshift 0 lit do
+			dup flj @ i fllog @ fln @ log2 - lshift + fpow flsft @ fmul   ( g x )
+			flv @ i 4 lit lshift +  dup fln @ 1 lit rshift 4 lit lshift +
+			rot flb 3 lit pick fpair
+		loop
+		drop
+		fln @ 1 lit rshift fln !
+		flsft @ dup fmul flsft !
+		fllog @ 1 lit - fllog !
+		flb flb flb emul
+	repeat
+;
+
+\ ── The proof ──
+
+: ftr variable ;   : fls variable ;   : fsh variable ;   : flbu variable ;
+: fnq variable ;   : fgb variable ;   : fnr variable ;   : fok variable ;
+: fcheck ( flag -- )   0= if 0 lit fok ! then ;
+
+\ Labels' elements.
+: flr variable ;   : flf variable ;   : flfv variable ;   : flg variable ;
+: flq variable ;
+
+\ Per round: arity (bits), leaves, cap address and length, challenge.
+: fbv variable ;   : fbits ( -- a )   fbv 40 lit lazy ;
+: fvv variable ;   : fleav ( -- a )   fvv 40 lit lazy ;
+: fcv variable ;   : fcaps ( -- a )   fcv 40 lit lazy ;
+: fnv variable ;   : fcapn ( -- a )   fnv 40 lit lazy ;
+: fchv variable ;  : fchs ( -- a )    fchv 100 lit lazy ;
+: fb0v variable ;  : fb0 ( -- a )     fb0v 10 lit lazy ;
+: ffnv variable ;  : ffin ( -- a )    ffnv 10 lit lazy ;
+: fdgv variable ;  : fdig ( -- a )    fdgv 400 lit lazy ;   \ a cap, as cells
+: fnon variable ;
+: f@ ( a r -- x )   2 lit lshift + @ ;
+: f! ( x a r -- )   2 lit lshift + ! ;
+
+\ farity ( -- )   each round's arity and leaf count: the first fold takes the
+\        layer to log_size - 1, then rounds of up to 3 bits down to log_blowup.
+: farity ( -- )
+	0 lit fnr !
+	fls @ 1 lit -                                    ( log )
+	begin dup flbu @ u> while
+		dup flbu @ - dup 3 lit u> if drop 3 lit then  ( log bits )
+		dup fbits fnr @ f!
+		2dup - 1 lit swap lshift fleav fnr @ f!       \ leaves: 2^(log - bits)
+		fnr @ 1 lit + fnr !
+		-
+	repeat
+	drop
+;
+
+: fbeg ( tr log_size shift log_blowup queries grind_bits -- ok )
+	fgb ! fnq ! flbu ! fsh ! fls ! ftr !
+	-1 lit fok !
+	"fri-round-root" tlab flr !   "fri-fold-challenge" tlab flf !
+	"fri-final-value" tlab flfv !  "fri-grind" tlab flg !
+	"fri-query-index" tlab flq !
+	fls @ flbu @ u> fls @ 1C lit u< and fcheck
+	fok @ if
+		farity
+		ftr @ flf @ fb0 tchal
+		r32 fnr @ = fcheck
+	then
+	fok @ fnr @ and if
+		fnr @ 0 lit do
+			fok @ if
+				r32 dup fleav i f@ dup 20 lit u> if drop 20 lit then = fcheck   ( n )
+				dup 5 lit lshift rtake fcaps i f!
+				dup fcapn i f!
+				rbad @ 0= fcheck
+				fok @ if
+					fcaps i f@ fdig 2 lit pick 3 lit lshift ucells
+					ftr @ flr @ fdig 3 lit pick 3 lit lshift tabs
+					ftr @ flf @ fchs i 4 lit lshift + tchal
+				then
+				drop
+			then
+		loop
+	then
+	fok @ if
+		10 lit rtake ffin 4 lit ucells
+		ftr @ flfv @ ffin 4 lit tabs
+		r32 fnon !  r32                                  ( nonce's high word )
+		0= ftr @ flg @ fnon @ fgb @ tgrind and fcheck
+		ftr @ flg @ fnon 1 lit tabs
+		r32 fnq @ = fcheck
+	then
+	fok @ rbad @ 0= and
+;
+
+\ fqidx ( -- low )
+: fqidx ( -- low )   ftr @ flq @ 1 lit fls @ 1 lit - lshift tindex ;
+
+: fval variable ;  : fvalb ( -- a )   fval 10 lit lazy ;
+: fvsv variable ;  : fvals ( -- a )   fvsv 80 lit lazy ;   \ a leaf: up to 8 values
+: fp variable ;    : flsh variable ;  : flg2 variable ;    : fj variable ;
+: fslot variable ;
+
+: fquery ( fx fnx low -- ok )
+	dup fp !
+	fls @ fgen swap fpow fsh @ fmul                       ( fx fnx x )
+	fb0 fvalb fpair
+	r32 fnr @ = fcheck
+	fsh @ dup fmul flsh !
+	fls @ 1 lit - flg2 !
+	fok @ fnr @ and if
+		fnr @ 0 lit do
+			fok @ if
+				fp @  1 lit flg2 @ fbits i f@ - lshift 1 lit -  and fj !
+				fp @  flg2 @ fbits i f@ - rshift fslot !
+				ropen
+				oidx @ fj @ = fcheck
+				fok @ if fcaps i f@ fcapn i f@ fleav i f@ mvcap fcheck then
+				olen @ 10 lit fbits i f@ lshift = fcheck
+				fok @ if
+					oleaf @ fvals 4 lit fbits i f@ lshift ucells
+					fvals fslot @ 4 lit lshift + fvalb 4 lit ceq fcheck
+					fvals 1 lit fbits i f@ lshift fj @ flsh @ flg2 @ fchs i 4 lit lshift + fleaf
+					fvals fvalb 4 lit cpy
+					fbits i f@ 0 lit do flsh @ dup fmul flsh ! loop
+					flg2 @ fbits i f@ - flg2 !
+					fj @ fp !
+				then
+			then
+		loop
+	then
+	fok @ if fvalb ffin 4 lit ceq fcheck then
+	fok @ rbad @ 0= and
+;
+
+\ ── Tests (./tools/fam --test src/poseidon2.fam src/ext.fam src/transcript.fam src/merkle.fam src/fri.fam) ──
+\ A FRI proof made by the Rust node (a degree < 64 polynomial on 256 points
+\ over the coset 31 * <g>; blowup 4, 4 queries, 4 grinding bits; transcript
+\ "fri-test"), as encoded in a STARK proof, and its first layer at the queries.
+
+\ ffix ( -- a n )   the proof (1536 bytes, as `,` emits them: in order).
+: ffix ( -- a n )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004060 ,   \ jal   x0,+1540
+02000000 , 10000000 , 73D14F5D , 358C405E , 6CC7DB5E , 8FF17119 , CC50AF5B , AF87FE44 ,
+8B784C0A , 42A3AC66 , 13938A1F , 255AC21E , 00B77237 , B16EBB40 , 188CC92B , 67329947 ,
+34B76639 , BEAEFE60 , F9407852 , 41D3E607 , 8D7F1243 , FD955975 , 23A4F92B , 9050634C ,
+3444C953 , F4501F68 , 1F6D1C04 , 38300243 , 2187B213 , 5BC71876 , CE2A5474 , E8968B3D ,
+D7568260 , 48D1782B , B57E1209 , 525DFE52 , 94F04363 , 4EC5681B , 6510C441 , 4766393E ,
+A7B46271 , EB908306 , 2C0FD110 , 0A18CC55 , 55D0E36D , 2F694920 , 5BF72568 , 2635E80C ,
+B9902C76 , E5B50A0A , 723EC74D , BA988A5E , 97068709 , E6D09F4C , 37110564 , 942FB758 ,
+F5F9A947 , FF25CC52 , D81B8004 , 9A2F5576 , DBA1B676 , 58228D22 , 8EC0FF6B , 5A6AAD72 ,
+5222A74A , BF494E68 , 1F2BF03B , FE217304 , C0FCAC23 , C1EDA044 , 9A143E08 , 460A1F4F ,
+1EBC1C6C , 317FC95B , 0538F646 , 7B84E30D , AABE9F5B , F7794D5E , 1E12EF3A , 38A2765E ,
+50AC5F47 , 56B39026 , 75B0100E , DC78A209 , 84EBC53B , F0E86048 , 68062D4A , EADF4314 ,
+07C11D3C , A4A7DB04 , 7E022236 , 1D29DB2B , 9A049955 , 201C6E12 , C065EC07 , 5EF8EB00 ,
+30DCE13D , 13CDFE2D , 3FEAD04B , 93CE9C27 , C4F1E037 , 3939B436 , 07EA904C , 2D649720 ,
+9329D74F , 9153CD1F , 84D92823 , 78AD8577 , 3FB6E717 , E4435441 , D2387F4C , EABFD44F ,
+F97D7E18 , FBDD9C4C , 75F20475 , 673B1C06 , C525B942 , 4596DF3E , 9CB36548 , 70531561 ,
+68E2DF46 , 8021C833 , 9B7CF703 , 6864ED48 , 7A198C25 , B4685717 , 70C0CD2A , 7EBAEE1C ,
+4786130C , CCB8976D , 04000000 , C212E370 , 815E5D33 , 25F6E837 , D7AF0516 , 81A53177 ,
+71A25933 , C3023A07 , 3D46F874 , 5BA07B5C , EAEF1D6D , DB0CCC0A , 2B5B621A , 0880D75C ,
+5A65AC02 , 08DED34D , E8B2FD4F , 60FBF22C , E321BE43 , DE320307 , 56749970 , C87BC20C ,
+5A6E1871 , 8CB1886B , 9B9E324A , 21DFB613 , 12090770 , 9CA25762 , D8C9056D , D10AFE00 ,
+9C58FF38 , 797E416F , 0557D16F , 02D86156 , E5AA8836 , 543FC65A , AD14991A , 08000000 ,
+00000000 , 04000000 , 02000000 , 03000000 , 80000000 , 1226E33C , 6CADC13C , 77D0C812 ,
+0D211B4A , 02A9030D , E5BD626D , F7991E16 , 63623914 , C023781C , 443A452B , 1BDB0041 ,
+CF595605 , 788C4258 , F90B5D3E , CC93DB14 , E2E80B76 , 97769B5F , C6443761 , B3A90824 ,
+B6A3CC28 , B7C53465 , DEB5EE66 , 3E62521B , 130CA771 , 28E43B59 , E59EE005 , 7FAC8D30 ,
+4069A400 , 8FCB2644 , E23ED300 , 50327859 , 7BE1225E , 00030000 , 00400000 , 000FC77D ,
+52800E30 , 57B5CA18 , 75C1E99D , 388D17B0 , 7362C76D , 2A2815E9 , 72F0E501 , 2B4F495A ,
+20D824B9 , 0CD2F0D8 , 6C4E853D , 709810D4 , 278482FF , 56B62223 , 1E9D76C0 , 41000200 ,
+00000800 , 00008000 , 00004E31 , 1865AB9E , 2470FFD4 , BA68F473 , 096D8CEF , 8219FCF9 ,
+8B17BE5C , 44287405 , 2022A6F3 , 3A4E0CB7 , C01AE6E7 , 760704A1 , 9B5788D1 , 163C8642 ,
+9230FA63 , 2052E45A , F1526A3E , 126A77FB , 1E76C7DB , 15051B04 , 1210EF61 , BC2CA564 ,
+D63C3904 , 092F0172 , EF173105 , 6A5C881F , C8542EDA , 764045D1 , D134FB98 , CB6337B9 ,
+4C5D1A9C , 2957F937 , A2210000 , 00000040 , 00000093 , 4A5F56B3 , 97501235 , 748D1642 ,
+CF923412 , 09F311AB , BE5C26AC , 4C8C2B23 , 39AF0C57 , 69B2035A , 686472C6 , AB6671F8 ,
+F9ED1986 , 7B572A86 , BE443ABD , 867D473E , C96D4200 , 02000000 , 0E000000 , 80000000 ,
+24A84537 , 74848302 , BB23B520 , 555DCC05 , 07AC3C53 , CCFBE252 , 6750446B , A2F0596F ,
+C1F9FB39 , 93946C5D , E70F5247 , D5020563 , FD865F0B , 28ED316A , 270FF82C , 660B4444 ,
+F810F73C , E794BE4E , 8AE66173 , DD989C0A , 79A2E31B , 9FDEA514 , 9D7F9F60 , B8BC3D55 ,
+85415833 , 78D05D5A , B5EA522E , A5EF3C46 , 658A135A , F3B7385A , 79326A3C , 29C9604D ,
+00020000 , 00400000 , 000088D1 , 69F6685D , 417AC0A1 , 03887096 , 36AA5C80 , 104AA731 ,
+542ED352 , 45B722DF , 3AE394B8 , 37C2EBBC , 270E0A2C , 1A7A53C3 , 54F6BE51 , 5C3C810A ,
+28AD55DD , 1FE3E464 , 4F000200 , 00000E00 , 00008000 , 000024A8 , 45377484 , 8302BB23 ,
+B520555D , CC0507AC , 3C53CCFB , E2526750 , 446BA2F0 , 596FC1F9 , FB399394 , 6C5DE70F ,
+5247D502 , 0563FD86 , 5F0B28ED , 316A270F , F82C660B , 4444F810 , F73CE794 , BE4E8AE6 ,
+6173DD98 , 9C0A79A2 , E31B9FDE , A5149D7F , 9F60B8BC , 3D558541 , 583378D0 , 5D5AB5EA ,
+522EA5EF , 3C46658A , 135AF3B7 , 385A7932 , 6A3C29C9 , 604D0002 , 00000040 , 00000000 ,
+88D169F6 , 685D417A , C0A10388 , 709636AA , 5C80104A , A731542E , D35245B7 , 22DF3AE3 ,
+94B837C2 , EBBC270E , 0A2C1A7A , 53C354F6 , BE515C3C , 810A28AD , 55DD1FE3 , E4644F00 ,
+600 lit
+;
+
+: fqv variable ;
+\ fqtab ( -- a )   each query's first-layer values, fx then fnx (base values).
+: fqtab ( -- a )
+	fqv @ 0= if
+		80 lit alloc dup fqv ! 20 lit zero
+		1619612198u lit fqv @ 0 lit + !  1204504520u lit fqv @ 10 lit + !
+		769382285u lit fqv @ 20 lit + !  348352641u lit fqv @ 30 lit + !
+		786471253u lit fqv @ 40 lit + !  1498685160u lit fqv @ 50 lit + !
+		786471253u lit fqv @ 60 lit + !  1498685160u lit fqv @ 70 lit + !
+	then
+	fqv @
+;
+: ftv variable ;   : ftt ( -- tr )   ftv 88 lit lazy ;
+
+\ frun ( buf n -- ok )   verify the fixture's proof, with its first layer.
+: frun ( buf n -- ok )
+	rinit
+	ftt "fri-test" tlab tnew
+	ftt 8 lit 1F lit 2 lit 4 lit 4 lit fbeg
+	4 lit 0 lit do fqidx fqtab i 5 lit lshift + dup 10 lit + rot fquery and loop
+;
+
+Test {
+	fri_verifies {
+		ffix mcopy frun assert
+		rpos @ rend @ asrt_eq                              \ the whole proof was read
+		ftt "after" tlab ftb tchal                         \ the transcript matches Rust's after
+		ftb 1615957435u lit 1025219654u lit 395836410u lit 655377785u lit c4? assert
+	}
+	fri_indices {
+		ffix mcopy rinit
+		ftt "fri-test" tlab tnew
+		ftt 8 lit 1F lit 2 lit 4 lit 4 lit fbeg assert
+		fqidx 33 lit asrt_eq
+	}
+	fri_wrong_first_layer {
+		fqtab dup @ 1 lit fadd over !
+		ffix mcopy frun 0 lit asrt_eq
+		dup @ 1 lit fsub swap !
+	}
+	fri_tampered_final {
+		ffix mcopy over 28C lit + dup c@ 1 lit xor swap c!  frun 0 lit asrt_eq
+	}
+	fri_tampered_opening {
+		ffix mcopy over 2B7 lit + dup c@ 1 lit xor swap c!  frun 0 lit asrt_eq
+	}
+	fri_bad_nonce {
+		ffix mcopy over 29C lit + dup c@ 1 lit xor swap c!  frun 0 lit asrt_eq
+	}
+}

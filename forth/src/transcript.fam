@@ -1,0 +1,154 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/transcript.fam — the Fiat-Shamir transcript (see ../rust/src/transcript.rs,
+\ which this must match exactly): a duplex sponge over width-24 Poseidon2,
+\ rate 16, capacity 8, that moves whole octets (8 elements).
+\
+\ - Absorbing queues octets; two fill the rate (overwriting it) and are
+\   permuted.  A label is the octet [label, 0, ...]; data is zero-padded to
+\   whole octets.
+\ - Sampling permutes first if an octet is queued (it overwrites the rate's
+\   first half) or the output is used up, then hands out the rate 4 elements
+\   at a time.  Every challenge absorbs its label first.
+\ - A label's element is the first element of `hash_bytes(label)` (`tlab`).
+\
+\ A transcript is 34 cells: the state (24), the queued octet (8), how many
+\ octets are queued (0 or 1), and how many half-octets of output have been
+\ handed out (4: used up).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ Offsets into a transcript.
+\   0x00 state   0x60 queued octet   0x80 queued count   0x84 halves used
+
+: tobv variable ;   : tob ( -- a )   tobv 20 lit lazy ;   \ an octet being absorbed
+: tlsv variable ;   : tls ( -- a )   tlsv 60 lit lazy ;   \ label hashing's state
+
+\ tlab ( s -- e )   a "..." label's element.
+: tlab ( s -- e )   tls swap dup strlen p2hashb tls @ ;
+
+\ tobs ( tr oct -- )   absorb the octet at oct.
+: tobs ( tr oct -- )
+	over 80 lit + @ if                              \ one queued: the pair fills the rate
+		over 20 lit + 8 lit cpy
+		dup 60 lit + over 8 lit cpy
+		dup p2perm  0 lit over 80 lit + !  0 lit swap 84 lit + !
+	else                                            \ queue it; earlier output is now stale
+		over 60 lit + 8 lit cpy
+		1 lit over 80 lit + !  4 lit swap 84 lit + !
+	then
+;
+
+\ tobs1 ( tr e -- )   absorb the octet [e, 0, ...].
+: tobs1 ( tr e -- )   tob 8 lit zero  tob !  tob tobs ;
+
+\ tsamp ( tr -- a )   the next 4 output elements (their address, in the state).
+: tsamp ( tr -- a )
+	dup 80 lit + @ over 84 lit + @ 4 lit = or if
+		dup 80 lit + @ if dup 60 lit + over 8 lit cpy then
+		dup p2perm  0 lit over 80 lit + !  0 lit over 84 lit + !
+	then
+	dup 84 lit + @ dup 1 lit + 2 lit pick 84 lit + !
+	4 lit lshift +
+;
+
+\ tnew ( tr lab -- )   start a transcript seeded with a label element.
+: tnew ( tr lab -- )
+	over 22 lit zero
+	7472 lit 2 lit pick 40 lit + !                  \ state[16] = TRANSCRIPT_DOMAIN
+	4 lit 2 lit pick 84 lit + !
+	tobs1
+;
+
+\ tabs ( tr lab elems n -- )   absorb n elements under a label.  Extension
+\        values are their 4 coefficients each; digests their 8 elements.
+: tae variable ;   : tan variable ;
+: tabs ( tr lab elems n -- )
+	tan ! tae !  over swap tobs1                     ( tr )
+	0 lit begin dup tan @ u< while                   ( tr k )
+		tob 8 lit zero
+		tan @ over - dup 8 lit u> if drop 8 lit then
+		0 lit do tae @ over i + 2 lit lshift + @ tob i 2 lit lshift + ! loop
+		over tob tobs
+		8 lit +
+	repeat
+	2drop
+;
+
+\ tchal ( tr lab out -- )   an extension challenge, into out (4 cells).
+: tchal ( tr lab out -- )   -rot over swap tobs1 tsamp swap 4 lit cpy ;
+
+\ tchalf ( tr lab -- x )   a base-field challenge: an extension challenge's
+\        first coefficient.
+: tchalf ( tr lab -- x )   over swap tobs1 tsamp @ ;
+
+\ tindex ( tr lab bound -- i )   an index below bound (a power of two, at most
+\        2^27): a challenge's low bits.
+: tindex ( tr lab bound -- i )   -rot tchalf swap 1 lit - and ;
+
+\ tgrind ( tr lab nonce bits -- flag )   whether nonce is a valid proof of
+\        work: absorbing [nonce] under the label and sampling gives an element
+\        whose low `bits` bits are zero.  Leaves the transcript unchanged.
+\        Nonces at or above p, and more than 27 bits, are never valid.
+: tgn variable ;   : tclv variable ;   : tcl ( -- a )   tclv 88 lit lazy ;
+: tgrind ( tr lab nonce bits -- flag )
+	dup 1B lit u> 2 lit pick 2013265921u lit u< 0= or if
+		2drop 2drop 0 lit
+	else
+		1 lit swap lshift 1 lit -                    ( tr lab nonce mask )
+		swap tgn !                                   ( tr lab mask )
+		rot tcl 22 lit cpy                           ( lab mask )
+		swap tcl swap tgn 1 lit tabs
+		tcl tsamp @ and 0=
+	then
+;
+
+\ ── Tests (./tools/fam --test src/poseidon2.fam src/ext.fam src/transcript.fam) ──
+\ The sequence and values printed by a test run of the Rust node's transcript.
+
+: ttv variable ;   : tt ( -- tr )   ttv 88 lit lazy ;
+: tcv variable ;   : tc ( -- a )    tcv 20 lit lazy ;   \ two extension values
+
+Test {
+	label_element {
+		"test" tlab 6225422u lit asrt_eq
+	}
+	transcript {
+		tt "test" tlab tnew
+		\ absorb [1, 2, 3] under "data", then challenge "c"
+		tc 1 lit over ! 2 lit over 4 lit + ! 3 lit over 8 lit + ! drop
+		tt "data" tlab tc 3 lit tabs
+		tt "c" tlab tc tchal
+		tc 1877723473u lit 1306478364u lit 192923429u lit 1161541472u lit c4? assert
+		\ absorb [c1, c1^2] as extension values under "ext", then challenge "d"
+		tc tc tc 10 lit + emul
+		tt "ext" tlab tc 8 lit tabs
+		tt "d" tlab tc tchal
+		tc 438706405u lit 1592052554u lit 498227820u lit 1150496051u lit c4? assert
+		\ absorb 1..20 under "long", then a field challenge, then an index
+		50 lit alloc 14 lit 0 lit do i 1 lit + over i 2 lit lshift + ! loop
+		tt "long" tlab rot 14 lit tabs
+		tt "f" tlab tchalf 783688285u lit asrt_eq
+		tt "q" tlab 100000 lit tindex 763814u lit asrt_eq
+		\ the smallest nonce with 8 zero bits is 13; grinding leaves the transcript alone
+		tt "pow" tlab 13u lit 8 lit tgrind assert
+		tt "pow" tlab 12u lit 8 lit tgrind 0 lit asrt_eq
+		tt "pow" tlab 2013265921u lit 0 lit tgrind 0 lit asrt_eq      \ a nonce >= p
+		tt "after" tlab tc tchal
+		tc 1608899994u lit 1305565341u lit 1991624469u lit 1212055723u lit c4? assert
+	}
+	grind_search {
+		\ the same transcript state as above, rebuilt: the first passing nonce is 13
+		tt "test" tlab tnew
+		tc 1 lit over ! 2 lit over 4 lit + ! 3 lit over 8 lit + ! drop
+		tt "data" tlab tc 3 lit tabs
+		tt "c" tlab tc tchal
+		tc tc tc 10 lit + emul
+		tt "ext" tlab tc 8 lit tabs
+		tt "d" tlab tc tchal
+		50 lit alloc 14 lit 0 lit do i 1 lit + over i 2 lit lshift + ! loop
+		tt "long" tlab rot 14 lit tabs
+		tt "f" tlab tchalf drop
+		tt "q" tlab 100000 lit tindex drop
+		0 lit begin tt "pow" tlab 2 lit pick 8 lit tgrind 0= while 1 lit + repeat
+		13u lit asrt_eq
+	}
+}

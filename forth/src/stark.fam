@@ -1,0 +1,332 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/stark.fam — verifying a STARK proof (see ../rust/src/stark.rs, `verify`),
+\ for any AIR given as data.  Non-hiding proofs only: the published proofs a
+\ validator checks -- a block's root proof and its chain proof -- are made
+\ without zero-knowledge blinding (hiding proofs never leave the miner).
+\
+\ The AIR (set before sbeg; see src/circuit.fam for the circuit VM's):
+\   swid, slen, sdeg      witness columns, rows, constraint degree
+\   sntr, snax, snch, snxc  main constraints, aux columns, challenges, aux
+\                         constraints
+\   snpre, spcap, splde   preprocessed columns, their cap (bytes), its log_lde
+\   sper                  periodic columns: cells [count, (len, values, coeffs)...]
+\                         -- values and coeffs are `,` tables (read with be@)
+\   sbnd                  boundaries: cells [count, (row, column, value)...]
+\   sstm, sstn            the statement's elements (cells) and count
+\   sprog, spn, smo, sao  the constraint program (symbolic.rs): nodes
+\                         (op, a, b) and the main and aux output nodes, as
+\                         `,` tables
+\ and the parameters slb, snq, sgb (log blowup, queries, grinding bits).
+\
+\ Verifying is three steps, so the caller can compute the auxiliary
+\ boundaries -- which depend on challenges drawn mid-proof -- in between:
+\   sbeg ( proof n -- ok )   read the commitments and out-of-domain values,
+\                           replay the transcript to z (challenges in sch)
+\   (the caller fills sab / sabn: rows of [row, column, value (4 cells)])
+\   smid ( -- ok )           check the constraints at z
+\   sfri ( -- ok )           check the openings and FRI, and that the whole
+\                           proof was read
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: swid variable ;  : slen variable ;  : sdeg variable ;  : sntr variable ;
+: snax variable ;  : snch variable ;  : snxc variable ;  : snpre variable ;
+: spcap variable ; : splde variable ; : sper variable ;  : sbnd variable ;
+: sstm variable ;  : sstn variable ;  : sprog variable ; : spn variable ;
+: smo variable ;   : sao variable ;   : slb variable ;   : snq variable ;
+: sgb variable ;   : sabn variable ;
+
+: sok variable ;
+: scheck ( flag -- )   0= if 0 lit sok ! then ;
+
+\ Derived sizes.
+: slogn variable ;  : slogc variable ;  : sloglde variable ;  : sleav variable ;
+: scapn variable ;  : sfw variable ;
+
+\ npow2 ( x -- p )   the least power of two >= x (x >= 1).
+: npow2 ( x -- p )   1 lit begin 2dup u> while 1 lit lshift repeat nip ;
+
+\ Buffers.  Capacities: 128 columns, 16 aux columns, 8 challenges, 8 aux
+\ boundaries, 4096 program nodes, 2048 shape elements.
+: strv variable ;  : str ( -- a )    strv 88 lit lazy ;      \ the transcript
+: soodv variable ; : sood ( -- a )   soodv 1400 lit lazy ;   \ out-of-domain values
+: schv variable ;  : sch ( -- a )    schv 80 lit lazy ;      \ challenges
+: sabv variable ;  : sab ( -- a )    sabv C0 lit lazy ;      \ aux boundaries
+: sshv variable ;  : sshp ( -- a )   sshv 2000 lit lazy ;    \ shape elements
+: sdgv variable ;  : sdig ( -- a )   sdgv 400 lit lazy ;     \ a cap, as cells
+: spvv variable ;  : sperv ( -- a )  spvv 400 lit lazy ;     \ periodic values at z
+: svlv variable ;  : svals ( -- a )  svlv 10000 lit lazy ;   \ program values
+: sxv variable ;   : sx ( -- a )     sxv 100 lit lazy ;      \ 16 scratch ext values
+: sr0v variable ;  : srow0 ( -- a )  sr0v 200 lit lazy ;     \ a full row, each side
+: sr1v variable ;  : srow1 ( -- a )  sr1v 200 lit lazy ;
+: sa0v variable ;  : saux0 ( -- a )  sa0v 100 lit lazy ;     \ an aux row, each side
+: sa1v variable ;  : saux1 ( -- a )  sa1v 100 lit lazy ;
+: scpv variable ;  : scmp ( -- a )   scpv 40 lit lazy ;      \ composition and mask, each side
+: sfxv variable ;  : sfx ( -- a )    sfxv 20 lit lazy ;      \ FRI's first-layer pair
+
+\ Scratch ext values: sx's slots.
+: x# ( k -- a )   4 lit lshift sx + ;
+: salpha ( -- a ) 0 lit x# ;   : sz ( -- a ) 1 lit x# ;    : szg ( -- a ) 2 lit x# ;
+: sbeta ( -- a )  3 lit x# ;   : sw ( -- a )  4 lit x# ;    : sacc ( -- a ) 5 lit x# ;
+: st1 ( -- a )    6 lit x# ;   : st2 ( -- a ) 7 lit x# ;    : szn ( -- a ) 8 lit x# ;
+: sdiv ( -- a )   9 lit x# ;   : sinz ( -- a ) A lit x# ;   : sinzg ( -- a ) B lit x# ;
+: stsum ( -- a )  C lit x# ;
+
+\ The out-of-domain values' places in sood: main at z and z·g (full width),
+\ aux at z and z·g, the composition at z -- the order they're absorbed in.
+: soz ( -- a )    sood ;
+: sozg ( -- a )   sood sfw @ 4 lit lshift + ;
+: saz ( -- a )    sood sfw @ 5 lit lshift + ;
+: sazg ( -- a )   saz snax @ 4 lit lshift + ;
+: scz ( -- a )    saz snax @ 5 lit lshift + ;
+: soodn ( -- n )  sfw @ snax @ + 1 lit lshift 1 lit + 2 lit lshift ;   \ cells
+
+: stcap variable ;  : sacap variable ;  : sccap variable ;
+
+\ ecst ( x out -- )   the extension element (x, 0, 0, 0).
+: ecst ( x out -- )   dup 4 lit zero ! ;
+\ ezsub ( a x out -- )   a - x for base x.
+: ezsub ( a x out -- )   rot over 4 lit cpy dup @ rot fsub swap ! ;
+
+\ sdigs ( cap -- buf n )   the cap's scapn hashes as cells.
+: sdigs ( cap -- buf n )   sdig scapn @ 3 lit lshift ucells sdig scapn @ 3 lit lshift ;
+
+\ ── sbeg ──
+
+\ sshape ( -- n )   the AIR's shape elements into sshp: the sizes, each
+\        periodic column (its length, then its values), each boundary.
+: sshk variable ;
+: s+ ( x -- )   sshp sshk @ 2 lit lshift + !  sshk @ 1 lit + sshk ! ;
+: sshape ( -- n )
+	0 lit sshk !
+	swid @ s+  slen @ s+  sdeg @ s+  sntr @ s+  snax @ s+  snch @ s+  snxc @ s+  snpre @ s+
+	sper @ @ ?dup if 0 lit do
+		sper @ i 3 lit * 1 lit + 2 lit lshift +       ( descriptor: len, values, coeffs )
+		dup @ s+
+		dup @ 0 lit do dup 4 lit + @ i 2 lit lshift + be@ s+ loop
+		drop
+	loop then
+	sbnd @ @ ?dup if 0 lit do
+		sbnd @ i 3 lit * 1 lit + 2 lit lshift +
+		dup @ s+ dup 4 lit + @ s+ 8 lit + @ s+
+	loop then
+	sshk @
+;
+
+\ sreadcap ( -- cap )   a cap of exactly scapn hashes.
+: sreadcap ( -- cap )   r32 scapn @ = scheck  scapn @ 5 lit lshift rtake ;
+
+\ sreadx ( dst n -- )   n extension values (if the count matches).
+: sreadx ( dst n -- )
+	r32 over = dup scheck if dup 4 lit lshift rtake -rot 2 lit lshift ucells else 2drop then
+;
+
+: sbeg ( proof n -- ok )
+	rinit  -1 lit sok !
+	\ The layout.
+	slen @ pow2? slen @ 1 lit u> and scheck
+	slen @ log2 slogn !
+	sdeg @ dup 0= if drop 1 lit then npow2 log2 slogc !
+	slogn @ slogc @ + slb @ + sloglde !
+	sloglde @ 1C lit u< slb @ 0= 0= and scheck
+	snpre @ if splde @ sloglde @ = scheck then
+	1 lit sloglde @ lshift 1 lit rshift sleav !
+	sleav @ dup 20 lit u> if drop 20 lit then scapn !
+	swid @ snpre @ + sfw !
+	sfw @ 81 lit u< snax @ 11 lit u< and snch @ 9 lit u< and scheck
+	sok @ if
+		\ The commitments and out-of-domain values.
+		sreadcap stcap !  sreadcap sacap !  sreadcap sccap !
+		soz sfw @ sreadx  sozg sfw @ sreadx  saz snax @ sreadx  sazg snax @ sreadx
+		10 lit rtake scz 4 lit ucells
+	then
+	sok @ rbad @ 0= and if
+		\ The statement: shape, preprocessed cap, the AIR's own elements.
+		str "stark-statement" tlab tnew
+		sshape 801 lit u< scheck
+		str "stark-statement" tlab sshp sshk @ tabs
+		snpre @ if str "stark-preprocessed-root" tlab spcap @ sdigs tabs then
+		str "stark-public" tlab sstm @ sstn @ tabs
+		\ The commitments, and the challenges between them.
+		str "stark-trace-root" tlab stcap @ sdigs tabs
+		snch @ ?dup if 0 lit do str "stark-aux-challenge" tlab sch i 4 lit lshift + tchal loop then
+		str "stark-aux-root" tlab sacap @ sdigs tabs
+		str "stark-alpha" tlab salpha tchal
+		str "stark-composition-root" tlab sccap @ sdigs tabs
+		str "stark-z" tlab sz tchal
+		sz slogn @ fgen szg emulb
+	then
+	0 lit sabn !
+	sok @ rbad @ 0= and
+;
+
+\ ── smid ──
+
+\ sperz ( -- )   each periodic column at z: its coefficients, as a
+\        polynomial in y = z^(n / len), by Horner's rule.
+: sperz ( -- )
+	sper @ @ ?dup if 0 lit do
+		sper @ i 3 lit * 1 lit + 2 lit lshift +       ( d: len, values, coeffs )
+		sz slen @ 2 lit pick @ log2 rshift st1 epow    \ y
+		sperv i 4 lit lshift + dup 4 lit zero          ( d out )
+		over @ 0 lit do
+			dup st1 over emul                          \ out = out * y
+			over 8 lit + @  2 lit pick @ 1 lit - i - 2 lit lshift + be@
+			over @ fadd over !                         \ + the next coefficient
+		loop
+		2drop
+	loop then
+;
+
+\ speval ( -- )   run the constraint program; node k's value is at (sval k).
+: sval ( k -- a )   4 lit lshift svals + ;
+: snop variable ;   : sna variable ;   : snb variable ;
+: speval ( -- )
+	spn @ 0 lit do
+		sprog @ i C lit * +  dup be@ snop !  dup 4 lit + be@ sna !  8 lit + be@ snb !
+		i sval                                                        ( out )
+		snop @ 0 lit = if sna @ swap ecst else
+		snop @ 1 lit = if snb @ if sozg else soz then sna @ 4 lit lshift + swap 4 lit cpy else
+		snop @ 2 lit = if snb @ if sazg else saz then sna @ 4 lit lshift + swap 4 lit cpy else
+		snop @ 3 lit = if sperv sna @ 4 lit lshift + swap 4 lit cpy else
+		snop @ 4 lit = if sch sna @ 4 lit lshift + swap 4 lit cpy else
+		snop @ 5 lit = if sna @ sval snb @ sval rot eadd else
+		snop @ 6 lit = if sna @ sval snb @ sval rot esub else
+		snop @ 7 lit = if sna @ sval snb @ sval rot emul else
+		st2 4 lit zero  st2 sna @ sval rot esub                      \ 8: negation
+		then then then then then then then then
+	loop
+;
+
+\ sterm ( v -- )   sacc += sw * v; sw *= alpha.   (A weighted term.)
+: sterm ( v -- )   sw st1 emul  sacc st1 sacc eadd  sw salpha sw emul ;
+
+: smid ( -- ok )
+	-1 lit sok !
+	sz slen @ szn epow
+	szn 1 lit 0 lit 0 lit 0 lit c4? 0= scheck          \ z not in the trace domain
+	sperz
+	speval
+	\ 1 / Z_T(z) = (z - g^(n-1)) / (z^n - 1)
+	sz slogn @ fgen slen @ 1 lit - fpow sdiv ezsub
+	szn 1 lit st1 ezsub  st1 st1 einv  sdiv st1 sdiv emul
+	\ The transition constraints, weighted by powers of alpha.
+	sacc 4 lit zero  sw 4 lit zero  1 lit sw !
+	sntr @ ?dup if 0 lit do smo @ i 2 lit lshift + be@ sval sterm loop then
+	snxc @ ?dup if 0 lit do sao @ i 2 lit lshift + be@ sval sterm loop then
+	sacc sdiv sacc emul
+	\ The boundaries: (column at z - value) / (z - g^row).
+	sbnd @ @ ?dup if 0 lit do
+		sbnd @ i 3 lit * 1 lit + 2 lit lshift +            ( d: row, column, value )
+		dup @ slen @ u< over 4 lit + @ sfw @ u< and scheck
+		dup @ slogn @ fgen swap fpow sz swap st2 ezsub  st2 st2 einv
+		dup 4 lit + @ 4 lit lshift soz +  over 8 lit + @  st1 ezsub
+		st1 st2 st1 emul  st1 sterm
+		drop
+	loop then
+	sabn @ ?dup if 0 lit do
+		sab i 18 lit * +                                    ( d: row, column, value (4) )
+		dup @ slen @ u< over 4 lit + @ snax @ u< and scheck
+		dup @ slogn @ fgen swap fpow sz swap st2 ezsub  st2 st2 einv
+		dup 4 lit + @ 4 lit lshift saz +  over 8 lit +  st1 esub
+		st1 st2 st1 emul  st1 sterm
+		drop
+	loop then
+	sacc scz 4 lit ceq scheck
+	\ Absorb the out-of-domain values; draw beta.
+	str "stark-ood" tlab sood soodn tabs
+	str "stark-beta" tlab sbeta tchal
+	sok @
+;
+
+\ ── sfri ──
+
+\ sdt ( d inv -- )   sacc += sw * d * inv; sw *= beta.   (A DEEP term.)
+: sdt ( d inv -- )   st1 emul  st1 sw st1 emul  sacc st1 sacc eadd  sw sbeta sw emul ;
+
+\ sdeep ( x row aux cmp out -- )   the DEEP combination at the base point x,
+\        from the full row (base values), aux row and composition/mask values
+\        there: for each column, (t - t(z)) / (x - z) and (t - t(zg)) /
+\        (x - zg), weighted by successive powers of beta; then the
+\        composition's term, and the mask's.
+: sdx variable ;  : sdr variable ;  : sda variable ;  : sdc variable ;  : sdo variable ;
+: sdeep ( x row aux cmp out -- )
+	sdo ! sdc ! sda ! sdr ! sdx !
+	sdx @ st2 ecst  st2 sz sinz esub  sinz sinz einv
+	st2 szg sinzg esub  sinzg sinzg einv
+	sacc 4 lit zero  sw 4 lit zero  1 lit sw !
+	sfw @ 0 lit do
+		sdr @ i 2 lit lshift + @                              ( t )
+		dup st2 ecst  st2 soz i 4 lit lshift + st2 esub  st2 sinz sdt
+		st2 ecst      st2 sozg i 4 lit lshift + st2 esub  st2 sinzg sdt
+	loop
+	snax @ ?dup if 0 lit do
+		sda @ i 4 lit lshift + saz i 4 lit lshift + st2 esub  st2 sinz sdt
+		sda @ i 4 lit lshift + sazg i 4 lit lshift + st2 esub  st2 sinzg sdt
+	loop then
+	sdc @ scz st2 esub  st2 sinz sdt
+	sdc @ 10 lit + sw st1 emul  sacc st1 sacc eadd
+	sacc sdo @ 4 lit cpy
+;
+
+: fpos variable ;   : spos variable ;
+: rsave ( var -- )   rpos @ swap ! ;
+: rload ( var -- )   @ rpos ! ;
+
+\ sopen ( low cap len -- low )   read an opening at low, of a leaf of len
+\        bytes, in the tree with this cap.
+: sopen ( low cap len -- low )
+	ropen  olen @ = scheck
+	scapn @ sleav @ mvcap scheck
+	oidx @ over = scheck
+;
+
+: sfri ( -- ok )
+	sok @ if str sloglde @ 1F lit slb @ snq @ sgb @ fbeg scheck then
+	sok @ if
+		fpos rsave
+		\ Past FRI's query proofs, to the STARK's openings.
+		snq @ 0 lit do r32 fnr @ = scheck  fnr @ ?dup if 0 lit do ropen loop then loop
+		r32 snq @ = scheck
+		spos rsave
+	then
+	sok @ rbad @ 0= and if
+		snq @ 0 lit do
+			sok @ if
+				fqidx                                                         ( low )
+				spos rload
+				stcap @ swid @ 3 lit lshift sopen
+				sok @ if
+					oleaf @ srow0 swid @ ucells
+					oleaf @ swid @ 2 lit lshift + srow1 swid @ ucells
+				then
+				r8 snpre @ if
+					1 lit = scheck
+					spcap @ snpre @ 3 lit lshift sopen
+					sok @ if
+						oleaf @ srow0 swid @ 2 lit lshift + snpre @ ucells
+						oleaf @ snpre @ 2 lit lshift + srow1 swid @ 2 lit lshift + snpre @ ucells
+					then
+				else 0= scheck then
+				sacap @ snax @ 5 lit lshift sopen
+				sok @ if
+					oleaf @ saux0 snax @ 2 lit lshift ucells
+					oleaf @ snax @ 4 lit lshift + saux1 snax @ 2 lit lshift ucells
+				then
+				sccap @ 40 lit sopen
+				sok @ if oleaf @ scmp 10 lit ucells then
+				spos rsave
+				sok @ if
+					dup sloglde @ fgen swap fpow 1F lit fmul                 ( low x )
+					dup srow0 saux0 scmp sfx sdeep
+					0 lit swap fsub srow1 saux1 scmp 20 lit + sfx 10 lit + sdeep
+					fpos rload
+					sfx dup 10 lit + rot fquery scheck
+					fpos rsave
+				else drop then
+			then
+		loop
+		spos rload
+		rpos @ rend @ = scheck                                            \ nothing left over
+	then
+	sok @ rbad @ 0= and
+;

@@ -1,1 +1,1 @@
-src/fence.fam src/disk.fam src/poseidon2.fam src/wots.fam src/full_node.fam
+src/fence.fam src/disk.fam src/poseidon2.fam src/wots.fam src/ext.fam src/transcript.fam src/merkle.fam src/fri.fam src/stark.fam src/circuit.fam src/full_node.fam

@@ -25,50 +25,29 @@
 : wtext variable ;    \ the AKJV text's address
 : wtextn variable ;   \ and length in bytes
 
-\ ── Helpers ──
-
-\ wlazy ( var n -- a )   var's buffer, allocating n bytes on first use.
-: wlazy ( var n -- a )
-	over @ dup if nip nip else drop alloc dup rot ! then
-;
-
-\ wcpy ( src dst n -- )   copy n cells (n >= 1).
-: wcpy ( src dst n -- )
-	0 lit do over i 2 lit lshift + @ over i 2 lit lshift + ! loop 2drop
-;
-
-\ wzero ( a n -- )   zero n cells (n >= 1).
-: wzero ( a n -- )   0 lit do 0 lit over i 2 lit lshift + ! loop drop ;
-
-\ weq ( a b n -- flag )   whether n cells at a and b are equal.
-: weq ( a b n -- flag )
-	-1 lit swap 0 lit do
-		2 lit pick i 2 lit lshift + @ 2 lit pick i 2 lit lshift + @ = and
-	loop
-	nip nip
-;
+\ ── Scratch ──
 
 \ Scratch: a permutation state, the digits (bytes), the signed digest, a
 \ chain value, and a public key's hash input.
-: wstv variable ;   : wst ( -- a )   wstv 60 lit wlazy ;
-: wdgv variable ;   : wdg ( -- a )   wdgv 40 lit wlazy ;
-: wsdv variable ;   : wsd ( -- a )   wsdv 20 lit wlazy ;
-: wtmv variable ;   : wtmp ( -- a )  wtmv 20 lit wlazy ;
-: wpkv variable ;   : wpkb ( -- a )  wpkv 820 lit wlazy ;
+: wstv variable ;   : wst ( -- a )   wstv 60 lit lazy ;
+: wdgv variable ;   : wdg ( -- a )   wdgv 40 lit lazy ;
+: wsdv variable ;   : wsd ( -- a )   wsdv 20 lit lazy ;
+: wtmv variable ;   : wtmp ( -- a )  wtmv 20 lit lazy ;
+: wpkv variable ;   : wpkb ( -- a )  wpkv 820 lit lazy ;
 
 \ ── Chains ──
 
 \ wstep ( val param chain step -- )   one chain step, in place on the 8
 \        cells at val: compress24(param, 3, chain, step, val, 0...).
 : wstep ( val param chain step -- )
-	wst 18 lit wzero
+	wst 18 lit zero
 	wst 1C lit + !                       \ cell 7: the step
 	wst 18 lit + !                       \ cell 6: the chain
-	wst 5 lit wcpy                       \ cells 0..4: param
+	wst 5 lit cpy                       \ cells 0..4: param
 	3 lit wst 14 lit + !                 \ cell 5: TAG_CHAIN
-	dup wst 20 lit + 8 lit wcpy          \ cells 8..15: the value
+	dup wst 20 lit + 8 lit cpy          \ cells 8..15: the value
 	wst p2cmp
-	wst swap 8 lit wcpy
+	wst swap 8 lit cpy
 ;
 
 \ wchain ( val param chain from to -- )   steps from .. to-1 (none if from >= to).
@@ -93,14 +72,14 @@
 : wksd variable ;   : wksk variable ;   : wkpk variable ;
 : wkeygen ( seed sk pk -- )
 	wkpk ! wksk ! wksd !
-	wst 18 lit wzero  wksd @ wst wseed  1 lit wst 20 lit + !  wst p2cmp16
-	wst wksk @ 5 lit wcpy
-	wst wkpk @ 5 lit wcpy
+	wst 18 lit zero  wksd @ wst wseed  1 lit wst 20 lit + !  wst p2cmp16
+	wst wksk @ 5 lit cpy
+	wst wkpk @ 5 lit cpy
 	40 lit 0 lit do
-		wst 18 lit wzero  wksd @ wst wseed
+		wst 18 lit zero  wksd @ wst wseed
 		2 lit wst 20 lit + !  i wst 24 lit + !  wst p2cmp16
-		wst wksk @ i 5 lit lshift + 14 lit + 8 lit wcpy
-		wst wkpk @ i 5 lit lshift + 14 lit + 8 lit wcpy
+		wst wksk @ i 5 lit lshift + 14 lit + 8 lit cpy
+		wst wkpk @ i 5 lit lshift + 14 lit + 8 lit cpy
 		wkpk @ i 5 lit lshift + 14 lit +  wkpk @  i  0 lit 7 lit wchain
 	loop
 ;
@@ -109,11 +88,11 @@
 \        hash_elements(4, param padded to 8 with zeros, tops).
 : wpkhash ( pk out -- )
 	swap
-	dup wpkb 5 lit wcpy
-	wpkb 14 lit + 3 lit wzero
-	14 lit + wpkb 20 lit + 200 lit wcpy
+	dup wpkb 5 lit cpy
+	wpkb 14 lit + 3 lit zero
+	14 lit + wpkb 20 lit + 200 lit cpy
 	wst wpkb 208 lit 4 lit p2hash
-	wst swap 8 lit wcpy
+	wst swap 8 lit cpy
 ;
 
 \ ── The text block ──
@@ -136,10 +115,10 @@
 \ wsel ( param digest rand -- pos )   the text position a randomizer selects:
 \        compress24(param, 5, digest, rand)[0]'s low 16 bits.
 : wsel ( param digest rand -- pos )
-	wst 18 lit wzero
-	wst 38 lit + 7 lit wcpy              \ cells 14..20: the randomizer
-	wst 18 lit + 8 lit wcpy              \ cells 6..13: the digest
-	wst 5 lit wcpy                       \ cells 0..4: param
+	wst 18 lit zero
+	wst 38 lit + 7 lit cpy              \ cells 14..20: the randomizer
+	wst 18 lit + 8 lit cpy              \ cells 6..13: the digest
+	wst 5 lit cpy                       \ cells 0..4: param
 	5 lit wst 14 lit + !                 \ cell 5: TAG_SELECT
 	wst p2cmp
 	wst @ FFFF lit and
@@ -151,14 +130,14 @@
 : wbind ( digest pos out -- )
 	wbo !
 	wtextn @ 1F lit + 5 lit rshift %     ( digest block )
-	wst 18 lit wzero
+	wst 18 lit zero
 	6 lit wst !                          \ cell 0: TAG_BIND
-	swap wst 4 lit + 8 lit wcpy          \ cells 1..8: the digest
+	swap wst 4 lit + 8 lit cpy          \ cells 1..8: the digest
 	5 lit lshift                         ( offset )
 	B lit 0 lit do dup i 3 lit * welem wst i 2 lit lshift + 24 lit + ! loop
 	drop
 	wst p2cmp
-	wst wbo @ 8 lit wcpy
+	wst wbo @ 8 lit cpy
 ;
 
 \ ── Digits ──
@@ -175,10 +154,10 @@
 \        compress24(param, 4, sd, rand), each element giving 10 base-8 digits,
 \        low first; the first 64.
 : wdigits ( param sd rand -- )
-	wst 18 lit wzero
-	wst 38 lit + 7 lit wcpy
-	wst 18 lit + 8 lit wcpy
-	wst 5 lit wcpy
+	wst 18 lit zero
+	wst 38 lit + 7 lit cpy
+	wst 18 lit + 8 lit cpy
+	wst 5 lit cpy
 	4 lit wst 14 lit + !                 \ cell 5: TAG_MESSAGE
 	wst p2cmp
 	0 lit                                ( idx )
@@ -210,12 +189,12 @@
 	0 lit
 	1000 lit 0 lit do
 		dup 0= if
-			wgs @ 7 lit wzero  i wgs @ !
+			wgs @ 7 lit zero  i wgs @ !
 			wgk @ wgd @ wgs @ wsdig
 			wgk @ wsd wgs @ wdigits
 			wsum E0 lit = if
 				40 lit 0 lit do
-					wgk @ i 5 lit lshift + 14 lit +  wgs @ i 5 lit lshift + 1C lit +  8 lit wcpy
+					wgk @ i 5 lit lshift + 14 lit +  wgs @ i 5 lit lshift + 1C lit +  8 lit cpy
 					wgs @ i 5 lit lshift + 1C lit +  wgk @  i  0 lit  wdg i + c@  wchain
 				loop
 				drop -1 lit
@@ -232,9 +211,9 @@
 	wsum E0 lit = if
 		-1 lit
 		40 lit 0 lit do
-			wgs @ i 5 lit lshift + 1C lit + wtmp 8 lit wcpy
+			wgs @ i 5 lit lshift + 1C lit + wtmp 8 lit cpy
 			wtmp wgk @ i wdg i + c@ 7 lit wchain
-			wtmp wgk @ i 5 lit lshift + 14 lit + 8 lit weq and
+			wtmp wgk @ i 5 lit lshift + 14 lit + 8 lit ceq and
 		loop
 	else 0 lit then
 ;
@@ -369,7 +348,7 @@ Test {
 	}
 	select_bind {
 		wtsetup
-		1C lit alloc dup 7 lit wzero              ( rand: trial 0 )
+		1C lit alloc dup 7 lit zero              ( rand: trial 0 )
 		wtpk @ wtdig @ 2 lit pick wsel 60497u lit asrt_eq
 		wtpk @ wtdig @ rot wsdig
 		wsd 0 lit + @ 1315383740u lit asrt_eq
@@ -424,7 +403,7 @@ Test {
 	wrong_digest {
 		wtsetup
 		wtsk @ wtdig @ wtsig @ wsign assert
-		20 lit alloc wtdig @ over 8 lit wcpy
+		20 lit alloc wtdig @ over 8 lit cpy
 		dup @ 1 lit fadd over !                      \ another digest
 		wtpk @ swap wtsig @ wverify 0 lit asrt_eq
 	}

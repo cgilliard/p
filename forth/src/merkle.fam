@@ -1,0 +1,232 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/merkle.fam — reading proof bytes, and checking Merkle openings against a
+\ tree's cap (see ../rust/src/merkle.rs and the codec in ../rust/src/stark.rs).
+\
+\ Proof bytes are read where they lie.  An opening's one-byte depth leaves
+\ what follows unaligned, so words are read a byte at a time (`u@`).  Every
+\ read is bounds-checked: running past the end sets `rbad` (and stops
+\ advancing), and verification fails if it's set.
+\
+\ Hashes: a leaf is `hash_octets(5, its byte length, its 4-byte words)` --
+\ each block of up to 16 elements *overwrites* the rate's first whole
+\ octets, then permutes; a node is `hash_pair(0x100 + level, left, right)`,
+\ level counting from 1 just above the leaves.  Digests read from bytes are
+\ reduced (`fred`); a computed hash is compared with a cap entry exactly.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ u@ ( a -- w )   a little-endian word at any address.
+: u@ ( a -- w )
+	dup 3 lit + c@ 8 lit lshift over 2 lit + c@ or 8 lit lshift
+	over 1 lit + c@ or 8 lit lshift swap c@ or
+;
+
+\ ucells ( src dst n -- )   n words from bytes at src, each reduced, into cells.
+: ucells ( src dst n -- )
+	0 lit do over i 2 lit lshift + u@ fred over i 2 lit lshift + ! loop 2drop
+;
+
+\ ueq ( a b n -- flag )   whether n words in bytes at a equal the cells at b.
+: ueq ( a b n -- flag )
+	-1 lit swap 0 lit do
+		2 lit pick i 2 lit lshift + u@ 2 lit pick i 2 lit lshift + @ = and
+	loop
+	nip nip
+;
+
+\ pow2? ( x -- flag )   a nonzero power of two.   log2 ( x -- k )   of one.
+: pow2? ( x -- flag )   dup 0= 0= swap dup 1 lit - and 0= and ;
+: log2 ( x -- k )   0 lit begin over 1 lit u> while 1 lit + swap 1 lit rshift swap repeat nip ;
+
+\ ── Reading ──
+
+: rpos variable ;   : rend variable ;   : rbad variable ;
+
+\ rinit ( a n -- )   start reading n bytes at a.
+: rinit ( a n -- )   over + rend ! rpos ! 0 lit rbad ! ;
+
+\ rtake ( n -- a )   the next n bytes' address; past the end, sets rbad and
+\        doesn't advance.
+: rtake ( n -- a )
+	rpos @ swap over +                       ( a end )
+	dup rend @ u> over 3 lit pick u< or if drop -1 lit rbad ! else rpos ! then
+;
+
+: r32 ( -- w )   4 lit rtake u@ ;
+: r8 ( -- b )    1 lit rtake c@ ;
+
+\ ── Openings ──
+
+\ The opening last read: index, leaf (address, length), depth, siblings.
+: oidx variable ;   : oleaf variable ;   : olen variable ;   : odep variable ;
+: osib variable ;
+
+\ ropen ( -- )   read an opening: index, leaf length and bytes, depth (one
+\        byte), that many 32-byte sibling hashes.
+: ropen ( -- )
+	r32 oidx !
+	r32 dup olen ! rtake oleaf !
+	r8 dup odep ! 5 lit lshift rtake osib !
+;
+
+: mstv variable ;   : mst ( -- a )    mstv 60 lit lazy ;   \ hashing state
+: mhv variable ;    : mh ( -- a )     mhv 20 lit lazy ;    \ the running hash
+: msv variable ;    : msib ( -- a )   msv 20 lit lazy ;    \ a sibling, as cells
+
+\ mleaf ( leaf len -- )   the hash of len bytes at leaf, into mh.
+: mlb variable ;   : mll variable ;
+: melem ( e -- x )   \ the leaf's element e: bytes 4e.., zero past its end
+	2 lit lshift
+	0 lit 4 lit 0 lit do
+		over 3 lit i - + dup mll @ u< if mlb @ + c@ else drop 0 lit then
+		swap 8 lit lshift or
+	loop
+	nip fred
+;
+: mleaf ( leaf len -- )
+	mll ! mlb !
+	mst 18 lit zero
+	5 lit mst 40 lit + !                       \ capacity: DOMAIN_MERKLE_LEAF
+	mll @ mst 44 lit + !                       \ and the byte length
+	mll @ 3 lit + 2 lit rshift                 ( m: elements )
+	dup 0= if mst p2perm then
+	0 lit begin 2dup u> while                  ( m k )
+		2dup - dup 10 lit u> if drop 10 lit then
+		mst over 7 lit + 3 lit rshift 3 lit lshift zero    \ clear whole octets
+		0 lit do dup i + melem mst i 2 lit lshift + ! loop
+		mst p2perm
+		10 lit +
+	repeat
+	2drop
+	mst mh 8 lit cpy
+;
+
+\ mnode ( level l r -- )   the node over cells l and r, into mh.
+: mnode ( level l r -- )
+	mst 18 lit zero
+	mst 20 lit + 8 lit cpy
+	mst 8 lit cpy
+	100 lit + mst 40 lit + !                   \ DOMAIN_MERKLE_NODE + level
+	10 lit mst 44 lit + !
+	mst p2perm
+	mst mh 8 lit cpy
+;
+
+\ mvcap ( cap capn leaves -- flag )   whether the last opening read is in the
+\        tree of `leaves` leaves whose top level is the capn hashes (bytes) at
+\        cap: its path climbs log2(leaves / capn) levels to the cap.
+: mcap variable ;   : mcn variable ;   : mlv variable ;
+: mvcap ( cap capn leaves -- flag )
+	mlv ! mcn ! mcap !
+	rbad @ 0=  mcn @ pow2? and  mlv @ pow2? and  mcn @ mlv @ u> 0= and
+	if
+		mlv @ log2 mcn @ log2 -                ( path )
+		dup odep @ = oidx @ mlv @ u< and if
+			oleaf @ olen @ mleaf
+			oidx @ swap                        ( index path )
+			dup if
+				0 lit do
+					osib @ i 5 lit lshift + msib 8 lit ucells
+					dup 1 lit and if i 1 lit + msib mh mnode else i 1 lit + mh msib mnode then
+					1 lit rshift
+				loop
+			else drop then
+			5 lit lshift mcap @ + mh 8 lit ueq
+		else drop 0 lit then
+	else 0 lit then
+;
+
+\ ── Tests (./tools/fam --test src/poseidon2.fam src/ext.fam src/transcript.fam src/merkle.fam) ──
+\ Vectors and bytes from the Rust node: leaf hashes, and an opening of leaf 45
+\ of a 64-leaf tree (36-byte leaves) against its 8-hash cap, as encoded in proofs.
+
+\ mfix ( -- a n )   a cap, then an opening (401 bytes, as `,` emits them: in order).
+: mfix ( -- a n )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F008019 ,   \ jal   x0,+408
+08000000 , 202D064D , 76C00D2E , 66EE2D50 , E313E566 , E7572A19 , B8D5BF24 , 88FF6B14 ,
+D6B7F066 , 6A42FB47 , D97EF30A , AA525660 , A5696D11 , 5EC02276 , B450673A , A6B00A14 ,
+2B593460 , 509D4D36 , 2C72B308 , 66CBF852 , 14F2A155 , 93ED6247 , A0327344 , 6C39FF73 ,
+7697A635 , 535E0C41 , 8485A813 , 9770AF2A , 2FE15372 , 20659666 , D3EBB85B , CE9E4575 ,
+FC5F7248 , E81A0D75 , 983E016D , FDD2534B , 5F2A9054 , F261BB1D , AC840100 , 0AFF6B02 ,
+E58D3A21 , 5F4F2872 , EF1D7B4D , CACCD663 , D7B48555 , 43843015 , 8422A030 , 33086A34 ,
+F075CE06 , 3D572608 , 4214B529 , ECAA560D , F13C7727 , ABC0F83F , 5EB83E02 , EFA44B44 ,
+0BBAFB32 , A3FF8300 , 7B5ABF0C , C6FC234A , ACA1246F , B5FD4568 , E5234B45 , 21584162 ,
+3FFFD005 , 2D000000 , 24000000 , 3C3F4245 , 484B4E51 , 54575A5D , 60636669 , 6C6F7275 ,
+787B7E81 , 84878A8D , 90939699 , 9C9FA2A5 , 033A8F7F , 5C5DFACB , 009AD72C , 429F4D22 ,
+0784A8A1 , 5CFF8D2B , 1C7D25E9 , 6E45AF63 , 7129E2D6 , 2083D5B2 , 09138AAB , 6B1B4AC4 ,
+3E9967A7 , 0434239B , 5FCEF797 , 203005D7 , 1DBB1807 , 289881BE , 2C09257D , 276F84DF ,
+18C22B54 , 25CCF492 , 134960DB , 570A4183 , 0C000000 ,
+191 lit
+;
+
+\ mcopy ( a n -- buf n )   a writable copy of a fixture.
+: mcopy ( a n -- buf n )
+	dup alloc swap                          ( a buf n )
+	dup 0 lit do 2 lit pick i + c@ 2 lit pick i + c! loop
+	rot drop
+;
+
+\ mopen ( buf n leaves -- flag )   read the cap and the opening, check it.
+: mopen ( buf n leaves -- flag )
+	-rot rinit
+	r32 dup 5 lit lshift rtake swap           ( leaves cap capn )
+	ropen
+	rot mvcap
+;
+
+Test {
+	leaf_0 {
+		1 lit alloc
+		0 lit mleaf
+		mh 643327251u lit 1341335401u lit 1900213177u lit 467996431u lit c4? assert
+		mh 10 lit + 645788733u lit 495047509u lit 248744769u lit 1808139855u lit c4? assert
+	}
+	leaf_6 {
+		6 lit alloc
+		6 lit 0 lit do i D lit * 5 lit + over i + c! loop
+		6 lit mleaf
+		mh 1130772395u lit 169432994u lit 457305246u lit 1487634439u lit c4? assert
+		mh 10 lit + 471632367u lit 990946341u lit 1525456405u lit 600588816u lit c4? assert
+	}
+	leaf_20 {
+		14 lit alloc
+		14 lit 0 lit do i D lit * 5 lit + over i + c! loop
+		14 lit mleaf
+		mh 522197869u lit 1702288062u lit 131955338u lit 117243700u lit c4? assert
+		mh 10 lit + 937679318u lit 48802834u lit 457602727u lit 940890914u lit c4? assert
+	}
+	leaf_36 {
+		24 lit alloc
+		24 lit 0 lit do i D lit * 5 lit + over i + c! loop
+		24 lit mleaf
+		mh 1119850225u lit 1892464453u lit 382549955u lit 1515539828u lit c4? assert
+		mh 10 lit + 593465510u lit 789342952u lit 377292749u lit 1672900119u lit c4? assert
+	}
+	leaf_72 {
+		48 lit alloc
+		48 lit 0 lit do i D lit * 5 lit + over i + c! loop
+		48 lit mleaf
+		mh 1903911299u lit 763166604u lit 622382593u lit 1757969329u lit c4? assert
+		mh 10 lit + 299119820u lit 877729764u lit 940526404u lit 1581419367u lit c4? assert
+	}
+	opening {
+		mfix mcopy 40 lit mopen assert
+		oidx @ 2D lit asrt_eq
+	}
+	opening_tampered_leaf {
+		mfix mcopy over 110 lit + dup c@ 1 lit xor swap c!  40 lit mopen 0 lit asrt_eq
+	}
+	opening_tampered_sibling {
+		mfix mcopy over 135 lit + dup c@ 1 lit xor swap c!  40 lit mopen 0 lit asrt_eq
+	}
+	opening_wrong_size {
+		mfix mcopy 80 lit mopen 0 lit asrt_eq
+	}
+	read_past_end {
+		mfix mcopy 1 lit - 40 lit mopen 0 lit asrt_eq
+		rbad @ assert
+	}
+}

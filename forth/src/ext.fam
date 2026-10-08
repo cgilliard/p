@@ -1,0 +1,157 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/ext.fam — the degree-4 extension of BabyBear, BabyBear[x] / (x^4 - 11)
+\ (see ../rust/src/ext.rs), where a STARK's challenges live; plus base-field
+\ powers and inverses.
+\
+\ An extension element is 4 cells, c0 + c1 x + c2 x^2 + c3 x^3, passed by
+\ address.  Results go to `out`, which may be either input.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ fpow ( x e -- x^e )   square and multiply over e's bits.
+: fpow ( x e -- r )
+	1 lit -rot                                   ( r x e )
+	begin dup while
+		dup 1 lit and if rot 2 lit pick fmul -rot then
+		swap dup fmul swap 1 lit rshift
+	repeat
+	2drop
+;
+
+\ finv ( x -- 1/x )   x^(p - 2); 0 maps to 0.
+: finv ( x -- y )   2013265919u lit fpow ;
+
+\ eadd / esub ( a b out -- )   coefficient-wise.
+: eadd ( a b out -- )
+	4 lit 0 lit do
+		2 lit pick i 2 lit lshift + @ 2 lit pick i 2 lit lshift + @ fadd over i 2 lit lshift + !
+	loop
+	2drop drop
+;
+: esub ( a b out -- )
+	4 lit 0 lit do
+		2 lit pick i 2 lit lshift + @ 2 lit pick i 2 lit lshift + @ fsub over i 2 lit lshift + !
+	loop
+	2drop drop
+;
+
+\ emulb ( a x out -- )   times a base-field element.
+: emulb ( a x out -- )
+	4 lit 0 lit do
+		2 lit pick i 2 lit lshift + @ 2 lit pick fmul over i 2 lit lshift + !
+	loop
+	2drop drop
+;
+
+\ emul ( a b out -- )   the schoolbook product into degree 6, then x^4 = 11
+\        folds terms 4..6 back down.
+: ewv variable ;   : ewide ( -- a )   ewv 1C lit lazy ;
+: emul ( a b out -- )
+	ewide 7 lit zero
+	4 lit 0 lit do 4 lit 0 lit do
+		2 lit pick j 2 lit lshift + @ 2 lit pick i 2 lit lshift + @ fmul
+		ewide i j + 2 lit lshift + dup @ rot fadd swap !
+	loop loop
+	ewide 10 lit + @ B lit fmul ewide @ fadd over !
+	ewide 14 lit + @ B lit fmul ewide 4 lit + @ fadd over 4 lit + !
+	ewide 18 lit + @ B lit fmul ewide 8 lit + @ fadd over 8 lit + !
+	ewide C lit + @ over C lit + !
+	2drop drop
+;
+
+\ einv ( a out -- )   a^(p^4 - 2), the inverse (0 maps to 0); the exponent's
+\        bits, most significant first.
+: eav variable ;   : eacc ( -- a )   eav 10 lit lazy ;
+: eexpw ( k -- w )   \ word k of p^4 - 2, most significant first
+	dup 0= if drop C5C1000 lit else
+	dup 1 lit = if drop 69780001 lit else
+	2 lit = if 51800001 lit else DFFFFFFF lit then then then
+;
+: einv ( a out -- )
+	eacc 4 lit zero  1 lit eacc !
+	4 lit 0 lit do
+		i eexpw
+		20 lit 0 lit do
+			eacc eacc eacc emul
+			dup 1F lit i - rshift 1 lit and if eacc 3 lit pick eacc emul then
+		loop
+		drop
+	loop
+	eacc swap 4 lit cpy drop
+;
+
+\ epow ( a e out -- )   a^e for a 32-bit e (out may be a).
+: epbv variable ;   : epb ( -- a )   epbv 10 lit lazy ;   \ the running power
+: epow ( a e out -- )
+	rot epb 4 lit cpy                                   ( e out )
+	dup 4 lit zero  1 lit over !                        \ out = 1
+	swap
+	begin dup while                                     ( out e )
+		dup 1 lit and if over epb 3 lit pick emul then
+		epb epb epb emul
+		1 lit rshift
+	repeat
+	2drop
+;
+
+\ ── Tests (./tools/fam --test src/poseidon2.fam src/ext.fam) ──
+\ Vectors printed by the Rust node's ext module.
+
+\ et ( -- a b out )   a, b and an output, fresh each call.
+: et ( -- a b out )
+	30 lit alloc
+	123456789u lit over !  987654321u lit over 4 lit + !
+	555555555u lit over 8 lit + !  1000000007u lit over C lit + !
+	31337u lit over 10 lit + !  40000000 lit over 14 lit + !
+	7 lit over 18 lit + !  2013265920u lit over 1C lit + !
+	dup 10 lit + over 20 lit +
+;
+\ c4? ( a x0 x1 x2 x3 -- flag )   whether the 4 cells at a are x0..x3 (for
+\        tests; returns a flag because asrt_eq exists only in test builds).
+: c4? ( a x0 x1 x2 x3 -- flag )
+	4 lit pick C lit + @ =
+	swap 4 lit pick 8 lit + @ = and
+	swap 3 lit pick 4 lit + @ = and
+	swap 2 lit pick @ = and
+	nip
+;
+
+Test {
+	ext_mul {
+		et 2 lit pick 2 lit pick 2 lit pick emul nip nip
+		619148263u lit 142539038u lit 540439412u lit 970188393u lit c4? assert
+	}
+	ext_add_sub {
+		et 2 lit pick 2 lit pick 2 lit pick eadd nip nip
+		123488126u lit 48130224u lit 555555562u lit 1000000006u lit c4? assert
+		et 2 lit pick 2 lit pick 2 lit pick esub nip nip
+		123425452u lit 1927178418u lit 555555548u lit 1000000008u lit c4? assert
+	}
+	ext_mul_base {
+		et nip over 12345u lit 2 lit pick emulb nip
+		31758008u lit 254175169u lit 1149599549u lit 1666724764u lit c4? assert
+	}
+	ext_inverse {
+		et nip 2dup einv nip
+		397913375u lit 1394126716u lit 1080238130u lit 463907256u lit c4? assert
+		et nip 2dup einv 2dup dup emul nip               \ a * (1/a) = 1
+		1 lit 0 lit 0 lit 0 lit c4? assert
+		et nip dup 4 lit zero over 4 lit zero 2dup einv nip  \ 1/0 = 0
+		0 lit 0 lit 0 lit 0 lit c4? assert
+	}
+	x4_is_11 {
+		et nip nip dup 4 lit zero 1 lit over 4 lit + !     ( x )
+		dup dup dup emul  dup dup dup emul                 \ x^2, then x^4
+		11u lit 0 lit 0 lit 0 lit c4? assert
+	}
+	ext_pow {
+		et nip 2dup A lit swap epow                        \ out = a^10
+		et 2drop                                           ( a out c: another copy of a )
+		9 lit 0 lit do dup 3 lit pick over emul loop      \ c = a^10, by repeated multiplication
+		4 lit ceq assert drop
+	}
+	base_inverse {
+		123456789u lit finv 266041062u lit asrt_eq
+		2 lit finv 1006632961u lit asrt_eq
+		3 lit 7 lit fpow 2187u lit asrt_eq
+	}
+}
