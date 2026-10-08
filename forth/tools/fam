@@ -1,0 +1,124 @@
+#!/bin/sh
+# fam — compile a .fam program and (by default) run it.
+#
+# The stdlib (lib/stdlib.fam) plus a test-harness header is prepended
+# automatically and the source is EOT-terminated, then fed to the fam compiler
+# (bin/fam) running under q32. Paths are resolved relative to this script.
+#
+# Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam [MORE.fam ...]
+#   INPUT.fam    your program(s); multiple files are concatenated in order
+#                (lib/stdlib.fam is prepended for you)
+#   --test       build and run ONLY the Test { ... } block, then delete the binary
+#   --bench      build and run ONLY the Bench { ... } block (timing per named
+#                body), then delete the binary
+#   --disk=FILE  attach FILE as a virtio-blk disk when running (forwarded to q32);
+#                lets a Test/Bench block exercise the real disk path (find_blk/
+#                vblkinit/vreq/vpoll). Only meaningful with --test/--bench.
+#   -o OUTPUT    output binary (default: ./a.bin)
+#
+# cargo-style: `fam prog.fam` just COMPILES (-> ./a.bin, like `cargo build`);
+# `fam prog.fam --test` compiles, runs the tests, and deletes the binary (like
+# `cargo test`); `fam prog.fam --bench` does the same for the benches (like
+# `cargo bench`). Pass -o to choose the output path; with --test/--bench -o,
+# the binary is kept at OUTPUT and still run.
+
+# --- locate the repo (this script lives in <root>/tools/) ---
+SCRIPT=$(readlink -f "$0" 2>/dev/null || echo "$0")
+TOOLS=$(dirname "$SCRIPT")
+ROOT=$(dirname "$TOOLS")
+STDLIB="$ROOT/lib/stdlib.fam"
+FAMC="$ROOT/bin/fam"
+Q32="$TOOLS/q32"
+
+# --- parse args ---
+OUT=""
+OUT_GIVEN=0
+IN=""
+TEST=0
+BENCH=0
+QOPTS=""          # extra flags forwarded to q32 on the run (e.g. --disk=, --net)
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-o) OUT="$2"; OUT_GIVEN=1; shift 2 ;;
+		-o*) OUT="${1#-o}"; OUT_GIVEN=1; shift ;;
+		--test) TEST=1; shift ;;
+		--bench) BENCH=1; shift ;;
+		--disk=*) QOPTS="$QOPTS $1"; shift ;;
+		--net) QOPTS="$QOPTS $1"; shift ;;
+		--hostfwd=*) QOPTS="$QOPTS $1"; shift ;;
+		-h|--help) echo "Usage: fam [--test|--bench] [--disk=FILE] [-o OUTPUT] INPUT.fam"; exit 0 ;;
+		--) shift; IN="$1"; shift ;;
+		-*) echo "fam: unknown option: $1" >&2; exit 1 ;;
+		*) IN="$IN $1"; shift ;;
+	esac
+done
+
+if [ "$TEST" = 1 ] && [ "$BENCH" = 1 ]; then echo "fam: --test and --bench are mutually exclusive" >&2; exit 1; fi
+if [ -z "$IN" ]; then echo "Usage: fam [--test|--bench] [-o OUTPUT] INPUT.fam [MORE.fam ...]" >&2; exit 1; fi
+for f in $IN; do
+	if [ ! -f "$f" ]; then echo "fam: input not found: $f" >&2; exit 1; fi
+done
+if [ ! -f "$STDLIB" ]; then echo "fam: stdlib not found: $STDLIB" >&2; exit 1; fi
+if [ ! -f "$FAMC" ];   then echo "fam: compiler not found: $FAMC (run scripts/build.sh)" >&2; exit 1; fi
+
+# --test/--bench build and run; a plain build only compiles. The binary is
+# deleted only when --test/--bench made a throwaway (no -o); -o always keeps it.
+RUN=0
+DELETE=0
+if [ "$TEST" = 1 ] || [ "$BENCH" = 1 ]; then
+	RUN=1
+	if [ "$OUT_GIVEN" = 0 ]; then OUT="$ROOT/bin/a.bin"; DELETE=1; fi
+elif [ "$OUT_GIVEN" = 0 ]; then
+	OUT="./a.bin"
+fi
+
+# --- pick the test-harness header ---
+#   default : lib/build.fam  no-ops any trailing Test/Bench { ... } blocks
+#   --test  : lib/test.fam   runs ONLY the tests; the suite-closing `}` jumps to
+#             `_tdone` (print summary + halt) and `Test` skips the program's
+#             top-level main (cargo-test model).  Bench blocks are consumed.
+#   --bench : lib/bench.fam  runs ONLY the benches (one timing line per named
+#             body; `N lit bops` adds ns/op).  Test blocks are consumed.
+# The header is prepended AFTER the stdlib and BEFORE the user source. A trailing
+# `bye` is appended as a safety halt (unreached when a Test/Bench block runs, or
+# when the program supplies its own bye).
+if [ "$TEST" = 1 ]; then
+	HEADER="$ROOT/lib/test.fam"
+elif [ "$BENCH" = 1 ]; then
+	HEADER="$ROOT/lib/bench.fam"
+else
+	HEADER="$ROOT/lib/build.fam"
+fi
+if [ ! -f "$HEADER" ]; then echo "fam: header not found: $HEADER" >&2; exit 1; fi
+
+# --- compile: stdlib + header + program(s) + tail, EOT-terminated, through fam ---
+# $IN is an intentionally-unquoted, space-separated list (files concatenated in
+# the order given, so earlier files may define words later ones use). In --test/
+# --bench the tail closes the block chain (`_tend`) and prints the summary before
+# halting; the trailing `bye` is a safety halt.
+# The source stream goes through a FILE (q32 --in/--out, file-backed serial),
+# not a pipe: QEMU's win32 stdio chardev loses bytes on piped stdin.  The temp
+# file sits next to the output (relative path — MSYS path conversion of
+# absolute /tmp paths inside comma-separated qemu args is unreliable).
+if [ "$TEST" = 1 ] || [ "$BENCH" = 1 ]; then TAIL='_tend
+bye'; else TAIL='bye'; fi
+STREAM="$OUT.in.$$"
+( cat "$STDLIB" "$HEADER" $IN; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
+"$Q32" --in="$STREAM" --out="$OUT" "$FAMC"
+rm -f "$STREAM"
+
+# --- verify the output is a real fam binary (begins with the q32 magic) ---
+MAGIC=$(head -c 4 "$OUT" 2>/dev/null | xxd -p)
+if [ "$MAGIC" != "13000000" ]; then
+	echo "?"
+	[ "$DELETE" = 1 ] && rm -f "$OUT"
+	exit 1
+fi
+
+# --- --test: run it (with any forwarded q32 opts), then delete the throwaway ---
+if [ "$RUN" = 1 ]; then
+	"$Q32" $QOPTS "$OUT"
+	rc=$?
+	[ "$DELETE" = 1 ] && rm -f "$OUT"
+	exit $rc
+fi

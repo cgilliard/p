@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# serial_pump PORT IN OUT — pump for QEMU's TCP serial chardev, in pure bash.
+#
+# Connects to 127.0.0.1:PORT (retrying while QEMU starts up), streams file IN
+# into the socket (IN = "-" means no input), and writes everything received
+# to file OUT until QEMU closes the connection (guest exit).  Used where
+# file-backed serial isn't available: QEMU's win32 build rejects
+# `-chardev file,input-path=...`, and its win32 stdio chardev loses bytes on
+# piped stdin.  The socket chardev behaves identically on every platform, so
+# this path is also testable on Linux via FAM_SERIAL=socket.
+#
+# Deliberately bash, not sh: /dev/tcp redirections are a bash feature, and
+# bash's non-POSIX mode lets a failed `exec 3<>` return instead of killing
+# the shell, which is what makes the connect-retry loop possible.  No other
+# dependencies — the build chain stays shell + qemu only.
+
+port=$1; in=$2; out=$3
+
+i=0
+until exec 3<>"/dev/tcp/127.0.0.1/$port"; do
+	i=$((i + 1))
+	if [ "$i" -ge 100 ]; then
+		echo "serial_pump: cannot connect to qemu on port $port" >&2
+		exit 1
+	fi
+	sleep 0.1
+done 2>/dev/null
+
+# Read errors are treated as EOF: on Windows, qemu's exit closes the socket
+# with RST (WinError 10054), not FIN.  The pump keeps pace with the guest's
+# output (compiles are far slower than loopback reads), so the buffer is
+# drained by then; correctness is enforced downstream anyway — qemu's exit
+# code carries the guest verdict, and every consumer checks its output
+# (fam0 cmp, the 13000000 magic, gen_hash word count).
+[ "$in" != "-" ] && cat "$in" >&3 2>/dev/null &
+cat <&3 > "$out" 2>/dev/null || :

@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+# famfmt — whitespace-only formatter for .fam source.
+#
+# Usage: famfmt [-i | --check] FILE...        (or: famfmt < in.fam > out.fam)
+#   (default)  print the formatted file to stdout (one FILE, or stdin)
+#   -i         rewrite FILEs in place (only touched when a change is needed)
+#   --check    exit 1 if any FILE would change (CI mode); prints the names
+#
+# What it does (and ONLY this — token content is never altered):
+#   * indentation: TABS, one per nesting level.  Nesting words:
+#       open   :  :I  :M  if  begin  do  {
+#       mid    else  while            (dedent the line itself, keep depth)
+#       close  ;  then  repeat  until  loop  }
+#     The token after a definer is a NAME (so `:I \`, `:I (`, `: {` work).
+#   * intra-line spacing between tokens is PRESERVED verbatim — hand-aligned
+#     asm operand columns (see gen_hash.fam sp_box) are the author's business.
+#   * trailing `\` comments are aligned within a contiguous same-indent group
+#     (min 3 spaces after the code, like the `HEX ,   \ asm` house style).
+#   * full-line `\` comments take the indent of the next code line.
+#   * `( ... )` block comments: char-counted nesting exactly like the stdlib
+#     word; interior lines of a multi-line block comment pass through verbatim.
+#   * "..." strings and 'c' char literals (including `' '`) are atomic.
+#   * blank-line runs cap at 2; trailing whitespace stripped; final newline.
+#
+# Safety: after formatting, both versions are re-lexed and their token streams
+# (code tokens + comment texts) must be identical, or famfmt refuses to emit.
+# Warns (stderr) on: defined names > 8 chars (silent-truncation footgun),
+# unbalanced nesting, unterminated strings / block comments.
+
+import sys
+
+TAB = "\t"
+GAP = 3  # min spaces between code and a trailing \ comment
+
+DEFINER = {":", ":I", ":M"}
+OPEN = {"if", "begin", "do", "{"}
+MID = {"else", "while"}
+CLOSE = {";", "then", "repeat", "until", "loop", "}"}
+
+WS = " \t"
+
+
+class Line:
+    __slots__ = ("kind", "raw", "code", "comment", "tokens", "indent")
+
+    def __init__(self, kind, raw="", code="", comment=None, tokens=None):
+        self.kind = kind  # blank | code | comment | verbatim
+        self.raw = raw
+        self.code = code          # interior spacing preserved, no indent/comment
+        self.comment = comment    # trailing \ comment text (incl. the \) or None
+        self.tokens = tokens or []  # (kind, text, is_name)
+        self.indent = 0
+
+
+class Lexer:
+    """Line-by-line lexer; carries block-comment / expect-name state across lines."""
+
+    def __init__(self, path="<stdin>"):
+        self.path = path
+        self.depth_paren = 0   # >0: inside a ( ... ) block comment
+        self.expect_name = False
+        self.warnings = []
+
+    def warn(self, lineno, msg):
+        self.warnings.append("%s:%d: %s" % (self.path, lineno, msg))
+
+    def lex_line(self, raw, lineno):
+        if self.depth_paren > 0:
+            # interior of a multi-line block comment: verbatim
+            i = 0
+            while i < len(raw) and self.depth_paren > 0:
+                if raw[i] == "(":
+                    self.depth_paren += 1
+                elif raw[i] == ")":
+                    self.depth_paren -= 1
+                i += 1
+            if self.depth_paren > 0 or raw[i:].strip() == "":
+                return Line("verbatim", raw=raw.rstrip("\n"))
+            # comment closes mid-line with code after it: keep the whole
+            # line verbatim rather than guess a layout for the remainder.
+            self.warn(lineno, "code after multi-line `)` kept verbatim")
+            return Line("verbatim", raw=raw.rstrip("\n"))
+
+        raw = raw.rstrip("\n")
+        s = raw
+        n = len(s)
+        i = 0
+        tokens = []
+        comment = None
+        code_end = 0
+        while True:
+            while i < n and s[i] in WS:
+                i += 1
+            if i >= n:
+                break
+            start = i
+            c = s[i]
+            if self.expect_name:
+                while i < n and s[i] not in WS:
+                    i += 1
+                name = s[start:i]
+                tokens.append(("word", name, True))
+                self.expect_name = False
+                if len(name) > 8:
+                    self.warn(lineno, "defined name `%s` is %d chars (limit 8 — silent footgun)" % (name, len(name)))
+                code_end = i
+                continue
+            if c == "\\" and (i + 1 >= n or s[i + 1] in WS):
+                comment = s[i:].rstrip()
+                break
+            if c == "(" and (i + 1 >= n or s[i + 1] in WS):
+                depth = 1
+                i += 1
+                while i < n and depth > 0:
+                    if s[i] == "(":
+                        depth += 1
+                    elif s[i] == ")":
+                        depth -= 1
+                    i += 1
+                if depth > 0:
+                    self.depth_paren = depth
+                    tokens.append(("bcomment", s[start:], False))
+                    code_end = n
+                    break
+                tokens.append(("bcomment", s[start:i], False))
+                code_end = i
+                continue
+            if c == '"':
+                i += 1
+                while i < n:
+                    if s[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    if s[i] == '"':
+                        i += 1
+                        break
+                    i += 1
+                else:
+                    self.warn(lineno, "unterminated string literal")
+                tokens.append(("str", s[start:i], False))
+                code_end = i
+                continue
+            if c == "'":
+                # 'x' or '\x' or ' ' (char literal may hold a space)
+                if i + 2 < n and s[i + 1] == "\\" and i + 3 < n and s[i + 3] == "'" \
+                        and (i + 4 >= n or s[i + 4] in WS):
+                    tokens.append(("char", s[i:i + 4], False))
+                    i += 4
+                    code_end = i
+                    continue
+                if i + 2 < n and s[i + 2] == "'" and (i + 3 >= n or s[i + 3] in WS):
+                    tokens.append(("char", s[i:i + 3], False))
+                    i += 3
+                    code_end = i
+                    continue
+            while i < n and s[i] not in WS:
+                i += 1
+            word = s[start:i]
+            tokens.append(("word", word, False))
+            if word in DEFINER:
+                self.expect_name = True
+            code_end = i
+
+        if not tokens and comment is None:
+            return Line("blank")
+        if not tokens:
+            return Line("comment", raw=raw, comment=comment)
+        code = s[:code_end]
+        code = code[len(code) - len(code.lstrip()):]  # strip leading ws only
+        return Line("code", raw=raw, code=code, comment=comment, tokens=tokens)
+
+
+def token_stream(text, path):
+    """Flat (kind, text) stream for the equivalence check (comments included)."""
+    lx = Lexer(path)
+    out = []
+    for ln, raw in enumerate(text.split("\n"), 1):
+        line = lx.lex_line(raw, ln)
+        if line.kind == "verbatim":
+            out.append(("bcomment-line", line.raw.strip()))
+        elif line.kind == "comment":
+            out.append(("comment", line.comment.rstrip()))
+        elif line.kind == "code":
+            for k, t, _ in line.tokens:
+                out.append((k, t))
+            if line.comment is not None:
+                out.append(("comment", line.comment.rstrip()))
+    return out
+
+
+def format_text(text, path="<stdin>"):
+    lx = Lexer(path)
+    lines = [lx.lex_line(raw, ln) for ln, raw in enumerate(text.split("\n"), 1)]
+    if lx.depth_paren > 0:
+        lx.warn(len(lines), "unterminated ( block comment at EOF")
+
+    # -- pass 1: indentation depth over code lines --
+    depth = 0
+    for ln, line in enumerate(lines, 1):
+        if line.kind != "code":
+            continue
+        words = [t for k, t, isname in line.tokens if k == "word" and not isname]
+        display = depth
+        j = 0
+        while j < len(words) and words[j] in CLOSE:
+            display -= 1
+            j += 1
+        if j == 0 and words and words[0] in MID:
+            display -= 1
+        line.indent = max(0, display)
+        for w in words:
+            if w in DEFINER or w in OPEN:
+                depth += 1
+            elif w in CLOSE:
+                if depth == 0:
+                    lx.warn(ln, "unbalanced `%s`" % w)
+                depth = max(0, depth - 1)
+    if depth != 0:
+        lx.warn(len(lines), "unbalanced nesting at EOF (depth %d)" % depth)
+
+    # -- pass 2: full-line comments take the indent of the next code line --
+    nxt = 0
+    for line in reversed(lines):
+        if line.kind == "code":
+            nxt = line.indent
+        elif line.kind == "comment":
+            line.indent = nxt
+
+    # -- pass 3: align trailing comments within contiguous same-indent groups --
+    group = []
+
+    def flush(group):
+        commented = [l for l in group if l.comment is not None]
+        if not commented:
+            return
+        col = max(len(l.code) for l in commented) + GAP
+        for l in commented:
+            l.code = l.code + " " * (col - len(l.code))
+    prev = None
+    for line in lines:
+        if line.kind == "code" and (prev is None or line.indent == prev):
+            group.append(line)
+            prev = line.indent
+        else:
+            flush(group)
+            group = [line] if line.kind == "code" else []
+            prev = line.indent if line.kind == "code" else None
+    flush(group)
+
+    # -- emit --
+    out = []
+    blanks = 0
+    for line in lines:
+        if line.kind == "blank":
+            blanks += 1
+            continue
+        if out:  # no leading blanks; cap runs at 2
+            out.extend([""] * min(blanks, 2))
+        blanks = 0
+        if line.kind == "verbatim":
+            out.append(line.raw.rstrip())
+        elif line.kind == "comment":
+            out.append(TAB * line.indent + line.comment.rstrip())
+        else:
+            body = line.code + (line.comment if line.comment is not None else "")
+            out.append(TAB * line.indent + body.rstrip())
+    formatted = "\n".join(out) + "\n"
+
+    # -- safety: the token stream must be unchanged --
+    if token_stream(text, path) != token_stream(formatted, path):
+        raise RuntimeError("%s: internal error — token stream changed; refusing to format" % path)
+    return formatted, lx.warnings
+
+
+def main(argv):
+    inplace = check = False
+    files = []
+    for a in argv[1:]:
+        if a == "-i":
+            inplace = True
+        elif a == "--check":
+            check = True
+        elif a in ("-h", "--help"):
+            print(__doc__ or open(__file__).read().split("\n\n")[0])
+            return 0
+        elif a == "-":
+            files.append(a)
+        elif a.startswith("-"):
+            sys.stderr.write("famfmt: unknown option: %s\n" % a)
+            return 2
+        else:
+            files.append(a)
+    if inplace and check:
+        sys.stderr.write("famfmt: -i and --check are mutually exclusive\n")
+        return 2
+    if not files:
+        files = ["-"]
+    if len(files) > 1 and not (inplace or check):
+        sys.stderr.write("famfmt: multiple files need -i or --check\n")
+        return 2
+
+    rc = 0
+    for path in files:
+        if path == "-":
+            text = sys.stdin.read()
+        else:
+            with open(path) as f:
+                text = f.read()
+        try:
+            formatted, warnings = format_text(text, path if path != "-" else "<stdin>")
+        except RuntimeError as e:
+            sys.stderr.write("famfmt: %s\n" % e)
+            return 3
+        for w in warnings:
+            sys.stderr.write("famfmt: warning: %s\n" % w)
+        changed = formatted != text
+        if check:
+            if changed:
+                print(path)
+                rc = 1
+        elif inplace:
+            if changed and path != "-":
+                with open(path, "w") as f:
+                    f.write(formatted)
+        else:
+            sys.stdout.write(formatted)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
