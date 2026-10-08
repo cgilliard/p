@@ -27,7 +27,7 @@ use crate::poseidon2::{BabyBear, digest_to_bytes, hash_octets, perm24};
 type Octet = [BabyBear; 8];
 
 /// The text: AKJV, gzip -9 -n (`data/AKJV.md`).
-pub const TEXT: &[u8] = include_bytes!("../data/akjv.txt.gz");
+pub const TEXT: &[u8] = include_bytes!("../../data/akjv.txt.gz");
 /// Bytes per block.
 pub const BLOCK_LEN: usize = 32;
 /// How many blocks the text makes.

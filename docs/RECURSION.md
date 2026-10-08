@@ -423,12 +423,76 @@ nothing here.
      each wrap does ~30 extension multiplications and two 16-bit range
      checks per slot more.
    - **It depends on #2:** the published root proof isn't
-     zero-knowledge, so the argument that it leaks nothing about its
-     children (their data and products, which would reveal the
-     grouping) is #2's argument.
-2. **Make the tree's outer layers zero-knowledge.** `TREE` uses `hiding:
-   false` (half the LDE, smaller and faster). Its witnesses are the chunk
-   proofs, which *are* hiding, so the leak is probably harmless -- but
-   that's an argument still to be made. Either make it (what a
-   non-hiding wrap of a zero-knowledge proof can reveal) or switch the
-   tree to hiding, at roughly twice the outer layers' LDE cost.
+     zero-knowledge, so hiding the grouping from it is best-effort, not
+     proven (see #2).
+2. **Tree proofs stay non-hiding (decided 2026-10-08).** `TREE` uses
+   `hiding: false` (half the LDE, about half the proving time). The
+   decision, and exactly what it gives up:
+   - **What's published:** only the root proof (and the chain-step
+     proof, whose witness -- the parent's chain proof, the block's root
+     proof, headers, roots -- is public anyway). Inner wraps and
+     aggregations are never published, so only the root's leakage
+     matters.
+   - **What a non-hiding proof reveals:** linear combinations of its own
+     trace. Each column is opened at under `4 · num_queries + 2` points
+     (106 on main) off the trace domain, and FRI reveals about two values
+     per query per fold round, each a random combination of every
+     column. With `hiding`, random rows and a FRI mask make all of that
+     uniform; without it, nothing does by construction.
+   - **What's in the root's trace:** (a) its child proofs -- ultimately
+     zero-knowledge chunk proofs, so revealing about them is harmless --
+     and (b) its children's *statements*: each child's `product`,
+     `counts` and `amounts`. (b) is what matters: with the public body
+     and challenge, a child's `product` would let anyone test candidate
+     groupings until one matches, and its `amounts` are that subtree's
+     fees.
+   - **Why it's probably harmless:** an opened value weights a column's
+     rows by Lagrange coefficients at a point off the domain -- a Cauchy
+     matrix, every square submatrix nonsingular -- so a column with at
+     least as many unknown uniform entries as revealed values reveals
+     nothing. The value columns are mostly Poseidon2 states over the
+     child proofs' Merkle data, derived from the chunk proofs'
+     randomness: hundreds of thousands of unknown entries per column
+     against ~106 openings.
+   - **Why that isn't a proof:** hash round states are pseudorandom, not
+     independent uniform values; the write-multiplicity columns are
+     mostly fixed by the circuit, the rest small integers that depend on
+     which values were looked up (including range checks on counts and
+     amounts); and FRI's ~1,000 revealed combinations have no mask. A
+     full argument would need a per-column audit. So: **the root
+     probably reveals nothing about the grouping or per-chunk fees, but
+     that's not proven.** It never reveals transactions -- those are
+     only in the chunk proofs, which are zero-knowledge.
+   - **The alternative, if ever wanted:** make only the root hiding
+     (the same circuits, hiding parameters, new root keys). The inner
+     layers can stay non-hiding, since a zero-knowledge root reveals
+     nothing of its witness. Cost: about double the root's proving --
+     a main wrap ~140 s → ~280 s, a one-chunk block ~7.5 → ~9.8 minutes
+     of CPU proving, too close to the 10-minute budget. A consensus
+     change (new keys), but no new circuits.
+
+## Privacy model (decided 2026-10-08)
+
+The goal is reasonable privacy, not Monero's. What each party sees:
+
+- **The public (the chain):** commitments only -- no amounts, keys,
+  addresses, signatures or contract terms; a contract spend looks like
+  any payment. Each block is one sorted list of inputs and one of
+  outputs, so transactions within a block aren't separated (grouping
+  hidden on a best-effort basis, #2 above). What is visible: that an
+  earlier output was spent in this block, and the block's total reward
+  and fees. Early on, with few transactions per block, the mixing is
+  small.
+- **The miner:** sees each transaction in full -- it needs the witness
+  to prove it. A user who submits to one miner or pool privately,
+  instead of the public mempool, is known only to that miner. Public
+  relay shows the transaction to every node; that's the user's choice
+  (miner software, not consensus).
+- **The counterparty:** whoever paid you knows your output's commitment,
+  so can see when it's spent. One-time keys keep amounts unguessable to
+  others; a lock that's ever made public (a key tree id, a known policy)
+  lets anyone test `H(lock, amount)` against the chain for likely
+  amounts -- use a fresh lock per payment (`salt`, `docs/CONTRACTS.md`).
+- **Stronger privacy is layer 2:** payments inside eltoo channels
+  (`docs/CONTRACTS.md`) never reach the chain; only opens and closes do,
+  and those look like ordinary payments.
