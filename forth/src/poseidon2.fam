@@ -1,0 +1,496 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/poseidon2.fam — the Poseidon2 permutation over BabyBear, width 24, and the
+\ `hash_elements` sponge: the hash the protocol is built on (see
+\ ../rust/src/poseidon2.rs, which this must match exactly).
+\
+\ Field: BabyBear, p = 2^31 - 2^27 + 1 = 0x78000001.  Elements are kept
+\ canonical, in [0, p), one per cell.  RV32I has no multiply, so `fmul` is a
+\ shift-and-add loop that doubles and adds modulo p a bit at a time (both
+\ operands below 2^31, so no intermediate exceeds 2^32).
+\
+\ Permutation (Plonky3's `default_babybear_poseidon2_24`): x^7 S-box; an
+\ initial external linear layer, 4 full rounds, 21 partial rounds, 4 full
+\ rounds.  The external layer applies the 4x4 MDS matrix [2 3 1 1; 1 2 3 1;
+\ 1 1 2 3; 3 1 1 2] to each group of four, then adds to every element the sum
+\ of its position-mod-4 class.  The internal layer is out[i] = d[i]*s[i] + sum.
+\
+\ Constants are written in decimal exactly as in the Rust source.  `,` emits a
+\ word most-significant byte first, so tables are read back with `be@`.
+\
+\ Only width 24 is here: width 16 is used only to make signatures, which a
+\ validating node never does.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ ── Field arithmetic ──
+
+\ fadd ( a b -- a+b mod p )
+:M fadd
+83220100 ,   \ lw   t0,0(sp)
+03234100 ,   \ lw   t1,4(sp)
+13014100 ,   \ addi sp,sp,4
+B3826200 ,   \ add  t0,t0,t1            ( < 2p < 2^32 )
+37030078 ,   \ lui  t1,0x78000
+13031300 ,   \ addi t1,t1,1             ( t1 = p )
+63E46200 ,   \ bltu t0,t1,+8
+B3826240 ,   \ sub  t0,t0,t1
+23205100 ,   \ sw   t0,0(sp)
+;
+
+\ fsub ( a b -- a-b mod p )
+:M fsub
+83220100 ,   \ lw   t0,0(sp)            ( b )
+03234100 ,   \ lw   t1,4(sp)            ( a )
+13014100 ,   \ addi sp,sp,4
+B3035340 ,   \ sub  t2,t1,t0
+63785300 ,   \ bgeu t1,t0,+16           ( a >= b: no wrap )
+B7020078 ,   \ lui  t0,0x78000
+93821200 ,   \ addi t0,t0,1             ( t0 = p )
+B3835300 ,   \ add  t2,t2,t0
+23207100 ,   \ sw   t2,0(sp)
+;
+
+\ fmul ( a b -- a*b mod p )   r = 0; for each of b's 31 bits, high first:
+\        r = 2r mod p, then r = r + a mod p if the bit is set.
+:M fmul
+83220100 ,   \ lw   t0,0(sp)            ( b )
+03234100 ,   \ lw   t1,4(sp)            ( a )
+13014100 ,   \ addi sp,sp,4
+B7030078 ,   \ lui  t2,0x78000
+93831300 ,   \ addi t2,t2,1             ( t2 = p )
+130E0000 ,   \ li   t3,0                ( r )
+930EF001 ,   \ li   t4,31               ( bits left )
+93921200 ,   \ slli t0,t0,1             ( b's bit 30 to the sign bit )
+131E1E00 ,   \ loop: slli t3,t3,1       ( r = 2r < 2^32 )
+63647E00 ,   \ bltu t3,t2,+8
+330E7E40 ,   \ sub  t3,t3,t2
+63D80200 ,   \ bge  t0,zero,+16         ( bit clear: skip the add )
+330E6E00 ,   \ add  t3,t3,t1            ( r + a < 2^32 )
+63647E00 ,   \ bltu t3,t2,+8
+330E7E40 ,   \ sub  t3,t3,t2
+93921200 ,   \ slli t0,t0,1             ( next bit )
+938EFEFF ,   \ addi t4,t4,-1
+E39E0EFC ,   \ bnez t4,loop
+2320C101 ,   \ sw   t3,0(sp)
+;
+
+\ be@ ( addr -- u )   load a word stored most-significant byte first (by `,`).
+:M be@
+83220100 ,   \ lw   t0,0(sp)
+03C30200 ,   \ lbu  t1,0(t0)
+13138301 ,   \ slli t1,t1,24
+83C31200 ,   \ lbu  t2,1(t0)
+93930301 ,   \ slli t2,t2,16
+33637300 ,   \ or   t1,t1,t2
+83C32200 ,   \ lbu  t2,2(t0)
+93938300 ,   \ slli t2,t2,8
+33637300 ,   \ or   t1,t1,t2
+83C33200 ,   \ lbu  t2,3(t0)
+33637300 ,   \ or   t1,t1,t2
+23206100 ,   \ sw   t1,0(sp)
+;
+
+\ ── Constants ──
+\ Each table word pushes the address of its constants, which follow its
+\ prologue in the code (`,`-emitted, so read with `be@`).
+
+\ The initial full rounds' constants (4 rounds x 24, Plonky3's
+\ EXTERNAL_RC_INITIAL_24).
+: p2rci  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004018 ,   \ jal   x0,+388          ( skip the 96 constants )
+\ round 0
+262278199u ,   127253399u ,   314968988u ,   246143118u ,   157582794u ,   118043943u ,
+454905424u ,   815798990u ,   1004040026u ,   1773108264u ,   1066694495u ,   1930780904u ,
+1180307149u ,   1464793095u ,   1660766320u ,   1389166148u ,   343354132u ,   1307439985u ,
+638242172u ,   525458520u ,   1964135730u ,   1751797115u ,   1421525369u ,   831813382u ,
+\ round 1
+695835963u ,   1845603984u ,   540703332u ,   1333667262u ,   1917861751u ,   1170029417u ,
+1989924532u ,   1518763784u ,   1339793538u ,   622609176u ,   686842369u ,   1737016378u ,
+1282239129u ,   897025192u ,   716894289u ,   1997503974u ,   395622276u ,   1201063290u ,
+1917549072u ,   1150912935u ,   1687379185u ,   1507936940u ,   241306552u ,   989176635u ,
+\ round 2
+1147522062u ,   27129487u ,   1257820264u ,   142102402u ,   217046702u ,   1664590951u ,
+855276054u ,   1215259350u ,   946500736u ,   552696906u ,   1424297384u ,   538103555u ,
+1608853840u ,   162510541u ,   623051854u ,   1549062383u ,   1908416316u ,   1622328571u ,
+1079030649u ,   1584033957u ,   1099252725u ,   1910423126u ,   447555988u ,   862495875u ,
+\ round 3
+128479034u ,   1587822577u ,   608401422u ,   1290028279u ,   342857858u ,   825405577u ,
+427731030u ,   1718628547u ,   588764636u ,   204228775u ,   1454563174u ,   1740472809u ,
+1338899225u ,   1269493554u ,   53007114u ,   1647670797u ,   306391314u ,   172614232u ,
+51256176u ,   1221257987u ,   1239734761u ,   273790406u ,   1781980094u ,   1291790245u ,
+;
+
+\ The final full rounds' constants (4 rounds x 24, EXTERNAL_RC_FINAL_24).
+: p2rcf  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004018 ,   \ jal   x0,+388          ( skip the 96 constants )
+\ round 0
+53041581u ,   723038058u ,   1439947916u ,   1136469704u ,   205609311u ,   1883820770u ,
+14387587u ,   720724951u ,   1854174607u ,   1629316321u ,   530151394u ,   1679178250u ,
+1549779579u ,   48375137u ,   976057819u ,   463976218u ,   875839332u ,   1946596189u ,
+434078361u ,   1878280202u ,   1363837384u ,   1470845646u ,   1792450386u ,   1040977421u ,
+\ round 1
+1209164052u ,   714957516u ,   390340387u ,   1213686459u ,   790726260u ,   117294666u ,
+140621810u ,   993455846u ,   1889603648u ,   78845751u ,   925018226u ,   708123747u ,
+1647665372u ,   1649953458u ,   942439428u ,   1006235079u ,   238616145u ,   930036496u ,
+1401020792u ,   989618631u ,   1545325389u ,   1715719711u ,   755691969u ,   150307788u ,
+\ round 2
+1567618575u ,   1663353317u ,   1950429111u ,   1891637550u ,   192082241u ,   1080533265u ,
+1463323727u ,   890243564u ,   158646617u ,   1402624179u ,   59510015u ,   1198261138u ,
+1065075039u ,   1150410028u ,   1293938517u ,   76770019u ,   1478577620u ,   1748789933u ,
+457372011u ,   1841795381u ,   760115692u ,   1042892522u ,   1507649755u ,   1827572010u ,
+\ round 3
+1206940496u ,   1896271507u ,   1003792297u ,   738091882u ,   1124078057u ,   1889898u ,
+813674331u ,   228520958u ,   1832911930u ,   781141772u ,   459826664u ,   202271745u ,
+1296144415u ,   1111203133u ,   1090783436u ,   641665156u ,   1393671120u ,   1303271640u ,
+809508074u ,   162506101u ,   1262312258u ,   1672219447u ,   1608891156u ,   1380248020u ,
+;
+
+\ The partial rounds' constants (21, INTERNAL_RC_24), one per round.
+: p2rcp  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F008005 ,   \ jal   x0,+88          ( skip the 21 constants )
+497520322u ,   1930103076u ,   1052077299u ,   1540960371u ,   924863639u ,   1365519753u ,
+1726563304u ,   440300254u ,   1891545577u ,   822033215u ,   1111544260u ,   308575117u ,
+1708681573u ,   1240419708u ,   1199068823u ,   1186174623u ,   1551596046u ,   1886977120u ,
+1327682690u ,   1210751726u ,   1810596765u ,
+;
+
+\ The internal layer's diagonal (`diagonal_24` in the Rust node).
+: p2diag  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004006 ,   \ jal   x0,+100          ( skip the 24 constants )
+2013265919u ,   \ -2
+1u ,   \ 1
+2u ,   \ 2
+1006632961u ,   \ 1/2
+3u ,   \ 3
+4u ,   \ 4
+1006632960u ,   \ -1/2
+2013265918u ,   \ -3
+2013265917u ,   \ -4
+2005401601u ,   \ 1/2^8
+1509949441u ,   \ 1/2^2
+1761607681u ,   \ 1/2^3
+1887436801u ,   \ 1/2^4
+1997537281u ,   \ 1/2^7
+2009333761u ,   \ 1/2^9
+2013265906u ,   \ 1/2^27
+7864320u ,   \ -1/2^8
+503316480u ,   \ -1/2^2
+251658240u ,   \ -1/2^3
+125829120u ,   \ -1/2^4
+62914560u ,   \ -1/2^5
+31457280u ,   \ -1/2^6
+15728640u ,   \ -1/2^7
+15u ,   \ -1/2^27
+;
+
+\ ── The permutation ──
+
+\ p2sbox ( x -- x^7 )
+: p2sbox  dup dup fmul dup dup fmul fmul fmul ;
+
+\ p2mat4 ( a -- )   the 4x4 MDS matrix on the four cells at a (the Rust
+\        `apply_mat4`'s addition chain).
+: p2ma variable ;
+: p2x0 variable ;   : p2x1 variable ;   : p2x2 variable ;   : p2x3 variable ;
+: p2t01 variable ;  : p2t23 variable ;  : p2t0123 variable ;
+: p2t01123 variable ;  : p2t01233 variable ;
+: p2mat4 ( a -- )
+	p2ma !
+	p2ma @ @ p2x0 !   p2ma @ 4 lit + @ p2x1 !
+	p2ma @ 8 lit + @ p2x2 !   p2ma @ C lit + @ p2x3 !
+	p2x0 @ p2x1 @ fadd p2t01 !
+	p2x2 @ p2x3 @ fadd p2t23 !
+	p2t01 @ p2t23 @ fadd p2t0123 !
+	p2t0123 @ p2x1 @ fadd p2t01123 !
+	p2t0123 @ p2x3 @ fadd p2t01233 !
+	p2t01123 @ p2t01 @ fadd              p2ma @ !           \ x0 = t01123 + t01
+	p2t01123 @ p2x2 @ dup fadd fadd      p2ma @ 4 lit + !   \ x1 = t01123 + 2x2
+	p2t01233 @ p2t23 @ fadd              p2ma @ 8 lit + !   \ x2 = t01233 + t23
+	p2t01233 @ p2x0 @ dup fadd fadd      p2ma @ C lit + !   \ x3 = t01233 + 2x0
+;
+
+\ p2ext ( st -- )   the external linear layer on the 24 cells at st.
+: p2ext ( st -- )
+	6 lit 0 lit do dup i 4 lit lshift + p2mat4 loop
+	4 lit 0 lit do                                    \ each position mod 4
+		0 lit
+		6 lit 0 lit do over i 4 lit lshift + j 2 lit lshift + @ fadd loop
+		6 lit 0 lit do
+			over i 4 lit lshift + j 2 lit lshift +     ( st sum a )
+			dup @ 2 lit pick fadd swap !
+		loop
+		drop
+	loop
+	drop
+;
+
+\ p2full ( st rc -- st )   a full round: every cell gets its constant and the
+\        S-box, then the external layer.  rc: the round's 24 constants.
+: p2full ( st rc -- st )
+	18 lit 0 lit do
+		over i 2 lit lshift +                     ( st rc a )
+		dup @ 2 lit pick i 2 lit lshift + be@ fadd p2sbox swap !
+	loop
+	drop dup p2ext
+;
+
+\ p2part ( st c -- st )   a partial round: cell 0 gets c and the S-box,
+\        then the internal layer, out[i] = d[i]*s[i] + sum(s).
+: p2part ( st c -- st )
+	over @ fadd p2sbox over !
+	0 lit 18 lit 0 lit do over i 2 lit lshift + @ fadd loop     ( st sum )
+	18 lit 0 lit do
+		over i 2 lit lshift +                     ( st sum a )
+		dup @ i 2 lit lshift p2diag + be@ fmul 2 lit pick fadd swap !
+	loop
+	drop
+;
+
+\ p2perm ( st -- )   permute the 24 cells at st in place.
+: p2perm ( st -- )
+	dup p2ext
+	4 lit 0 lit do p2rci i 60 lit * + p2full loop
+	15 lit 0 lit do p2rcp i 2 lit lshift + be@ p2part loop
+	4 lit 0 lit do p2rcf i 60 lit * + p2full loop
+	drop
+;
+
+\ ── The sponge ──
+
+\ p2hash ( st elems n domain -- )   the Rust node's `hash_elements(domain,
+\        elems[..n])`: rate 16, capacity 8.  The state starts as zeros with
+\        domain and n in cells 16 and 17; each block of up to 16 elements is
+\        added into the rate, then the state permuted (an empty input is
+\        permuted once).  The digest is the state's first 8 cells.  st: a
+\        24-cell scratch state.  Elements, n and domain must be below p.
+: p2hs variable ;   : p2he variable ;   : p2hn variable ;
+: p2hash ( st elems n domain -- )
+	swap p2hn !  swap p2he !  swap dup p2hs !   ( domain st )
+	18 lit 0 lit do 0 lit over i 2 lit lshift + ! loop
+	40 lit + !                                     \ cell 16 = domain
+	p2hn @ p2hs @ 44 lit + !                     \ cell 17 = n
+	p2hn @ 0= if p2hs @ p2perm then
+	0 lit begin dup p2hn @ u< while               ( k: the block's first element )
+		p2hn @ over - dup 10 lit u> if drop 10 lit then
+		0 lit do
+			p2he @ over i + 2 lit lshift + @      ( k x )
+			p2hs @ i 2 lit lshift + dup @ rot fadd swap !
+		loop
+		p2hs @ p2perm
+		10 lit +
+	repeat
+	drop
+;
+
+\ ── Tests (./tools/fam --test src/poseidon2.fam) ──
+\ Vectors: Plonky3's known answer for width 24, and values printed by the Rust
+\ node's own poseidon2 module.
+
+\ p2t! ( st i v -- st )   set cell i.
+: p2t! ( st i v -- st )  -rot 2 lit lshift over + rot swap ! ;
+
+\ p2telems ( -- addr )   40 test elements, (i+1) * 100000007 mod p.
+: p2telems ( -- addr )
+	A0 lit alloc
+	28 lit 0 lit do i 1 lit + 100000007u lit fmul over i 2 lit lshift + ! loop
+;
+
+Test {
+	field_ops {
+		2013265920u lit 2013265920u lit fmul 1 lit asrt_eq    \ (p-1)^2 = 1
+		2013265920u lit 1 lit fadd 0 lit asrt_eq             \ wraps to 0
+		0 lit 1 lit fsub 2013265920u lit asrt_eq             \ wraps to p-1
+		123456789u lit 0 lit fmul 0 lit asrt_eq
+		1006632961u lit 2 lit fmul 1 lit asrt_eq             \ 1/2 * 2
+		3 lit p2sbox 2187u lit asrt_eq                         \ 3^7
+	}
+	plonky3_kat {
+		60 lit alloc
+		0 lit 886409618u lit p2t!
+		1 lit 1327899896u lit p2t!
+		2 lit 1902407911u lit p2t!
+		3 lit 591953491u lit p2t!
+		4 lit 648428576u lit p2t!
+		5 lit 1844789031u lit p2t!
+		6 lit 1198336108u lit p2t!
+		7 lit 355597330u lit p2t!
+		8 lit 1799586834u lit p2t!
+		9 lit 59617783u lit p2t!
+		A lit 790334801u lit p2t!
+		B lit 1968791836u lit p2t!
+		C lit 559272107u lit p2t!
+		D lit 31054313u lit p2t!
+		E lit 1042221543u lit p2t!
+		F lit 474748436u lit p2t!
+		10 lit 135686258u lit p2t!
+		11 lit 263665994u lit p2t!
+		12 lit 1962340735u lit p2t!
+		13 lit 1741539604u lit p2t!
+		14 lit 2026927696u lit p2t!
+		15 lit 449439011u lit p2t!
+		16 lit 1131357108u lit p2t!
+		17 lit 50869465u lit p2t!
+		dup p2perm
+		dup 0 lit + @ 882297297u lit asrt_eq
+		dup 4 lit + @ 1264077610u lit asrt_eq
+		dup 8 lit + @ 512812497u lit asrt_eq
+		dup C lit + @ 782602970u lit asrt_eq
+		dup 10 lit + @ 867738552u lit asrt_eq
+		dup 14 lit + @ 1251075457u lit asrt_eq
+		dup 18 lit + @ 309180082u lit asrt_eq
+		dup 1C lit + @ 340784773u lit asrt_eq
+		dup 20 lit + @ 524041877u lit asrt_eq
+		dup 24 lit + @ 351272188u lit asrt_eq
+		dup 28 lit + @ 404451680u lit asrt_eq
+		dup 2C lit + @ 15001466u lit asrt_eq
+		dup 30 lit + @ 322926653u lit asrt_eq
+		dup 34 lit + @ 1773004150u lit asrt_eq
+		dup 38 lit + @ 1718440818u lit asrt_eq
+		dup 3C lit + @ 674682955u lit asrt_eq
+		dup 40 lit + @ 1154713225u lit asrt_eq
+		dup 44 lit + @ 1719133502u lit asrt_eq
+		dup 48 lit + @ 324232301u lit asrt_eq
+		dup 4C lit + @ 1005243141u lit asrt_eq
+		dup 50 lit + @ 443371079u lit asrt_eq
+		dup 54 lit + @ 268735940u lit asrt_eq
+		dup 58 lit + @ 770060019u lit asrt_eq
+		dup 5C lit + @ 718377682u lit asrt_eq
+		drop
+	}
+	zero_state {
+		60 lit alloc
+		18 lit 0 lit do 0 lit over i 2 lit lshift + ! loop
+		dup p2perm
+		dup 0 lit + @ 400117224u lit asrt_eq
+		dup 4 lit + @ 993058517u lit asrt_eq
+		dup 8 lit + @ 1143686568u lit asrt_eq
+		dup C lit + @ 167077231u lit asrt_eq
+		dup 10 lit + @ 512027304u lit asrt_eq
+		dup 14 lit + @ 1699297555u lit asrt_eq
+		dup 18 lit + @ 73036051u lit asrt_eq
+		dup 1C lit + @ 384892923u lit asrt_eq
+		dup 20 lit + @ 1638785080u lit asrt_eq
+		dup 24 lit + @ 1986004076u lit asrt_eq
+		dup 28 lit + @ 962251114u lit asrt_eq
+		dup 2C lit + @ 1342022841u lit asrt_eq
+		dup 30 lit + @ 237647043u lit asrt_eq
+		dup 34 lit + @ 599501300u lit asrt_eq
+		dup 38 lit + @ 1325347421u lit asrt_eq
+		dup 3C lit + @ 758164838u lit asrt_eq
+		dup 40 lit + @ 909746918u lit asrt_eq
+		dup 44 lit + @ 1857572136u lit asrt_eq
+		dup 48 lit + @ 456675026u lit asrt_eq
+		dup 4C lit + @ 284439419u lit asrt_eq
+		dup 50 lit + @ 1688929831u lit asrt_eq
+		dup 54 lit + @ 43577996u lit asrt_eq
+		dup 58 lit + @ 781522191u lit asrt_eq
+		dup 5C lit + @ 999813579u lit asrt_eq
+		drop
+	}
+	hash_0 {
+		60 lit alloc dup p2telems 0 lit 7 lit p2hash
+		dup 0 lit + @ 1627315598u lit asrt_eq
+		dup 4 lit + @ 1761354601u lit asrt_eq
+		dup 8 lit + @ 281708984u lit asrt_eq
+		dup C lit + @ 266992459u lit asrt_eq
+		dup 10 lit + @ 1392976764u lit asrt_eq
+		dup 14 lit + @ 1123429369u lit asrt_eq
+		dup 18 lit + @ 1708531367u lit asrt_eq
+		dup 1C lit + @ 249648635u lit asrt_eq
+		drop
+	}
+	hash_1 {
+		60 lit alloc dup p2telems 1 lit 7 lit p2hash
+		dup 0 lit + @ 73875047u lit asrt_eq
+		dup 4 lit + @ 1705834712u lit asrt_eq
+		dup 8 lit + @ 556375787u lit asrt_eq
+		dup C lit + @ 591334808u lit asrt_eq
+		dup 10 lit + @ 340248548u lit asrt_eq
+		dup 14 lit + @ 1888438887u lit asrt_eq
+		dup 18 lit + @ 216171817u lit asrt_eq
+		dup 1C lit + @ 138975161u lit asrt_eq
+		drop
+	}
+	hash_8 {
+		60 lit alloc dup p2telems 8 lit 7 lit p2hash
+		dup 0 lit + @ 820883206u lit asrt_eq
+		dup 4 lit + @ 1548378431u lit asrt_eq
+		dup 8 lit + @ 771515887u lit asrt_eq
+		dup C lit + @ 1181314180u lit asrt_eq
+		dup 10 lit + @ 1274240081u lit asrt_eq
+		dup 14 lit + @ 1666939782u lit asrt_eq
+		dup 18 lit + @ 757441229u lit asrt_eq
+		dup 1C lit + @ 450625112u lit asrt_eq
+		drop
+	}
+	hash_16 {
+		60 lit alloc dup p2telems 10 lit 7 lit p2hash
+		dup 0 lit + @ 1305424785u lit asrt_eq
+		dup 4 lit + @ 1456082717u lit asrt_eq
+		dup 8 lit + @ 763871473u lit asrt_eq
+		dup C lit + @ 1289910162u lit asrt_eq
+		dup 10 lit + @ 383619926u lit asrt_eq
+		dup 14 lit + @ 246005617u lit asrt_eq
+		dup 18 lit + @ 38350260u lit asrt_eq
+		dup 1C lit + @ 1162689003u lit asrt_eq
+		drop
+	}
+	hash_17 {
+		60 lit alloc dup p2telems 11 lit 7 lit p2hash
+		dup 0 lit + @ 154239477u lit asrt_eq
+		dup 4 lit + @ 83111955u lit asrt_eq
+		dup 8 lit + @ 807760661u lit asrt_eq
+		dup C lit + @ 596362439u lit asrt_eq
+		dup 10 lit + @ 746299015u lit asrt_eq
+		dup 14 lit + @ 1217815806u lit asrt_eq
+		dup 18 lit + @ 493671711u lit asrt_eq
+		dup 1C lit + @ 680773456u lit asrt_eq
+		drop
+	}
+	hash_40 {
+		60 lit alloc dup p2telems 28 lit 7 lit p2hash
+		dup 0 lit + @ 590670950u lit asrt_eq
+		dup 4 lit + @ 223719837u lit asrt_eq
+		dup 8 lit + @ 980625243u lit asrt_eq
+		dup C lit + @ 1400726637u lit asrt_eq
+		dup 10 lit + @ 459559956u lit asrt_eq
+		dup 14 lit + @ 121558506u lit asrt_eq
+		dup 18 lit + @ 1376977712u lit asrt_eq
+		dup 1C lit + @ 1950058675u lit asrt_eq
+		drop
+	}
+}
+
+\ ── Benches (./tools/fam --bench src/poseidon2.fam) ──
+Bench {
+	perm {
+		60 lit alloc
+		18 lit 0 lit do 0 lit over i 2 lit lshift + ! loop
+		bgo
+		64 lit 0 lit do dup p2perm loop
+		drop
+		64 lit bops
+	}
+	fmul {
+		bgo
+		1234567u lit
+		3E8 lit 0 lit do 2013265920u lit fmul loop
+		drop
+		3E8 lit bops
+	}
+}
