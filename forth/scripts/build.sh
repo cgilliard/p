@@ -117,3 +117,13 @@ cmp ./bin/fam0 ./fam0.seed
 run bin/fam.uncompressed bin/fam0 src/fam.fam0
 run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/asm.fam src/fampack.fam
 pack bin/fam.uncompressed bin/fam
+run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
+run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
+run bin/full_node.bin \
+        bin/fam \
+        lib/stdlib.fam \
+        lib/build.fam \
+        `cat scripts/files.txt`
+cat ../data/akjv.txt.gz >> bin/full_node.bin
+patch_config bin/tabernacle.uncompressed bin/full_node.bin
+pack bin/tabernacle.uncompressed bin/tabernacle
