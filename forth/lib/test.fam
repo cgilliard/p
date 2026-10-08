@@ -1,0 +1,401 @@
+\ ============================================================
+\ lib/test.fam — `--test` test-harness header.
+\ Prepended by `./tools/fam --test` AFTER the stdlib, BEFORE the user source(s).
+\ Runs ONLY the Test { name { code asrt_eq } ... } blocks (the program's
+\ top-level main is skipped — cargo-test model) and prints "<n> tests pass.
+\ Success!". MULTIPLE Test blocks (e.g. one per file) are supported: each block
+\ chains to the next, skipping the main code between them; the appended `_tend`
+\ closes the chain and prints the summary. On the first failing asrt_eq/assert,
+\ prints "Failed: <name>" and exits non-zero (first failure halts).
+\
+\ Stack-leak check: `sp` IS the data stack pointer, and `{`/`_tdone` snapshot it
+\ (via `sp@`) at the start of each test and compare on the way out. A test body
+\ that pushes without a matching pop (or vice versa) fails as "FAILED (stack
+\ leak)", same exit path as a failed asrt_eq/assert — a test must leave the
+\ stack exactly as it found it, even when its last line "consumes" the value
+\ under test.
+\
+\ Control-flow plumbing (compile time): `_skip` plants a forward `jal` before the
+\ user source; each `Test` `jpat!`s the pending jump to its suite start (so main
+\ is jumped over) and each `}` plants the next forward jump; `_tend` `jpat!`s the
+\ last one to itself and emits a `jal` to `_tdone`. `here`/`,j0`/`jpat!` only do
+\ compile-time work inside a `:I`/`:M` body, hence the `_skip` wrapper. Names are
+\ scanned straight from the source by `Test`/`}` (a bare `fib0` never reaches
+\ `???`). stdlib (incl. `???`) is untouched; the default build uses lib/build.fam.
+\ ============================================================
+
+\ tname ( -- addr ) ptr to current test's name string.  tcount ( -- addr ) counter.
+\ (allocated first -> fixed slots; _tdone reads tcount, name lookup finds _tdone.)
+: tname  variable ;
+: tcount variable ;
+: tstart variable ;   \ mtime (ticks) captured at the first test
+: _sp0   variable ;   \ data-stack pointer snapshot at the current test's start
+
+\ _now ( -- ticks )  RUNTIME: read the machine timer low word (CLINT mtime @
+\        0x0200BFF8). QEMU virt ticks at 10 MHz (100 ns/tick).
+: _now
+B7C20002 ,   \ lui  t0, 0x0200C
+03A382FF ,   \ lw   t1, -8(t0)         ( mtime low @ 0x0200BFF8 )
+1301C1FF ,   \ addi sp, sp, -4
+23206100 ,   \ sw   t1, 0(sp)
+;
+
+\ sp@ ( -- n )  RUNTIME: push the data-stack pointer as it was BEFORE this
+\        word ran (the depth at the call site) — used to snapshot/verify
+\        stack balance around a test body. `:M` (inlined): must not disturb
+\        sp itself before reading it.
+:M sp@
+93020100 ,   \ addi t0, sp, 0   ( t0 = sp, before this word's own push )
+1301C1FF ,   \ addi sp, sp, -4  ( push a slot )
+23205100 ,   \ sw   t0, 0(sp)   ( store the pre-push sp value )
+;
+
+\ _elapsed ( -- )  RUNTIME: print (now - tstart) as "S.CCs" (10 MHz timebase:
+\        10000000=0x989680 ticks/s, 100000=0x186A0 ticks/centisecond).
+: _elapsed
+_now tstart @ -                    \ delta ticks
+dup 989680 lit / u.               \ whole seconds
+2E lit putc                       \ '.'
+989680 lit % 186A0 lit /          \ centiseconds (0..99)
+dup 0A lit u< if 30 lit putc then \ leading zero
+u.
+73 lit putc                       \ 's'
+;
+
+\ ANSI colour helpers (escape sequences, byte-by-byte via putc):
+\   _grn = ESC[32m (green)   _red = ESC[31m (red)   _rst = ESC[0m (reset)
+: _grn 1B lit putc 5B lit putc 33 lit putc 32 lit putc 6D lit putc ;
+: _red 1B lit putc 5B lit putc 33 lit putc 31 lit putc 6D lit putc ;
+: _rst 1B lit putc 5B lit putc 30 lit putc 6D lit putc ;
+
+\ _okprev ( -- )  RUNTIME: report the just-finished test as passed (green "ok").
+: _okprev
+"test " puts tname @ puts " ... " puts _grn "ok" puts _rst 0A lit putc
+;
+
+\ _fail  ( -- )  RUNTIME: report the current test FAILED, print the result line,
+\        and exit 1 (first failure halts — no-bugs policy).
+: _fail
+"test " puts tname @ puts " ... " puts _red "FAILED" puts _rst 0A lit putc
+0A lit putc
+"test result: " puts _red "FAILED" puts _rst 0A lit putc
+B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
+37330100 ,   \ lui  t1, 0x13
+13033333 ,   \ addi t1, t1, 0x333       ( 0x00013333 = FAIL -> exit 1 )
+23A06200 ,   \ sw   t1, 0(t0)
+6F000000 ,   \ jal  x0, .               ( spin )
+;
+
+\ _leak ( -- )  RUNTIME: report the current test FAILED because it left the
+\        data stack unbalanced (pushed more than it popped, or vice versa),
+\        then exit 1 — same no-bugs policy / exit path as _fail.
+: _leak
+"test " puts tname @ puts " ... " puts _red "FAILED (stack leak)" puts _rst 0A lit putc
+0A lit putc
+"test result: " puts _red "FAILED" puts _rst 0A lit putc
+B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
+37330100 ,   \ lui  t1, 0x13
+13033333 ,   \ addi t1, t1, 0x333       ( 0x00013333 = FAIL -> exit 1 )
+23A06200 ,   \ sw   t1, 0(t0)
+6F000000 ,   \ jal  x0, .               ( spin )
+;
+
+\ asrt_eq ( actual expected -- )  fail unless equal.
+: asrt_eq <> if _fail then ;
+
+\ assert  ( flag -- )  fail unless flag is non-zero.  0 lit assert -> fail.
+: assert 0= if _fail then ;
+
+\ _tdone ( -- )  RUNTIME: report the last test as ok, then the result line. Reached
+\        by a `jal` from `_tend` (no return-id), so it must NOT return — ends in `bye`.
+\        No name-push happens between the last test's body and here, so the
+\        stack-balance check compares sp directly against the snapshot (no offset).
+: _tdone
+tcount @ if
+sp@ _sp0 @ <> if _leak then
+_okprev
+then
+0A lit putc
+"test result: " puts _grn "ok" puts _rst ". " puts
+tcount @ u.
+" passed; finished in " puts
+_elapsed
+0A lit putc
+bye
+;
+
+\ Test ( C: -- )  COMPILE-TIME: `jpat!` the pending forward jump to here (skips the
+\        preceding main / links from the previous block), consume the suite `{`,
+\        and emit a string-push of the FIRST test name.
+:I Test
+jpat!
+63F02403 ,   \ bgeu s1,s2, bs_eof
+83C20400 ,   \ lbu t0,0(s1)
+1303B007 ,   \ addi t1,zero,0x7B
+63966200 ,   \ bne t0,t1, bs_next
+93841400 ,   \ addi s1,s1,1
+6F000001 ,   \ jal zero, wscan
+93841400 ,   \ addi s1,s1,1
+6FF05FFE ,   \ jal zero, bscan
+6F00C013 ,   \ jal zero, done  (+316: END shifted by the 11-instr empty-block check below)
+63FC2403 ,   \ bgeu s1,s2, emit
+83C20400 ,   \ lbu t0,0(s1)
+1303C005 ,   \ addi t1,zero,0x5C
+638A6200 ,   \ beq t0,t1, wcmt
+13030002 ,   \ addi t1,zero,32
+63625302 ,   \ bltu t1,t0, emit
+93841400 ,   \ addi s1,s1,1
+6FF05FFE ,   \ jal zero, wscan
+63FC2401 ,   \ bgeu s1,s2, emit
+83C20400 ,   \ lbu t0,0(s1)
+93841400 ,   \ addi s1,s1,1
+1303A000 ,   \ addi t1,zero,0x0A
+E39862FE ,   \ bne t0,t1, wcmt
+6FF0DFFC ,   \ jal zero, wscan
+\ --- empty-block check: if the first token after `{` is `}`, this Test block
+\     has no tests. Consume the `}`, plant the suite-closing forward jump
+\     (here ,j0) that `_tend` will jpat!, and return — so `Test { }` compiles to
+\     "0 passed" instead of swallowing the `}` and underflowing at `_tend`.
+63F62403 ,   \ bgeu s1,s2, emit     ( EOF after `{` -> normal path, +44 )
+83C20400 ,   \ lbu  t0,0(s1)
+1303D007 ,   \ addi t1,zero,0x7D    ( '}' )
+63906202 ,   \ bne  t0,t1, emit     ( not `}` -> normal name scan, +32 )
+93841400 ,   \ addi s1,s1,1         ( consume the `}` )
+1302C2FF ,   \ addi tp,tp,-4        ( here: push gp to the cstack )
+23203200 ,   \ sw   gp,0(tp)
+9302F006 ,   \ addi t0,zero,111     ( ,j0: emit a `jal x0,0` placeholder )
+23A05100 ,   \ sw   t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+6F00800D ,   \ jal  zero, done      ( return: skip the name-push preamble, +216 )
+93027029 ,   \ addi t0,zero,663
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7824201 ,   \ lui t0,0x1428
+93823229 ,   \ addi t0,t0,659
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B702C1FF ,   \ lui t0,0xffc10
+93823211 ,   \ addi t0,t0,275
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7225100 ,   \ lui t0,0x512
+93823202 ,   \ addi t0,t0,35
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+938A0100 ,   \ addi s5,gp,0
+9302F006 ,   \ addi t0,zero,111
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+63F02403 ,   \ bgeu s1,s2, ndone
+83C20400 ,   \ lbu t0,0(s1)
+13030002 ,   \ addi t1,zero,32
+637A5300 ,   \ bgeu t1,t0, ndone
+23805100 ,   \ sb t0,0(gp)
+93811100 ,   \ addi gp,gp,1
+93841400 ,   \ addi s1,s1,1
+6FF05FFE ,   \ jal zero, ncopy
+23800100 ,   \ sb zero,0(gp)
+93811100 ,   \ addi gp,gp,1
+93F23100 ,   \ andi t0,gp,3
+63880200 ,   \ beq t0,zero, enc
+23800100 ,   \ sb zero,0(gp)
+93811100 ,   \ addi gp,gp,1
+6FF01FFF ,   \ jal zero, nalign
+B38E5141 ,   \ sub t4,gp,s5
+9302F006 ,   \ addi t0,zero,111
+13D3BE00 ,   \ srli t1,t4,11
+13731300 ,   \ andi t1,t1,1
+13134301 ,   \ slli t1,t1,20
+B3E26200 ,   \ or t0,t0,t1
+13D3CE00 ,   \ srli t1,t4,12
+1373F30F ,   \ andi t1,t1,255
+1313C300 ,   \ slli t1,t1,12
+B3E26200 ,   \ or t0,t0,t1
+13D31E00 ,   \ srli t1,t4,1
+1373F33F ,   \ andi t1,t1,1023
+13135301 ,   \ slli t1,t1,21
+B3E26200 ,   \ or t0,t0,t1
+13D34E01 ,   \ srli t1,t4,20
+13731300 ,   \ andi t1,t1,1
+1313F301 ,   \ slli t1,t1,31
+B3E26200 ,   \ or t0,t0,t1
+23A05A00 ,   \ sw t0,0(s5)
+;
+
+\ { ( nameaddr -- )  RUNTIME: report the PREVIOUS test as ok (delayed by one, since
+\        "ok" is only known once the body finished without failing), then record this
+\        test's name and bump the counter. Also checks the PREVIOUS test's stack
+\        balance: nameaddr for THIS test is already pushed (sp is 4 lower than the
+\        clean baseline the previous body should have restored), hence the `4 lit +`
+\        before comparing against the `_sp0` snapshot taken when that test started.
+: {
+tcount @ if
+sp@ 4 lit + _sp0 @ <> if _leak then
+_okprev
+then
+tcount @ 0= if _now tstart ! then   \ first test: capture the start time
+tname !
+tcount @ 1 lit + tcount !
+sp@ _sp0 !   \ snapshot the (now clean) stack depth for the test about to run
+;
+
+\ } ( C: -- )  COMPILE-TIME: lookahead. A closing `}` ends the suite: plant a
+\        forward `jal` placeholder (`here ,j0`) for the next block / `_tend` to
+\        backpatch. Any other token is the NEXT test name (string-push).
+:I }
+63F22405 ,   \ bgeu s1,s2, close
+83C20400 ,   \ lbu t0,0(s1)
+1303C005 ,   \ addi t1,zero,0x5C
+638A6200 ,   \ beq t0,t1, wcmt
+13030002 ,   \ addi t1,zero,32
+63625302 ,   \ bltu t1,t0, chkcl
+93841400 ,   \ addi s1,s1,1
+6FF05FFE ,   \ jal zero, ws1
+63F22403 ,   \ bgeu s1,s2, close
+83C20400 ,   \ lbu t0,0(s1)
+93841400 ,   \ addi s1,s1,1
+1303A000 ,   \ addi t1,zero,0x0A
+E39862FE ,   \ bne t0,t1, wcmt
+6FF0DFFC ,   \ jal zero, ws1
+1303D007 ,   \ addi t1,zero,0x7D
+63906202 ,   \ bne t0,t1, ws2
+93841400 ,   \ addi s1,s1,1
+1302C2FF ,   \ addi tp,tp,-4
+23203200 ,   \ sw gp,0(tp)
+9302F006 ,   \ addi t0,zero,111
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+6F00000F ,   \ jal zero, done
+63FC2401 ,   \ bgeu s1,s2, emit
+83C20400 ,   \ lbu t0,0(s1)
+13030002 ,   \ addi t1,zero,32
+63665300 ,   \ bltu t1,t0, emit
+93841400 ,   \ addi s1,s1,1
+6FF0DFFE ,   \ jal zero, ws2
+93027029 ,   \ addi t0,zero,663
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7824201 ,   \ lui t0,0x1428
+93823229 ,   \ addi t0,t0,659
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B702C1FF ,   \ lui t0,0xffc10
+93823211 ,   \ addi t0,t0,275
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7225100 ,   \ lui t0,0x512
+93823202 ,   \ addi t0,t0,35
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+938A0100 ,   \ addi s5,gp,0
+9302F006 ,   \ addi t0,zero,111
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+63F02403 ,   \ bgeu s1,s2, ndone
+83C20400 ,   \ lbu t0,0(s1)
+13030002 ,   \ addi t1,zero,32
+637A5300 ,   \ bgeu t1,t0, ndone
+23805100 ,   \ sb t0,0(gp)
+93811100 ,   \ addi gp,gp,1
+93841400 ,   \ addi s1,s1,1
+6FF05FFE ,   \ jal zero, ncopy
+23800100 ,   \ sb zero,0(gp)
+93811100 ,   \ addi gp,gp,1
+93F23100 ,   \ andi t0,gp,3
+63880200 ,   \ beq t0,zero, enc
+23800100 ,   \ sb zero,0(gp)
+93811100 ,   \ addi gp,gp,1
+6FF01FFF ,   \ jal zero, nalign
+B38E5141 ,   \ sub t4,gp,s5
+9302F006 ,   \ addi t0,zero,111
+13D3BE00 ,   \ srli t1,t4,11
+13731300 ,   \ andi t1,t1,1
+13134301 ,   \ slli t1,t1,20
+B3E26200 ,   \ or t0,t0,t1
+13D3CE00 ,   \ srli t1,t4,12
+1373F30F ,   \ andi t1,t1,255
+1313C300 ,   \ slli t1,t1,12
+B3E26200 ,   \ or t0,t0,t1
+13D31E00 ,   \ srli t1,t4,1
+1373F33F ,   \ andi t1,t1,1023
+13135301 ,   \ slli t1,t1,21
+B3E26200 ,   \ or t0,t0,t1
+13D34E01 ,   \ srli t1,t4,20
+13731300 ,   \ andi t1,t1,1
+1313F301 ,   \ slli t1,t1,31
+B3E26200 ,   \ or t0,t0,t1
+23A05A00 ,   \ sw t0,0(s5)
+;
+
+\ _tend ( C: -- )  COMPILE-TIME: close the chain — `jpat!` the last forward jump to
+\        here, then look up `_tdone` in the name table and emit `jal x0,_tdone`
+\        (PC-relative). Appended once by ./tools/fam after the user source(s).
+:I _tend
+jpat!
+377F646F ,
+130FFF45 ,
+B76F0000 ,
+938FEF56 ,
+138E0B00 ,
+63726E03 ,
+83220E00 ,
+639AE201 ,
+83224E00 ,
+6396F201 ,
+8323CE00 ,
+6F000001 ,
+130E4E01 ,
+6FF01FFE ,
+6F004005 ,
+B38E3340 ,
+9302F006 ,
+13D3BE00 ,
+13731300 ,
+13134301 ,
+B3E26200 ,
+13D3CE00 ,
+1373F30F ,
+1313C300 ,
+B3E26200 ,
+13D31E00 ,
+1373F33F ,
+13135301 ,
+B3E26200 ,
+13D34E01 ,
+13731300 ,
+1313F301 ,
+B3E26200 ,
+23A05100 ,
+93814100 ,
+;
+
+\ _skip ( C: -- )  COMPILE-TIME: emit a forward `jal x0,0` placeholder + push its
+\        addr (here ,j0). Wrapped in a :I so here/,j0 run at compile time.
+:I _skip here ,j0 ;
+
+\ Bench ( C: -- )  COMPILE-TIME: consume a `Bench { ... }` brace group the
+\ same way `Test` is consumed above/in lib/build.fam, so benched sources
+\ still build (and test) as normal programs.  ./tools/fam --bench swaps in
+\ lib/bench.fam, which RUNS the block instead.
+:I Bench
+93030000 ,   \ addi t2, x0, 0           ( depth = 0 )
+nxchar       \ tloop: push next char (0x04 at EOF), advance s1
+83220200 ,   \ lw   t0, 0(tp)
+13024200 ,   \ addi tp, tp, 4
+13034000 ,   \ addi t1, x0, 0x04        ( EOT )
+63846202 ,   \ beq  t0, t1, abort       ( EOF -> unterminated )
+1303B007 ,   \ addi t1, x0, 0x7B        ( '{' )
+63966200 ,   \ bne  t0, t1, tclose
+93831300 ,   \ addi t2, t2, 1           ( '{' -> depth++ )
+6FF09FFC ,   \ jal  x0, tloop
+1303D007 ,   \ addi t1, x0, 0x7D        ( tclose: '}' )
+E39062FC ,   \ bne  t0, t1, tloop
+9383F3FF ,   \ addi t2, t2, -1          ( '}' -> depth-- )
+E39C03FA ,   \ bnez t2, tloop
+6F004004 ,   \ jal  x0, done            ( depth 0 -> matched close )
+abort        \ unterminated: print '?' and halt the compiler
+;
+
+\ Init the counter (runtime, after stdlib `init`), then plant the skip-main jump.
+0 lit tcount !
+_skip
