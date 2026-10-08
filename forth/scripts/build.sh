@@ -115,3 +115,5 @@ patch_config() {
 run bin/fam0 fam0.seed src/fam0.fam0
 cmp ./bin/fam0 ./fam0.seed
 run bin/fam.uncompressed bin/fam0 src/fam.fam0
+run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/asm.fam src/fampack.fam
+pack bin/fam.uncompressed bin/fam

@@ -1,0 +1,454 @@
+\ ────────────────────────────────────────────────────────────────
+\ lib/asm.fam — RV32I mini-assembler primitives
+\
+\ Layer 1 below the high-level stdlib words. Lets fam programs
+\ emit individual RV32I instructions inline using natural
+\ assembler-like syntax. Originally machine-generated (the
+\ generator is gone); maintained by hand now.
+\
+\ Calling convention (cstack source order, bottom-to-top):
+\   I-type:  imm rs1 rd  OP    (addi, andi, slli, srli, lw, lbu)
+\   R-type:  rs2 rs1 rd  OP    (add, sub, _or) — `A B C sub` =
+\                              `sub C, B, A` so C = B - A
+\   S-type:  imm rs2 rs1 OP    (sw, sb)
+\   U-type:  imm rd      OP    (lui)
+\
+\ Register-name :I words push the register's number to cstack:
+\   zr=0  sp=2  gp=3  t0=5  t1=6  t2=7  s5..s11=21..27
+\   t3..t6=28..31  a0..a3=10..13  s6=22
+\ ────────────────────────────────────────────────────────────────
+
+\ ── Register names (push number to cstack at compile time) ──
+:I zr    \ pushes 0 (0x0)
+1302C2FF ,   \ addi tp,tp,-4
+93020000 ,   \ li t0,0
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I sp    \ pushes 2 (0x2)
+1302C2FF ,   \ addi tp,tp,-4
+93022000 ,   \ li t0,2
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I gp    \ pushes 3 (0x3)
+1302C2FF ,   \ addi tp,tp,-4
+93023000 ,   \ li t0,3
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I t0    \ pushes 5 (0x5)
+1302C2FF ,   \ addi tp,tp,-4
+93025000 ,   \ li t0,5
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I t1    \ pushes 6 (0x6)
+1302C2FF ,   \ addi tp,tp,-4
+93026000 ,   \ li t0,6
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I t2    \ pushes 7 (0x7)
+1302C2FF ,   \ addi tp,tp,-4
+93027000 ,   \ li t0,7
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I t3    \ pushes 28 (0x1c)
+1302C2FF ,   \ addi tp,tp,-4
+9302C001 ,   \ li t0,28
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I t4    \ pushes 29 (0x1d)
+1302C2FF ,   \ addi tp,tp,-4
+9302D001 ,   \ li t0,29
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I t5    \ pushes 30 (0x1e)
+1302C2FF ,   \ addi tp,tp,-4
+9302E001 ,   \ li t0,30
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I t6    \ pushes 31 (0x1f)
+1302C2FF ,   \ addi tp,tp,-4
+9302F001 ,   \ li t0,31
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I a0    \ pushes 10 (0xa)
+1302C2FF ,   \ addi tp,tp,-4
+9302A000 ,   \ li t0,10
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I a1    \ pushes 11 (0xb)
+1302C2FF ,   \ addi tp,tp,-4
+9302B000 ,   \ li t0,11
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I a2    \ pushes 12 (0xc)
+1302C2FF ,   \ addi tp,tp,-4
+9302C000 ,   \ li t0,12
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I a3    \ pushes 13 (0xd)
+1302C2FF ,   \ addi tp,tp,-4
+9302D000 ,   \ li t0,13
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I s5    \ pushes 21 (0x15)
+1302C2FF ,   \ addi tp,tp,-4
+93025001 ,   \ li t0,21
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I s6    \ pushes 22 (0x16)
+1302C2FF ,   \ addi tp,tp,-4
+93026001 ,   \ li t0,22
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I s7    \ pushes 23 (0x17)
+1302C2FF ,   \ addi tp,tp,-4
+93027001 ,   \ li t0,23
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I s8    \ pushes 24 (0x18)
+1302C2FF ,   \ addi tp,tp,-4
+93028001 ,   \ li t0,24
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I s9    \ pushes 25 (0x19)
+1302C2FF ,   \ addi tp,tp,-4
+93029001 ,   \ li t0,25
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I s10    \ pushes 26 (0x1a)
+1302C2FF ,   \ addi tp,tp,-4
+9302A001 ,   \ li t0,26
+23205200 ,   \ sw t0,0(tp)
+;
+
+:I s11    \ pushes 27 (0x1b)
+1302C2FF ,   \ addi tp,tp,-4
+9302B001 ,   \ li t0,27
+23205200 ,   \ sw t0,0(tp)
+;
+
+\ ── Instruction encoders (emit one RV32I word at gp) ──
+:I addi    \ I-type, opcode=0x13
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+13033001 ,   \ li t1,19
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I andi    \ I-type, opcode=0x13
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37730000 ,   \ lui t1,0x7
+13033301 ,   \ addi t1,t1,19
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I slli    \ I-type, opcode=0x13
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37130000 ,   \ lui t1,0x1
+13033301 ,   \ addi t1,t1,19
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I srli    \ I-type, opcode=0x13
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37530000 ,   \ lui t1,0x5
+13033301 ,   \ addi t1,t1,19
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I lw    \ I-type, opcode=0x3
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37230000 ,   \ lui t1,0x2
+13033300 ,   \ addi t1,t1,3
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I lbu    \ I-type, opcode=0x3
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37430000 ,   \ lui t1,0x4
+13033300 ,   \ addi t1,t1,3
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I add    \ R-type, opcode=0x33
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+93F3F301 ,   \ andi t2,t2,31
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+13033003 ,   \ li t1,51
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I sub    \ R-type, opcode=0x33
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+93F3F301 ,   \ andi t2,t2,31
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37030040 ,   \ lui t1,0x40000
+13033303 ,   \ addi t1,t1,51
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I _or    \ R-type, opcode=0x33
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+93F3F301 ,   \ andi t2,t2,31
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37630000 ,   \ lui t1,0x6
+13033303 ,   \ addi t1,t1,51
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I mul    \ R-type, opcode=0x33
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+93F3F301 ,   \ andi t2,t2,31
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37030002 ,   \ lui t1,0x2000
+13033303 ,   \ addi t1,t1,51
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I mulhu    \ R-type, opcode=0x33
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+93F3F301 ,   \ andi t2,t2,31
+93927200 ,   \ slli t0,t0,0x7
+1313F300 ,   \ slli t1,t1,0xf
+93934301 ,   \ slli t2,t2,0x14
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+37330002 ,   \ lui t1,0x2003
+13033303 ,   \ addi t1,t1,51
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I sw    \ S-type, opcode=0x23
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+9392F200 ,   \ slli t0,t0,0xf
+13134301 ,   \ slli t1,t1,0x14
+13FEF301 ,   \ andi t3,t2,31
+131E7E00 ,   \ slli t3,t3,0x7
+93D35300 ,   \ srli t2,t2,0x5
+93939301 ,   \ slli t2,t2,0x19
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+B3E2C201 ,   \ or t0,t0,t3
+37230000 ,   \ lui t1,0x2
+13033302 ,   \ addi t1,t1,35
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I sb    \ S-type, opcode=0x23
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+83238200 ,   \ lw t2,8(tp)
+1302C200 ,   \ addi tp,tp,12
+93F2F201 ,   \ andi t0,t0,31
+1373F301 ,   \ andi t1,t1,31
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1
+B3F3C301 ,   \ and t2,t2,t3
+9392F200 ,   \ slli t0,t0,0xf
+13134301 ,   \ slli t1,t1,0x14
+13FEF301 ,   \ andi t3,t2,31
+131E7E00 ,   \ slli t3,t3,0x7
+93D35300 ,   \ srli t2,t2,0x5
+93939301 ,   \ slli t2,t2,0x19
+B3E26200 ,   \ or t0,t0,t1
+B3E27200 ,   \ or t0,t0,t2
+B3E2C201 ,   \ or t0,t0,t3
+13033002 ,   \ li t1,35
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+:I lui    \ U-type, opcode=0x37
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+13028200 ,   \ addi tp,tp,8
+93F2F201 ,   \ andi t0,t0,31
+370E1000 ,   \ lui t3,0x100
+130EFEFF ,   \ addi t3,t3,-1
+3373C301 ,   \ and t1,t1,t3
+93927200 ,   \ slli t0,t0,0x7
+1313C300 ,   \ slli t1,t1,0xc
+B3E26200 ,   \ or t0,t0,t1
+13037003 ,   \ li t1,55
+B3E26200 ,   \ or t0,t0,t1
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+\ ── _emit: write byte from a0 to UART (runtime) ──
+:M _emit
+B7020010 ,   \ lui t0,0x10000
+03C35200 ,   \ lbu t1,5(t0)
+13730302 ,   \ andi t1,t1,32
+E30C03FE ,   \ beqz t1,0x500
+2380A200 ,   \ sb a0,0(t0)
+;

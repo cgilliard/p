@@ -1,0 +1,1070 @@
+:I \
+63FC2401 ,
+83C20400 ,
+93841400 ,
+1303A000 ,
+63846200 ,
+6FF0DFFE ,
+;
+
+\ ============================================================
+\ fam standard library  (single file — catted in front of the
+\ user program as one EOT-terminated UART stream).
+\ ------------------------------------------------------------
+
+\ nxchar  ( C: -- ch )   read next source byte AND advance s1.
+\         compile-time fragment; clobbers t0, pushes to cstack.
+:M nxchar
+63F82401 ,   \ bgeu s1, s2, nx_eof
+83C20400 ,   \ lbu  t0, 0(s1)
+93841400 ,   \ addi s1, s1, 1
+6F008000 ,   \ jal  x0, nx_push
+93024000 ,   \ addi t0, x0, 0x04        ( nx_eof: EOT sentinel )
+1302C2FF ,   \ addi tp, tp, -4          ( nx_push )
+23205200 ,   \ sw   t0, 0(tp)
+;
+
+\ pxchar  ( C: -- ch )   peek next source byte; does NOT advance s1.
+\         compile-time fragment; clobbers t0, pushes to cstack.
+:M pxchar
+63F62401 ,   \ bgeu s1, s2, px_eof
+83C20400 ,   \ lbu  t0, 0(s1)
+6F008000 ,   \ jal  x0, px_push
+93024000 ,   \ addi t0, x0, 0x04        ( px_eof: EOT sentinel )
+1302C2FF ,   \ addi tp, tp, -4          ( px_push )
+23205200 ,   \ sw   t0, 0(tp)
+;
+
+\ skipch  ( C: -- )      advance s1 one byte (discard), bounded by s2.
+\         compile-time fragment; no cstack effect.
+:M skipch
+63F42401 ,   \ bgeu s1, s2, sk_end
+93841400 ,   \ addi s1, s1, 1
+;
+
+
+\ bye   ( -- )   RUNTIME: clean program shutdown (process exit 0).
+\        a `:` word — called, not inlined (no perf need; saves binary).
+: bye
+B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher 0x100000 )
+37530000 ,   \ lui  t1, 0x5
+13035355 ,   \ addi t1, t1, 0x555       ( 0x5555 = PASS -> exit 0 )
+23A06200 ,   \ sw   t1, 0(t0)
+6F000000 ,   \ jal  x0, .               ( spin until QEMU exits )
+;
+
+\ abort  ( C: -- )   COMPILE-TIME: abort — print '?' + LF to the UART,
+\         then exit code 1. compile-time fragment (for :I scanners).
+:M abort
+B7020010 ,   \ lui  t0, 0x10000         ( UART base 0x10000000 )
+03C35200 ,   \ lbu  t1, 5(t0)           ( ca1: LSR )
+13730302 ,   \ andi t1, t1, 0x20        ( THR-empty bit )
+E30C03FE ,   \ beqz t1, ca1
+1303F003 ,   \ addi t1, x0, 0x3F        ( '?' )
+23806200 ,   \ sb   t1, 0(t0)
+03C35200 ,   \ lbu  t1, 5(t0)           ( ca2 )
+13730302 ,   \ andi t1, t1, 0x20
+E30C03FE ,   \ beqz t1, ca2
+1303A000 ,   \ addi t1, x0, 0x0A        ( LF )
+23806200 ,   \ sb   t1, 0(t0)
+B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher 0x100000 )
+37330100 ,   \ lui  t1, 0x13
+13033333 ,   \ addi t1, t1, 0x333       ( 0x00013333 = FAIL -> exit 1 )
+23A06200 ,   \ sw   t1, 0(t0)
+6F000000 ,   \ jal  x0, ca3             ( spin until QEMU exits )
+;
+
+
+\ (   block comment — consume source to the MATCHING ')'. NESTS, and
+\     spans newlines. Unterminated (EOF first) -> abort. :I, compile time.
+\     Nesting depth kept in t2 (nxchar preserves it).
+:I (
+93031000 ,   \ addi t2, x0, 1           ( depth = 1: inside the opening '(' )
+nxchar       \ ploop: push next char (0x04 at EOF), advance s1
+83220200 ,   \ lw   t0, 0(tp)           ( peek pushed char )
+13024200 ,   \ addi tp, tp, 4           ( pop )
+13034000 ,   \ addi t1, x0, 0x04        ( EOT )
+63846202 ,   \ beq  t0, t1, abort       ( EOF -> unterminated )
+13038002 ,   \ addi t1, x0, 0x28        ( '(' )
+63966200 ,   \ bne  t0, t1, pclose
+93831300 ,   \ addi t2, t2, 1           ( '(' -> depth++ )
+6FF09FFC ,   \ jal  x0, ploop
+13039002 ,   \ addi t1, x0, 0x29        ( pclose: ')' )
+E39062FC ,   \ bne  t0, t1, ploop
+9383F3FF ,   \ addi t2, t2, -1          ( ')' -> depth-- )
+E39C03FA ,   \ bnez t2, ploop           ( still nested -> keep scanning )
+6F004004 ,   \ jal  x0, done            ( depth 0 -> matched close )
+abort        \ unterminated: print '?' and halt the compiler
+;
+
+
+\ init  ( -- )   RUNTIME: set up the return-id (RID) stack used by
+\        every `:`-word call, the bump allocator, and the data stack.
+\          s10 = gp             RID-stack floor / overflow bound
+\          s11 = gp + 0x1000    RID-stack top (1024 entries, grows DOWN)
+\          gp  = gp + 0x1000    heap base — first free byte ABOVE the
+\                               RID stack (bump-allocate upward from here)
+\          sp  = gp + 64 MiB    data-stack top (grows DOWN toward the heap;
+\                               64 MiB of headroom shared between the two)
+\        runtime fragment; must run before any `:`-word call.
+:M init
+138D0100 ,   \ addi s10, gp, 0          ( s10 = gp = RID floor / region base )
+B7120000 ,   \ lui  t0, 0x1             ( t0 = 0x1000 )
+B38D5100 ,   \ add  s11, gp, t0         ( s11 = gp + 0x1000 = RID top )
+\        Variable region: 16 KiB (4096 cells) at [s10+0x1000, s10+0x5000), i.e.
+\        right after the RID stack. VARBASE = s10 + 0x1000. The `variable` word
+\        hands out fixed cells here, so they live in DATA (not code).
+B7520000 ,   \ lui  t0, 0x5             ( t0 = 0x5000 = 0x1000 RID + 0x4000 vars )
+B3815100 ,   \ add  gp,  gp, t0         ( gp += 0x5000 = heap base, above RID+vars )
+B7020004 ,   \ lui  t0, 0x4000          ( t0 = 0x04000000 = 64 MiB )
+33815100 ,   \ add  sp,  gp, t0         ( sp = gp + 64 MiB = data-stack top )
+B7020100 ,   \ lui  t0, 0x10            ( t0 = 0x10000 = 64 KiB )
+330C5100 ,   \ add  s8, sp, t0          ( s8 = loop-control stack top, grows down )
+;
+
+
+\ ------------------------------------------------------------
+\ Layer 5 — runtime literals and I/O.
+\ ------------------------------------------------------------
+
+\ lit   ( C: n -- )   COMPILE-TIME: pop n from the cstack and EMIT code
+\        that pushes n onto the runtime data stack. The counterpart to
+\        `,` (which emits a literal WORD); `lit` emits a runtime PUSH.
+\        Emits  lui t1,%hi ; addi t1,t1,%lo ; addi sp,sp,-4 ; sw t1,0(sp)
+\        — lui+addi covers the full 32-bit range (the +0x800 rounds %hi
+\        so a set bit 11 in %lo doesn't corrupt it). :I word.
+:I lit
+63628205 ,   \ bltu tp, s8, work        ( cstack has an item -> work; else abort )
+abort        \ cstack underflow (16-instr fragment)
+83220200 ,   \ work: lw t0, 0(tp)       ( t0 = n )
+13024200 ,   \ addi tp, tp, 4           ( pop cstack )
+930F1000 ,   \ addi t6, x0, 1
+939FBF00 ,   \ slli t6, t6, 11          ( t6 = 0x800 )
+3383F201 ,   \ add  t1, t0, t6          ( n + 0x800 )
+1353C300 ,   \ srli t1, t1, 12          ( t1 = %hi )
+9313C300 ,   \ slli t2, t1, 12
+B3837240 ,   \ sub  t2, t0, t2          ( t2 = %lo, signed )
+130E1000 ,   \ addi t3, x0, 1
+131ECE00 ,   \ slli t3, t3, 12
+130EFEFF ,   \ addi t3, t3, -1          ( t3 = 0xFFF )
+B3F3C301 ,   \ and  t2, t2, t3          ( mask %lo to 12 bits )
+931EC300 ,   \ slli t4, t1, 12          ( lui imm field )
+130F7033 ,   \ addi t5, x0, 0x337       ( lui t1 opcode template )
+B3EEEE01 ,   \ or   t4, t4, t5
+23A0D101 ,   \ sw   t4, 0(gp)           ( emit: lui t1, %hi )
+93814100 ,   \ addi gp, gp, 4
+939E4301 ,   \ slli t4, t2, 20          ( addi imm field )
+370F0300 ,   \ lui  t5, 0x30
+130F3F31 ,   \ addi t5, t5, 0x313       ( addi t1,t1 opcode template )
+B3EEEE01 ,   \ or   t4, t4, t5
+23A0D101 ,   \ sw   t4, 0(gp)           ( emit: addi t1, t1, %lo )
+93814100 ,   \ addi gp, gp, 4
+B70EC1FF ,   \ lui  t4, 0xFFC10
+938E3E11 ,   \ addi t4, t4, 0x113       ( = 0xFFC10113 )
+23A0D101 ,   \ sw   t4, 0(gp)           ( emit: addi sp, sp, -4 )
+93814100 ,   \ addi gp, gp, 4
+B72E6100 ,   \ lui  t4, 0x612
+938E3E02 ,   \ addi t4, t4, 0x23        ( = 0x00612023 )
+23A0D101 ,   \ sw   t4, 0(gp)           ( emit: sw t1, 0(sp) )
+93814100 ,   \ addi gp, gp, 4
+;
+
+\ putc  ( c -- )   RUNTIME: pop a byte off the data stack, write to UART.
+\        a `:` word (called, not inlined).
+: putc
+B7020010 ,   \ lui  t0, 0x10000         ( UART base )
+03C35200 ,   \ lbu  t1, 5(t0)           ( LSR )
+13730302 ,   \ andi t1, t1, 0x20        ( THR-empty bit )
+E30C03FE ,   \ beqz t1, -8              ( wait until ready )
+03230100 ,   \ lw   t1, 0(sp)           ( pop the byte )
+13014100 ,   \ addi sp, sp, 4
+23806200 ,   \ sb   t1, 0(t0)           ( write to UART )
+;
+
+\ puts  ( addr -- )   RUNTIME: write a null-terminated string to the UART.
+\        a `:` word; pairs with the "..." string literal.
+: puts
+83220100 ,   \ lw   t0, 0(sp)           ( addr )
+13014100 ,   \ addi sp, sp, 4
+37030010 ,   \ lui  t1, 0x10000         ( UART base )
+83C30200 ,   \ ploop: lbu t2, 0(t0)
+638E0300 ,   \ beqz t2, pend            ( null -> done )
+034E5300 ,   \ lbu  t3, 5(t1)           ( wait THR-empty )
+137E0E02 ,   \ andi t3, t3, 0x20
+E30C0EFE ,   \ beqz t3, -8
+23007300 ,   \ sb   t2, 0(t1)           ( write byte )
+93821200 ,   \ addi t0, t0, 1
+6FF05FFE ,   \ jal  x0, ploop
+;
+
+\ Minimal stack/arith primitives (the arithmetic layer proper comes later).
+\ dup ( a -- a a )
+:M dup
+83220100 ,   \ lw t0,0(sp)
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+\ drop ( a -- )
+:M drop
+13014100 ,   \ addi sp,sp,4
+;
+\ 1- ( a -- a-1 )
+:M 1-
+83220100 ,   \ lw t0,0(sp)
+9382F2FF ,   \ addi t0,t0,-1
+23205100 ,   \ sw t0,0(sp)
+;
+\ 0= ( a -- flag )   flag = 1 if a==0 else 0
+:M 0=
+83220100 ,   \ lw t0,0(sp)
+93B21200 ,   \ seqz t0,t0
+B3025040 ,   \ neg t0,t0
+23205100 ,   \ sw t0,0(sp)
+;
+
+\ ============================================================
+\ Control flow — if / else / then.  Built from emit/patch :M
+\ fragments. Every conditional jump is a fixed `bne t0,x0,+8`
+\ trampoline over a `jal`, so the only backpatched offset is a
+\ J-type jump (+-1MiB, range-checked) — never a B-type branch
+\ whose range (~2KB) could silently truncate on a long body.
+\ ============================================================
+
+\ ,test  ( C: -- )  emit: pop flag; `bne t0,x0,+8` (skip the jal if true).
+:M ,test
+B7220100 ,   \ lui t0,0x12
+93823228 ,   \ addi t0,t0,643
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7024100 ,   \ lui t0,0x410
+93823211 ,   \ addi t0,t0,275
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7920200 ,   \ lui t0,0x29
+93823246 ,   \ addi t0,t0,1123
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+\ ,j0    ( C: -- )  emit a `jal x0, 0` placeholder (forward jump).
+:M ,j0
+9302F006 ,   \ li t0,111
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+\ here   ( C: -- addr )  push the current output cursor (gp) to the cstack.
+:M here
+1302C2FF ,   \ addi tp,tp,-4
+23203200 ,   \ sw gp,0(tp)
+;
+
+\ jpat!  ( C: addr -- )  backpatch the jal at addr to jump to here (gp).
+\        Aborts on cstack underflow or a >1MiB offset (no silent truncation).
+:M jpat!
+637A8207 ,   \ bgeu tp,s8,bad
+03230200 ,   \ lw t1,0(tp)
+13024200 ,   \ addi tp,tp,4
+B3826140 ,   \ sub t0,gp,t1
+93D34241 ,   \ srai t2,t0,0x14
+63860300 ,   \ beqz t2,20 <.L1^B1>
+130EF0FF ,   \ li t3,-1
+639CC305 ,   \ bne t2,t3,bad
+93030000 ,   \ li t2,0
+13DE4201 ,   \ srli t3,t0,0x14
+137E1E00 ,   \ andi t3,t3,1
+131EFE01 ,   \ slli t3,t3,0x1f
+B3E3C301 ,   \ or t2,t2,t3
+13DE1200 ,   \ srli t3,t0,0x1
+137EFE3F ,   \ andi t3,t3,1023
+131E5E01 ,   \ slli t3,t3,0x15
+B3E3C301 ,   \ or t2,t2,t3
+13DEB200 ,   \ srli t3,t0,0xb
+137E1E00 ,   \ andi t3,t3,1
+131E4E01 ,   \ slli t3,t3,0x14
+B3E3C301 ,   \ or t2,t2,t3
+13DEC200 ,   \ srli t3,t0,0xc
+137EFE0F ,   \ zext.b t3,t3
+131ECE00 ,   \ slli t3,t3,0xc
+B3E3C301 ,   \ or t2,t2,t3
+032E0300 ,   \ lw t3,0(t1)
+B3E3C301 ,   \ or t2,t2,t3
+23207300 ,   \ sw t2,0(t1)
+6F004004 ,   \ j done
+abort        \ underflow / out-of-range -> compile error
+;
+
+\ cswap  ( C: a b -- b a )  swap the top two cstack items (>=2 guard).
+:M cswap
+93024200 ,   \ addi t0,tp,4
+63FC8201 ,   \ bgeu t0,s8,bad
+83220200 ,   \ lw t0,0(tp)
+03234200 ,   \ lw t1,4(tp)
+23206200 ,   \ sw t1,0(tp)
+23225200 ,   \ sw t0,4(tp)
+6F004004 ,   \ j done
+abort        \ fewer than 2 items -> compile error
+;
+
+\ flag if <true> then          /          flag if <true> else <false> then
+:I if    ,test here ,j0 ;
+:I then  jpat! ;
+:I else  here ,j0 cswap jpat! ;
+
+\ ============================================================
+\ Loops — begin/until and begin/while/repeat. Same trampoline
+\ rule: the conditional is a fixed `bne +8`; the loop-back/exit
+\ is a range-checked `jal` (never a B-type branch).
+\ ============================================================
+
+\ ,jto  ( C: target -- )  emit `jal x0, target` (backward; +-1MiB checked).
+:M ,jto
+63788207 ,   \ bgeu tp,s8,bad
+03230200 ,   \ lw t1,0(tp)
+13024200 ,   \ addi tp,tp,4
+B3023340 ,   \ sub t0,t1,gp
+93D34241 ,   \ srai t2,t0,0x14
+63860300 ,   \ beqz t2,20 <.L1^B1>
+130EF0FF ,   \ li t3,-1
+639AC305 ,   \ bne t2,t3,bad
+9303F006 ,   \ li t2,111
+13DE4201 ,   \ srli t3,t0,0x14
+137E1E00 ,   \ andi t3,t3,1
+131EFE01 ,   \ slli t3,t3,0x1f
+B3E3C301 ,   \ or t2,t2,t3
+13DE1200 ,   \ srli t3,t0,0x1
+137EFE3F ,   \ andi t3,t3,1023
+131E5E01 ,   \ slli t3,t3,0x15
+B3E3C301 ,   \ or t2,t2,t3
+13DEB200 ,   \ srli t3,t0,0xb
+137E1E00 ,   \ andi t3,t3,1
+131E4E01 ,   \ slli t3,t3,0x14
+B3E3C301 ,   \ or t2,t2,t3
+13DEC200 ,   \ srli t3,t0,0xc
+137EFE0F ,   \ zext.b t3,t3
+131ECE00 ,   \ slli t3,t3,0xc
+B3E3C301 ,   \ or t2,t2,t3
+23A07100 ,   \ sw t2,0(gp)
+93814100 ,   \ addi gp,gp,4
+6F004004 ,   \ j done
+abort        \ underflow / out-of-range -> compile error
+;
+
+\ begin ... until            loop back to begin while flag is false (exit on true)
+\ begin ... while ... repeat  exit the loop when flag is false
+:I begin   here ;
+:I until   ,test ,jto ;
+:I while   ,test here ,j0 ;
+:I repeat  cswap ,jto jpat! ;
+
+\ ???   ( a0 = token start, a1 = token length )   COMPILE-TIME literal hook.
+\        Recognizes and pushes to the cstack (for lit/`,`):
+\          'x'      char (length 3)         '\x'  escape: \n \r \t \\ \' \" \0
+\          ' '      char literals may hold a space (token split is rejoined via s2)
+\          1234u    unsigned decimal        -1234  signed negative decimal
+\        STRING "..." self-emits: bytes (escapes processed) inline + address push.
+\        Overflow / malformed / unrecognized -> abort. :I word.
+:I ???
+83420500 ,   \ lbu t0,0(a0)
+13037002 ,   \ li t1,39
+6388620A ,   \ beq t0,t1,charlit
+13032002 ,   \ li t1,34
+63886214 ,   \ beq t0,t1,strlit
+1303D002 ,   \ li t1,45
+63826202 ,   \ beq t0,t1,neg
+B303B500 ,   \ add t2,a0,a1
+9383F3FF ,   \ addi t2,t2,-1
+03CE0300 ,   \ lbu t3,0(t2)
+13035007 ,   \ li t1,117
+63106E2A ,   \ bne t3,t1,bad
+930E0500 ,   \ mv t4,a0
+930F0000 ,   \ li t6,0
+6F000001 ,   \ j parse
+930E1500 ,   \ addi t4,a0,1
+B303B500 ,   \ add t2,a0,a1
+930F1000 ,   \ li t6,1
+63827E28 ,   \ beq t4,t2,bad
+130F0000 ,   \ li t5,0
+63F47E04 ,   \ bgeu t4,t2,pdone
+83C20E00 ,   \ lbu t0,0(t4)
+13030003 ,   \ li t1,48
+63E86226 ,   \ bltu t0,t1,bad
+1303A003 ,   \ li t1,58
+63F46226 ,   \ bgeu t0,t1,bad
+938202FD ,   \ addi t0,t0,-48
+37A39919 ,   \ lui t1,0x1999a
+13039399 ,   \ addi t1,t1,-1639
+636CE325 ,   \ bltu t1,t5,bad
+13133F00 ,   \ slli t1,t5,0x3
+131E1F00 ,   \ slli t3,t5,0x1
+3303C301 ,   \ add t1,t1,t3
+330E5300 ,   \ add t3,t1,t0
+63626E24 ,   \ bltu t3,t1,bad
+130F0E00 ,   \ mv t5,t3
+938E1E00 ,   \ addi t4,t4,1
+6FF0DFFB ,   \ j ploop
+63880F00 ,   \ beqz t6,pushit
+37030080 ,   \ lui t1,0x80000
+6366E323 ,   \ bltu t1,t5,bad
+330FE041 ,   \ neg t5,t5
+93020F00 ,   \ mv t0,t5
+1302C2FF ,   \ addi tp,tp,-4
+23205200 ,   \ sw t0,0(tp)
+6F008025 ,   \ j done
+930E1500 ,   \ addi t4,a0,1
+83C20E00 ,   \ lbu t0,0(t4)
+1303C005 ,   \ li t1,92
+639C6206 ,   \ bne t0,t1,cgot
+938E1E00 ,   \ addi t4,t4,1
+83C20E00 ,   \ lbu t0,0(t4)
+1303E006 ,   \ li t1,110
+63966200 ,   \ bne t0,t1,cm_r
+9302A000 ,   \ li t0,10
+6F000006 ,   \ j cgot
+13032007 ,   \ li t1,114
+63966200 ,   \ bne t0,t1,cm_t
+9302D000 ,   \ li t0,13
+6F000005 ,   \ j cgot
+13034007 ,   \ li t1,116
+63966200 ,   \ bne t0,t1,cm_bs
+93029000 ,   \ li t0,9
+6F000004 ,   \ j cgot
+1303C005 ,   \ li t1,92
+63966200 ,   \ bne t0,t1,cm_sq
+9302C005 ,   \ li t0,92
+6F000003 ,   \ j cgot
+13037002 ,   \ li t1,39
+63966200 ,   \ bne t0,t1,cm_dq
+93027002 ,   \ li t0,39
+6F000002 ,   \ j cgot
+13032002 ,   \ li t1,34
+63966200 ,   \ bne t0,t1,cm_0
+93022002 ,   \ li t0,34
+6F000001 ,   \ j cgot
+13030003 ,   \ li t1,48
+639C6218 ,   \ bne t0,t1,bad
+93020000 ,   \ li t0,0
+938E1E00 ,   \ addi t4,t4,1
+03C30E00 ,   \ lbu t1,0(t4)
+93037002 ,   \ li t2,39
+63127318 ,   \ bne t1,t2,bad
+938E1E00 ,   \ addi t4,t4,1
+93840E00 ,   \ mv s1,t4
+1302C2FF ,   \ addi tp,tp,-4
+23205200 ,   \ sw t0,0(tp)
+6F00001B ,   \ j done
+93027029 ,   \ li t0,663
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7824201 ,   \ lui t0,0x1428
+93823229 ,   \ addi t0,t0,659
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B702C1FF ,   \ lui t0,0xffc10
+93823211 ,   \ addi t0,t0,275
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7225100 ,   \ lui t0,0x512
+93823202 ,   \ addi t0,t0,35
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+938A0100 ,   \ mv s5,gp
+9302F006 ,   \ li t0,111
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+930E1500 ,   \ addi t4,a0,1
+63FE2E11 ,   \ bgeu t4,s2,bad
+83C20E00 ,   \ lbu t0,0(t4)
+13032002 ,   \ li t1,34
+638A6208 ,   \ beq t0,t1,ssdone
+1303C005 ,   \ li t1,92
+639E6206 ,   \ bne t0,t1,ssemit
+938E1E00 ,   \ addi t4,t4,1
+63F02E11 ,   \ bgeu t4,s2,bad
+83C20E00 ,   \ lbu t0,0(t4)
+1303E006 ,   \ li t1,110
+63966200 ,   \ bne t0,t1,sm_r
+9302A000 ,   \ li t0,10
+6F000006 ,   \ j ssemit
+13032007 ,   \ li t1,114
+63966200 ,   \ bne t0,t1,sm_t
+9302D000 ,   \ li t0,13
+6F000005 ,   \ j ssemit
+13034007 ,   \ li t1,116
+63966200 ,   \ bne t0,t1,sm_bs
+93029000 ,   \ li t0,9
+6F000004 ,   \ j ssemit
+1303C005 ,   \ li t1,92
+63966200 ,   \ bne t0,t1,sm_sq
+9302C005 ,   \ li t0,92
+6F000003 ,   \ j ssemit
+13037002 ,   \ li t1,39
+63966200 ,   \ bne t0,t1,sm_dq
+93027002 ,   \ li t0,39
+6F000002 ,   \ j ssemit
+13032002 ,   \ li t1,34
+63966200 ,   \ bne t0,t1,sm_0
+93022002 ,   \ li t0,34
+6F000001 ,   \ j ssemit
+13030003 ,   \ li t1,48
+639A6208 ,   \ bne t0,t1,bad
+93020000 ,   \ li t0,0
+23805100 ,   \ sb t0,0(gp)
+93811100 ,   \ addi gp,gp,1
+938E1E00 ,   \ addi t4,t4,1
+6FF05FF6 ,   \ j ssloop
+938E1E00 ,   \ addi t4,t4,1
+93840E00 ,   \ mv s1,t4
+93020000 ,   \ li t0,0
+23805100 ,   \ sb t0,0(gp)
+93811100 ,   \ addi gp,gp,1
+93F23100 ,   \ andi t0,gp,3
+638A0200 ,   \ beqz t0,ssbp
+13030000 ,   \ li t1,0
+23806100 ,   \ sb t1,0(gp)
+93811100 ,   \ addi gp,gp,1
+6FF0DFFE ,   \ j ssalign
+B38E5141 ,   \ sub t4,gp,s5
+9302F006 ,   \ li t0,111
+13D3BE00 ,   \ srli t1,t4,0xb
+13731300 ,   \ andi t1,t1,1
+13134301 ,   \ slli t1,t1,0x14
+B3E26200 ,   \ or t0,t0,t1
+13D3CE00 ,   \ srli t1,t4,0xc
+1373F30F ,   \ zext.b t1,t1
+1313C300 ,   \ slli t1,t1,0xc
+B3E26200 ,   \ or t0,t0,t1
+13D31E00 ,   \ srli t1,t4,0x1
+1373F33F ,   \ andi t1,t1,1023
+13135301 ,   \ slli t1,t1,0x15
+B3E26200 ,   \ or t0,t0,t1
+13D34E01 ,   \ srli t1,t4,0x14
+13731300 ,   \ andi t1,t1,1
+1313F301 ,   \ slli t1,t1,0x1f
+B3E26200 ,   \ or t0,t0,t1
+23A05A00 ,   \ sw t0,0(s5)
+6F004004 ,   \ j done
+abort        \ overflow / malformed / unrecognized -> compile error
+;
+
+
+\ Run init — first emitting token, so it lands right after the prologue
+\ and runs before any user code. Every program is set up automatically.
+
+\ ============================================================
+\ Arithmetic, comparison, bitwise.  ( a b -- ) with b on top.
+\ Comparisons yield a Forth flag: -1 = true (all bits), 0 = false.
+\ No RISC-V M extension, so * / % are shift/subtract loops (: words).
+\ ============================================================
+
+\ +  ( a b -- a+b )
+:M +
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3025300 ,   \ add t0,t1,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ -  ( a b -- a-b )
+:M -
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3025340 ,   \ sub t0,t1,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ and  ( a b -- a&b )
+:M and
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3725300 ,   \ and t0,t1,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ or  ( a b -- a|b )
+:M or
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3625300 ,   \ or t0,t1,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ xor  ( a b -- a^b )
+:M xor
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3425300 ,   \ xor t0,t1,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ invert  ( a -- ~a )
+:M invert
+83220100 ,   \ lw t0,0(sp)
+93C2F2FF ,   \ not t0,t0
+23205100 ,   \ sw t0,0(sp)
+;
+\ lshift  ( a n -- a<<n )
+:M lshift
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3125300 ,   \ sll t0,t1,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ rshift  ( a n -- a>>n  logical )
+:M rshift
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3525300 ,   \ srl t0,t1,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+
+\ =  ( a b -- flag )
+:M =
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3425300 ,   \ xor t0,t1,t0
+93B21200 ,   \ seqz t0,t0
+B3025040 ,   \ neg t0,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ <>  ( a b -- flag )
+:M <>
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3425300 ,   \ xor t0,t1,t0
+B3325000 ,   \ snez t0,t0
+B3025040 ,   \ neg t0,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ <  ( a b -- flag )  signed
+:M <
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3225300 ,   \ slt t0,t1,t0
+B3025040 ,   \ neg t0,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ >  ( a b -- flag )  signed
+:M >
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3A26200 ,   \ slt t0,t0,t1
+B3025040 ,   \ neg t0,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ u<  ( a b -- flag )  unsigned
+:M u<
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3325300 ,   \ sltu t0,t1,t0
+B3025040 ,   \ neg t0,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ u>  ( a b -- flag )  unsigned
+:M u>
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+B3B26200 ,   \ sltu t0,t0,t1
+B3025040 ,   \ neg t0,t0
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ 0<  ( a -- flag )  a<0 signed
+:M 0<
+83220100 ,   \ lw t0,0(sp)
+B3A20200 ,   \ sltz t0,t0
+B3025040 ,   \ neg t0,t0
+23205100 ,   \ sw t0,0(sp)
+;
+
+\ *  ( a b -- a*b )  shift-and-add
+: *
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+93030000 ,   \ li t2,0
+638E0200 ,   \ beqz t0,28 <.L2^B1>
+13FE1200 ,   \ andi t3,t0,1
+63040E00 ,   \ beqz t3,1c <.L3^B1>
+B3836300 ,   \ add t2,t2,t1
+13131300 ,   \ slli t1,t1,0x1
+93D21200 ,   \ srli t0,t0,0x1
+6FF09FFE ,   \ j c <.L1^B1>
+13014100 ,   \ addi sp,sp,4
+23207100 ,   \ sw t2,0(sp)
+;
+\ /  ( a b -- a/b )  unsigned; /0 loops forever
+: /
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+93030000 ,   \ li t2,0
+63685300 ,   \ bltu t1,t0,1c <.L2^B1>
+33035340 ,   \ sub t1,t1,t0
+93831300 ,   \ addi t2,t2,1
+6FF05FFF ,   \ j c <.L1^B1>
+13014100 ,   \ addi sp,sp,4
+23207100 ,   \ sw t2,0(sp)
+;
+\ %  ( a b -- a%b )  unsigned
+: %
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+63665300 ,   \ bltu t1,t0,14 <.L2^B1>
+33035340 ,   \ sub t1,t1,t0
+6FF09FFF ,   \ j 8 <.L1^B1>
+13014100 ,   \ addi sp,sp,4
+23206100 ,   \ sw t1,0(sp)
+;
+
+
+\ ============================================================
+\ Memory access, variables, stack manipulation.
+\ ============================================================
+
+\ @  ( addr -- val )    ! ( val addr -- )    word load/store
+\ @  ( addr -- val )
+:M @
+83220100 ,   \ lw t0,0(sp)
+83A20200 ,   \ lw t0,0(t0)
+23205100 ,   \ sw t0,0(sp)
+;
+\ !  ( val addr -- )
+:M !
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+23A06200 ,   \ sw t1,0(t0)
+13018100 ,   \ addi sp,sp,8
+;
+\ c@  ( addr -- byte )
+:M c@
+83220100 ,   \ lw t0,0(sp)
+83C20200 ,   \ lbu t0,0(t0)
+23205100 ,   \ sw t0,0(sp)
+;
+\ c!  ( byte addr -- )
+:M c!
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+23806200 ,   \ sb t1,0(t0)
+13018100 ,   \ addi sp,sp,8
+;
+\ h@  ( addr -- half )
+:M h@
+83220100 ,   \ lw t0,0(sp)
+83D20200 ,   \ lhu t0,0(t0)
+23205100 ,   \ sw t0,0(sp)
+;
+\ h!  ( half addr -- )
+:M h!
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+23906200 ,   \ sh t1,0(t0)
+13018100 ,   \ addi sp,sp,8
+;
+
+\ variable  ( -- addr )   COMPILE-TIME: hand out the next fixed 4-byte cell in
+\        the DATA-side variable region (VARBASE = s10+0x1000), and EMIT code that
+\        pushes its address at runtime ( push s10 + 0x1000 + 4*slot ). The cell
+\        lives in DATA, not code, so `!`/`@` never touch the code image.
+\        Slots are counted in this :I word's own (compile-time) cell below, so the
+\        counter never appears in the output. >4096 variables -> compile error.
+\        Use:  : counter variable ;   then  N lit counter !   /   counter @
+:I variable
+97020000 ,   \ auipc t0, 0              ( t0 = PC of this instruction )
+9382020F ,   \ addi  t0, t0, 240        ( t0 = &slot-counter, the cell below )
+03AE0200 ,   \ lw    t3, 0(t0)          ( t3 = k = next free slot )
+B71E0000 ,   \ lui   t4, 0x1            ( t4 = 4096 = region capacity, in cells )
+6362DE05 ,   \ bltu  t3, t4, +68        ( k < 4096 -> ok; else fall into abort )
+abort        \ too many variables -> compile error (16-instr fragment)
+930E1E00 ,   \ addi  t4, t3, 1          ( ok: )
+23A0D201 ,   \ sw    t4, 0(t0)          ( slot-counter = k + 1 )
+93122E00 ,   \ slli  t0, t3, 2          ( t0 = 4k )
+371F0000 ,   \ lui   t5, 0x1            ( t5 = 0x1000 = VARBASE offset from s10 )
+B382E201 ,   \ add   t0, t0, t5         ( t0 = C = 0x1000 + 4k )
+930F1000 ,   \ addi  t6, x0, 1
+939FBF00 ,   \ slli  t6, t6, 11         ( t6 = 0x800 )
+3383F201 ,   \ add   t1, t0, t6         ( C + 0x800 )
+1353C300 ,   \ srli  t1, t1, 12         ( t1 = %hi )
+9313C300 ,   \ slli  t2, t1, 12
+B3837240 ,   \ sub   t2, t0, t2         ( t2 = %lo, signed )
+130E1000 ,   \ addi  t3, x0, 1
+131ECE00 ,   \ slli  t3, t3, 12
+130EFEFF ,   \ addi  t3, t3, -1         ( t3 = 0xFFF )
+B3F3C301 ,   \ and   t2, t2, t3         ( mask %lo to 12 bits )
+931EC300 ,   \ slli  t4, t1, 12         ( emit: lui t1, %hi )
+130F7033 ,   \ addi  t5, x0, 0x337
+B3EEEE01 ,   \ or    t4, t4, t5
+23A0D101 ,   \ sw    t4, 0(gp)
+93814100 ,   \ addi  gp, gp, 4
+939E4301 ,   \ slli  t4, t2, 20         ( emit: addi t1, t1, %lo )
+370F0300 ,   \ lui   t5, 0x30
+130F3F31 ,   \ addi  t5, t5, 0x313
+B3EEEE01 ,   \ or    t4, t4, t5
+23A0D101 ,   \ sw    t4, 0(gp)
+93814100 ,   \ addi  gp, gp, 4
+B70E6D00 ,   \ lui   t4, 0x6D0          ( emit: add t1, s10, t1  = 0x006D0333 )
+938E3E33 ,   \ addi  t4, t4, 0x333
+23A0D101 ,   \ sw    t4, 0(gp)
+93814100 ,   \ addi  gp, gp, 4
+B70EC1FF ,   \ lui   t4, 0xFFC10        ( emit: addi sp, sp, -4 )
+938E3E11 ,   \ addi  t4, t4, 0x113
+23A0D101 ,   \ sw    t4, 0(gp)
+93814100 ,   \ addi  gp, gp, 4
+B72E6100 ,   \ lui   t4, 0x612          ( emit: sw t1, 0(sp) )
+938E3E02 ,   \ addi  t4, t4, 0x23
+23A0D101 ,   \ sw    t4, 0(gp)
+93814100 ,   \ addi  gp, gp, 4
+6F008000 ,   \ jal   x0, +8             ( jump over the counter cell )
+00000000 ,   \ slot-counter ( compile-time only; never emitted to the output )
+;
+
+\ swap  ( a b -- b a )
+:M swap
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+23206100 ,   \ sw t1,0(sp)
+23225100 ,   \ sw t0,4(sp)
+;
+\ over  ( a b -- a b a )
+:M over
+83224100 ,   \ lw t0,4(sp)
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+\ rot  ( a b c -- b c a )
+:M rot
+83228100 ,   \ lw t0,8(sp)
+03234100 ,   \ lw t1,4(sp)
+83230100 ,   \ lw t2,0(sp)
+23205100 ,   \ sw t0,0(sp)
+23227100 ,   \ sw t2,4(sp)
+23246100 ,   \ sw t1,8(sp)
+;
+\ nip  ( a b -- b )
+:M nip
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+23205100 ,   \ sw t0,0(sp)
+;
+\ tuck  ( a b -- b a b )
+:M tuck
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+23226100 ,   \ sw t1,4(sp)
+23245100 ,   \ sw t0,8(sp)
+;
+\ 2dup  ( a b -- a b a b )
+:M 2dup
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+130181FF ,   \ addi sp,sp,-8
+23205100 ,   \ sw t0,0(sp)
+23226100 ,   \ sw t1,4(sp)
+;
+\ pick  ( xN .. x0 n -- xN .. x0 xN )  copy the n-th data-stack item down.
+\ 0 pick = dup, 1 pick = over.  Pure lw/slli/add/sw, no jalr, so verifier-clean.
+:M pick
+83220100 ,   \ lw   t0,0(sp)    t0 = n
+93922200 ,   \ slli t0,t0,2     t0 = n*4
+B3822200 ,   \ add  t0,t0,sp    t0 = sp + n*4
+83A24200 ,   \ lw   t0,4(t0)    t0 = the n-th item (sp + n*4 + 4)
+23205100 ,   \ sw   t0,0(sp)    overwrite n with it
+;
+
+
+\ ============================================================
+\ Counted loops — limit start DO ... LOOP  (index via i / j).
+\ Loop frames (index,limit) live on the s8 stack. Same trampoline:
+\ `bge +8` over the backward `jal`.
+\ ============================================================
+
+\ ,doemit  ( C: -- )  emit: pop limit/start off sp, push (index,limit) onto s8.
+:M ,doemit
+B7220100 ,   \ lui t0,0x12
+93823228 ,   \ addi t0,t0,643
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7224100 ,   \ lui t0,0x412
+93823230 ,   \ addi t0,t0,771
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7028100 ,   \ lui t0,0x810
+93823211 ,   \ addi t0,t0,275
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7128CFF ,   \ lui t0,0xff8c1
+938232C1 ,   \ addi t0,t0,-1005
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7225C00 ,   \ lui t0,0x5c2
+93823202 ,   \ addi t0,t0,35
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7226C00 ,   \ lui t0,0x6c2
+93823222 ,   \ addi t0,t0,547
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+\ ,loopinc ( C: -- )  emit: index++; if index>=limit skip the loop-back jal.
+:M ,loopinc
+B7220C00 ,   \ lui t0,0xc2
+93823228 ,   \ addi t0,t0,643
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7821200 ,   \ lui t0,0x128
+93823229 ,   \ addi t0,t0,659
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7225C00 ,   \ lui t0,0x5c2
+93823202 ,   \ addi t0,t0,35
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7224C00 ,   \ lui t0,0x4c2
+93823230 ,   \ addi t0,t0,771
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+B7D26200 ,   \ lui t0,0x62d
+93823246 ,   \ addi t0,t0,1123
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+\ ,popfrm  ( C: -- )  emit: drop the loop frame (s8 += 8).
+:M ,popfrm
+B7128C00 ,   \ lui t0,0x8c1
+938232C1 ,   \ addi t0,t0,-1005
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+\ limit start do <body> loop      ( index runs start .. limit-1 )
+:I do    ,doemit here ;
+:I loop  ,loopinc ,jto ,popfrm ;
+\ i ( -- index )   innermost loop index;   j ( -- index )   next-outer index
+:M i
+83220C00 ,   \ lw t0,0(s8)
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+:M j
+83228C00 ,   \ lw t0,8(s8)
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+
+\ ============================================================
+\ Number printing.
+\ ============================================================
+
+\ u.  ( u -- )   print an unsigned decimal (digits reversed via the data stack).
+: u.
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+130E0000 ,   \ li t3,0
+13030000 ,   \ li t1,0
+930EA000 ,   \ li t4,10
+63E8D201 ,   \ bltu t0,t4,24 <got>
+B382D241 ,   \ sub t0,t0,t4
+13031300 ,   \ addi t1,t1,1
+6FF01FFF ,   \ j 10 <sub10>
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+130E1E00 ,   \ addi t3,t3,1
+93020300 ,   \ mv t0,t1
+E39C02FC ,   \ bnez t0,c <extract>
+370F0010 ,   \ lui t5,0x10000
+83230100 ,   \ lw t2,0(sp)
+13014100 ,   \ addi sp,sp,4
+93830303 ,   \ addi t2,t2,48
+834F5F00 ,   \ lbu t6,5(t5)
+93FF0F02 ,   \ andi t6,t6,32
+E38C0FFE ,   \ beqz t6,48 <wait>
+23007F00 ,   \ sb t2,0(t5)
+130EFEFF ,   \ addi t3,t3,-1
+E3100EFE ,   \ bnez t3,3c <prn>
+;
+
+\ .  ( n -- )   print a signed decimal.
+: .  dup 0< if 2D lit putc 0 lit swap - then u. ;
+
+
+\ u.x  ( u -- )   print u as 8 hex digits (no prefix).
+: u.x
+83220100 ,   \ lw t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+130EC001 ,   \ li t3,28
+370F0010 ,   \ lui t5,0x10000
+33D3C201 ,   \ srl t1,t0,t3
+1373F300 ,   \ andi t1,t1,15
+930EA000 ,   \ li t4,10
+6346D301 ,   \ blt t1,t4,28 <.L2^B1>
+13037303 ,   \ addi t1,t1,55
+6F008000 ,   \ j 2c <.L3^B1>
+13030303 ,   \ addi t1,t1,48
+834F5F00 ,   \ lbu t6,5(t5)
+93FF0F02 ,   \ andi t6,t6,32
+E38C0FFE ,   \ beqz t6,2c <.L3^B1>
+23006F00 ,   \ sb t1,0(t5)
+130ECEFF ,   \ addi t3,t3,-4
+E3580EFC ,   \ bgez t3,10 <.L1^B1>
+;
+
+\ ?dup ( x -- x x | 0 -- 0 )   duplicate top only if non-zero
+:M ?dup
+83220100 ,   \ lw t0,0(sp)
+63860200 ,   \ beqz t0,10 <.L1^B1>
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+\ -rot ( a b c -- c a b )
+:M -rot
+83220100 ,   \ lw t0,0(sp)
+03234100 ,   \ lw t1,4(sp)
+83238100 ,   \ lw t2,8(sp)
+23206100 ,   \ sw t1,0(sp)
+23227100 ,   \ sw t2,4(sp)
+23245100 ,   \ sw t0,8(sp)
+;
+\ 2drop ( a b -- )
+:M 2drop
+13018100 ,   \ addi sp,sp,8
+;
+
+
+\ getc  ( -- ch )   RUNTIME: read one byte from the UART (blocks). :M (inlined
+\        so it never pushes a return-id — safe inside loops that pin s11).
+:M getc
+B7020010 ,   \ lui  t0, 0x10000         ( UART base )
+03C35200 ,   \ lbu  t1, 5(t0)           ( LSR )
+13731300 ,   \ andi t1, t1, 1           ( RX data-ready bit )
+E30C03FE ,   \ beqz t1, -8              ( wait for a byte )
+03C30200 ,   \ lbu  t1, 0(t0)           ( read the byte )
+1301C1FF ,   \ addi sp, sp, -4
+23206100 ,   \ sw   t1, 0(sp)           ( push it )
+;
+
+\ alloc ( n -- ptr )   RUNTIME: bump-allocate n bytes (rounded up to a multiple
+\        of 4) from the heap (gp); returns the old gp. BOUNDS-CHECKED: if the
+\        allocation would meet the data stack (need > sp - gp) it returns 0
+\        (null) and leaves gp unchanged. A negative/huge n aligns to a huge
+\        unsigned size and so also returns 0. No free.
+:M alloc
+83220100 ,   \ lw   t0, 0(sp)           ( t0 = n )
+93823200 ,   \ addi t0, t0, 3
+93F2C2FF ,   \ andi t0, t0, -4          ( t0 = round n up to a multiple of 4 )
+33033140 ,   \ sub  t1, sp, gp          ( t1 = available bytes = sp - gp )
+63685300 ,   \ bltu t1, t0, +16         ( need > available -> exhausted )
+23203100 ,   \ sw   gp, 0(sp)           ( ptr = old gp )
+B3815100 ,   \ add  gp, gp, t0          ( gp += t0 )
+6F008000 ,   \ jal  x0, +8              ( skip the null path )
+23200100 ,   \ sw   x0, 0(sp)           ( exhausted: return 0 )
+;
+
+init
