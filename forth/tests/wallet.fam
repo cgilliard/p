@@ -1,0 +1,205 @@
+\ tests/wallet.fam — test-only: src/sha.fam against published vectors, the
+\ backup words against BIP39's, keys against the Rust node's
+\ (`forth_wallet_vectors` in ../rust/src/main.rs), the entropy device, and
+\ the wallet kept on the disk -- across a chain started over.
+
+: twv variable ;  : tw ( -- a )   twv 200 lit lazy ;
+: twov variable ; : two ( -- a )  twov 40 lit lazy ;
+
+\ twhex ( a n hex -- f )   whether the n bytes at a are the hex string.
+: twnib ( c -- n )   dup 41 lit u< if 30 lit - else 37 lit - then ;
+: twa variable ;  : twh variable ;  : twf variable ;
+: twhex ( a n hex -- f )
+	twh ! swap twa !  -1 lit twf !
+	0 lit do
+		twh @ i 1 lit lshift + dup c@ twnib 4 lit lshift swap 1 lit + c@ twnib or
+		twa @ i + c@ =  twf @ and twf !
+	loop twf @
+;
+
+\ twfill ( c n -- a n )   n bytes of c, at tw.
+: twfill ( c n -- a n )   dup 0 lit do over tw i + c! loop nip tw swap ;
+
+\ twput ( hex a n -- )   n bytes from hex.
+: twput ( hex a n -- )
+	0 lit do over i 1 lit lshift + dup c@ twnib 4 lit lshift swap 1 lit + c@ twnib or over i + c! loop 2drop
+;
+
+\ The Rust node's output of 5.000000123 coins to 0/7 of seed 7f..7f.
+: twcv variable ;  : twc ( -- a )  twcv 20 lit lazy ;
+: twnv variable ;  : twn ( -- a )  twnv 10 lit lazy ;
+: twrust ( -- )
+	"C332E3417C2F52393C73C168C0ACE2160136991A39EE7A039385D653E160833B" twc 20 lit twput
+	"3A07A96F849FEA0871B7446F7E18F35B" twn 10 lit twput
+;
+: twseed ( -- )   7F lit 20 lit twfill drop wlseed 8 lit cpy  wlview kcview ;
+
+\ twleaf ( comm nonce pos height -- )   an unspent output in the state
+\        (records and index only: the scan reads nothing else).
+: twkv variable ;  : twk ( -- a )  twkv 8 lit lazy ;
+: twlv variable ;  : twlb ( -- a )  twlv 40 lit lazy ;
+: twleaf ( comm nonce pos height -- )
+	twlb 30 lit + be!  twk 8 lit nzero  twk 4 lit + be!
+	twlb 20 lit + 10 lit ncpy  dup twlb 20 lit ncpy
+	stleaves twk twlb btput  stindex twk btput
+;
+
+
+: twabc ( -- a n )   "abc" dup strlen ;
+: twlong ( -- a n )  "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" dup strlen ;
+
+\ The words for entropy 0x7f..7f.
+: twlegal ( -- a n )
+	"legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title"
+	dup strlen ;
+
+: twiv variable ;  : twid ( -- a )  twiv 10 lit lazy ;
+: twbv variable ;  : twbig ( -- a )  twbv 2000 lit lazy ;
+
+Test {
+	sha256_vectors {
+		tw 0 lit two sha256  two 20 lit "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855" twhex assert
+		twabc two sha256  two 20 lit "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD" twhex assert
+		twlong two sha256  two 20 lit "248D6A61D20638B8E5C026930C3E6039A33CE45964FF2167F6ECEDD419DB06C1" twhex assert
+	}
+	sha256_streams_across_blocks {
+		\ 300 bytes 0, 1, ..., in pieces of 37: as one.
+		12C lit 0 lit do i tw i + c! loop
+		tw 12C lit two 20 lit + sha256
+		shinit  tw  8 lit 0 lit do dup 25 lit shupd 25 lit + loop  tw 12C lit + over - shupd  two shfin
+		two two 20 lit + 8 lit ceq assert
+	}
+	hmac_vector {
+		"Jefe" 4 lit hmkey  hmbeg "what do ya want for nothing?" dup strlen shupd  two hmend
+		two 20 lit "5BDCC146BF60754E6A042426089575C75A003F089D2739839DEC58B964EC3843" twhex assert
+	}
+	pbkdf2_vectors {
+		"password" 8 lit "salt" 4 lit 1 lit two pbkdf
+		two 20 lit "120FB6CFFCF8B32C43E7225256C4F837A86548C92CCC35480805987CB70BE17B" twhex assert
+		"password" 8 lit "salt" 4 lit 2 lit two pbkdf
+		two 20 lit "AE4D0C95AF6B46D32D0ADFF928F06DD02A303F8EF3C251DFD6E2D85A95474C43" twhex assert
+		"password" 8 lit "salt" 4 lit 1000 lit two pbkdf
+		two 20 lit "C5E478D59288C841AA530DB6845C4C8D962893A001CE4E11A4963873AA98134A" twhex assert
+	}
+	words_match_bip39 {
+		\ The reference vectors: entropy 00.., 7f.., 80.., ff.. and their last words.
+		0 lit 20 lit twfill drop mnshow  mnb 20 lit + c@ 66 lit asrt_eq
+		17 lit mnidx 66 lit asrt_eq                          \ "art"
+		twlegal mnparse assert  7F lit 20 lit twfill drop mnb 8 lit ceq assert
+		0 lit mnidx 3FB lit asrt_eq  17 lit mnidx 717 lit asrt_eq   \ "legal" .. "title"
+		80 lit 20 lit twfill drop mnshow  17 lit mnidx BD lit asrt_eq   \ "bless"
+		FF lit 20 lit twfill drop mnshow  17 lit mnidx 7AF lit asrt_eq  \ "vote"
+		0 lit mnidx 7FF lit asrt_eq                          \ "zoo"
+	}
+	words_read_forgivingly {
+		"  LEGAL winn thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title\n" dup strlen
+		mnparse assert  7F lit 20 lit twfill drop mnb 8 lit ceq assert
+	}
+	words_refused {
+		\ 23 words; a word not in the list; a prefix of more than one word (and
+		\ one too short); two words swapped.
+		"legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth" dup strlen
+		mnparse 0= assert  mnerr @ 1 lit asrt_eq  mnc @ 17 lit asrt_eq
+		"legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth titlex" dup strlen
+		mnparse 0= assert  mnerr @ 2 lit asrt_eq  mnc @ 17 lit asrt_eq
+		"legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage wor title" dup strlen
+		mnparse 0= assert  mnerr @ 2 lit asrt_eq  mnc @ 16 lit asrt_eq
+		"legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave worth sausage title" dup strlen
+		mnparse 0= assert  mnerr @ 3 lit asrt_eq
+	}
+	keys_match_rust {
+		7F lit 20 lit twfill drop wlseed 8 lit cpy
+		two kcview  two 20 lit "DED22B7196A8616C91DD1F4558ACD91ADE4C6840CBA2DE411D569B476274391B" twhex assert
+		7 lit two kcks  two 20 lit "D84A4C34A8BF4F1A74E5B402088C8B5A75622E26D9F58C558848A415153A4569" twhex assert
+		wtsetup  two wtsk @ wtpk @ wkeygen  wtpk @ two 20 lit + wpkhash
+		two 20 lit + 20 lit "81B9402AAE8E4D1886B6BE4F3AB0C74377C7A45D92F8245ADB218B32E1B5E303" twhex assert
+	}
+	entropy_device {
+		tw 40 lit rnget assert  tw 40 lit + 40 lit rnget assert
+		tw tw 40 lit + 10 lit ceq 0= assert
+		two wlent assert  two 20 lit + wlent assert  two two 20 lit + 8 lit ceq 0= assert
+	}
+	recovery_matches_rust {
+		twseed twrust
+		7 lit 2A05F27B lit 1 lit two wlcomm  two twc 8 lit ceq assert
+		twc twn wlours assert  wlidx @ 7 lit asrt_eq  wlalo @ 2A05F27B lit asrt_eq  wlahi @ 1 lit asrt_eq
+		twc 7 lit 2A05F27B lit 1 lit two wlseal  two twn 4 lit ceq assert
+		twn 3 lit + dup c@ 1 lit xor swap c!  twc twn wlours 0= assert
+	}
+	scan_finds_ours {
+		0 lit bnet !  acfmt  acopen assert
+		pgop 9 lit pgm 6C lit + !  pgmd                 \ the state at height 9
+		twseed twrust  twc twn 3 lit 2 lit twleaf          \ ours (Rust's), from height 2
+		2 lit 7 lit 0 lit tw 20 lit + wlcomm                   \ ours: 7 units to 0/2, from height 5
+		tw 20 lit + 2 lit 7 lit 0 lit tw 40 lit + wlseal
+		tw 20 lit + tw 40 lit + 4 lit 5 lit twleaf
+		33 lit 20 lit twfill 2drop  tw tw 10 lit + 5 lit 6 lit twleaf    \ a stranger's
+		pgcommit assert
+		7F lit 20 lit twfill drop  two 8 lit cpy  two two 2 lit wlmake assert
+		wlscan
+		wlflags 2 lit and 0= assert  wlnfound @ 2 lit asrt_eq
+		pgop wlm 8 lit + @ 186A8 lit asrt_eq                \ past 0/7, by 100,000
+		wlouts twc wlrec@ btget assert  wlrec@ @ 7 lit asrt_eq
+		twc wlrec@ wlstat 8 lit asrt_eq 6 lit asrt_eq       \ held, 8 confirmations
+		wabal  wares 20 lit + qbe@ 1 lit asrt_eq 2A05F282 lit asrt_eq   \ held: both
+		wares 28 lit + be32 13 lit asrt_eq  wares qbe@ or 0= assert
+		pgop 13 lit pgm 6C lit + !  pgmd                \ height 19: the hold is over
+		wabal  wares qbe@ 1 lit asrt_eq 2A05F282 lit asrt_eq             \ spendable
+		stindex twc btdel assert  twc wlrec@ wlstat drop 5 lit asrt_eq   \ spent
+		waouts  wares be32 2 lit asrt_eq
+		pgabort  pgop wlm 1C lit zero  pgmd pgcommit assert
+	}
+	slates_pay {
+		0 lit bnet !  acfmt  acopen assert
+		pgop 9 lit pgm 6C lit + !  pgmd
+		twseed twrust  twc twn 3 lit 2 lit twleaf          \ 5.000000123 to 0/7
+		pgcommit assert
+		7F lit 20 lit twfill drop  two 8 lit cpy  two two 2 lit wlmake assert
+		wlscan  pgop 13 lit pgm 6C lit + !  pgmd  pgcommit assert      \ past the hold
+		\ send 1 coin, fee 0.0001: that output in, change out
+		3B9ACA00 lit 0 lit 186A0 lit 0 lit wssend assert
+		wsb wsn @ slparse assert  slni @ 1 lit asrt_eq  slno @ 1 lit asrt_eq
+		0 lit slout 20 lit + sl64@ 0 lit asrt_eq EE69A1DB lit asrt_eq    \ 3.999900123
+		wsb 7 lit + twid 10 lit ncpy
+		wlouts twc wlrec@ btget assert  wlrec@ 10 lit + @ 1 lit asrt_eq   \ locked
+		wsb wsn @ wsrecv 0= assert                         \ our own slate
+		twid wscancel assert
+		wlouts twc wlrec@ btget assert  wlrec@ 10 lit + @ 0 lit asrt_eq   \ free
+		twid wscancel 0= assert
+		\ again, answered as a receiver would: one more output, the amount
+		3B9ACA00 lit 0 lit 186A0 lit 0 lit wssend assert
+		wsb twbig wsn @ ncpy  2 lit twbig 6 lit + c!
+		twbig 845 lit + dup sl16@ 1 lit + swap sl16!     \ outputs: 2
+		50 lit 3B9ACA00 lit 0 lit twbig wsn @ + wsmkout
+		twbig wsn @ 38 lit + wsfin assert
+		wtx c@ 6 lit asrt_eq  wtx 1 lit + sl16@ 1 lit asrt_eq  wtn @ 10B4 lit asrt_eq
+		wtid two 8 lit cpy
+		wlouts twc wlrec@ btget assert  wlrec@ 10 lit + @ 2 lit asrt_eq   \ signed away
+		twbig wsn @ 38 lit + wsfin assert  wtid two 8 lit ceq assert    \ the same, again
+		twbig wsn @ + 30 lit + dup c@ 1 lit xor swap c!     \ a different answer
+		twbig wsn @ 38 lit + wsfin 0= assert
+		pgop wlm 1C lit zero  pgmd pgcommit assert
+	}
+	wallet_kept_on_the_disk {
+		0 lit bnet !  acfmt  acopen assert
+		pgop wlm 1C lit zero  pgmd pgcommit assert
+		wl? 0= assert
+		7F lit 20 lit twfill drop  two 8 lit cpy
+		0 lit wlpwn !  two two 20 lit + wlstr  two two 20 lit + 8 lit ceq assert
+		two two 20 lit + 2 lit wlmake assert
+		wl? assert  wlflags 2 lit asrt_eq
+		acfmt  acopen assert                            \ the chain started over
+		wl? assert  wlload  wlseed two 8 lit ceq assert  pgop wlm 30 lit + two 8 lit ceq assert
+		pgop wlm 1C lit zero  pgmd pgcommit assert
+	}
+}
+
+Bench {
+	passphrase {
+		7F lit 20 lit twfill drop two 8 lit cpy
+		"correct horse" dup strlen dup wlpwn !  wlpw swap ncpy
+		two two 20 lit + wlstr
+		two 20 lit + 20 lit "28BB423706499C55CC84AEED7BCEC9E902ACAD19F160B71B2756F171DF778E4D" twhex assert
+		0 lit wlpwn !
+	}
+}

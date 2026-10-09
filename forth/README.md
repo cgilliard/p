@@ -68,6 +68,41 @@ a real Rust node on the host: the Forth node syncs block by block,
 reorganizes onto the Rust node's branch, and fast-syncs from it. Accepting main block 3b -- validating
 it and reorganizing from block 2 to the 2b/3b branch -- took 21.5 s.
 
+`src/wallet.fam` is the wallet's seed and keys, as the Rust node makes them
+(`../rust/src/wallet.rs`, `mnemonic.rs`, `keychain.rs`): the same 24 BIP39
+backup words (`src/bip39.fam`), and passphrase (PBKDF2-HMAC-SHA256,
+`src/sha.fam`), give the same keys in either node -- `tests/wallet.fam`
+checks them against `forth_wallet_vectors`. It lives in the pager's meta
+page, on the node's one disk; starting the chain over keeps it. A new
+wallet's seed comes from a virtio entropy device (`src/rng.fam`; `tools/q32`
+attaches one). The first run makes a wallet and shows its words once;
+`scripts/node.sh --recover` restores one on a new disk, the words typed on
+the console (`--passphrase` for a passphrase) -- never passed as settings.
+A restored wallet finds its outputs once the node has caught up, by their
+recovery nonces in the state, as the Rust node's restore does.
+
+`src/wapi.fam` is the wallet's API: UDP on its own port (the node's + 1,
+47654), forwarded from 127.0.0.1 only, every datagram both ways carrying an
+HMAC-SHA256 under the wallet's API key, with sessions and counters so
+nothing can be replayed. `tools/wallet` (Python, no dependencies) is its
+client: `tools/wallet status | balance | outputs`. It asks for the API key
+once -- the node shows it when the wallet is made, or with
+`scripts/node.sh --api-key` -- and keeps it in `data/wallet.key`.
+
+Payments are slates, as in the Rust wallet and in the same armored files, so
+either can pay the other: `tools/wallet send AMOUNT [FEE]` writes S1,
+`receive FILE` answers one with S2, `finalize FILE` signs and submits,
+`cancel ID` undoes an unsigned one, `slates` lists them (`src/slate.fam`).
+A signed transaction is kept before its signature leaves the node, and
+`src/txrelay.fam` announces it to the node's peers until it's confirmed,
+serving it as the Rust node's relay does. Both directions have been run
+against a Rust dev node, end to end.
+
+`scripts/test.sh` builds the tests as two programs -- the chain's and
+network's without the wallet's sources, the wallet's with everything --
+because the compiler takes at most 65,536 call sites in one program, and the
+node with every test is past that. The node itself has about 10,000 to spare.
+
 ## Test fixtures
 
 `tests/fixtures/<network>/` holds a real chain from the Rust node: blocks 0
@@ -82,7 +117,9 @@ and 20 minutes on main):
     cd ../rust && cargo test --release -- --ignored --nocapture forth_snapshot_fixtures
 
 The last (quick) writes `snap1.bin` and `snap2.bin`: the state as of blocks 1
-and 2 as the Rust node serves it -- its sync points and pieces.
+and 2 as the Rust node serves it -- its sync points and pieces. The wallet's
+key vectors (in `tests/wallet.fam`) come from
+`cargo test --release -- --ignored --nocapture forth_wallet_vectors`.
 
 Tests load the blocks into memory as a pack (`tools/fxpack`, `tools/fam
 --load`, `tests/fx.fam`) rather than compiling them in; `tools/fxinfo` turns

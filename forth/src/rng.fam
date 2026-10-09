@@ -1,0 +1,69 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/rng.fam — random bytes from a virtio entropy device (legacy MMIO,
+\ polled): the host's randomness, for a new wallet's seed (src/wallet.fam).
+\ Under QEMU that's `-device virtio-rng-device` (tools/q32 adds one); real
+\ hardware needs its own driver for its TRNG behind the same two words.
+\
+\ Region (page-aligned): 0 the queue (4 descriptors, available ring at 0x40,
+\ used ring at 0x1000), 0x2000 the buffer (64 bytes).
+\
+\   rnopen ( -- ok )        find and start the device
+\   rnget  ( a n -- ok )    n random bytes
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: rndev variable ;  : rnq variable ;  : rnav variable ;
+
+\ rnfind ( -- dev | 0 )   the entropy device (DeviceID 4).
+: rnfd variable ;
+: rnfind ( -- dev | 0 )
+	0 lit rnfd !  10008000 lit
+	begin dup 10001000 lit u< 0= rnfd @ 0= and while
+		dup @ 74726976 lit = over 8 lit + @ 4 lit = and if dup rnfd ! then
+		1000 lit -
+	repeat drop rnfd @
+;
+
+: rnstat ( bits -- )   rndev @ 70 lit + @ or rndev @ 70 lit + ! ;
+
+: rnopen ( -- ok )
+	rndev @ 0= if
+		rnfind dup rndev ! if
+			4000 lit alloc FFF lit + FFFFF000 lit and rnq !
+			rnq @ C10 lit zero  0 lit rnav !
+			0 lit rndev @ 70 lit + !  1 lit rnstat  2 lit rnstat
+			0 lit rndev @ 20 lit + !  8 lit rnstat               \ no features
+			1000 lit rndev @ 28 lit + !
+			0 lit rndev @ 30 lit + !  4 lit rndev @ 38 lit + !  1000 lit rndev @ 3C lit + !
+			rnq @ C lit rshift rndev @ 40 lit + !
+			fence_io  4 lit rnstat
+		then
+	then
+	rndev @ 0= 0=
+;
+
+\ rnreq ( -- n )   one request for the buffer's 64 bytes: how many came (0:
+\        the device didn't answer).
+: rnreq ( -- n )
+	rnq @ 2000 lit + rnq @ !  0 lit rnq @ 4 lit + !  40 lit rnq @ 8 lit + !  2 lit rnq @ C lit + h!
+	0 lit rnq @ 44 lit + rnav @ 3 lit and 1 lit lshift + h!
+	rnav @ 1 lit + dup rnav !  rnq @ 42 lit + h!
+	fence_io  0 lit rndev @ 50 lit + !
+	1000000 lit begin
+		1 lit -  dup 0= rnq @ 1002 lit + h@ rnav @ FFFF lit and = or
+	until
+	fence_r
+	if rnq @ 1004 lit + rnav @ 1 lit - 3 lit and 3 lit lshift + 4 lit + @  dup 40 lit u> if drop 40 lit then else 0 lit then
+;
+
+: rna variable ;  : rnn variable ;
+: rnget ( a n -- ok )
+	rnn ! rna !
+	rnopen if
+		begin rnn @ if rnreq else 0 lit then ?dup while
+			dup rnn @ u> if drop rnn @ then
+			rnq @ 2000 lit + rna @ 2 lit pick ncpy
+			dup rna @ + rna !  rnn @ swap - rnn !
+		repeat
+		rnn @ 0=
+	else 0 lit then
+;

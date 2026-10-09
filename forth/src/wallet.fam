@@ -1,0 +1,486 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/wallet.fam — the wallet: its seed, backup words and keys (following
+\ ../rust/src/wallet.rs, mnemonic.rs and keychain.rs, so the same words give
+\ the same wallet in either node).
+\
+\ Backup words: the 32 bytes of entropy plus a checksum (the first byte of
+\ their SHA-256), as 24 11-bit indices into the BIP39 English list
+\ (src/bip39.fam).  Read back forgivingly -- any case or spacing, a word
+\ shortened to four or more letters if that names one word -- and strictly:
+\ exactly 24 known words with the right checksum.  The seed is the entropy,
+\ or with a passphrase PBKDF2-HMAC-SHA256(passphrase, "tabernacle-passphrase-
+\ v1" ‖ entropy, 100,000 rounds) (src/sha.fam).
+\
+\ Keys: one-time WOTS keys (src/wots.fam), key 0/i from
+\ hash_bytes_32("tabernacle-keychain-v1" ‖ seed ‖ account ‖ index), the last
+\ two little-endian u32s; the view key (reading outputs' recovery nonces) is
+\ hash_bytes_32("tabernacle-view-v1" ‖ seed).
+\
+\ On the disk: the pager's meta page (src/pager.fam) from 0x200 -- 0 "WALT",
+\ 4 flags (1: a passphrase was set, 2: restored, not yet recovered), 8 the
+\ next key index, C the records' version (2), 10 the seed, 30 the entropy (the words), 50 the API key
+\ (src/wapi.fam) -- written in one commit, and kept by `pgfmt`.  So a node that starts its chain over keeps
+\ its wallet; a new disk is a new wallet, restored from the words.
+\
+\ The words and passphrase are typed on the serial console (`wlboot`), never
+\ passed as settings.
+\
+\   wlboot ( -- )                 open the wallet, or make or restore one
+\   wl?    ( -- f )               whether the disk holds a wallet
+\   mnshow ( entropy -- )         the words, four rows of six
+\   mnparse ( a n -- ok )         words -> entropy, at mnb (mnerr: why not)
+\   kcks   ( index out -- )       key 0/index's seed (wkeygen makes the key)
+\   kcview ( out -- )             the view key
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: wlmag ( -- w )   544C4157 lit ;                       \ "WALT"
+: wlm ( -- a )     pgm 200 lit + ;
+: wl? ( -- f )     pgop wlm @ wlmag = ;
+: wlflags ( -- f ) pgop wlm 4 lit + @ ;
+: wlsv variable ;  : wlseed ( -- a )  wlsv 20 lit lazy ;  \ the seed, in memory
+: wlload ( -- )    pgop wlm 10 lit + wlseed 8 lit cpy ;
+
+\ wlmake ( entropy seed flags -- ok )   keep a new wallet (key index 0).
+: wlmake ( entropy seed flags -- ok )
+	pgop wlm 1C lit zero  wlmag wlm !
+	wlm 4 lit + !  wlm 10 lit + 8 lit cpy  wlm 30 lit + 8 lit cpy  2 lit wlm C lit + !  pgmd
+	pgcommit
+;
+
+\ wlhex ( a n -- )   bytes in hex.
+: wlnib ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then putc ;
+: wlhex ( a n -- )   0 lit do dup i + c@ dup 4 lit rshift wlnib wlnib loop drop ;
+
+\ wldec ( n -- )   in decimal.
+: wldec ( n -- )   dup A lit u< if 30 lit + putc else dup A lit / wldec A lit % 30 lit + putc then ;
+\ wlle! ( v a -- )   a little-endian u32, at any alignment.
+: wlle! ( v a -- )   4 lit 0 lit do over i 3 lit lshift rshift over i + c! loop 2drop ;
+
+\ ── Backup words ──
+
+: mnbv variable ;  : mnb ( -- a )  mnbv 24 lit lazy ;   \ entropy ‖ checksum
+: mnhv variable ;  : mnh ( -- a )  mnhv 20 lit lazy ;
+: mnsum ( -- c )   mnb 20 lit mnh sha256 mnh c@ ;        \ the checksum of mnb's entropy
+: mnbit ( i -- b ) dup 3 lit rshift mnb + c@ swap 7 lit and 7 lit swap - rshift 1 lit and ;
+: mnk variable ;
+: mnidx ( k -- idx )   B lit * mnk !  0 lit B lit 0 lit do 1 lit lshift mnk @ i + mnbit or loop ;
+: mnword ( idx -- a )  3 lit lshift bwords + ;
+: mntype ( a -- )      8 lit 0 lit do dup i + c@ ?dup if putc then loop drop ;
+
+: mnshow ( entropy -- )
+	mnb 8 lit cpy  mnsum mnb 20 lit + c!
+	18 lit 0 lit do
+		i 6 lit % 0= if "  " puts then
+		i mnidx mnword mntype
+		i 1 lit + 6 lit % if 20 lit else A lit then putc
+	loop
+;
+
+\ Reading: words separated by anything up to a space.
+: mnpa variable ;  : mnpn variable ;  : mnpi variable ;
+: mnc variable ;     \ words read
+: mnerr variable ;   \ 0 ok, 1 not 24 words (mnc of them), 2 word mnc isn't a
+                     \ backup word, 3 the checksum doesn't hold
+: mnwv variable ;  : mnw ( -- a )  mnwv 10 lit lazy ;  : mnwl variable ;
+: mnch ( -- c )    mnpa @ mnpi @ + c@ ;
+: mnin? ( -- f )   mnpi @ mnpn @ u< ;
+
+\ mnget ( -- f )   the next word, lowercased, into mnw (zero-padded; its
+\        length in mnwl); false at the end.
+: mnget ( -- f )
+	begin mnin? if mnch 21 lit u< else 0 lit then while mnpi @ 1 lit + mnpi ! repeat
+	mnw 4 lit zero  0 lit mnwl !
+	begin mnin? if mnch 20 lit u> else 0 lit then while
+		mnch dup 41 lit - 1A lit u< if 20 lit or then
+		mnwl @ F lit u< if mnw mnwl @ + c! else drop then
+		mnwl @ 1 lit + mnwl !  mnpi @ 1 lit + mnpi !
+	repeat
+	mnwl @ 0= 0=
+;
+
+\ mncount ( a n -- k )   how many words.
+: mncount ( a n -- k )   mnpn ! mnpa !  0 lit mnpi !  0 lit begin mnget while 1 lit + repeat ;
+
+\ mnpre? ( a -- f )   whether word a starts with mnw.
+: mnpre? ( a -- f )   -1 lit swap  mnwl @ 0 lit do dup i + c@ mnw i + c@ = rot and swap loop drop ;
+: mnexact ( -- idx | -1 )
+	-1 lit  800 lit 0 lit do
+		i mnword dup @ mnw @ = swap 4 lit + @ mnw 4 lit + @ = and if drop i then
+	loop
+;
+: mnfound variable ;  : mnhits variable ;
+\ mnlook ( -- idx | -1 )   mnw's index: the word, or the one word it's a
+\        prefix of (four letters or more).
+: mnlook ( -- idx | -1 )
+	mnwl @ 8 lit u> if -1 lit else
+	mnexact dup 0< if
+		drop mnwl @ 4 lit u< if -1 lit else
+			0 lit mnhits !
+			800 lit 0 lit do
+				i mnword mnpre? if mnhits @ 0= if i mnfound ! then mnhits @ 1 lit + mnhits ! then
+			loop
+			mnhits @ 1 lit = if mnfound @ else -1 lit then
+		then
+	then then
+;
+
+\ mnset ( idx -- )   word mnc's 11 bits, into mnb.
+: mnset ( idx -- )
+	B lit 0 lit do
+		dup A lit i - rshift 1 lit and if
+			mnc @ B lit * i +  dup 3 lit rshift mnb +  dup c@ rot 7 lit and 80 lit swap rshift or  swap c!
+		then
+	loop drop
+;
+
+: mnparse ( a n -- ok )
+	mnpn ! mnpa !  0 lit mnpi !  0 lit mnc !  0 lit mnerr !  mnb 9 lit zero
+	begin mnerr @ 0= if mnget else 0 lit then while
+		mnc @ 18 lit u< if mnlook dup 0< if drop 2 lit mnerr ! else mnset then then
+		mnerr @ 0= if mnc @ 1 lit + mnc ! then
+	repeat
+	mnerr @ 0= if mnc @ 18 lit = 0= if 1 lit mnerr ! then then
+	mnerr @ 0= if mnb 20 lit + c@ mnsum = 0= if 3 lit mnerr ! then then
+	mnerr @ 0=
+;
+
+\ ── Keys ──
+
+: wlhv variable ;  : wlhb ( -- a )  wlhv 60 lit lazy ;   \ bytes to hash
+: wltv variable ;  : wlst ( -- a )  wltv 60 lit lazy ;   \ the sponge
+
+: kcks ( index out -- )
+	swap  "tabernacle-keychain-v1" wlhb 16 lit ncpy  wlseed wlhb 16 lit + 20 lit ncpy
+	0 lit wlhb 36 lit + wlle!  wlhb 3A lit + wlle!
+	wlst wlhb 3E lit p2hashb  wlst swap 8 lit cpy
+;
+: kcview ( out -- )
+	"tabernacle-view-v1" wlhb 12 lit ncpy  wlseed wlhb 12 lit + 20 lit ncpy
+	wlst wlhb 32 lit p2hashb  wlst swap 8 lit cpy
+;
+
+\ The passphrase, as typed.
+: wlpwv variable ;  : wlpw ( -- a )  wlpwv 100 lit lazy ;  : wlpwn variable ;
+
+\ wlstr ( entropy out -- )   the seed: the entropy, stretched with the
+\        passphrase if there is one.
+: wlstr ( entropy out -- )
+	wlpwn @ if
+		swap "tabernacle-passphrase-v1" wlhb 18 lit ncpy  wlhb 18 lit + 20 lit ncpy
+		wlpw wlpwn @ wlhb 38 lit 186A0 lit 5 lit pick pbkdf drop
+	else 8 lit cpy then
+;
+
+\ wlent ( out -- ok )   32 fresh random bytes: the entropy device's, hashed
+\        with the clock.
+: wlent ( out -- ok )
+	wlhb 40 lit rnget if
+		101000 lit @ wlhb 40 lit + !  101004 lit @ wlhb 44 lit + !
+		wlhb 48 lit rot sha256  -1 lit
+	else drop 0 lit then
+;
+
+\ ── Outputs ──
+\ Tree 5: commitment (32) -> 0 key index, 4 amount (two cells), C origin (0
+\ mined, 1 change, 2 received, 3 recovered), 10 lock (0 free, 1 locked into
+\ an unfinished slate, 2 signed away, 3 held), 14 held until (height), 18 the
+\ height it was first seen on chain (-1: not yet), 1C 0, 20 the slate it's
+\ locked or signed into (16).  What the chain says now (unspent or not, its
+\ height) is read from the state when asked.
+
+: wlouts ( -- )   5 lit 20 lit 30 lit btuse ;
+: wlrv variable ;  : wlrec@ ( -- a )  wlrv 30 lit lazy ;   \ a record
+: wlkv variable ;  : wlkey ( -- a )   wlkv 40 lit lazy ;   \ a key, and a key read
+
+\ wlq+ ( alo ahi blo bhi -- lo hi )   64-bit add.
+: wlq+ ( alo ahi blo bhi -- lo hi )   rot + -rot  over + dup rot u< if swap 1 lit + else swap then ;
+
+\ wltip ( -- h )   the state's height.
+: wltip ( -- h )   pgop pgm 6C lit + @ ;
+\ wlmat ( -- n )   confirmations a reward (or a recovered output) needs; and
+\ wlhold ( -- n )  blocks a recovered output is held (both shorter on dev).
+: wlmat ( -- n )   bnet @ if 3 lit else A lit then ;
+: wlhold ( -- n )  bnet @ if 3 lit else A lit then ;
+
+\ wlon ( comm -- h -1 | 0 )   the height of the unspent output with this
+\        commitment, if there is one.
+: wlon ( comm -- h -1 | 0 )
+	stindex stk btget if
+		stleaves stk stv btget if stv 30 lit + be32 -1 lit else 0 lit then
+	else 0 lit then
+;
+
+\ Statuses: 0 pending, 1 spendable, 2 immature, 3 locked, 4 spending,
+\ 5 spent, 6 held.  wlstat ( comm rec -- status confirmations )
+: wlsc variable ;
+: wlstat ( comm rec -- status confirmations )
+	swap wlon if
+		wltip swap - 1 lit +  wlsc !                       ( rec )
+		dup 10 lit + @ 1 lit = if drop 3 lit else
+		dup 10 lit + @ 2 lit = if drop 4 lit else
+		dup 10 lit + @ 3 lit = over 14 lit + @ wltip u> and if drop 6 lit else
+			C lit + @ dup 0= swap 3 lit = or if wlsc @ wlmat u< if 2 lit else 1 lit then else 1 lit then
+		then then then
+		wlsc @
+	else
+		dup 10 lit + @ 2 lit = if drop 5 lit else
+		dup 10 lit + @ 1 lit = if drop 3 lit else
+		18 lit + @ -1 lit = if 0 lit else 5 lit then
+		then then  0 lit
+	then
+;
+
+\ wleach ( -- f )   the next record of tree 5 (from the key at wlkey): its
+\        commitment at wlkey + 20, the record at wlrec@; false at the end.
+\        Start with wlkey zeroed.
+: wleach ( -- f )
+	wlouts wlkey wlkey 20 lit + wlrec@ btseek dup if
+		wlkey 20 lit + wlkey 20 lit ncpy  wlkey 20 lit binc
+	then
+;
+
+\ ── Restoring ──
+\ An output's recovery nonce (../rust/src/recovery.rs): index (u32 LE),
+\ amount (u64 LE) and "TBN1", xor the first 16 bytes of
+\ hash_bytes_32("tabernacle-recovery-v1" ‖ view key ‖ commitment).  Ours if
+\ it opens and key 0/index, with the amount, makes the commitment.
+
+: wlvv variable ;  : wlview ( -- a )  wlvv 20 lit lazy ;
+: wlsk variable ;  : wlpk variable ;
+: wlkeys ( -- )   wlsk @ 0= if 814 lit alloc wlsk !  814 lit alloc wlpk ! then ;
+: wlev variable ;  : wlel ( -- a )  wlev 30 lit lazy ;   \ a commitment's elements
+: wlpv variable ;  : wlpl ( -- a )  wlpv 20 lit lazy ;   \ an opened nonce
+: wlidx variable ;  : wlalo variable ;  : wlahi variable ;  : wlso variable ;
+
+\ wlcomm ( index alo ahi out -- )   the commitment of an output paying amount
+\        to key 0/index: hash_elements(1, its key's hash ‖ the amount's four
+\        16-bit limbs).
+: wlcomm ( index alo ahi out -- )
+	swap dup FFFF lit and wlel 28 lit + !  10 lit rshift wlel 2C lit + !
+	swap dup FFFF lit and wlel 20 lit + !  10 lit rshift wlel 24 lit + !
+	swap  wlhb kcks  wlkeys  wlhb wlsk @ wlpk @ wkeygen  wlpk @ wlel wpkhash
+	wlst wlel C lit 1 lit p2hash  wlst swap 8 lit cpy
+;
+
+\ wlpad ( comm -- )   the commitment's pad: wlst's first 16 bytes.
+: wlpad ( comm -- )
+	"tabernacle-recovery-v1" wlhb 16 lit ncpy  wlview wlhb 16 lit + 20 lit ncpy
+	wlhb 36 lit + 20 lit ncpy
+	wlst wlhb 56 lit p2hashb
+;
+\ wlxor ( a b out -- )   16 bytes, a xor b.
+: wlxor ( a b out -- )   10 lit 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ xor over i + c! loop drop 2drop ;
+
+\ wlseal ( comm index alo ahi out -- )   the nonce sealing an output of ours.
+: wlseal ( comm index alo ahi out -- )
+	wlso !  wlpl 8 lit + wlle!  wlpl 4 lit + wlle!  wlpl wlle!  314E4254 lit wlpl C lit + !
+	wlpad  wlpl wlst wlso @ wlxor
+;
+
+\ wlopen ( comm nonce -- f )   whether it opens: then wlidx, wlalo, wlahi.
+: wlopen ( comm nonce -- f )
+	swap wlpad  wlst wlpl wlxor
+	wlpl C lit + @ 314E4254 lit = dup if                  \ "TBN1"
+		wlpl @ wlidx !  wlpl 4 lit + @ wlalo !  wlpl 8 lit + @ wlahi !
+	then
+;
+
+\ wlours ( comm nonce -- f )   whether the output is ours (wlidx .. set).
+: wlcv variable ;  : wlcc ( -- a )  wlcv 20 lit lazy ;
+: wlours ( comm nonce -- f )
+	over swap wlopen if
+		wlidx @ wlalo @ wlahi @ wlcc wlcomm  wlcc 8 lit ceq
+	else drop 0 lit then
+;
+
+\ Found outputs wait in wlfnd (32 at a time: the scan can't write tree 5
+\ while it walks tree 0): commitment, index, amount, height -- 0x30 bytes.
+: wlfv variable ;  : wlfnd ( k -- a )  30 lit * wlfv 600 lit lazy + ;
+: wlfn variable ;  : wlmax variable ;  : wlnfound variable ;
+: wlslo variable ;  : wlshi variable ;  : wlpos variable ;  : wlmore variable ;
+
+\ wlkeep ( -- )   the found outputs, into tree 5 (held: recovered).
+: wlkeep ( -- )
+	wlfn @ ?dup if 0 lit do
+		wlouts  i wlfnd wlrec@ btget 0= if
+			wlrec@ C lit zero
+			i wlfnd 20 lit + @ wlrec@ !  i wlfnd 24 lit + wlrec@ 4 lit + 2 lit cpy
+			3 lit wlrec@ C lit + !  3 lit wlrec@ 10 lit + !  wltip wlhold + wlrec@ 14 lit + !
+			i wlfnd 2C lit + @ wlrec@ 18 lit + !
+			i wlfnd wlrec@ btput
+		then
+	loop then
+	0 lit wlfn !
+;
+
+\ wlscan ( -- )   find every unspent output of ours in the state; keys are
+\        handed out from 100,000 past the highest index found (spent
+\        outputs aren't in the state, so the keys they used can't be seen).
+: wlscan ( -- )
+	wlload  wlview kcview
+	0 lit wlfn !  -1 lit wlmax !  0 lit wlnfound !  0 lit wlslo !  0 lit wlshi !
+	stk 4 lit zero
+	-1 lit wlmore !
+	begin wlmore @ while
+		stleaves stk stq stv btseek if
+			stq stk 8 lit ncpy  stk 8 lit binc
+			stv stv 20 lit + wlours if
+				wlnfound @ 1 lit + wlnfound !
+				wlidx @ wlmax @ u> wlmax @ 0< or if wlidx @ wlmax ! then
+				stv wlfn @ wlfnd 8 lit cpy  wlidx @ wlfn @ wlfnd 20 lit + !
+				wlalo @ wlfn @ wlfnd 24 lit + !  wlahi @ wlfn @ wlfnd 28 lit + !
+				stv 30 lit + be32 wlfn @ wlfnd 2C lit + !
+				wlslo @ wlshi @ wlalo @ wlahi @ wlq+ wlshi ! wlslo !
+				wlfn @ 1 lit + dup wlfn !  20 lit = if wlkeep then
+			then
+		else 0 lit wlmore ! then
+	repeat
+	wlkeep
+	pgop  wlmax @ 1 lit + 186A0 lit +  wlm 8 lit + @ 2dup u< if nip else drop then  wlm 8 lit + !
+	wlm 4 lit + @ 2 lit -1 lit xor and wlm 4 lit + !  pgmd
+	pgcommit drop
+;
+
+\ wlup? ( -- f )   whether the node has caught up: no fast sync under way,
+\        and its tip as high as the best peer's.
+: wlup? ( -- f )
+	pfsv @ if 0 lit else
+		0 lit pbest dup 0< if drop 0 lit else
+			pp 28 lit + @  dbtip ?dup if 20 lit + @ swap u< 0= else drop 0 lit then
+		then
+	then
+;
+
+\ wltick ( -- )   a restored wallet: once caught up, find its outputs.
+: wltick ( -- )
+	wl? if wlflags 2 lit and if wlup? if
+		"wallet: restoring: looking for its outputs in the state\n" puts
+		wlscan
+		"wallet: restored: " puts wlnfound @ wldec " output(s) found; new keys from index " puts
+		pgop wlm 8 lit + @ wldec A lit putc
+	then then then
+;
+
+\ ── The console ──
+
+: wlinv variable ;  : wlin ( -- a )  wlinv 400 lit lazy ;  : wlinn variable ;
+
+\ wlline ( a max -- n )   a line from the console, without its end.
+: wlline ( a max -- n )
+	0 lit begin getc dup A lit = over 4 lit = or 0= while
+		dup D lit = if drop else
+			over 3 lit pick u< if 3 lit pick 2 lit pick + c! 1 lit + else drop then
+		then
+	repeat drop nip nip
+;
+
+: wlbad ( -- )
+	mnerr @ 1 lit = if "node: that's " puts mnc @ wldec " words, not 24" puts then
+	mnerr @ 2 lit = if "node: word " puts mnc @ 1 lit + wldec " isn't a backup word" puts then
+	mnerr @ 3 lit = if "node: the words don't fit together -- one is wrong or out of order" puts then
+	"; enter them again:\n" puts
+;
+
+\ wlwords ( -- )   the backup words, typed until they're right: their
+\        entropy at mnb.
+: wlwords ( -- )
+	"Enter the wallet's 24 backup words, on one or more lines (they aren't shown):\n" puts
+	0 lit wlinn !
+	begin
+		wlin wlinn @ +  3FE lit wlinn @ -  wlline  wlinn @ +
+		20 lit over wlin + c!  1 lit + wlinn !
+		wlin wlinn @ mncount dup 18 lit u< if
+			"  " puts wldec " of 24\n" puts  0 lit
+		else
+			drop wlin wlinn @ mnparse dup 0= if wlbad 0 lit wlinn ! then
+		then
+	until
+	wlin 100 lit zero
+;
+
+\ wlnewpw ( -- )   a new passphrase, typed twice.
+: wlnewpw ( -- )
+	begin
+		"A passphrase for the new wallet (needed with the words to restore it; not shown):\n" puts
+		wlpw FF lit wlline wlpwn !
+		"Again:\n" puts  wlin FF lit wlline
+		wlpwn @ 0= if drop "node: it can't be empty (start without --passphrase for none)\n" puts 0 lit else
+		wlpwn @ = if wlin wlpw wlpwn @ mcmp 0= else 0 lit then
+		dup 0= if "node: those don't match\n" puts then
+		then
+	until
+	wlin 40 lit zero
+;
+
+: wlclear ( -- )   1B lit putc "[2J" puts  1B lit putc "[3J" puts  1B lit putc "[H" puts ;
+
+: wlshow ( -- )
+	"\nnode: a new wallet.  Its 24 backup words -- write them down, in order, and keep\nthem safe:\n\n" puts
+	pgop wlm 30 lit + mnshow
+	"\nThey" puts  wlflags 1 lit and if " and the passphrase" puts then
+	" are the only way to restore the wallet, and anyone holding\nthem can spend everything in it.  The wallet lives on this disk: deleting\ndata/disk.img deletes it.  Press Enter once they're written down.\n" puts
+	wlin FF lit wlline drop
+	wlclear  mnb 9 lit zero
+;
+
+: wlrec variable ;   \ restore from the words (setting `recover`)
+: wlpass variable ;  \ with a passphrase (setting `passphrase`)
+
+\ wlnew ( -- ok )   a new wallet, its words shown.
+: wlnew ( -- ok )
+	wlpass @ if wlnewpw else 0 lit wlpwn ! then
+	mnb wlent if
+		wlpwn @ if "node: stretching the passphrase (about two minutes)\n" puts then
+		mnb wlseed wlstr
+		mnb wlseed  wlpwn @ 0= 0= 1 lit and  wlmake
+		dup if wlshow then
+	else "node: no source of randomness for a new wallet's seed\n" puts 0 lit then
+;
+
+\ wlback ( -- ok )   a wallet from its words, to be recovered once the
+\        node has caught up.
+: wlback ( -- ok )
+	wlwords
+	wlpass @ if
+		"The wallet's passphrase (not shown):\n" puts  wlpw FF lit wlline wlpwn !
+	else 0 lit wlpwn ! then
+	wlpwn @ if "node: stretching the passphrase (about two minutes)\n" puts then
+	mnb wlseed wlstr
+	mnb wlseed  wlpwn @ 0= 0= 1 lit and 2 lit or  wlmake
+	mnb 9 lit zero
+	dup if "node: restoring the wallet: it finds its coins once the node has caught up\n" puts then
+;
+
+\ wlmigr ( -- )   a wallet whose records are older: its outputs (all
+\        recovered, then) found again by a scan.
+: wlmigr ( -- )
+	pgop wlm C lit + @ 2 lit u< if
+		wlouts btdrop  pgop 2 lit wlm C lit + !  wlm 4 lit + @ 2 lit or wlm 4 lit + !  pgmd
+		pgcommit drop
+	then
+;
+
+\ wlapik ( -- )   the API key: made if the wallet has none, and then shown.
+: wlshowk variable ;   \ show it (setting `apikey`)
+: wlapik ( -- )
+	wlhb 8 lit zero  pgop wlm 50 lit + wlhb 8 lit ceq if
+		wlhb wlent if
+			pgop wlhb wlm 50 lit + 8 lit cpy  pgmd  pgcommit drop
+			"node: a new API key for the wallet (tools/wallet asks for it once)\n" puts  -1 lit wlshowk !
+		then
+	then
+;
+
+: wlboot ( -- )
+	wl? if
+		wlrec @ if "node: this disk already holds a wallet; to restore one, start on a new disk\n(rm data/disk.img, which deletes this wallet)\n" puts bye then
+		wlpass @ if "node: passphrase: this disk already holds a wallet (a passphrase is set when\nit's made, or with recover)\n" puts bye then
+		"node: wallet open" puts  wlflags 2 lit and if ", to be restored once the node has caught up" puts then  A lit putc
+	else
+		wlrec @ if wlback else wlnew then
+		0= if "node: couldn't keep the wallet on the disk\n" puts bye then
+	then
+	wlmigr wlapik
+	wlload  wlpw 40 lit zero  0 lit wlpwn !
+	wlshowk @ if "node: the wallet's API key: " puts pgop wlm 50 lit + 20 lit wlhex A lit putc then
+;

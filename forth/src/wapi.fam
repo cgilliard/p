@@ -1,0 +1,247 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/wapi.fam — the wallet's API: UDP on its own port (`naport`, 47654 by
+\ default), forwarded from the host's 127.0.0.1 only (scripts/node.sh), for
+\ tools/wallet.  Every datagram, both ways, carries an HMAC-SHA256 under the
+\ wallet's API key (src/wallet.fam; shown on the console when it's made, or
+\ with the `apikey` setting), so only the key's holder is answered and the
+\ answers can be trusted.
+\
+\ Datagram (numbers big-endian): 0 "TBWA"  4 type  5 status (answers)
+\ 6 session (8)  E counter (8)  16 body length (2)  18 body  then the MAC
+\ (32) of everything before it.  An answer has its request's type + 0x80,
+\ session and counter.
+\
+\   1 HELLO   -> body: the session (8, new each time the node starts) and the
+\                last counter used in it (8)
+\   2 CALL    body: a command and its arguments -> body: the result's length
+\                (4), then its first 1024 bytes
+\   3 MORE    body: an offset (4) -> body: the last result's 1024 bytes there
+\   4 PUT     body: an offset (4) and up to 1024 bytes, into the upload (a
+\                slate on its way in: 64 KiB) -> empty
+\
+\ A CALL or MORE must be in the session, with a counter above the last one
+\ (so nothing can be replayed); the last answer is sent again for its
+\ counter (so a lost answer can be asked for again).
+\
+\ Statuses: 0 ok, 1 unknown command or bad request, 2 the wallet is being
+\ restored (waiting for the node to catch up), 3 refused: the result says
+\ why (text).
+\
+\ Commands, and their results:
+\   1 status    0 tip height (4)  4 best peer's height (4, -1: none)  8 fast
+\               sync phase (1, 0: none)  9 peers answering (1)  A wallet flags
+\               (1)  B network (1, 0 main, 1 dev)  C next key index (4)
+\   2 balance   spendable, immature, pending, locked, held (8 each), held
+\               until (4), tip height (4)
+\   3 outputs   count (4), then each output's 0x38 bytes: commitment (32),
+\               key index (4), amount (8), status (1: src/wallet.fam's
+\               `wlstat`), origin (1), 0 (2), confirmations (4), held until (4)
+\   4 send      args: amount, fee (8 each) -> slate S1 (src/slate.fam)
+\   5 receive   args: the upload's length (4: slate S1) -> slate S2
+\   6 finalize  args: the upload's length (4: slate S2) -> the transaction's
+\               id (32) and bytes; the node announces it to its peers
+\   7 cancel    args: a slate id (16)
+\   8 slates    count (4), then each slate's 0x44 bytes: id (16), role (1: 0
+\               sender, 1 receiver), state (1: 0 sent, 1 received, 2
+\               finalized, 3 cancelled), unconfirmed (1), 0, amount, fee (8
+\               each), the transaction's id (32)
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: wamag ( -- w )   54425741 lit ;                       \ "TBWA"
+: wasv variable ;  : wases ( -- a )  wasv 8 lit lazy ;   \ the session
+: walo variable ;  : wahi variable ;                    \ the last counter
+: warv variable ;  : wares ( -- a )  warv 40000 lit lazy ;   \ the last result
+: warn variable ;
+: wav variable ;   : walast ( -- a )  wav 500 lit lazy ;   \ the last answer
+: waln variable ;
+: wamv variable ;  : wamac ( -- a )  wamv 20 lit lazy ;
+: wauv variable ;  : waup ( -- a )  wauv 10000 lit lazy ;   \ the upload
+: waon variable ;
+
+\ waopen ( -- )   a new session.
+: waopen ( -- )
+	wases 8 lit rnget 0= if 101000 lit @ wases !  101004 lit @ wases 4 lit + ! then
+	0 lit walo !  0 lit wahi !  0 lit warn !  0 lit waln !  -1 lit waon !
+;
+
+\ wamacof ( a n -- )   the MAC of n bytes, into wamac.
+: wamacof ( a n -- )   pgop wlm 50 lit + 20 lit hmkey  hmbeg shupd  wamac hmend ;
+
+\ ── Answers ──
+\ Built at npkt: the header copied from the request, then the body.
+
+: wab ( -- a )   npkt 18 lit + ;                         \ the answer's body
+\ waans ( status n -- )   send the answer with an n-byte body; keep it.
+: waans ( status n -- )
+	swap npkt 5 lit + c!  nsrc @ swap
+	dup npkt 16 lit + nb16!
+	18 lit + dup  npkt swap wamacof  wamac npkt 2 lit pick + 20 lit ncpy
+	20 lit +  dup waln !  npkt walast 2 lit pick ncpy
+	nsport @ swap  naport @ nsfrom !  nsend drop  0 lit nsfrom !
+;
+\ (nsrc nsport, still the request's: the answer goes back to it)
+
+\ wachunk ( off -- n )   the result's bytes from off, into the body after
+\        a 4-byte prefix at body + 0; how many.
+: wachunk ( off -- n )
+	warn @ over - dup 0< if drop 0 lit then  dup 400 lit u> if drop 400 lit then
+	dup if wares rot + wab 4 lit + 2 lit pick ncpy else nip then
+;
+
+\ ── Commands ──
+
+: war@ ( k -- a )   wares + ;
+
+: wastatus ( -- )
+	wares 10 lit nzero
+	dbtip ?dup if 20 lit + @ else 0 lit then wares be!
+	0 lit pbest dup 0< if drop -1 lit else pp 28 lit + @ then wares 4 lit + be!
+	pfsv @ wares 8 lit + c!
+	0 lit ppn 0 lit do i pp 8 lit + @ 2 lit = if 1 lit + then loop wares 9 lit + c!
+	wl? if wlflags else 0 lit then wares A lit + c!  bnet @ wares B lit + c!
+	wl? if pgop wlm 8 lit + @ else 0 lit then wares C lit + be!
+	10 lit warn !
+;
+
+\ wasum ( lo hi k -- )   add to total k (cells at wares + 8k: lo, hi).
+: wasa variable ;
+: wasum ( lo hi k -- )
+	3 lit lshift wares + wasa !  wasa @ @ wasa @ 4 lit + @ wlq+ wasa @ 4 lit + ! wasa @ !
+;
+
+: wahu variable ;
+: wabal ( -- )
+	wares 30 lit nzero  0 lit wahu !
+	wlkey 20 lit nzero
+	begin wleach while
+		wlkey 20 lit + wlrec@ wlstat drop                  ( status )
+		wlrec@ 4 lit + @ wlrec@ 8 lit + @ rot              ( lo hi status )
+		dup 1 lit = if drop 0 lit wasum else
+		dup 2 lit = if drop 1 lit wasum else
+		dup 0 lit = if drop 2 lit wasum else
+		dup 3 lit = over 4 lit = or if drop 3 lit wasum else
+		dup 6 lit = if drop 4 lit wasum  wlrec@ 14 lit + @ wahu @ u> if wlrec@ 14 lit + @ wahu ! then else
+		drop 2drop then then then then then
+	repeat
+	\ the totals were summed little-endian at 8k: rewrite them big-endian
+	5 lit 0 lit do i 3 lit lshift wares + dup @ swap 4 lit + @  i 3 lit lshift wares + qbe! loop
+	wahu @ wares 28 lit + be!  wltip wares 2C lit + be!
+	30 lit warn !
+;
+
+: waouts ( -- )
+	wlkey 20 lit nzero  4 lit warn !
+	begin wleach warn @ 38 lit + 40000 lit u> 0= and while
+		warn @ war@ dup 38 lit nzero                       ( r )
+		wlkey 20 lit + over 20 lit ncpy
+		wlrec@ @ over 20 lit + be!
+		wlrec@ 4 lit + @ wlrec@ 8 lit + @ 2 lit pick 24 lit + qbe!
+		wlrec@ C lit + @ over 2D lit + c!
+		wlrec@ 14 lit + @ over 34 lit + be!
+		wlkey 20 lit + wlrec@ wlstat  2 lit pick 30 lit + be!  over 2C lit + c!
+		drop  warn @ 38 lit + warn !
+	repeat
+	warn @ 4 lit - 38 lit / wares be!
+;
+
+\ waerr ( -- status )   refused: why, as the result.
+: waerr ( -- status )
+	wserr @ ?dup if dup strlen dup warn ! wares swap ncpy else 0 lit warn ! then  3 lit
+;
+\ waslate ( ok -- status )   the slate made (wsb), or why not.
+: waslate ( ok -- status )   if wsb wares wsn @ ncpy  wsn @ warn !  0 lit else waerr then ;
+
+: waslist ( -- )
+	trk 20 lit nzero  4 lit warn !
+	begin treach warn @ 44 lit + 40000 lit u> 0= and while
+		warn @ war@ dup 44 lit nzero                       ( r )
+		trk 10 lit + over 10 lit ncpy
+		wsr @ over 10 lit + c!  wsr 4 lit + @ over 11 lit + c!  trpend? 1 lit and over 12 lit + c!
+		wsr 18 lit + @ wsr 1C lit + @ 2 lit pick 14 lit + qbe!
+		wsr 20 lit + @ wsr 24 lit + @ 2 lit pick 1C lit + qbe!
+		wsr 28 lit + over 24 lit + 20 lit ncpy
+		drop  warn @ 44 lit + warn !
+	repeat
+	warn @ 4 lit - 44 lit / wares be!
+;
+
+\ wacall ( a n -- status )   run a command: its result at wares.
+: waa variable ;  : wan2 variable ;
+: wacall ( a n -- status )
+	0 lit warn !  wan2 ! waa !
+	wan2 @ if waa @ c@
+		dup 1 lit = if drop wastatus 0 lit else
+		wl? 0= if drop 1 lit else
+		wlflags 2 lit and if drop 2 lit else
+		dup 2 lit = if drop wabal 0 lit else
+		dup 3 lit = if drop waouts 0 lit else
+		dup 4 lit = wan2 @ 11 lit = and if drop
+			waa @ 1 lit + qbe@ waa @ 9 lit + qbe@ wssend waslate else
+		dup 5 lit = wan2 @ 5 lit = and if drop
+			waa @ 1 lit + be32 dup 10000 lit u> if drop 1 lit else waup swap wsrecv waslate then else
+		dup 6 lit = wan2 @ 5 lit = and if drop
+			waa @ 1 lit + be32 dup 10000 lit u> if drop 1 lit else waup swap wsfin if
+				wtid wares 20 lit ncpy  wtx wares 20 lit + wtn @ ncpy  wtn @ 20 lit + warn !  trsoon  0 lit
+			else waerr then then else
+		dup 7 lit = wan2 @ 11 lit = and if drop
+			waa @ 1 lit + wscancel if 0 lit else waerr then else
+		dup 8 lit = if drop waslist 0 lit else
+		drop 1 lit then then then then then then then then then then
+	else 1 lit then
+;
+
+\ ── Requests ──
+
+: wqv variable ;  : waq ( -- a )  wqv 600 lit lazy ;   \ the request (aligned)
+: wan variable ;
+: wablen ( -- n )   waq 16 lit + nb16@ ;
+
+\ wacheck ( -- f )   a well-formed request, its MAC right.
+: wacheck ( -- f )
+	wan @ 38 lit u< if 0 lit else
+	waq be32 wamag =  wablen 38 lit + wan @ = and dup if
+		waq wan @ 20 lit - wamacof  wamac waq wan @ + 20 lit - 20 lit mcmp 0= and
+	then then
+;
+
+\ wanew? ( -- f )   the request's counter is above the last one: then it's
+\        the last.   wasame? ( -- f )   it's the last one.
+: wactr ( -- lo hi )   waq E lit + qbe@ ;
+: wanew? ( -- f )
+	wactr  dup wahi @ u> if 2drop -1 lit else
+	wahi @ = if walo @ u> else drop 0 lit then then
+;
+: wasame? ( -- f )   wactr wahi @ = swap walo @ = and ;
+
+\ wareq ( -- )   a request whose MAC is right.
+: wareq ( -- )
+	waq npkt 16 lit ncpy  waq 4 lit + c@ 80 lit or npkt 4 lit + c!
+	waq 4 lit + c@ 1 lit = if
+		wases wab 8 lit ncpy  walo @ wahi @ wab 8 lit + qbe!  0 lit 10 lit waans
+	else
+	waq 6 lit + wases 8 lit mcmp 0= if
+		wanew? if
+			wactr wahi ! walo !
+			waq 4 lit + c@ 2 lit = if
+				waq 18 lit + wablen wacall
+				warn @ wab be!  0 lit wachunk 4 lit + waans
+			else waq 4 lit + c@ 3 lit = wablen 4 lit = and if
+				waq 18 lit + be32 dup wab be!  wachunk 4 lit + 0 lit swap waans
+			else waq 4 lit + c@ 4 lit = wablen 4 lit u< 0= and if
+				waq 18 lit + be32  wablen 4 lit -  2dup + 10000 lit u> if 2drop 1 lit else
+					waq 1C lit + rot waup + rot ncpy  0 lit then  0 lit waans
+			else 1 lit 0 lit waans then then then
+		else wasame? waln @ and if
+			walast npkt waln @ ncpy  nsrc @ nsport @ waln @  naport @ nsfrom !  nsend drop  0 lit nsfrom !
+		then then
+	then then
+;
+
+\ wain ( -- )   a datagram on the API port.
+: wain ( -- )
+	npn @ 600 lit u> 0= if
+		npay @ waq npn @ ncpy  npn @ wan !
+		waon @ 0= if waopen then
+		wacheck if wareq then
+	then
+;

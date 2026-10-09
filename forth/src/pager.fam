@@ -23,7 +23,8 @@
 \
 \ Meta page (cells): 0 "STAT"  4 version (2)  8 commits  C hwm  10 free list
 \ head  14 .. 24 four roots (src/btree.fam)  24 .. 100 the state (src/state.fam,
-\ src/accept.fam, src/snap.fam)  100 .. 110 four more roots.
+\ src/accept.fam, src/snap.fam)  100 .. 110 four more roots  200 .. 270 the
+\ wallet (src/wallet.fam).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : pgbase ( -- sector )   110008 lit ;                 \ after the tip log (src/store.fam)
@@ -309,9 +310,15 @@
 ;
 
 \ pgfmt ( -- ok )   empty pages: a new meta page, committed.
+\        A wallet in it (from 0x200, src/wallet.fam) is kept: a chain
+\        started over doesn't lose its keys.  Its outputs (a tree) aren't,
+\        so it's marked to find them again, as a restored wallet does.
+: pgwv variable ;  : pgw ( -- a )  pgwv 70 lit lazy ;
 : pgfmt ( -- ok )
 	pgreset pgjclear drop
-	pgop  pgm 400 lit zero
+	pgop  pgm @ pgmag = pgm 4 lit + @ 2 lit = and  dup if pgm 200 lit + pgw 1C lit cpy then
+	pgm 400 lit zero
+	if pgw pgm 200 lit + 1C lit cpy  pgm 204 lit + @ 2 lit or pgm 204 lit + ! then
 	pgmag pgm !  2 lit pgm 4 lit + !  pgd0 pgm C lit + !  pgmd
 	pgcommit
 ;

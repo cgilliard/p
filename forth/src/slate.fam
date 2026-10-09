@@ -1,0 +1,466 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/slate.fam — payments: slates (../rust/src/slate.rs) and the wallet's
+\ side of them (../rust/src/wallet.rs: send, receive, finalize, cancel), and
+\ the transaction a finished slate makes (../rust/src/transaction.rs).
+\
+\ A slate (numbers little-endian): 0 "TSLT"  4 version (2, u16)  6 stage (1
+\ send, 2 receive)  7 id (16)  17 amount (8)  1F fee (8)  27 inputs (u16),
+\ each a public key (0x814) and its amount (8); then outputs (u16), each a
+\ lock (32), amount (8) and recovery nonce (16).  The sender's S1 has its
+\ inputs and change; the receiver's S2 adds one output, last, paying exactly
+\ the amount.  Inputs must cover outputs, the amount (at S1) and the fee
+\ exactly.  Read strictly: nothing left over, and (stricter than the Rust
+\ node, which never makes one) every field element canonical.
+\
+\ The transaction (version 6): inputs (u16), each its amount, 0 (a key
+\ spend), the public key, a one-time key's proof (index 0, no path) and its
+\ signature (1, then 0x81C bytes); outputs (u16).  Inputs sorted by their
+\ commitment, outputs by their bytes; every input signs the same message:
+\ hash_elements(2, [inputs, 0 x 15] ‖ each input's commitment and 8 zeros
+\ ‖ each output's commitment and its nonce's eight 16-bit limbs).  Its id is
+\ hash_bytes_32 of its bytes.
+\
+\ Records: tree 6, slate id (16) -> 0 role (0 sender, 1 receiver), 4 state (0
+\ sent, 1 received, 2 finalized, 3 cancelled), 8 the slate's pages (S1 for
+\ the sender, S2 for the receiver), C its length, 10 the transaction's pages,
+\ 14 its length, 18 amount (two cells), 20 fee (two cells), 28 the
+\ transaction's id (32), 48 an input's commitment (32: still unspent, the
+\ transaction isn't confirmed).
+\
+\   wssend   ( alo ahi flo fhi -- ok )   S1, at wsb (wsn bytes)
+\   wsrecv   ( a n -- ok )               S2 for S1, at wsb
+\   wsfin    ( a n -- ok )               the transaction for S2: its id at
+\                                        wtid, its bytes at wtx (wtn)
+\   wscancel ( id -- ok )
+\ Each commits; on failure, wserr says why.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: slP ( -- p )   78000001 lit ;
+: slmag ( -- w )   544C5354 lit ;                     \ "TSLT"
+: wserr variable ;
+
+\ Little-endian numbers at any alignment.
+: slle@ ( a -- w )
+	dup c@  over 1 lit + c@ 8 lit lshift or  over 2 lit + c@ 10 lit lshift or  swap 3 lit + c@ 18 lit lshift or
+;
+: sl16@ ( a -- h )   dup c@ swap 1 lit + c@ 8 lit lshift or ;
+: sl16! ( h a -- )   over over c!  swap 8 lit rshift swap 1 lit + c! ;
+
+\ slcanon? ( a n -- f )   n bytes of field elements, each below p.
+: slcanon? ( a n -- f )   -1 lit swap 2 lit rshift 0 lit do over i 2 lit lshift + slle@ slP u< and loop nip ;
+
+\ ── Page chains: blobs ──
+
+: sbf variable ;  : sbl variable ;  : sbo variable ;  : sbp variable ;
+: sbk variable ;  : sba variable ;  : sbn variable ;
+
+\ sbput ( a n -- p )   keep n bytes (n > 0) in a chain of pages: the first.
+: sbput ( a n -- p )
+	sbn ! sba !  0 lit sbf !  0 lit sbl !  0 lit sbo !
+	begin sbo @ sbn @ u< while
+		pgop  pgnew sbp !
+		sbl @ if sbp @ sbl @ pgget !  sbl @ pgdirty else sbp @ sbf ! then
+		sbp @ sbl !
+		sbn @ sbo @ - dup FF8 lit u> if drop FF8 lit then sbk !
+		sbk @ sbp @ pgget 4 lit + !
+		sba @ sbo @ +  sbp @ pgget 8 lit +  sbk @ ncpy
+		sbp @ pgdirty
+		sbo @ sbk @ + sbo !
+	repeat
+	sbf @
+;
+\ sbget ( p buf -- n )   a chain's bytes.
+: sbget ( p buf -- n )
+	sba ! sbp !  0 lit sbo !
+	begin sbp @ while
+		pgop  sbp @ pgget dup 4 lit + @ sbk !  8 lit + sba @ sbo @ + sbk @ ncpy
+		sbo @ sbk @ + sbo !  sbp @ pgget @ sbp !
+	repeat
+	sbo @
+;
+
+\ ── Reading a slate ──
+
+: sla variable ;  : sln variable ;  : slst variable ;  : slni variable ;  : slno variable ;
+: slia variable ;  : sloa variable ;
+: slin ( k -- a )    81C lit * slia @ + ;               \ input k: key, then amount
+: slout ( k -- a )   38 lit * sloa @ + ;                \ output k: lock, amount, nonce
+: slid ( -- a )      sla @ 7 lit + ;
+: slamt ( -- lo hi ) sla @ 17 lit + dup slle@ swap 4 lit + slle@ ;
+: slfee ( -- lo hi ) sla @ 1F lit + dup slle@ swap 4 lit + slle@ ;
+: sl64@ ( a -- lo hi )   dup slle@ swap 4 lit + slle@ ;
+
+\ Sums of 64-bit amounts, in three cells (so overflow shows).
+: slsi variable ;  : slso variable ;  : slsv variable ;  : slhi variable ;  : slc variable ;
+: slsum ( a -- )   slsv ! ;
+: sl+ ( lo hi -- )
+	slhi !
+	slsv @ @ over + dup slsv @ !  u> if 1 lit else 0 lit then slc !
+	slsv @ 4 lit + @ slhi @ + dup slhi @ u< if 1 lit else 0 lit then
+	swap slc @ + dup 0= slc @ and if 1 lit else 0 lit then
+	swap slsv @ 4 lit + !  +  slsv @ 8 lit + @ + slsv @ 8 lit + !
+;
+: slav variable ;  : slacc ( -- a )  slav 18 lit lazy ;  \ two sums
+
+\ slparse ( a n -- ok )   read and check a slate.
+: slparse ( a n -- ok )
+	sln ! sla !  0 lit wserr !
+	sln @ 2B lit u< if "truncated" wserr ! else
+	sla @ slle@ slmag = 0= if "not a slate" wserr ! else
+	sla @ 4 lit + sl16@ 2 lit = 0= if "an unsupported slate version" wserr ! else
+	sla @ 6 lit + c@ dup slst !  dup 1 lit = swap 2 lit = or 0= if "an unknown stage" wserr ! else
+	sla @ 27 lit + sl16@ slni !  sla @ 29 lit + slia !
+	slni @ 81C lit * 2B lit +  sln @ u> if "truncated" wserr ! else
+	slni @ slin sl16@ slno !  slni @ slin 2 lit + sloa !
+	slno @ 38 lit *  sloa @ sla @ - +  sln @ = 0= if "the wrong length" wserr ! else
+	slni @ 0= if "no inputs" wserr ! else
+	slamt or 0= if "a zero amount" wserr ! then
+	then then then then then then then
+	wserr @ 0= if                                      \ canonical, and no input twice
+		slni @ 0 lit do i slin 814 lit slcanon? 0= if "a public key isn't canonical" wserr ! then loop
+		slno @ ?dup if 0 lit do i slout 20 lit slcanon? 0= if "an output's lock isn't canonical" wserr ! then loop then
+		slni @ 1 lit u> if
+			slni @ 1 lit do i 0 lit do
+				j slin i slin 814 lit mcmp 0= if "an input appears twice" wserr ! then
+			loop loop
+		then
+	then
+	wserr @ 0= if                                      \ balanced: in = out + (amount) + fee
+		slacc 6 lit zero
+		slacc slsum  slni @ 0 lit do i slin 814 lit + sl64@ sl+ loop
+		slacc C lit + slsum
+		slno @ ?dup if 0 lit do i slout 20 lit + sl64@ sl+ loop then
+		slst @ 1 lit = if slamt sl+ then  slfee sl+
+		slacc slacc C lit + 3 lit ceq  slacc 8 lit + @ 0= and 0= if "the inputs don't exactly cover the outputs, amount and fee" wserr ! then
+	then
+	wserr @ 0=
+;
+
+\ ── Outputs ──
+
+: wslv variable ;  : wsels ( -- a )  wslv 40 lit lazy ;
+
+\ wlcommit ( lock alo ahi out -- )   an output's commitment:
+\        hash_elements(1, lock ‖ the amount's four 16-bit limbs).
+: wlcommit ( lock alo ahi out -- )
+	swap dup FFFF lit and wsels 28 lit + !  10 lit rshift wsels 2C lit + !
+	swap dup FFFF lit and wsels 20 lit + !  10 lit rshift wsels 24 lit + !
+	swap wsels 20 lit ncpy
+	wlst wsels C lit 1 lit p2hash  wlst swap 8 lit cpy
+;
+
+\ wskey ( index -- )   key 0/index's pair: wlsk @, wlpk @.
+: wskey ( index -- )   wlhb kcks  wlkeys  wlhb wlsk @ wlpk @ wkeygen ;
+
+\ wsmkout ( index alo ahi out -- )   our output paying amount to key
+\        0/index, sealed for recovery (its commitment at wlcc).
+: wso variable ;  : wsi variable ;  : wsal variable ;  : wsah variable ;
+: wsmkout ( index alo ahi out -- )
+	wso ! wsah ! wsal ! wsi !
+	wsi @ wskey  wlpk @ wsels wpkhash  wsels wso @ 20 lit ncpy
+	wsal @ wso @ 20 lit + wlle!  wsah @ wso @ 24 lit + wlle!
+	wso @ wsal @ wsah @ wlcc wlcommit
+	wlcc wsi @ wsal @ wsah @ wso @ 28 lit + wlseal
+;
+
+\ wlnext ( -- index )   a fresh key index (in the transaction being made).
+: wlnext ( -- index )   pgop wlm 8 lit + @ dup 1 lit + wlm 8 lit + !  pgmd ;
+
+\ wskeep ( origin -- )   record the output just made (wsmkout) as ours.
+: wskeep ( origin -- )
+	wlrec@ C lit zero  wsi @ wlrec@ !  wsal @ wlrec@ 4 lit + !  wsah @ wlrec@ 8 lit + !
+	wlrec@ C lit + !  -1 lit wlrec@ 18 lit + !
+	wlouts wlcc wlrec@ btput
+;
+
+\ ── Records ──
+
+: wslates ( -- )   6 lit 10 lit 68 lit btuse ;
+: wsrv variable ;  : wsr ( -- a )  wsrv 68 lit lazy ;
+: wsbv variable ;  : wsb ( -- a )  wsbv 8000 lit lazy ;  : wsn variable ;   \ a slate made
+: wscv variable ;  : wsc ( -- a )  wscv 8000 lit lazy ;                     \ a slate kept
+: wsget ( id -- found )   wslates wsr btget ;
+: wsput ( id -- )   wslates wsr btput ;
+
+\ wsready ( -- ok )   whether keys can be handed out (not still restoring).
+: wsready ( -- ok )
+	wlview kcview
+	wlflags 2 lit and if "the wallet is still being restored (waiting for the node to catch up)" wserr ! 0 lit else -1 lit then
+;
+
+\ ── Sending ──
+
+\ Candidates: spendable outputs: commitment, index, amount, chosen.
+: wscdv variable ;  : wscd ( k -- a )  30 lit * wscdv 6000 lit lazy + ;
+: wscn variable ;  : wsnl variable ;  : wsnh variable ;  : wstl variable ;  : wsth variable ;
+: wsbest variable ;  : wsk variable ;  : wscho variable ;
+
+\ wsq< ( alo ahi blo bhi -- f )   a < b, unsigned 64-bit.
+: wsq< ( alo ahi blo bhi -- f )
+	rot 2dup = if 2drop u< else u> nip nip then
+;
+\ wsmore? ( -- f )   the chosen total is below what's needed.
+: wsmore? ( -- f )   wstl @ wsth @ wsnl @ wsnh @ wsq< ;
+
+\ wscands ( -- )   the spendable outputs.
+: wscands ( -- )
+	0 lit wscn !  wlkey 20 lit nzero
+	begin wleach wscn @ 200 lit u< and while
+		wlkey 20 lit + wlrec@ wlstat drop 1 lit = if
+			wlkey 20 lit + wscn @ wscd 20 lit ncpy
+			wlrec@ @ wscn @ wscd 20 lit + !
+			wlrec@ 4 lit + @ wscn @ wscd 24 lit + !  wlrec@ 8 lit + @ wscn @ wscd 28 lit + !
+			0 lit wscn @ wscd 2C lit + !
+			wscn @ 1 lit + wscn !
+		then
+	repeat
+;
+
+\ wsbetter ( k -- f )   candidate k beats the best so far: more coins, or as
+\        many and a lower commitment.
+: wsamt ( k -- lo hi )   wscd dup 24 lit + @ swap 28 lit + @ ;
+: wsbl variable ;  : wsbh variable ;  : wskl variable ;  : wskh variable ;
+: wsbetter ( k -- f )
+	dup wsamt wskh ! wskl !  wsbest @ wsamt wsbh ! wsbl !
+	wsbl @ wsbh @ wskl @ wskh @ wsq< if drop -1 lit else
+	wskl @ wskh @ wsbl @ wsbh @ wsq< if drop 0 lit else
+	wscd wsbest @ wscd 20 lit mcmp 0< then then
+;
+
+\ wspick ( -- f )   choose the best unchosen candidate; false if none is left.
+: wspick ( -- f )
+	-1 lit wsbest !
+	wscn @ ?dup if 0 lit do
+		i wscd 2C lit + @ 0= if
+			wsbest @ 0< if i wsbest ! else i wsbetter if i wsbest ! then then
+		then
+	loop then
+	wsbest @ 0< 0= dup if
+		-1 lit wsbest @ wscd 2C lit + !
+		wstl @ wsth @ wsbest @ wsamt wlq+ wsth ! wstl !
+		wscho @ 1 lit + wscho !
+	then
+;
+
+: wsid ( -- a )   wsb 7 lit + ;
+
+\ wssend ( alo ahi flo fhi -- ok )
+: wsfl variable ;  : wsfh variable ;
+: wssend ( alo ahi flo fhi -- ok )
+	wsfh ! wsfl ! wsah ! wsal !
+	wsready if
+		wsal @ wsah @ or 0= if "send a nonzero amount" wserr ! 0 lit else
+		wsal @ wsah @ wsfl @ wsfh @ wlq+ wsnh ! wsnl !
+		wscands  0 lit wstl !  0 lit wsth !  0 lit wscho !
+		begin wsmore? wscho @ 8 lit u< and if wspick else 0 lit then 0= until
+		wsmore? if "not enough spendable coins (in at most 8 outputs)" wserr ! 0 lit else
+			\ the slate's header
+			wsb 2B lit nzero  slmag wsb wlle!  2 lit wsb 4 lit + sl16!  1 lit wsb 6 lit + c!
+			wsid 10 lit rnget drop
+			wsal @ wsb 17 lit + wlle!  wsah @ wsb 1B lit + wlle!
+			wsfl @ wsb 1F lit + wlle!  wsfh @ wsb 23 lit + wlle!
+			wscho @ wsb 27 lit + sl16!
+			\ inputs: each chosen key and amount, locked to the slate
+			29 lit wsn !
+			wscn @ 0 lit do i wscd 2C lit + @ if
+				i wscd 20 lit + @ wskey  wlpk @ wsb wsn @ + 814 lit ncpy
+				i wscd 24 lit + @ wsb wsn @ + 814 lit + wlle!  i wscd 28 lit + @ wsb wsn @ + 818 lit + wlle!
+				wsn @ 81C lit + wsn !
+				wlouts i wscd wlrec@ btget drop  1 lit wlrec@ 10 lit + !  wsid wlrec@ 20 lit + 10 lit ncpy
+				i wscd wlrec@ btput
+			then loop
+			\ change, if any
+			wstl @ wsnl @ -  wsth @ wsnh @ -  wstl @ wsnl @ u< if 1 lit - then       ( change: lo hi )
+			2dup or if
+				1 lit wsb wsn @ + sl16!  wsn @ 2 lit + wsn !
+				wlnext rot rot wsb wsn @ + wsmkout  1 lit wskeep
+				wsn @ 38 lit + wsn !
+			else 2drop 0 lit wsb wsn @ + sl16!  wsn @ 2 lit + wsn ! then
+			wsb wsn @ slparse if
+				wsr 68 lit nzero  wsb wsn @ sbput wsr 8 lit + !  wsn @ wsr C lit + !
+				slamt wsr 1C lit + ! wsr 18 lit + !  slfee wsr 24 lit + ! wsr 20 lit + !
+				wsid wsput
+				pgcommit
+			else pgabort 0 lit then
+		then then
+	else 0 lit then
+;
+
+\ ── Receiving ──
+
+: wsrecv ( a n -- ok )
+	slparse if
+		slst @ 1 lit = 0= if "the slate is at the wrong stage (receive)" wserr ! 0 lit else
+		slid wsget if
+			wsr @ 1 lit = if wsr 8 lit + @ wsb sbget wsn !  -1 lit
+			else "that's our own slate: give it to the receiver" wserr ! 0 lit then
+		else wsready if
+			sla @ wsb sln @ ncpy  sln @ wsn !
+			2 lit wsb 6 lit + c!
+			sloa @ sla @ - 2 lit - wsb + dup sl16@ 1 lit + swap sl16!
+			wlnext slamt wsb wsn @ + wsmkout  2 lit wskeep  wsn @ 38 lit + wsn !
+			wsb wsn @ slparse if
+				wsr 68 lit nzero  1 lit wsr !  1 lit wsr 4 lit + !
+				wsb wsn @ sbput wsr 8 lit + !  wsn @ wsr C lit + !
+				slamt wsr 1C lit + ! wsr 18 lit + !  slfee wsr 24 lit + ! wsr 20 lit + !
+				slid wsput
+				pgcommit
+			else pgabort 0 lit then
+		else 0 lit then then then
+	else 0 lit then
+;
+
+\ ── Finalizing ──
+
+: wtxv variable ;  : wtx ( -- a )  wtxv 10000 lit lazy ;  : wtn variable ;
+: wtidv variable ;  : wtid ( -- a )  wtidv 20 lit lazy ;
+: wfsv variable ;  : wfsig ( -- a )  wfsv 820 lit lazy ;
+: wfdv variable ;  : wfdig ( -- a )  wfdv 20 lit lazy ;
+: wtev variable ;  : wtel ( -- a )  wtev 800 lit lazy ;   \ the signing message's elements
+: wfpv variable ;  : wfpk ( -- a )  wfpv 820 lit lazy ;   \ a public key, aligned
+\ Inputs: commitment (32), slate input k, key index; outputs: commitment, k.
+: wtiv variable ;  : wti ( k -- a )  28 lit * wtiv 400 lit lazy + ;
+\ Outputs: the output's bytes (0x38), its commitment (32).
+: wtov variable ;  : wto ( k -- a )  60 lit * wtov 600 lit lazy + ;
+: wtn1 variable ;  : wtp1 variable ;  : wsok variable ;
+
+\ wtsort ( base n size cmp-off cmp-n -- )   sort n entries of size bytes by
+\        cmp-n bytes at entry + cmp-off -- a few, so insertion by swapping.
+: wtb variable ;  : wtz variable ;  : wtco variable ;  : wtcn variable ;
+: wtswv variable ;  : wtsw ( -- a )  wtswv 80 lit lazy ;
+: wtat ( k -- a )   wtz @ * wtb @ + ;
+: wtsort ( base n size cmp-off cmp-n -- )
+	wtcn ! wtco ! wtz ! swap wtb !
+	dup 1 lit u> if
+		1 lit do
+			i begin dup if dup 1 lit - wtat wtco @ + over wtat wtco @ + wtcn @ mcmp 0 lit > else 0 lit then while
+				dup wtat wtsw wtz @ ncpy  dup 1 lit - wtat over wtat wtz @ ncpy  wtsw over 1 lit - wtat wtz @ ncpy
+				1 lit -
+			repeat drop
+		loop
+	else drop then
+;
+
+\ wsmatch ( -- f )   S2 (sla ..) is S1 (at wsc, wtn1 bytes) plus one output
+\        paying the amount.
+: wsmatch ( -- f )
+	sln @ wtn1 @ 38 lit + =
+	sla @ wsc 6 lit mcmp 0= and  slst @ 2 lit = and  wsc 6 lit + c@ 1 lit = and
+	wtp1 @ 7 lit u> and if
+		sla @ 7 lit + wsc 7 lit + wtp1 @ 7 lit - mcmp 0=
+		sla @ wtp1 @ + sl16@  wsc wtp1 @ + sl16@ 1 lit + = and
+		wtn1 @ wtp1 @ 2 lit + - ?dup if  sla @ wtp1 @ + 2 lit + wsc wtp1 @ + 2 lit + rot mcmp 0= and  then
+		slno @ 1 lit - slout 20 lit + sl64@ slamt rot = -rot = and and
+	else 0 lit then
+;
+
+\ wsinputs ( -- ok )   S2's inputs: their commitments, and our keys for them
+\        (each locked to this slate).
+: wsinputs ( -- ok )
+	-1 lit wsok !
+	slni @ 0 lit do
+		i slin wfpk 814 lit ncpy  wfpk wsels wpkhash
+		wsels i slin 814 lit + sl64@ i wti wlcommit  i i wti 20 lit + !
+		wlouts i wti wlrec@ btget
+		wlrec@ 10 lit + @ 1 lit = and  wlrec@ 20 lit + slid 10 lit mcmp 0= and if
+			wlrec@ @ i wti 24 lit + !
+		else 0 lit wsok ! then
+	loop
+	wsok @ dup 0= if "a slate input isn't ours, locked to it" wserr ! then
+;
+
+\ wsmsg ( -- )   the signing message's digest, into wfdig.
+: wsmsg ( -- )
+	wtel 10 lit zero  slni @ wtel !
+	10 lit                                              ( elements so far )
+	slni @ 0 lit do
+		i wti over 2 lit lshift wtel + 8 lit cpy  8 lit +
+		dup 2 lit lshift wtel + 8 lit zero  8 lit +
+	loop
+	slno @ 0 lit do
+		i wto 38 lit + over 2 lit lshift wtel + 8 lit cpy  8 lit +
+		8 lit 0 lit do
+			j wto 28 lit + i 1 lit lshift + sl16@  over 2 lit lshift wtel + !  1 lit +
+		loop
+	loop
+	wlst wtel rot 2 lit p2hash  wlst wfdig 8 lit cpy
+;
+
+\ wsbuild ( -- ok )   sign every input and write the transaction at wtx.
+: wsbuild ( -- ok )
+	-1 lit wsok !
+	6 lit wtx c!  slni @ wtx 1 lit + sl16!  3 lit wtn !
+	slni @ 0 lit do
+		i wti 20 lit + @ slin                              ( input )
+		dup 814 lit + wtx wtn @ + 8 lit ncpy  0 lit wtx wtn @ + 8 lit + c!
+		wtx wtn @ + 9 lit + 814 lit ncpy
+		wtx wtn @ + 81D lit + 5 lit nzero  1 lit wtx wtn @ + 822 lit + c!
+		i wti 24 lit + @ wskey
+		wlsk @ wfdig wfsig wsign  wlpk @ wfdig wfsig wverify and wsok @ and wsok !
+		wfsig wtx wtn @ + 823 lit + 81C lit ncpy
+		wtn @ 103F lit + wtn !
+	loop
+	slno @ wtx wtn @ + sl16!  wtn @ 2 lit + wtn !
+	slno @ 0 lit do i wto wtx wtn @ + 38 lit ncpy  wtn @ 38 lit + wtn ! loop
+	wlst wtx wtn @ p2hashb  wlst wtid 8 lit cpy
+	wsok @ dup 0= if "signing failed" wserr ! then
+;
+
+: wsfin ( a n -- ok )
+	slparse if
+		slst @ 2 lit = 0= if "the slate is at the wrong stage (send)" wserr ! 0 lit else
+		slid wsget 0= if "this wallet has no record of that slate" wserr ! 0 lit else
+		wsr @ 0= 0= if "only the sender finalizes" wserr ! 0 lit else
+		wsr 4 lit + @ 3 lit = if "that slate was cancelled" wserr ! 0 lit else
+			wsr 8 lit + @ wsc sbget wtn1 !
+			wsc 27 lit + sl16@ 81C lit * 29 lit + wtp1 !
+			wsmatch 0= if "the returned slate doesn't match the one sent" wserr ! 0 lit else
+			wsr 4 lit + @ 2 lit = if
+				\ finalized before: the same transaction, if it's the same answer
+				wsr 10 lit + @ wtx sbget wtn !  wsr 28 lit + wtid 8 lit cpy
+				0 lit wsok !
+				wtx 1 lit + sl16@ 103F lit * 3 lit +  dup wtx + sl16@ 0 lit do
+					dup 2 lit + i 38 lit * + wtx +  slno @ 1 lit - slout 38 lit mcmp 0= if -1 lit wsok ! then
+				loop drop
+				wsok @ dup 0= if "that slate was already finalized with a different answer" wserr ! then
+			else
+				slno @ 0 lit do
+					i slout i wto 38 lit ncpy  i wto  i wto 20 lit + sl64@  i wto 38 lit + wlcommit
+				loop
+				wsinputs if
+					wtiv @ slni @ 28 lit 0 lit 20 lit wtsort     \ inputs by commitment
+					wtov @ slno @ 60 lit 0 lit 38 lit wtsort     \ outputs by their bytes
+					wsmsg wsbuild if
+						\ kept before anyone sees a signature
+						slni @ 0 lit do
+							wlouts i wti wlrec@ btget drop  2 lit wlrec@ 10 lit + !  i wti wlrec@ btput
+						loop
+						2 lit wsr 4 lit + !  wtx wtn @ sbput wsr 10 lit + !  wtn @ wsr 14 lit + !
+						wtid wsr 28 lit + 8 lit cpy  0 lit wti wsr 48 lit + 8 lit cpy
+						slid wsput
+						pgcommit
+					else pgabort 0 lit then
+				else 0 lit then
+			then then
+		then then then then
+	else 0 lit then
+;
+
+\ ── Cancelling ──
+
+: wscancel ( id -- ok )
+	dup wsget 0= if drop "this wallet has no record of that slate" wserr ! 0 lit else
+	wsr @ wsr 4 lit + @ or if drop "only an unfinalized slate we sent can be cancelled" wserr ! 0 lit else
+		wsr 8 lit + @ wsc sbget wsc swap slparse drop
+		slni @ 0 lit do
+			i slin wfpk 814 lit ncpy  wfpk wsels wpkhash
+			wsels i slin 814 lit + sl64@ wlcc wlcommit
+			wlouts wlcc wlrec@ btget  wlrec@ 10 lit + @ 1 lit = and  wlrec@ 20 lit + slid 10 lit mcmp 0= and if
+				0 lit wlrec@ 10 lit + !  wlrec@ 20 lit + 10 lit nzero  wlcc wlrec@ btput
+			then
+		loop
+		slno @ ?dup if 0 lit do i slout dup 20 lit + sl64@ wlcc wlcommit  wlouts wlcc btdel drop loop then
+		3 lit wsr 4 lit + !  wsput
+		pgcommit
+	then then
+;

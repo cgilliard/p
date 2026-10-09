@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""wallet -- talk to the Forth node's wallet over its API (src/wapi.fam).
+
+Usage: tools/wallet [--node HOST:PORT] [--key-file FILE] COMMAND [ARGS]
+
+Commands:
+  status                    the node: its tip, peers, fast sync, the wallet
+  balance                   the wallet's coins, by status
+  outputs                   each output the wallet owns
+  send AMOUNT [FEE] [FILE]  start a payment: writes slate S1 for the receiver
+                            (FILE, or <id>.s1.slate; the fee defaults to 0.0001)
+  receive FILE              answer a payment's S1: writes S2 (<id>.s2.slate)
+                            for the sender
+  finalize FILE             finish a payment from the receiver's S2: the node
+                            signs it and announces it to its peers
+  cancel ID                 undo a payment that was never finalized
+  slates                    payments, and where they've got to
+  key                       enter the API key again
+
+Payments are slates exchanged as files, as with the Rust node's wallet (the
+same armored format, so either can pay the other): the sender runs `send`,
+the receiver `receive`s that file, the sender `finalize`s the one that comes
+back.
+
+The node answers only requests carrying an HMAC under the wallet's API key.
+It shows the key on its console when the wallet is made (or run
+`scripts/node.sh --api-key`); this tool asks for it once and keeps it in
+data/wallet.key (readable by you alone). The API port is the node's UDP
+port + 1 (47654), forwarded from 127.0.0.1 only.
+"""
+
+import argparse
+import getpass
+import hashlib
+import hmac
+import os
+import socket
+import struct
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_KEY_FILE = os.path.join(HERE, "..", "data", "wallet.key")
+MAGIC = b"TBWA"
+HELLO, CALL, MORE, PUT = 1, 2, 3, 4
+CHUNK = 1024
+UNITS_PER_COIN = 1_000_000_000
+DEFAULT_FEE = 100_000
+SLATE_BEGIN = "-----BEGIN TABERNACLE SLATE-----"
+SLATE_END = "-----END TABERNACLE SLATE-----"
+STAGES = {1: "send", 2: "receive"}
+ROLES = {0: "sent", 1: "received"}
+SLATE_STATES = {0: "waiting for the receiver's answer", 1: "answered", 2: "finalized", 3: "cancelled"}
+ATTEMPTS = 4
+TIMEOUT = 1.5
+
+STATUS_ERRORS = {
+    1: "the node didn't understand the request",
+    2: "the wallet is being restored: it finds its outputs once the node has caught up",
+}
+OUTPUT_STATUS = {0: "pending", 1: "spendable", 2: "immature", 3: "locked", 4: "spending", 5: "spent", 6: "held"}
+ORIGIN = {0: "mined", 1: "change", 2: "received", 3: "recovered"}
+FAST_SYNC = {0: "no", 1: "waiting for a peer's height", 2: "fetching blocks", 3: "checking the chain proof", 4: "downloading the state"}
+
+
+class Failure(Exception):
+    pass
+
+
+def parse_amount(text):
+    """Coins (2.5, 3) as base units, exactly."""
+    whole, _, frac = text.strip().partition(".")
+    if not whole.isdigit() or (frac and not frac.isdigit()) or len(frac) > 9:
+        raise Failure(f"not an amount: {text}")
+    units = int(whole) * UNITS_PER_COIN + int(frac.ljust(9, "0") or 0)
+    if units >= 1 << 64:
+        raise Failure(f"too large an amount: {text}")
+    return units
+
+
+def slate_summary(data):
+    """The armor's summary lines for slate bytes."""
+    if len(data) < 0x27 or data[:4] != b"TSLT":
+        raise Failure("not a slate")
+    stage = STAGES.get(data[6])
+    if stage is None:
+        raise Failure("not a slate (unknown stage)")
+    amount, fee = struct.unpack("<QQ", data[0x17:0x27])
+    return f"stage: {stage}\nid: {data[7:0x17].hex()}\namount: {amount_text(amount)}\nfee: {amount_text(fee)}"
+
+
+def amount_text(units):
+    return f"{units // UNITS_PER_COIN}.{units % UNITS_PER_COIN:09d}"
+
+
+def write_slate(path, data):
+    text = SLATE_BEGIN + "\n" + slate_summary(data) + "\n\n"
+    hexed = data.hex()
+    text += "".join(hexed[i : i + 64] + "\n" for i in range(0, len(hexed), 64))
+    text += SLATE_END + "\n"
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def read_slate(path):
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+    except OSError as e:
+        raise Failure(f"reading {path}: {e.strerror}")
+    if not (text.startswith(SLATE_BEGIN) and text.endswith(SLATE_END)):
+        raise Failure(f"{path} isn't a slate (no armor)")
+    body = text[len(SLATE_BEGIN) : -len(SLATE_END)].strip()
+    summary, sep, data = body.partition("\n\n")
+    if not sep:
+        raise Failure(f"{path} isn't a slate (no summary)")
+    try:
+        data = bytes.fromhex("".join(data.split()))
+    except ValueError:
+        raise Failure(f"{path} isn't a slate (bad hex)")
+    if summary.strip() != slate_summary(data):
+        raise Failure(f"{path}: the summary doesn't match the slate")
+    return data
+
+
+def read_key(path):
+    try:
+        with open(path) as f:
+            text = f.read().strip()
+    except FileNotFoundError:
+        return None
+    try:
+        key = bytes.fromhex(text)
+    except ValueError:
+        key = b""
+    if len(key) != 32:
+        raise Failure(f"{path} doesn't hold an API key (64 hex digits); run `tools/wallet key`")
+    return key
+
+
+def ask_key(path):
+    print("The wallet's API key: the node shows it on its console when the wallet is made,")
+    print("or run scripts/node.sh --api-key. It's kept in " + os.path.normpath(path) + ".")
+    while True:
+        text = getpass.getpass("API key (not shown): ").strip()
+        try:
+            key = bytes.fromhex(text)
+        except ValueError:
+            key = b""
+        if len(key) == 32:
+            break
+        print("That isn't an API key: it's 64 hex digits.")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key.hex() + "\n")
+    return key
+
+
+class Node:
+    def __init__(self, host, port, key):
+        self.addr = (host, port)
+        self.key = key
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(TIMEOUT)
+        self.session = bytes(8)
+        self.counter = 0
+
+    def mac(self, data):
+        return hmac.new(self.key, data, hashlib.sha256).digest()
+
+    def exchange(self, kind, counter, body):
+        """Send a request (again, if no answer comes); its answer's status and body."""
+        head = MAGIC + bytes([kind, 0]) + self.session + struct.pack(">QH", counter, len(body))
+        packet = head + body
+        packet += self.mac(packet)
+        for _ in range(ATTEMPTS):
+            self.sock.sendto(packet, self.addr)
+            try:
+                while True:
+                    data, _ = self.sock.recvfrom(2048)
+                    answer = self.check(data, kind, counter)
+                    if answer is not None:
+                        return answer
+            except socket.timeout:
+                continue
+            except ConnectionRefusedError:
+                raise Failure(f"nothing is listening at {self.addr[0]}:{self.addr[1]} -- is the node running?")
+        raise Failure(f"no answer from the node at {self.addr[0]}:{self.addr[1]} (is it running? is the API key right?)")
+
+    def check(self, data, kind, counter):
+        if len(data) < 0x38 or data[:4] != MAGIC:
+            return None
+        if not hmac.compare_digest(self.mac(data[:-32]), data[-32:]):
+            return None
+        n = struct.unpack(">H", data[0x16:0x18])[0]
+        if 0x18 + n + 32 != len(data) or data[4] != kind | 0x80:
+            return None
+        if struct.unpack(">Q", data[0xE:0x16])[0] != counter:
+            return None
+        if kind != HELLO and data[6:0xE] != self.session:
+            return None
+        return data[5], data[0x18 : 0x18 + n]
+
+    def hello(self):
+        _, body = self.exchange(HELLO, 0, b"")
+        if len(body) != 16:
+            raise Failure("the node's answer to HELLO is malformed")
+        self.session = body[:8]
+        self.counter = struct.unpack(">Q", body[8:])[0]
+
+    def call(self, command, args=b""):
+        """Run a command: its whole result."""
+        if self.counter == 0 and self.session == bytes(8):
+            self.hello()
+        self.counter += 1
+        status, body = self.exchange(CALL, self.counter, bytes([command]) + args)
+        if status == 3:
+            raise Failure(body[4:].decode(errors="replace") or "the node refused")
+        if status:
+            raise Failure(STATUS_ERRORS.get(status, f"the node refused (status {status})"))
+        total = struct.unpack(">I", body[:4])[0]
+        result = bytearray(body[4:])
+        while len(result) < total:
+            self.counter += 1
+            status, body = self.exchange(MORE, self.counter, struct.pack(">I", len(result)))
+            if status or len(body) <= 4:
+                raise Failure("the node stopped answering partway through a result")
+            result += body[4:]
+        return bytes(result[:total])
+
+    def upload(self, data):
+        """Put data in the node's upload buffer, a chunk at a time."""
+        if self.counter == 0 and self.session == bytes(8):
+            self.hello()
+        for offset in range(0, len(data), CHUNK):
+            self.counter += 1
+            status, _ = self.exchange(PUT, self.counter, struct.pack(">I", offset) + data[offset : offset + CHUNK])
+            if status:
+                raise Failure("the node refused the upload (too big?)")
+
+
+def show_status(node):
+    r = node.call(1)
+    tip, peer, phase, peers, flags, net, next_index = struct.unpack(">IIBBBBI", r[:16])
+    print(f"network:      {'dev' if net else 'main'}")
+    print(f"tip:          height {tip}")
+    print(f"best peer:    {'none heard yet' if peer == 0xFFFFFFFF else f'height {peer}'} ({peers} answering)")
+    print(f"fast sync:    {FAST_SYNC.get(phase, phase)}")
+    if flags & 2:
+        state = "being restored (it finds its outputs once the node has caught up)"
+    else:
+        state = "ready"
+    print(f"wallet:       {state}{', with a passphrase' if flags & 1 else ''}")
+    print(f"next key:     {next_index}")
+
+
+def show_balance(node):
+    r = node.call(2)
+    spendable, immature, pending, locked, held, until, tip = struct.unpack(">QQQQQII", r[:48])
+    total = spendable + immature + pending + locked + held
+    print(f"spendable:    {amount_text(spendable)}")
+    if immature:
+        print(f"immature:     {amount_text(immature)}")
+    if pending:
+        print(f"pending:      {amount_text(pending)}")
+    if locked:
+        print(f"locked:       {amount_text(locked)}")
+    if held:
+        print(f"held:         {amount_text(held)} (restored: spendable from height {until})")
+    print(f"total:        {amount_text(total)}   (at height {tip})")
+
+
+def show_outputs(node):
+    r = node.call(3)
+    count = struct.unpack(">I", r[:4])[0]
+    if count == 0:
+        print("no outputs")
+        return
+    print(f"{'commitment':<18} {'key':>7} {'amount':>22}  status")
+    for k in range(count):
+        o = r[4 + k * 0x38 : 4 + (k + 1) * 0x38]
+        commitment, index, units, status, origin, confirmations, until = struct.unpack(">32sIQBBxxII", o)
+        text = OUTPUT_STATUS.get(status, str(status))
+        if status in (1, 2, 6):
+            text += f", {confirmations} confirmation{'s' if confirmations != 1 else ''}"
+        if status == 6:
+            text += f", until height {until}"
+        print(f"{commitment[:8].hex():<18} {index:>7} {amount_text(units):>22}  {text} ({ORIGIN.get(origin, origin)})")
+
+
+def do_send(node, args):
+    if not args or len(args) > 3:
+        raise Failure("usage: send AMOUNT [FEE] [FILE]")
+    amount = parse_amount(args[0])
+    fee, path = DEFAULT_FEE, None
+    if len(args) >= 2:
+        try:
+            fee = parse_amount(args[1])
+        except Failure:
+            if len(args) == 3:
+                raise
+            path = args[1]
+    if len(args) == 3:
+        path = args[2]
+    s1 = node.call(4, struct.pack(">QQ", amount, fee))
+    path = path or f"{s1[7:0x17].hex()}.s1.slate"
+    write_slate(path, s1)
+    print(f"Sending {amount_text(amount)} (fee {amount_text(fee)}): slate {s1[7:0x17].hex()}.")
+    print(f"Wrote {path}: give it to the receiver, then `finalize` the file they send back.")
+
+
+def do_receive(node, args):
+    if len(args) != 1:
+        raise Failure("usage: receive FILE")
+    s1 = read_slate(args[0])
+    node.upload(s1)
+    s2 = node.call(5, struct.pack(">I", len(s1)))
+    path = f"{s2[7:0x17].hex()}.s2.slate"
+    amount = struct.unpack("<Q", s2[0x17:0x1F])[0]
+    write_slate(path, s2)
+    print(f"Receiving {amount_text(amount)}: wrote {path} -- send it back to the sender to finalize.")
+
+
+def do_finalize(node, args):
+    if len(args) != 1:
+        raise Failure("usage: finalize FILE")
+    s2 = read_slate(args[0])
+    node.upload(s2)
+    r = node.call(6, struct.pack(">I", len(s2)))
+    print(f"Signed and announced to the node's peers: transaction {r[:32].hex()} ({len(r) - 32} bytes).")
+
+
+def do_cancel(node, args):
+    if len(args) != 1:
+        raise Failure("usage: cancel ID")
+    try:
+        slate_id = bytes.fromhex(args[0])
+    except ValueError:
+        slate_id = b""
+    if len(slate_id) != 16:
+        raise Failure(f"not a slate id: {args[0]} (32 hex characters; see `slates`)")
+    node.call(7, slate_id)
+    print(f"Cancelled slate {args[0]}: its coins are free again.")
+
+
+def do_slates(node, args):
+    r = node.call(8)
+    count = struct.unpack(">I", r[:4])[0]
+    if count == 0:
+        print("no slates")
+        return
+    for k in range(count):
+        e = r[4 + k * 0x44 : 4 + (k + 1) * 0x44]
+        slate_id, role, state, pending, amount, fee, txid = struct.unpack(">16sBBBxQQ32s", e)
+        line = f"{slate_id.hex()}  {ROLES.get(role, role):8}  {amount_text(amount):>20}  fee {amount_text(fee)}  {SLATE_STATES.get(state, state)}"
+        if state == 2:
+            line += f" ({'unconfirmed' if pending else 'confirmed'}: {txid.hex()[:16]})"
+        print(line)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Talk to the Forth node's wallet.")
+    parser.add_argument("--node", default="127.0.0.1:47654", help="the wallet API's address (127.0.0.1:47654)")
+    parser.add_argument("--key-file", default=DEFAULT_KEY_FILE, help="where the API key is kept (data/wallet.key)")
+    parser.add_argument("command", choices=["status", "balance", "outputs", "send", "receive", "finalize", "cancel", "slates", "key"])
+    parser.add_argument("args", nargs="*")
+    args = parser.parse_args()
+    host, _, port = args.node.rpartition(":")
+    try:
+        if args.command == "key":
+            ask_key(args.key_file)
+            return 0
+        key = read_key(args.key_file) or ask_key(args.key_file)
+        node = Node(host or "127.0.0.1", int(port), key)
+        if args.command in ("status", "balance", "outputs"):
+            {"status": show_status, "balance": show_balance, "outputs": show_outputs}[args.command](node)
+        else:
+            {"send": do_send, "receive": do_receive, "finalize": do_finalize, "cancel": do_cancel, "slates": do_slates}[args.command](node, args.args)
+    except Failure as e:
+        print(f"wallet: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

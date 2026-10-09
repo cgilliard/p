@@ -1,6 +1,7 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 \ src/full_node.fam — the node: read its settings, open the disk (the chain
-\ and state carry over between runs), start the network, and keep in step
+\ and state carry over between runs), open its wallet (or make or restore
+\ one, on the console: src/wallet.fam), start the network, and keep in step
 \ with its peers, saying what it's doing.
 \
 \ Settings arrive on the serial input (after tabernacle's own line, when
@@ -11,6 +12,12 @@
 \   depth=N             fast sync: start N blocks behind the best peer, on a
 \                       node with nothing past genesis (25; 0: never)
 \   net=main | net=dev  the network (main)
+\   recover             restore the wallet from its backup words (typed next,
+\                       on the console), on a disk that has none
+\   passphrase          a new wallet's passphrase, or a restored one's, typed
+\                       on the console
+\   api=N               the wallet API's UDP port (our port + 1: src/wapi.fam)
+\   apikey              show the wallet's API key (tools/wallet asks for it)
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : fncv variable ;  : fncfg ( -- a )  fncv 400 lit lazy ;
@@ -60,7 +67,11 @@
 		else "depth=" fnpre? if fnnum pfdep !
 		else "net=dev" fnpre? if 1 lit bnet !
 		else "net=main" fnpre? if 0 lit bnet !
-		else fnbad then then then then then
+		else "recover" fnpre? if -1 lit wlrec !
+		else "passphrase" fnpre? if -1 lit wlpass !
+		else "api=" fnpre? if fnnum naport !
+		else "apikey" fnpre? if -1 lit wlshowk !
+		else fnbad then then then then then then then then then
 	repeat
 ;
 
@@ -103,6 +114,13 @@
 
 \ ── Running ──
 
+\ fnstep ( -- )   the datagrams that have come (the peers', the wallet API's,
+\        the transaction relay's), then the timers.
+: fnstep ( -- )
+	begin nrecv while ndport @ naport @ = if wain else trin 0= if pin then then repeat
+	ptick trtick
+;
+
 \ fnclean ( -- )   zero the heap, from here to below the data stack (64 MiB
 \        above the heap's base, `init`): booted by tabernacle, that memory
 \        holds tabernacle's stacks and queues, and the node counts on fresh
@@ -115,16 +133,18 @@
 	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  BA25 lit nport !
 	19 lit pfdep !  0 lit bnet !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
 	fnread fnparse
+	naport @ 0= if nport @ 1 lit + naport ! then
 	"node: " puts  bnet @ if "dev" else "main" then puts  " network, UDP port " puts nport @ fndec
-	", fast sync depth " puts pfdep @ fndec A lit putc
+	", fast sync depth " puts pfdep @ fndec  ", wallet API port " puts naport @ fndec A lit putc
 	acopen 0= if
 		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"
 		else "node: no disk" then puts A lit putc bye
 	then
+	wlboot
 	dbtip ?dup if "node: resuming at height " puts 20 lit + @ fndec A lit putc else "node: a new chain\n" puts then
 	pstart 0= if "node: no network device" puts A lit putc bye then
 	ppn 0 lit do i pp 8 lit + @ if "node: seed " puts i pp @ fnip. 3A lit putc i pp 4 lit + @ fndec A lit putc then loop
-	begin pstep fnsay 0 lit until
+	begin fnstep fnsay wltick 0 lit until
 ;
 
 ntext                 \ first: find the Bible text, keep the heap off it (src/text.fam)

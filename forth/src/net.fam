@@ -21,6 +21,9 @@
 \                              npn (its length), valid until the next nrecv
 \   npkt ( -- a )              where to build a datagram's bytes
 \   nsend ( ip port n -- ok )  send the n bytes built at npkt
+\
+\ A second port may be opened (`naport`, the wallet's API: src/wapi.fam): a
+\ datagram's port is then in ndport, and a reply goes from nsfrom (0: nport).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : ndev variable ;  : nq variable ;  : nhl variable ;
@@ -28,6 +31,7 @@
 : nmacv variable ;  : nmac ( -- a )  nmacv 8 lit lazy ;
 : nadr variable ;  : ngw variable ;  : nmask variable ;  : nport variable ;  : nipid variable ;
 : nsrc variable ;  : nsport variable ;  : npay variable ;  : npn variable ;
+: naport variable ;  : ndport variable ;  : nsfrom variable ;
 
 : nrxb ( id -- a )   600 lit * 4000 lit + nq @ + ;
 : nfb variable ;                                     \ the transmit buffer in use
@@ -68,7 +72,7 @@
 \        receive queue.
 : nopen ( -- ok )
 	nfind dup ndev ! if
-		B000 lit alloc FFF lit + FFFFF000 lit and nq !
+		C000 lit alloc FFF lit + FFFFF000 lit and nq !       \ (0xB000, page-aligned)
 		nq @ 2980 lit zero
 		0 lit nrxc !  0 lit nrxa !  0 lit ntxc !  0 lit nheld !  A000 lit nfb !
 		nadr @ 0= if A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  BA25 lit nport ! then
@@ -163,7 +167,8 @@
 : nfree ( -- )   nrid @ npost  fence_io  0 lit ndev @ 50 lit + ! ;
 
 \ nin ( a n -- f )   handle a frame: answer ARP for us and learn from ARP;
-\        an IPv4 UDP datagram to our port -> true (nsrc .. npn set).
+\        an IPv4 UDP datagram to our port (or naport) -> true (nsrc .. npn,
+\        ndport set).
 : nin ( a n -- f )
 	dup 2A lit u< if 2drop 0 lit else
 	over C lit + nb16@ dup 806 lit = if
@@ -185,7 +190,8 @@
 		if
 			drop  dup C lit + be32 nsrc !
 			dup 14 lit + dup nb16@ nsport !
-			dup 2 lit + nb16@ nport @ =
+			dup 2 lit + nb16@ dup ndport !
+			dup nport @ =  swap naport @ = naport @ 0= 0= and  or
 			over 4 lit + nb16@ 8 lit -  dup npn !
 			3 lit pick 2 lit + nb16@ 1C lit - u> 0= and          \ the UDP length fits
 			swap 8 lit + npay !  nip
@@ -240,7 +246,7 @@
 		dup 10 lit rshift + dup 10 lit rshift + FFFF lit and FFFF lit xor
 		over A lit + nb16!
 		14 lit +
-		nport @ over nb16!  nsdp @ over 2 lit + nb16!  nsdn @ 8 lit + over 4 lit + nb16!  0 lit swap 6 lit + nb16!
+		nsfrom @ ?dup 0= if nport @ then over nb16!  nsdp @ over 2 lit + nb16!  nsdn @ 8 lit + over 4 lit + nb16!  0 lit swap 6 lit + nb16!
 		nsdn @ 2A lit + dup 3C lit u< if drop 3C lit then ntx
 		-1 lit
 	else 0 lit then

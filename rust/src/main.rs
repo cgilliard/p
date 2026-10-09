@@ -1064,6 +1064,29 @@ mod tests {
         }
     }
 
+    /// The Forth wallet's key vectors (`forth/tests/wallet.fam`): for the
+    /// backup words of entropy 0x7f..7f, the seed with a passphrase, and
+    /// the seed's view key, key seed and public key hash at 0/7. Quick:
+    /// `cargo test --release -- --ignored --nocapture forth_wallet_vectors`.
+    #[test]
+    #[ignore]
+    fn forth_wallet_vectors() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
+        let entropy = [0x7f; 32];
+        println!("words      {}", mnemonic::to_phrase(&entropy));
+        println!("passphrase {}", hex(&mnemonic::seed_from(&entropy, "correct horse")));
+        let keychain = keychain::Keychain::from_seed(entropy);
+        println!("view key   {}", hex(&keychain.view_key().0));
+        let id = keychain::KeyId::new(0, 7);
+        let key_seed = poseidon2::hash_bytes_32(&[b"tabernacle-keychain-v1".as_slice(), &entropy, &id.to_bytes()].concat());
+        println!("key seed   {}", hex(&key_seed));
+        println!("pk hash    {}", hex(&poseidon2::digest_to_bytes(keychain.public_key(id).hash())));
+        // An output of 5.000000123 coins to 0/7, sealed for recovery.
+        let commitment = keychain.output(id, 5_000_000_123).commitment();
+        println!("commitment {}", hex(&commitment));
+        println!("nonce      {}", hex(&recovery::seal(&keychain.view_key(), &commitment, 7, 5_000_000_123)));
+    }
+
     /// Fast sync for the Forth validator's tests (`forth/tests/fixtures/<network>/`,
     /// reading `forth_fixtures`' chain): the state as of blocks 1 and 2, as
     /// this node serves it, in `snap1.bin` and `snap2.bin` -- the sync point

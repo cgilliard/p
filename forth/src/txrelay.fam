@@ -1,0 +1,110 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/txrelay.fam — getting the wallet's transactions to the network, as the
+\ Rust node relays them (../rust/src/txrelay.rs): announce each signed,
+\ unconfirmed one (TX_INV: count u8, then txid (32) and size u32 each) to
+\ every peer that's answered, every 30 seconds until it's confirmed; serve it
+\ to a peer that asks (GET_TX: cookie u64, txid, first u32, count u16 ->
+\ TX_CHUNKs: txid, index u32, up to 1024 bytes); and answer GET_TX_INV
+\ (cookie u64) with the announcement.  A transaction is confirmed once the
+\ input its record names (src/slate.fam) is no longer unspent.
+\
+\   trin   ( -- f )   handle a datagram for the relay, if it is one
+\   trtick ( -- )     announce, when it's time
+\   trsoon ( -- )     announce at the next tick
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: trwhen variable ;  : trc variable ;
+: trkv variable ;  : trk ( -- a )  trkv 20 lit lazy ;    \ a slate id, and one read
+: trcv variable ;  : trcid ( -- a )  trcv 20 lit lazy ;   \ the one loaded
+
+\ treach ( -- f )   the next slate record (from trk) into wsr.
+: treach ( -- f )
+	wslates trk trk 10 lit + wsr btseek dup if
+		trk 10 lit + trk 10 lit ncpy  trk 10 lit binc
+	then
+;
+
+\ trpend? ( -- f )   the record at wsr is a transaction of ours not yet
+\        confirmed.
+: trpend? ( -- f )
+	wsr @ 0=  wsr 4 lit + @ 2 lit = and if wsr 48 lit + wlon dup if nip then else 0 lit then
+;
+
+\ trinv ( a -- n )   a TX_INV body at a (up to 8): its length (0: nothing).
+: trinv ( a -- n )
+	trk 20 lit nzero  0 lit trc !
+	begin treach trc @ 8 lit u< and while
+		trpend? if
+			wsr 28 lit + over 1 lit + trc @ 24 lit * + 20 lit ncpy
+			wsr 14 lit + @ over 21 lit + trc @ 24 lit * + be!
+			trc @ 1 lit + trc !
+		then
+	repeat
+	trc @ swap c!  trc @ dup if 24 lit * 1 lit + then
+;
+
+\ trfind ( txid -- f )   load our transaction with this id into wtx (wtn),
+\        its id into trcid.
+: trfind ( txid -- f )
+	trk 20 lit nzero  0 lit trc !
+	begin trc @ 0= if treach else 0 lit then while
+		wsr 4 lit + @ 2 lit =  wsr 28 lit + 2 lit pick 20 lit mcmp 0= and if
+			wsr 10 lit + @ wtx sbget wtn !  -1 lit trc !
+		then
+	repeat
+	trc @ if trcid 20 lit ncpy -1 lit else drop 0 lit then
+;
+
+\ trchunk ( c -- )   TX_CHUNK c of the transaction loaded.
+: trchunk ( c -- )
+	9 lit phdr  trcid over 20 lit ncpy  over over 20 lit + be!
+	wtn @ 2 lit pick A lit lshift - dup 400 lit u> if drop 400 lit then     ( c body len )
+	rot A lit lshift wtx + 2 lit pick 24 lit + 2 lit pick ncpy
+	nip 2A lit + preply
+;
+
+\ trget ( -- )   GET_TX, with our cookie: the chunks asked for.
+: trget ( -- )
+	pbn @ 2E lit = if
+		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
+			pbd @ 8 lit + trfind if
+				wtn @ 3FF lit + A lit rshift                      ( chunks )
+				pbd @ 28 lit + be32  pbd @ 2C lit + nb16@ over +  ( chunks first end )
+				rot over over u> if nip else drop then          ( first end' )
+				2dup u< if swap do i trchunk loop else 2drop then
+			then
+		then
+	then
+;
+
+\ trginv ( -- )   GET_TX_INV, with our cookie: what we hold.
+: trginv ( -- )
+	pbn @ 8 lit = if
+		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
+			7 lit phdr trinv ?dup if 6 lit + preply then
+		then
+	then
+;
+
+: trin ( -- f )
+	pok? if
+		npay @ 5 lit + c@ dup 8 lit = swap A lit = or if
+			npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+			npay @ 5 lit + c@ 8 lit = if trget else trginv then
+			-1 lit
+		else 0 lit then
+	else 0 lit then
+;
+
+: trsoon ( -- )   0 lit trwhen ! ;
+
+: trtick ( -- )
+	trwhen @ 0= trwhen @ pago 7530 lit u> or if
+		pms 1 lit or trwhen !
+		wl? if
+			7 lit phdr trinv ?dup if
+				6 lit +  ppn 0 lit do i pp 8 lit + @ 2 lit = if i over psendk then loop drop
+			then
+		then
+	then
+;

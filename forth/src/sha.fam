@@ -1,0 +1,143 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/sha.fam — SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) and one block of
+\ PBKDF2-HMAC-SHA256 (RFC 8018): what the wallet's backup words need
+\ (src/wallet.fam) -- their checksum, and stretching a passphrase.  The
+\ protocol itself hashes with Poseidon2; this matches ../rust/src/mnemonic.rs.
+\
+\ One hash at a time: a context of the 8 state words, the bytes buffered, the
+\ length so far, and the 64-byte block (`shc`), which HMAC saves and restores
+\ to start from its keyed states.
+\
+\   shinit ( -- )                 start a hash
+\   shupd  ( a n -- )             hash n more bytes
+\   shfin  ( out -- )             the 32-byte digest
+\   sha256 ( a n out -- )
+\   hmkey  ( key n -- )           key HMAC
+\   hmbeg  ( -- )  ... shupd ...  hmend ( out -- )   one MAC, of what's hashed
+\   pbkdf  ( pw n salt n rounds out -- )   PBKDF2's first 32-byte block
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ The round constants.
+: shk  ( -- addr )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20          ( t0 = the first constant, after this prologue )
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)          ( push it )
+6F004010 ,   \ jal   x0,+260          ( skip the 64 constants )
+428A2F98 , 71374491 , B5C0FBCF , E9B5DBA5 , 3956C25B , 59F111F1 , 923F82A4 , AB1C5ED5 ,
+D807AA98 , 12835B01 , 243185BE , 550C7DC3 , 72BE5D74 , 80DEB1FE , 9BDC06A7 , C19BF174 ,
+E49B69C1 , EFBE4786 , 0FC19DC6 , 240CA1CC , 2DE92C6F , 4A7484AA , 5CB0A9DC , 76F988DA ,
+983E5152 , A831C66D , B00327C8 , BF597FC7 , C6E00BF3 , D5A79147 , 06CA6351 , 14292967 ,
+27B70A85 , 2E1B2138 , 4D2C6DFC , 53380D13 , 650A7354 , 766A0ABB , 81C2C92E , 92722C85 ,
+A2BFE8A1 , A81A664B , C24B8B70 , C76C51A3 , D192E819 , D6990624 , F40E3585 , 106AA070 ,
+19A4C116 , 1E376C08 , 2748774C , 34B0BCB5 , 391C0CB3 , 4ED8AA4A , 5B9CCA4F , 682E6FF3 ,
+748F82EE , 78A5636F , 84C87814 , 8CC70208 , 90BEFFFA , A4506CEB , BEF9A3F7 , C67178F2 ,
+;
+
+\ The context: 0 the state (8 words), 20 bytes buffered, 24 the length, 28
+\ the block (64 bytes).  0x68 bytes, 0x1A cells.
+: shcv variable ;  : shc ( -- a )  shcv 68 lit lazy ;
+: shf ( -- a )    shc 20 lit + ;
+: shl ( -- a )    shc 24 lit + ;
+: shblk ( -- a )  shc 28 lit + ;
+: shwv variable ;  : shw ( -- a )  shwv 100 lit lazy ;     \ the message schedule
+: shva variable ;  : shvb variable ;  : shvc variable ;  : shvd variable ;
+: shve variable ;  : shvf variable ;  : shvg variable ;  : shvh variable ;
+
+\ shrot ( x n -- y )   rotate right by n (1 .. 31).
+: shrot ( x n -- y )   2dup rshift -rot 20 lit swap - lshift or ;
+\ shbe@ ( a -- w )   a big-endian word, at any alignment.
+: shbe@ ( a -- w )
+	dup c@ 18 lit lshift  over 1 lit + c@ 10 lit lshift or
+	over 2 lit + c@ 8 lit lshift or  swap 3 lit + c@ or
+;
+: shbe! ( w a -- )   4 lit 0 lit do over 18 lit i 3 lit lshift - rshift over i + c! loop 2drop ;
+: shw@ ( i -- w )   2 lit lshift shw + @ ;
+: sh+! ( n a -- )    dup @ rot + swap ! ;
+
+\ shcomp ( -- )   compress the block into the state.
+: shcomp ( -- )
+	10 lit 0 lit do shblk i 2 lit lshift + shbe@ shw i 2 lit lshift + ! loop
+	40 lit 10 lit do
+		i F lit - shw@ dup 7 lit shrot over 12 lit shrot xor swap 3 lit rshift xor
+		i 2 lit - shw@ dup 11 lit shrot over 13 lit shrot xor swap A lit rshift xor +
+		i 10 lit - shw@ + i 7 lit - shw@ +  shw i 2 lit lshift + !
+	loop
+	shc @ shva !  shc 4 lit + @ shvb !  shc 8 lit + @ shvc !  shc C lit + @ shvd !
+	shc 10 lit + @ shve !  shc 14 lit + @ shvf !  shc 18 lit + @ shvg !  shc 1C lit + @ shvh !
+	40 lit 0 lit do
+		shve @ dup 6 lit shrot over B lit shrot xor swap 19 lit shrot xor
+		shve @ shvf @ and  shve @ -1 lit xor shvg @ and xor +
+		shvh @ +  shk i 2 lit lshift + be@ +  i shw@ +                \ t1
+		shva @ dup 2 lit shrot over D lit shrot xor swap 16 lit shrot xor
+		shva @ shvb @ and  shva @ shvc @ and xor  shvb @ shvc @ and xor +   \ t1 t2
+		shvg @ shvh !  shvf @ shvg !  shve @ shvf !  over shvd @ + shve !
+		shvc @ shvd !  shvb @ shvc !  shva @ shvb !  + shva !
+	loop
+	shva @ shc sh+!  shvb @ shc 4 lit + sh+!  shvc @ shc 8 lit + sh+!  shvd @ shc C lit + sh+!
+	shve @ shc 10 lit + sh+!  shvf @ shc 14 lit + sh+!  shvg @ shc 18 lit + sh+!  shvh @ shc 1C lit + sh+!
+;
+
+: shinit ( -- )
+	6A09E667 lit shc !  BB67AE85 lit shc 4 lit + !  3C6EF372 lit shc 8 lit + !  A54FF53A lit shc C lit + !
+	510E527F lit shc 10 lit + !  9B05688C lit shc 14 lit + !  1F83D9AB lit shc 18 lit + !  5BE0CD19 lit shc 1C lit + !
+	0 lit shf !  0 lit shl !
+;
+
+: shupd ( a n -- )
+	dup shl sh+!
+	?dup if 0 lit do
+		dup i + c@ shblk shf @ + c!
+		shf @ 1 lit + dup shf !  40 lit = if shcomp 0 lit shf ! then
+	loop then drop
+;
+
+: shpv variable ;  : shpad ( -- a )  shpv 8 lit lazy ;
+: shfin ( out -- )
+	shl @ 1D lit rshift shpad shbe!  shl @ 3 lit lshift shpad 4 lit + shbe!
+	80 lit shblk shf @ + c!  shf @ 1 lit + shf !
+	shf @ 38 lit u> if
+		begin shf @ 40 lit u< while 0 lit shblk shf @ + c! shf @ 1 lit + shf ! repeat
+		shcomp 0 lit shf !
+	then
+	begin shf @ 38 lit u< while 0 lit shblk shf @ + c! shf @ 1 lit + shf ! repeat
+	shpad shblk 38 lit + 8 lit ncpy  shcomp
+	8 lit 0 lit do shc i 2 lit lshift + @ over i 2 lit lshift + shbe! loop drop
+;
+
+: sha256 ( a n out -- )   -rot shinit shupd shfin ;
+
+\ ── HMAC-SHA256 ──
+\ The keyed inner and outer contexts, saved once per key.
+
+: hmiv variable ;  : hmi ( -- a )  hmiv 68 lit lazy ;
+: hmov variable ;  : hmo ( -- a )  hmov 68 lit lazy ;
+: hmbv variable ;  : hmb ( -- a )  hmbv 40 lit lazy ;       \ the padded key
+: hmtv variable ;  : hmt ( -- a )  hmtv 20 lit lazy ;       \ the inner digest
+
+\ hmpad ( c -- )   hash the padded key, each byte xor c.
+: hmpad ( c -- )   40 lit 0 lit do hmb i + c@ over xor shpad c! shpad 1 lit shupd loop drop ;
+
+: hmkey ( key n -- )
+	hmb 10 lit zero
+	dup 40 lit u> if hmb sha256 else hmb swap ncpy then
+	shinit 36 lit hmpad  shc hmi 1A lit cpy
+	shinit 5C lit hmpad  shc hmo 1A lit cpy
+;
+: hmbeg ( -- )   hmi shc 1A lit cpy ;
+: hmend ( out -- )   hmt shfin  hmo shc 1A lit cpy  hmt 20 lit shupd  shfin ;
+
+\ ── PBKDF2-HMAC-SHA256, one block ──
+
+: pbuv variable ;  : pbu ( -- a )  pbuv 20 lit lazy ;
+: pbo variable ;  : pbr variable ;  : pbsa variable ;  : pbsn variable ;
+: pbone ( -- a )   shpad 4 lit + ;
+: pbkdf ( pw n salt n rounds out -- )
+	pbo ! pbr ! pbsn ! pbsa !  hmkey
+	hmbeg pbsa @ pbsn @ shupd  1 lit pbone shbe!  pbone 4 lit shupd  pbu hmend
+	pbu pbo @ 20 lit ncpy
+	pbr @ 1 lit u> if pbr @ 1 lit do
+		hmbeg pbu 20 lit shupd pbu hmend
+		20 lit 0 lit do pbu i + c@ pbo @ i + c@ xor pbo @ i + c! loop
+	loop then
+;
