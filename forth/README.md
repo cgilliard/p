@@ -98,10 +98,14 @@ A signed transaction is kept before its signature leaves the node, and
 serving it as the Rust node's relay does. Both directions have been run
 against a Rust dev node, end to end.
 
-`scripts/test.sh` builds the tests as two programs -- the chain's and
-network's without the wallet's sources, the wallet's with everything --
-because the compiler takes at most 65,536 call sites in one program, and the
-node with every test is past that. The node itself has about 10,000 to spare.
+The compiler's output uses no `jalr` -- every jump is a `jal`, reaching
+1 MiB either way -- and returns go through a search tree from return-id to
+return site. A program of any size compiles: every 512 KiB or so (at a `:`),
+the compiler emits an island, holding the return tree for the segment of
+code before it, linked to the islands on either side, and a relay jump for
+every word defined so far, which far calls go through (`src/fam.S`,
+`emit_island`). A program can have 262,136 call sites; the node has about
+8,000.
 
 ## Test fixtures
 

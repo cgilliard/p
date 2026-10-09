@@ -106,7 +106,7 @@
 : assert 0= if _fail then ;
 
 \ _tdone ( -- )  RUNTIME: report the last bench, then the summary.  Reached by
-\        a `jal` from `_tend` (no return-id), so it must NOT return.
+\        a call after `_tend`, and must NOT return.
 : _tdone
 	bcount @ if _bprev then
 	0A lit putc
@@ -341,45 +341,8 @@ abort        \ unterminated: print '?' and halt the compiler
 ;
 
 \ _tend ( C: -- )  COMPILE-TIME: lib/test.fam's `_tend` verbatim — close the
-\ chain and `jal` to `_tdone`.  Appended once by ./tools/fam --bench.
-:I _tend
-jpat!
-377F646F ,
-130FFF45 ,
-B76F0000 ,
-938FEF56 ,
-138E0B00 ,
-63726E03 ,
-83220E00 ,
-639AE201 ,
-83224E00 ,
-6396F201 ,
-8323CE00 ,
-6F000001 ,
-130E4E01 ,
-6FF01FFE ,
-6F004005 ,
-B38E3340 ,
-9302F006 ,
-13D3BE00 ,
-13731300 ,
-13134301 ,
-B3E26200 ,
-13D3CE00 ,
-1373F30F ,
-1313C300 ,
-B3E26200 ,
-13D31E00 ,
-1373F33F ,
-13135301 ,
-B3E26200 ,
-13D34E01 ,
-13731300 ,
-1313F301 ,
-B3E26200 ,
-23A05100 ,
-93814100 ,
-;
+\ chain.  Appended once by ./tools/fam --bench, followed by a call to `_tdone`.
+:I _tend jpat! ;
 
 \ _skip ( C: -- )  COMPILE-TIME: plant the skip-main forward jump.
 :I _skip here ,j0 ;

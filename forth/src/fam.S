@@ -45,6 +45,7 @@ _base\@:
 .endm
 
 .set    N_CALLS, 0
+.equ    ISLAND_GAP, 0x80000         # 512 KiB of output between islands
 
 # --- call-site emission --------------------------------------------------
 
@@ -262,9 +263,19 @@ _start:
     mv      s6, s7                      # name table cursor (empty)
     li      t0, 0x100000                # 1 MB name table
     add     t1, s7, t0                  # call-site table base (after the name table)
-    addi    t2, t1, 4                   # first entry slot (word 0 holds the cursor)
-    sw      t2, 0(t1)                   # init call-site cursor = base + 4
-    li      t0, 0x40000                 # 256 KB call-site table (return-id -> site)
+    # Call-site table header (32 bytes), then the entries (return-id -> site):
+    #   +0  cursor (next free entry)
+    #   +4  the last island's id check (0 = no island yet)
+    #   +8  the last island's forward-jump slot, patched by the next (0 = none)
+    #   +12 the first return-id of the current segment
+    #   +16 output address of the last island (where the spacing counts from)
+    #   +20 the return entry the current segment's `;` jumps to
+    addi    t2, t1, 32                  # first entry slot
+    sw      t2, 0(t1)                   # init call-site cursor = base + 32
+    sw      zero, 4(t1)
+    sw      zero, 8(t1)
+    sw      zero, 12(t1)
+    li      t0, 0x100000                # 1 MB call-site table (262,136 sites)
     add     gp, t1, t0                  # heap base = after the call-site table
     # Memory above gp splits into two DISJOINT fixed regions: the heap [gp,
     # gp+64MiB) and a 1 KiB fam stack [gp+64MiB, gp+64MiB+0x400).  sp is the
@@ -310,8 +321,9 @@ compile:
     sb      zero, 3(gp)
     addi    gp, gp, 4
     # Two prologue slots, skipped by `j +12`:
-    #   __ret (s0+8):  backpatched to __ret_chain at EOT; words' ';' jump here.
-    #   __ovf (s0+12): a self-loop halt; the emitted RID-overflow check jumps here.
+    #   __ret (s0+8):  backpatched to the first island's return entry; the
+    #                  first segment's ';'s jump here.
+    #   __ovf (s0+12): a self-loop halt (unused now: calls halt in place).
     addi    a0, s0, 16                  # program code begins at s0+16 (past both slots)
     CALL    emit_j                      # `j +12` at s0+4 -> s0+16
     CHECK_HEAP 4, t0
@@ -333,6 +345,11 @@ compile:
     li      t0, 0x00018193              # addi gp, gp, 0  (at s0+20, patched at EOT)
     sw      t0, 0(gp)
     addi    gp, gp, 4                   # gp = s0+24 (user program starts here)
+    li      t0, 0x100000
+    add     t0, s7, t0                  # call-site table header
+    sw      s0, 16(t0)                  # spacing counts from the output start
+    addi    t1, s0, 8
+    sw      t1, 20(t0)                  # `;` jumps to __ret until the first island
 .Lc_next:
     # Immediate-region overflow guard: while a :I body is compiling (region
     # word1 != 0), the cursor (gp) must stay below s7 (name table = region end).
@@ -393,8 +410,10 @@ compile:
 .Lc_semi_word:
     beqz    ra, .Lc_unmatched           # not inside a ':' definition -> unmatched
     # finish the word: emit its return, then backpatch the skip-jump
-    addi    a0, s0, 8                   # __ret trampoline = s0+8
-    CALL    emit_j                      # emit `j __ret` at gp
+    li      t0, 0x100000
+    add     t0, s7, t0
+    lw      a0, 20(t0)                  # the segment's return entry (__ret or an island's)
+    CALL    emit_j                      # emit `j <return entry>` at gp
     mv      a0, ra                      # the skip-jump placeholder
     mv      a1, gp                      # patch it to here (.skip = past body+return)
     CALL    patch_j
@@ -432,7 +451,24 @@ compile:
 
 # ': name <body> ;' -- ordinary word. Emit a skip-jump over the body, record
 # the entry (kind=word), then let the main loop compile the body until ';'.
+# First, once ISLAND_GAP bytes have been emitted since the last island, emit
+# another (see emit_island) -- here, between definitions, where a `j` over it
+# is all it takes.
 .Lc_defcolon:
+    li      t0, 0x1400
+    add     t0, s10, t0
+    lw      t1, 4(t0)                   # in a :I body -> no island
+    bnez    t1, .Lc_defname
+    bnez    ra, .Lc_defname             # inside a ':' definition -> no island
+    li      t0, 0x100000
+    add     t0, s7, t0
+    lw      t1, 16(t0)                  # the last island
+    sub     t1, gp, t1
+    li      t0, ISLAND_GAP
+    bltu    t1, t0, .Lc_defname
+    li      a0, 0                       # not the last
+    CALL    emit_island
+.Lc_defname:
     NEXT_TOKEN s1, s2, t2, .Lc_deferr   # read word name = [t2, s1)
     sub     t0, s1, t2                  # names are packed into 2 words -> max 8 bytes
     li      t1, 8
@@ -496,33 +532,39 @@ compile:
     mv      s2, a7                      # limit  = body end
     j       .Lc_next
 # A reference to a word (a6 = entry from nt_lookup): emit a call --
-#   push a fresh return-id onto the OUTPUT's RID stack, then `j entry`.
-#   Record (return-id -> return-site) in the call-site table for the EOT
-#   __ret_chain (Part 2b).
+#   push a fresh return-id onto the OUTPUT's RID stack, then `j entry` (or
+#   `j` its relay, out of reach).  Record (return-id -> return-site) in the
+#   call-site table for the islands' BSTs (emit_island).
 .Lc_callword:
     li      t3, 0x100000
     add     t3, s7, t3                  # t3 = call-site table base
     lw      t4, 0(t3)                   # t4 = cursor (next free entry)
     sub     t5, t4, t3
-    addi    t5, t5, -4
-    srli    t5, t5, 2                   # t5 = return-id r = (cursor - base - 4)/4
+    addi    t5, t5, -32
+    srli    t5, t5, 2                   # t5 = return-id r = (cursor - base - 32)/4
     li      a0, 0xFFCD8D93              # addi s11, s11, -4
     CALL    emit_word
     li      a0, 0x01ADF463             # bgeu s11, s10, +8  (skip trap-jump if no overflow)
     CALL    emit_word
-    addi    a0, s0, 12                 # j __ovf  (RID-overflow halt; trampoline, 1 MiB reach)
-    CALL    emit_j
+    li      a0, 0x6F                   # j .  (RID-overflow halt, in place)
+    CALL    emit_word
     mv      a0, t5                      # li t0, r   (lui+addi: r may exceed 2047)
     li      a1, 0x2B7                   #   lui t0, 0
     li      a2, 0x28293                 #   addi t0, t0, 0
     CALL    emit_li
     li      a0, 0x005DA023              # sw t0, 0(s11)
     CALL    emit_word
-    mv      a0, a6                      # j entry
-    CALL    emit_j
+    mv      a0, a6                      # j entry, if it's in reach;
+    sub     t0, a6, gp
+    srai    t0, t0, 20
+    beqz    t0, 1f
+    li      t1, -1
+    beq     t0, t1, 1f
+    mv      a0, a7                      # else j its relay in the last island
+1:  CALL    emit_j
     sw      gp, 0(t4)                   # site[r] = return point (current gp)
     addi    t4, t4, 4
-    li      t0, 0x40000
+    li      t0, 0x100000
     add     t0, t3, t0                  # call-site table end
     bgeu    t4, t0, __panic             # call-site table overflow
     sw      t4, 0(t3)                   # store updated cursor
@@ -565,39 +607,11 @@ compile:
 .Lc_done:
     # Halt at the program end: a program that runs off its end -- or whose
     # final action is a call that returns to the EOT position -- lands here
-    # instead of falling into __ret_chain. (A real program exits before this.)
+    # instead of falling into the last island. (A real program exits before this.)
     mv      a0, gp
     CALL    emit_j                      # `j .` at the program end
-    # Generate __ret_chain after it: pop the return-id, range-check it (a
-    # corrupt id halts), then a balanced BST mapping return-id -> return-site
-    # (O(log n) per return vs. the old linear chain).
-    mv      t6, gp                      # t6 = __ret_chain start (for the backpatch)
-    li      a0, 0x000DA283              # lw t0, 0(s11)   (pop return-id)
-    CALL    emit_word
-    li      a0, 0x004D8D93              # addi s11, s11, 4
-    CALL    emit_word
-    li      t3, 0x100000
-    add     t3, s7, t3                  # t3 = call-site table base
-    lw      t4, 0(t3)                   # t4 = cursor (one past last entry)
-    sub     t5, t4, t3
-    addi    t5, t5, -4
-    srli    t5, t5, 2                   # t5 = N (number of call sites)
-    # Range check: li t1, N ; bltu t0, t1, +8 ; j .  -- a popped id >= N (a
-    # corrupt RID stack) halts rather than jumping to a bogus BST leaf.
-    mv      a0, t5                      # li t1, N   (lui+addi: N may exceed 2047)
-    li      a1, 0x337                   #   lui t1, 0
-    li      a2, 0x30313                 #   addi t1, t1, 0
-    CALL    emit_li
-    li      a0, 0x0062E463             # bltu t0, t1, +8  (skip the halt if id < N)
-    CALL    emit_word
-    li      a0, 0x6F                   # j .   (bad-id halt; skipped when id < N)
-    CALL    emit_word
-    li      a0, 0                       # lo = 0
-    addi    a1, t5, -1                  # hi = N - 1
-    CALL    gen_bst                     # emit the balanced BST over [0, N-1]
-    addi    a0, s0, 8                   # patch the __ret trampoline (s0+8) ...
-    mv      a1, t6                      # ... to jump to __ret_chain
-    CALL    patch_j
+    li      a0, 1                       # the last island: the rest of the returns
+    CALL    emit_island
     addi    a0, s0, 16                  # patch the prologue gp-load (auipc @ s0+16) ...
     mv      a1, gp                      # ... to point gp at the end of the output
     CALL    patch_la
@@ -643,7 +657,7 @@ nt_lookup:
 #   (builds the scrambled J-type immediate). Clobbers t0, t1.
 #   The J-immediate is 21-bit signed (+-1 MiB), so an offset beyond that can't be
 #   encoded -- bail to __panic rather than silently emit a truncated/wrong jump.
-#   This makes the no-jalr ~1 MiB output ceiling a clean error, not a miscompile.
+#   (Islands keep every jump the output makes in reach; this is the backstop.)
 encode_jal:
     srai    t0, a0, 20                  # in range iff offset>>20 is 0 or -1
     beqz    t0, 1f
@@ -717,11 +731,11 @@ patch_la:
 #   A leaf (lo==hi) is just `j site[lo]`; the range check upstream guarantees
 #   a valid id reaches the right leaf. Recursive: lo/hi/mid/jleft live in a
 #   16-byte sp frame across the two recursive calls. site[id] = *((s7+0x100000)
-#   + 4 + id*4).  Clobbers t0-t6, a0-a1 (frame-saved values reloaded each time).
+#   + 32 + id*4).  Clobbers t0-t6, a0-a1 (frame-saved values reloaded each time).
 gen_bst:
     blt     a1, a0, .Lgb_done           # lo > hi: empty subtree
     bne     a0, a1, .Lgb_node           # lo != hi: internal node
-    li      t3, 0x100004                # leaf: lo == hi -> j site[lo]
+    li      t3, 0x100020                # leaf: lo == hi -> j site[lo]
     add     t3, s7, t3                  # &site[0]
     slli    t4, a0, 2
     add     t3, t3, t4                  # &site[lo]
@@ -744,7 +758,7 @@ gen_bst:
     CALL    emit_li
     li      a0, 0x00629463             # bne t0, t1, +8  (skip the hit jump)
     CALL    emit_word
-    li      t3, 0x100004                # j site[mid]
+    li      t3, 0x100020                # j site[mid]
     add     t3, s7, t3
     lw      t4, 8(sp)
     slli    t4, t4, 2
@@ -783,6 +797,129 @@ gen_bst:
     mv      a1, a0                      # target = the j's own address -> `j .` halt
     CALL    patch_j
     addi    sp, sp, 16
+    RET
+
+# emit_island -- a0 = 1 for the last (at EOT), 0 otherwise.  Every jump the
+#   output makes is a `jal` (no jalr), reaching +-1 MiB; islands are what let
+#   the output be any size.  The output is cut into segments, each ending in an
+#   island (the last at EOT), every ISLAND_GAP bytes or so:
+#       j over                          (not the last: execution flows past)
+#   ret:                                each `;` in the next segment jumps here
+#       lw t0,0(s11) ; addi s11,s11,4   (pop the return-id)
+#   chk:                                the id in t0
+#       li t1,lo ; bgeu t0,t1,+8 ; j <the previous island's chk>   (or j .)
+#       li t1,N  ; bltu t0,t1,+8 ; j <the next island's chk>       (or j .)
+#       <balanced BST over [lo, N-1]: this segment's return sites>
+#       j <word or its earlier relay>   for every ':' word so far   (not the last)
+#   over:
+#   where [lo, N-1] are the return-ids of the call sites in the segment.  Ids
+#   increase with the output address, so a return walks the chain of islands to
+#   its segment's and finds its site there.  A call to a word out of a `jal`'s
+#   reach jumps to the word's relay in the last island instead (name-table
+#   field1), which jumps to the word or to its relay in the island before.
+#   Each jump spans at most a segment and an island.  The first island also
+#   patches the __ret slot (s0+8), which the first segment's `;`s jump to.
+#   Uses a 16-byte sp frame: [last, over slot, ret, chk].  Clobbers t0-t6, a0-a7.
+emit_island:
+    addi    sp, sp, -16
+    addi    t0, s3, -0x400              # t0 = stack floor (= heap top)
+    bltu    sp, t0, __panic             # frame overflowed its 1 KiB stack
+    sw      a0, 0(sp)                   # last?
+    bnez    a0, 1f
+    sw      gp, 4(sp)                   # the `j over` slot
+    li      a0, 0x6F                    # j over  (placeholder, patched below)
+    CALL    emit_word
+1:  sw      gp, 8(sp)                   # ret
+    li      a0, 0x000DA283              # lw t0, 0(s11)   (pop return-id)
+    CALL    emit_word
+    li      a0, 0x004D8D93              # addi s11, s11, 4
+    CALL    emit_word
+    sw      gp, 12(sp)                  # chk
+    li      t3, 0x100000
+    add     t3, s7, t3                  # t3 = call-site table base
+    lw      a0, 8(t3)                   # the previous island's forward jump ...
+    beqz    a0, 2f
+    mv      a1, gp                      # ... comes here
+    CALL    patch_j
+2:  li      t3, 0x100000
+    add     t3, s7, t3
+    lw      t4, 4(t3)                   # the first island?
+    bnez    t4, 3f
+    addi    a0, s0, 8                   # then __ret (s0+8) ...
+    lw      a1, 8(sp)                   # ... jumps to its ret
+    CALL    patch_j
+3:  li      t3, 0x100000
+    add     t3, s7, t3
+    lw      a0, 12(t3)                  # li t1, lo
+    li      a1, 0x337                   #   lui t1, 0
+    li      a2, 0x30313                 #   addi t1, t1, 0
+    CALL    emit_li
+    li      a0, 0x0062F463              # bgeu t0, t1, +8  (id >= lo: stay)
+    CALL    emit_word
+    li      t3, 0x100000
+    add     t3, s7, t3
+    lw      a0, 4(t3)                   # j <previous chk>
+    bnez    a0, 4f
+    mv      a0, gp                      # none: j .  (an id below 0 can't happen)
+4:  CALL    emit_j
+    li      t3, 0x100000
+    add     t3, s7, t3
+    lw      t4, 0(t3)
+    sub     t5, t4, t3
+    addi    t5, t5, -32
+    srli    a0, t5, 2                   # li t1, N  (the number of call sites so far)
+    li      a1, 0x337
+    li      a2, 0x30313
+    CALL    emit_li
+    li      a0, 0x0062E463              # bltu t0, t1, +8  (id < N: stay)
+    CALL    emit_word
+    li      t3, 0x100000
+    add     t3, s7, t3
+    sw      zero, 8(t3)
+    lw      t4, 0(sp)
+    bnez    t4, 5f                      # the last: j .  (a corrupt id halts)
+    sw      gp, 8(t3)                   # else the next island patches it
+5:  li      a0, 0x6F                    # j .  (placeholder)
+    CALL    emit_word
+    li      t3, 0x100000
+    add     t3, s7, t3
+    lw      t4, 0(t3)
+    sub     t5, t4, t3
+    addi    t5, t5, -32
+    srli    t5, t5, 2                   # N
+    lw      a0, 12(t3)                  # lo
+    addi    a1, t5, -1                  # hi = N - 1
+    sw      t5, 12(t3)                  # the next segment starts at N
+    lw      t4, 12(sp)
+    sw      t4, 4(t3)                   # its previous chk is this one
+    lw      t4, 8(sp)
+    sw      t4, 20(t3)                  # its `;`s jump to this ret
+    CALL    gen_bst                     # this segment's return sites
+    lw      t4, 0(sp)
+    bnez    t4, 9f
+    mv      t2, s7                      # a relay for every ':' word
+6:  bgeu    t2, s6, 8f
+    lw      t0, 8(t2)                   # kind
+    li      t1, 1
+    bne     t0, t1, 7f
+    lw      a0, 12(t2)                  # the word's entry, if it's in reach
+    sub     t0, a0, gp
+    srai    t0, t0, 20
+    beqz    t0, 65f
+    li      t1, -1
+    beq     t0, t1, 65f
+    lw      a0, 16(t2)                  # else its relay in the island before
+65: sw      gp, 16(t2)                  # field1 = this relay
+    CALL    emit_j
+7:  addi    t2, t2, 20
+    j       6b
+8:  lw      a0, 4(sp)                   # j over -> here
+    mv      a1, gp
+    CALL    patch_j
+    li      t3, 0x100000
+    add     t3, s7, t3
+    sw      gp, 16(t3)                  # the spacing counts from here
+9:  addi    sp, sp, 16
     RET
 
 # imm_tramp -- one-slot trampoline for invoking an immediate word at a runtime-

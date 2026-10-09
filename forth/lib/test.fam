@@ -18,14 +18,14 @@
 \ Control-flow plumbing (compile time): `_skip` plants a forward `jal` before the
 \ user source; each `Test` `jpat!`s the pending jump to its suite start (so main
 \ is jumped over) and each `}` plants the next forward jump; `_tend` `jpat!`s the
-\ last one to itself and emits a `jal` to `_tdone`. `here`/`,j0`/`jpat!` only do
+\ last one to itself, and a call to `_tdone` follows. `here`/`,j0`/`jpat!` only do
 \ compile-time work inside a `:I`/`:M` body, hence the `_skip` wrapper. Names are
 \ scanned straight from the source by `Test`/`}` (a bare `fib0` never reaches
 \ `???`). stdlib (incl. `???`) is untouched; the default build uses lib/build.fam.
 \ ============================================================
 
 \ tname ( -- addr ) ptr to current test's name string.  tcount ( -- addr ) counter.
-\ (allocated first -> fixed slots; _tdone reads tcount, name lookup finds _tdone.)
+\ (allocated first -> fixed slots; _tdone reads tcount.)
 : tname  variable ;
 : tcount variable ;
 : tstart variable ;   \ mtime (ticks) captured at the first test
@@ -107,7 +107,7 @@ B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
 : assert 0= if _fail then ;
 
 \ _tdone ( -- )  RUNTIME: report the last test as ok, then the result line. Reached
-\        by a `jal` from `_tend` (no return-id), so it must NOT return — ends in `bye`.
+\        by a call after `_tend`, and must NOT return — ends in `bye`.
 \        No name-push happens between the last test's body and here, so the
 \        stack-balance check compares sp directly against the snapshot (no offset).
 : _tdone
@@ -328,46 +328,9 @@ B3E26200 ,   \ or t0,t0,t1
 ;
 
 \ _tend ( C: -- )  COMPILE-TIME: close the chain — `jpat!` the last forward jump to
-\        here, then look up `_tdone` in the name table and emit `jal x0,_tdone`
-\        (PC-relative). Appended once by ./tools/fam after the user source(s).
-:I _tend
-jpat!
-377F646F ,
-130FFF45 ,
-B76F0000 ,
-938FEF56 ,
-138E0B00 ,
-63726E03 ,
-83220E00 ,
-639AE201 ,
-83224E00 ,
-6396F201 ,
-8323CE00 ,
-6F000001 ,
-130E4E01 ,
-6FF01FFE ,
-6F004005 ,
-B38E3340 ,
-9302F006 ,
-13D3BE00 ,
-13731300 ,
-13134301 ,
-B3E26200 ,
-13D3CE00 ,
-1373F30F ,
-1313C300 ,
-B3E26200 ,
-13D31E00 ,
-1373F33F ,
-13135301 ,
-B3E26200 ,
-13D34E01 ,
-13731300 ,
-1313F301 ,
-B3E26200 ,
-23A05100 ,
-93814100 ,
-;
+\        here. Appended once by ./tools/fam after the user source(s), followed by
+\        `_tdone` (an ordinary call, so it reaches across any size of program).
+:I _tend jpat! ;
 
 \ _skip ( C: -- )  COMPILE-TIME: emit a forward `jal x0,0` placeholder + push its
 \        addr (here ,j0). Wrapped in a :I so here/,j0 run at compile time.

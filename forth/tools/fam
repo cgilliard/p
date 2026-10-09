@@ -111,6 +111,7 @@ if [ ! -f "$HEADER" ]; then echo "fam: header not found: $HEADER" >&2; exit 1; f
 # file sits next to the output (relative path — MSYS path conversion of
 # absolute /tmp paths inside comma-separated qemu args is unreliable).
 if [ "$TEST" = 1 ] || [ "$BENCH" = 1 ]; then TAIL='_tend
+_tdone
 bye'; else TAIL='bye'; fi
 STREAM="$OUT.in.$$"
 ( cat "$STDLIB" "$HEADER" $IN; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
