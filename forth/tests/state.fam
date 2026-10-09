@@ -1,0 +1,62 @@
+\ tests/state.fam — test-only: src/state.fam against roots printed by the Rust
+\ node's state tree, for its own test data: output k's commitment is
+\ hash_bytes(k, 8 bytes little-endian), its nonce the first 16 bytes of
+\ hash_bytes(k + 1,000,000), its height k mod 1000 + 7.
+
+: tsbv variable ;  : tsb ( -- a )   tsbv 8 lit lazy ;
+: tscv variable ;  : tscm ( -- a )  tscv 20 lit lazy ;
+: tsnv variable ;  : tsno ( -- a )  tsnv 20 lit lazy ;
+: tssv variable ;  : tsst ( -- a )  tssv 60 lit lazy ;
+: tsrv variable ;  : tsr ( -- a )   tsrv 40 lit lazy ;     \ the root, then the expected one
+
+\ tsdata ( k -- )   output k's commitment and nonce.
+: tsdata ( k -- )
+	dup tsb ! 0 lit tsb 4 lit + !  tsst tsb 8 lit p2hashb  tsst tscm 8 lit cpy
+	F4240 lit + tsb ! 0 lit tsb 4 lit + !  tsst tsb 8 lit p2hashb  tsst tsno 8 lit cpy
+;
+\ tspush ( k -- )   append output k.
+: tspush ( k -- )   dup tsdata  tscm tsno rot 3E8 lit % 7 lit + stpush ;
+\ tsspend ( k -- ok )   spend output k.
+: tsspend ( k -- ok )   tsdata tscm stspend ;
+\ tsok ( w0 .. w7 -- f )   whether the root is the 32 bytes whose words these are.
+: tsok ( w0 .. w7 -- f )
+	8 lit 0 lit do tsr 20 lit + 1C lit i 2 lit lshift - + ! loop
+	tsr stroot  tsr tsr 20 lit + 8 lit ceq
+;
+
+Test {
+	state_empty {
+		dbopen assert  pgfmt assert  stopen assert
+		69E9BE5A lit 6656A1C7 lit 634B5066 lit 1B0710DE lit 3BCCBFE7 lit 2D800113 lit 65266B07 lit 2F7D4B5C lit tsok assert
+		stc@ or 0 lit asrt_eq
+	}
+	state_pushes {
+		0 lit stuf !  0 lit stul !  0 lit stuk !
+		0 lit tspush
+		1DB68C90 lit 22F45C49 lit 49A4BD18 lit 256DC376 lit 1FF27888 lit 9647DC6 lit 73CE57B3 lit ED81126 lit tsok assert
+		10 lit 1 lit do i tspush loop
+		1D04219E lit 32B2BBA6 lit 673BC7FB lit 6D904218 lit 7580494 lit 47DC06F6 lit 60B05B2 lit 1D8E112D lit tsok assert
+		10 lit tspush
+		5E6F2E1B lit FDF21EB lit 312CBAF2 lit 16628470 lit 77660D93 lit 43A1EFC4 lit 2A5D22B6 lit 1849E869 lit tsok assert
+		28 lit 11 lit do i tspush loop
+		2636909C lit 35FD6CB2 lit 11A87120 lit 702500C1 lit 207C7A5F lit F51A603 lit 74E7B454 lit 3B0FA66B lit tsok assert
+		stc@ 0 lit asrt_eq 28 lit asrt_eq
+	}
+	state_spends {
+		3 lit tsspend assert
+		FE8CBEB lit 6FDAC961 lit 7395EAFC lit 65E62EA9 lit 26E228BF lit 7349A01C lit 6B2A9AA4 lit 68C6EFF0 lit tsok assert
+		11 lit tsspend assert
+		BB80A67 lit 1E85B80F lit 6D140E5E lit 58A1BD46 lit 77386958 lit 3AE9799F lit 1AF2AD5F lit 591552E6 lit tsok assert
+		27 lit tsspend assert
+		3F09CD5C lit 4A2DE5CD lit 4D95388 lit 319F5D51 lit 448076D9 lit 28F5B5F5 lit 4C08AF90 lit 194E8FE9 lit tsok assert
+		0 lit tsspend assert
+		13B6AC40 lit 3121B98D lit 4F9AA1D5 lit 766256D7 lit 65D9E3A0 lit 1508C31B lit 71E73F52 lit 1BCA7856 lit tsok assert
+		3 lit tsspend 0 lit asrt_eq                                \ already spent
+		stc@ 0 lit asrt_eq 28 lit asrt_eq                            \ spending keeps the count
+	}
+	state_persists {
+		pgcommit assert
+		stopen assert
+		13B6AC40 lit 3121B98D lit 4F9AA1D5 lit 766256D7 lit 65D9E3A0 lit 1508C31B lit 71E73F52 lit 1BCA7856 lit tsok assert
+	}
+}

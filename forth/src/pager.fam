@@ -1,0 +1,326 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/pager.fam — 4 KiB pages on the virtio disk (after the tip log of
+\ src/store.fam), a page cache, and atomic commits of any size.
+\
+\ Layout: page p is sectors pgbase + 8p.  Page 0: the meta page.  Page 1: the
+\ journal's header.  Pages 2 .. 2 + 0x1FF: the journal's index (the page each
+\ slot holds, 1,024 to a page).  Then 2^19 journal slots, then data pages
+\ (allocated from `hwm`, or reused from the free list).
+\
+\ A transaction is everything since the last commit.  Its changed pages stay
+\ in the cache while there's room; when the cache needs a slot and only
+\ changed pages are left to give, one is written to the next journal slot and
+\ remembered there (`pgjmap`), and read back from there if it's needed again.
+\ So a transaction is limited by the journal (2^19 pages, 2 GiB), not memory.
+\
+\ `pgcommit`: every changed page still cached goes to the journal too; then
+\ the index and the header (the count, and a checksum of the index) -- made
+\ durable; then every journaled page is copied home -- made durable; then the
+\ header is cleared.  At open, a whole header and index mean a commit was
+\ interrupted after its journal was complete: it's replayed.  So the pages on
+\ disk always hold either the last commit or the one before.  `pgabort` drops
+\ the transaction.
+\
+\ Meta page (cells): 0 "STAT"  4 version (2)  8 commits  C hwm  10 free list
+\ head  14 .. 24 four roots (src/btree.fam)  24 .. 100 the state (src/state.fam,
+\ src/accept.fam, src/snap.fam)  100 .. 110 four more roots.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: pgbase ( -- sector )   110008 lit ;                 \ after the tip log (src/store.fam)
+: pgsz ( -- n )          1000 lit ;                    \ bytes a page
+: pgn ( -- n )           400 lit ;                     \ cache slots
+: pgjcap ( -- n )        80000 lit ;                   \ journal slots: 2^19
+: pgj0 ( -- p )          202 lit ;                     \ the first journal slot's page
+: pgd0 ( -- p )          80202 lit ;                   \ the first data page
+: pgjtn ( -- n )         100000 lit ;                  \ journal map slots: 2^20
+: pgmag ( -- w )         54415453 lit ;                \ "STAT"
+: pgjmag ( -- w )        4C4E524A lit ;                \ "JRNL"
+
+\ dbion ( sector buf n write? -- ok )   n sectors, waiting for them.
+: dbiw variable ;   : dbin variable ;   : dbib variable ;   : dbis variable ;
+: dbion ( sector buf n write? -- ok )
+	dbiw ! dbin ! dbib ! dbis !
+	dbds @ dbis @ dbib @ dbin @  dbiw @ if vwriten else vreadn then
+	vwait vstat nip 1 lit =
+;
+
+\ pgio ( p buf write? -- ok )   one page.
+: pgio ( p buf write? -- ok )   rot 3 lit lshift pgbase + -rot 8 lit swap dbion ;
+
+\ ── The journal map: page -> slot, for pages journaled this transaction ──
+\ An open-addressing table of (page + 1, slot); slot s's page and table index
+\ kept too (pgjl, pgji), to write the index and to clear the table.
+
+: pgjtv variable ;  : pgjt ( -- a )  pgjtv pgjtn 3 lit lshift lazy ;
+: pgjlv variable ;  : pgjl ( -- a )  pgjlv pgjcap 2 lit lshift lazy ;
+: pgjiv variable ;  : pgji ( -- a )  pgjiv pgjcap 2 lit lshift lazy ;
+: pgjn variable ;   \ slots used this transaction
+
+: pgjh# ( p -- i )   dup B lit rshift xor dup 13 lit rshift xor pgjtn 1 lit - and ;
+: pgjt@ ( i -- key )   3 lit lshift pgjt + @ ;
+
+\ pgjmap ( p -- slot )   page p's journal slot this transaction, or -1.
+: pgjr variable ;
+: pgjmap ( p -- slot )
+	-1 lit pgjr !
+	dup pgjh#
+	begin dup pgjt@ dup if 2 lit pick 1 lit + <> else drop 0 lit then while
+		1 lit + pgjtn 1 lit - and
+	repeat
+	dup pgjt@ if 3 lit lshift pgjt + 4 lit + @ pgjr ! else drop then
+	drop pgjr @
+;
+
+\ pgjnew ( p -- slot )   a new slot for page p.  Halts if the journal is full.
+: pgjnew ( p -- slot )
+	pgjn @ pgjcap u< 0= if "transaction too large for the journal" puts A lit putc bye then
+	dup pgjh#
+	begin dup pgjt@ while 1 lit + pgjtn 1 lit - and repeat      ( p i )
+	over 1 lit + over 3 lit lshift pgjt + !
+	pgjn @ over 3 lit lshift pgjt + 4 lit + !
+	pgji pgjn @ 2 lit lshift + !
+	pgjl pgjn @ 2 lit lshift + !
+	pgjn @  dup 1 lit + pgjn !
+;
+
+\ pgjclr ( -- )   forget the journal map.
+: pgjclr ( -- )
+	pgjn @ ?dup if 0 lit do 0 lit pgji i 2 lit lshift + @ 3 lit lshift pgjt + ! loop then
+	0 lit pgjn !
+;
+
+\ ── The cache ──
+\ Slot s: the page it holds plus one (0: empty), whether it's changed since
+\ it was last written (to the journal or home), and the last operation that
+\ used it.  A page not used by the current operation (`pgop`) may be evicted:
+\ a clean one simply, a changed one by journaling it first.
+
+: pgcpv variable ;  : pgcp ( -- a )  pgcpv pgn 2 lit lshift lazy ;
+: pgcdv variable ;  : pgcd ( -- a )  pgcdv pgn 2 lit lshift lazy ;
+: pgcev variable ;  : pgce ( -- a )  pgcev pgn 2 lit lshift lazy ;
+: pgbv variable ;
+: pgbufs ( -- a )
+	pgbv @ 0= if pgn C lit lshift 1000 lit + alloc FFF lit + FFFFF000 lit and pgbv ! then
+	pgbv @
+;
+: pgbuf ( s -- a )    C lit lshift pgbufs + ;
+: pgc@ ( s arr -- v ) swap 2 lit lshift + @ ;
+: pgc! ( v s arr -- ) swap 2 lit lshift + ! ;
+: pgep variable ;   : pgrr variable ;
+
+\ pgop ( -- )   start an operation: pages it uses stay cached through it.
+: pgop ( -- )   pgep @ 1 lit + pgep ! ;
+
+\ Finding a page's slot: 2,048 buckets by the page's hash, each a chain of
+\ slots (pgnx: the next slot, plus one; 0 ends it).
+: pgbhv variable ;  : pgbh ( -- a )  pgbhv 2000 lit lazy ;
+: pgnxv variable ;  : pgnx ( -- a )  pgnxv pgn 2 lit lshift lazy ;
+: pgh# ( p -- b )   dup B lit rshift xor 7FF lit and ;
+
+\ pglink ( s p -- )   slot s holds page p: into p's bucket.
+: pglink ( s p -- )
+	pgh# 2 lit lshift pgbh +
+	dup @ 2 lit pick pgnx pgc!
+	swap 1 lit + swap !
+;
+
+\ pgunlk ( s p -- )   slot s no longer holds page p: out of p's bucket.
+: pgunlk ( s p -- )
+	pgh# 2 lit lshift pgbh +                                ( s cell )
+	begin dup @ dup if 1 lit - 2 lit pick <> else drop 0 lit then while
+		@ 1 lit - 2 lit lshift pgnx +
+	repeat
+	dup @ if over pgnx pgc@ swap ! else drop then
+	drop
+;
+
+\ pgslot ( p -- s )   the slot holding page p, or -1.
+: pgslot ( p -- s )
+	dup pgh# 2 lit lshift pgbh + @                          ( p v )
+	begin dup if dup 1 lit - pgcp pgc@ 2 lit pick 1 lit + <> else 0 lit then while
+		1 lit - pgnx pgc@
+	repeat
+	nip 1 lit -
+;
+
+\ pgspill ( s -- )   write changed slot s's page to its journal slot.
+: pgspill ( s -- )
+	dup pgcp pgc@ 1 lit -                                  ( s p )
+	dup pgjmap dup 0< if drop dup pgjnew then nip          ( s slot )
+	pgj0 + over pgbuf -1 lit pgio drop
+	0 lit swap pgcd pgc!
+;
+
+\ pgvict ( -- s )   a slot to use: an empty one; else one not used by this
+\        operation, clean if possible (round robin), journaled if changed.
+\        Halts if every slot is in use by this operation.
+: pgvs variable ;
+: pgvict ( -- s )
+	-1 lit pgvs !
+	pgn 0 lit do pgvs @ 0< if i pgcp pgc@ 0= if i pgvs ! then then loop
+	pgvs @ 0< if
+		pgn 0 lit do
+			pgvs @ 0< if
+				pgrr @ 1 lit + pgn 1 lit - and dup pgrr !
+				dup pgcd pgc@ 0= over pgce pgc@ pgep @ <> and if pgvs ! else drop then
+			then
+		loop
+	then
+	pgvs @ 0< if
+		pgn 0 lit do
+			pgvs @ 0< if
+				pgrr @ 1 lit + pgn 1 lit - and dup pgrr !
+				dup pgce pgc@ pgep @ <> if dup pgspill pgvs ! else drop then
+			then
+		loop
+	then
+	pgvs @ 0< if "page cache full" puts A lit putc bye then
+	pgvs @
+;
+
+\ pgget ( p -- a )   page p's buffer: from the cache, else this transaction's
+\        journal, else its home.
+: pggp variable ;
+: pgget ( p -- a )
+	dup pggp ! pgslot
+	dup 0< if
+		drop pgvict
+		dup pgcp pgc@ ?dup if 1 lit - over swap pgunlk then
+		pggp @ 1 lit + over pgcp pgc!
+		dup pggp @ pglink
+		0 lit over pgcd pgc!
+		pggp @ pgjmap dup 0< if drop pggp @ else pgj0 + then
+		over pgbuf 0 lit pgio drop
+	then
+	pgep @ over pgce pgc!
+	pgbuf
+;
+
+\ pgdirty ( p -- )   page p (cached) has changed.
+: pgdirty ( p -- )   pgslot dup 0< if drop else 1 lit swap pgcd pgc! then ;
+
+\ ── Meta, allocation ──
+
+: pgm ( -- a )   0 lit pgget ;
+: pgmd ( -- )    0 lit pgdirty ;
+
+\ pgnew ( -- p )   a fresh, zeroed, changed page: from the free list, else new.
+: pgnew ( -- p )
+	pgm 10 lit + @ ?dup if
+		dup pgget @ pgm 10 lit + !
+	else
+		pgm C lit + @ dup 1 lit + pgm C lit + !
+	then
+	pgmd
+	dup pgget 400 lit zero
+	dup pgdirty
+;
+
+\ pgfree ( p -- )   page p is no longer used.
+: pgfree ( p -- )
+	dup pgget pgm 10 lit + @ swap !  dup pgdirty
+	pgm 10 lit + !  pgmd
+;
+
+\ ── Commit, abort, recovery ──
+
+: pgjhv variable ;  : pgjh ( -- a )  pgjhv 1000 lit lazy ;   \ the header
+: pgtv variable ;   : pgtb ( -- a )  pgtv 1000 lit lazy ;    \ a page in passing
+
+\ pgsum ( c w -- c' )   fold a word into a checksum.
+: pgsum ( c w -- c' )   swap dup 5 lit lshift swap 1B lit rshift or xor ;
+
+\ pgjflush ( -- )   journal every changed page still in the cache.
+: pgjflush ( -- )   pgn 0 lit do i pgcd pgc@ if i pgspill then loop ;
+
+\ pgjwrite ( -- ok )   the journal's index and header (the journal's pages
+\        are written), made durable.
+: pgjwrite ( -- ok )
+	-1 lit  pgjn @                                          ( ok c )
+	pgjn @ 3FF lit + A lit rshift ?dup if 0 lit do           \ index pages
+		pgtb 400 lit zero
+		400 lit 0 lit do
+			j A lit lshift i +  dup pgjn @ u< if
+				2 lit lshift pgjl + @ dup pgtb i 2 lit lshift + !  pgsum
+			else drop then
+		loop
+		i 2 lit + pgtb -1 lit pgio rot and swap
+	loop then
+	pgjh 400 lit zero  pgjmag pgjh !  pgm 8 lit + @ pgjh 4 lit + !
+	pgjn @ pgjh 8 lit + !  pgjh C lit + !
+	dbsync
+	1 lit pgjh -1 lit pgio and  dbsync
+;
+
+\ pgapply ( -- ok )   every journaled page to its home (from the cache if it's
+\        there -- the same contents -- else from its slot), made durable.
+: pgapply ( -- ok )
+	-1 lit
+	pgjn @ ?dup if 0 lit do
+		pgjl i 2 lit lshift + @                                ( ok p )
+		dup pgslot dup 0< if
+			drop i pgj0 + pgtb 0 lit pgio drop  pgtb -1 lit pgio
+		else pgbuf -1 lit pgio then
+		and
+	loop then
+	dbsync
+;
+
+\ pgjclear ( -- ok )   the journal is spent.
+: pgjclear ( -- ok )   pgjh 400 lit zero  1 lit pgjh -1 lit pgio  dbsync ;
+
+\ pgcommit ( -- ok )   make every change since the last commit durable,
+\        atomically.
+: pgcommit ( -- ok )
+	pgm 8 lit + @ 1 lit + pgm 8 lit + !  pgmd
+	pgjflush
+	pgjwrite pgapply and pgjclear and
+	pgjclr
+;
+
+\ pgreset ( -- )   forget the cache and the journal map (as at startup).
+: pgreset ( -- )   pgn 0 lit do 0 lit i pgcp pgc!  0 lit i pgcd pgc! loop  pgbh 800 lit zero  pgjclr ;
+
+\ pgabort ( -- )   drop every change since the last commit.
+: pgabort ( -- )   pgreset ;
+
+\ pgreplay ( -- )   finish an interrupted commit: if the header and the index
+\        it covers are whole, copy every journaled page home.
+: pgreplay ( -- )
+	1 lit pgjh 0 lit pgio drop
+	pgjh @ pgjmag =  pgjh 8 lit + @ pgjcap 1 lit + u< and  if
+		pgjh 8 lit + @  dup                                     ( n c )
+		over 3FF lit + A lit rshift ?dup if 0 lit do
+			i 2 lit + pgtb 0 lit pgio drop
+			400 lit 0 lit do
+				j A lit lshift i +  2 lit pick u< if
+					pgtb i 2 lit lshift + @ dup  j A lit lshift i + 2 lit lshift pgjl + !  pgsum
+				then
+			loop
+		loop then
+		pgjh C lit + @ = if
+			?dup if 0 lit do
+				i pgj0 + pgtb 0 lit pgio drop
+				pgjl i 2 lit lshift + @ pgtb -1 lit pgio drop
+			loop then
+			dbsync  pgjclear drop
+		else drop then
+	then
+;
+
+\ pgfmt ( -- ok )   empty pages: a new meta page, committed.
+: pgfmt ( -- ok )
+	pgreset pgjclear drop
+	pgop  pgm 400 lit zero
+	pgmag pgm !  2 lit pgm 4 lit + !  pgd0 pgm C lit + !  pgmd
+	pgcommit
+;
+
+\ pgopen ( -- ok )   attach the disk; finish any interrupted commit; read the
+\        meta page, or start empty pages.
+: pgopen ( -- ok )
+	dbdev dup if
+		pgreset pgreplay pgop
+		pgm @ pgmag = pgm 4 lit + @ 2 lit = and 0= if pgfmt and then
+	then
+;

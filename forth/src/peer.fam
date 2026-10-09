@@ -1,0 +1,604 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/peer.fam — the network protocol (../rust/src/wire.rs, discovery.rs,
+\ transfer.rs, statesync.rs, fastsync.rs), over src/net.fam's UDP: find
+\ peers, catch up block by block (or by fast sync), and serve what this node
+\ can.
+\
+\ Every packet: magic "TBRN" ("TBRD" on dev), version 12, type, body; numbers
+\ big-endian; at most 1,200 bytes.  This node takes:
+\   GET_HOSTS -> HOSTS (with the cookie we issue the asker; no hosts shared)
+\   HOSTS     the answer to ours: the peer's cookie for us, and more hosts
+\   INV       a peer's block (and its tip's height): where it is
+\   CHUNK     a block downloading
+\   GET_SYNC_POINT -> SYNC_POINT, GET_PIECE -> PIECE_CHUNKs (cookie checked):
+\             fast sync's state, served as of a recent block (src/snap.fam)
+\   SYNC_POINT, PIECE_CHUNK   fast sync's, fetching
+\ Not served: blocks (GET_INV, GET_CHUNKS) -- this node keeps blocks' deltas,
+\ not the blocks -- and transactions.
+\
+\ Discovery: each known host is asked GET_HOSTS (a nonce from a keyed hash)
+\ every minute; an answer within 5 s with that nonce makes it a peer and
+\ carries its cookie, which every bulk request (GET_CHUNKS, GET_PIECE) must
+\ quote.  A host that keeps not answering is dropped (seeds never are).
+\
+\ Block by block: the peer furthest ahead is asked (GET_INV by height) for
+\ the block after our tip; its INV starts a download -- windows of CHUNKs,
+\ asked again after a second of silence -- and the block is checked against
+\ the hash announced, then taken (src/accept.fam).  A block whose parent we
+\ don't have (the peer is on another branch) sends us one height down, until
+\ the branches meet.  Peers' heights come from their INVs, asked for when
+\ unknown or a minute old.
+\
+\ Fast sync (a node with no blocks past genesis, `pfdep` > 0): once a peer's
+\ height is known, H = that less pfdep; blocks H and H + 1 are fetched, H's
+\ sync point asked of every peer and believed once H + 1's chain proof checks
+\ out, then the state as of H fetched piece by piece and the node started
+\ there (src/snap.fam); H + 1 on is block by block.
+\
+\   pseed ( ip port -- )   a host to start from
+\   pstart ( -- ok )       open the network
+\   pstep ( -- )           handle what's arrived, and move everything along
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: pwin ( -- n )     10 lit ;                         \ chunks asked for at once
+: pumin ( a b -- m )   2dup u> if nip else drop then ;
+: pchl ( -- n )     400 lit ;                        \ a chunk's bytes
+
+: pms ( -- ms )   hnow drop ;
+: pago ( t -- ms )   pms swap - ;                    \ milliseconds since t
+
+\ ── Packets ──
+
+: pbd variable ;  : pbn variable ;                   \ the body received
+
+\ phdr ( type -- body )   start a packet at npkt.
+: phdr ( type -- body )
+	54 lit npkt c!  42 lit npkt 1 lit + c!  52 lit npkt 2 lit + c!
+	bnet @ if 44 lit else 4E lit then npkt 3 lit + c!
+	C lit npkt 4 lit + c!  npkt 5 lit + c!  npkt 6 lit +
+;
+
+\ pok? ( -- f )   whether the datagram is a packet of ours (header).
+: pok? ( -- f )
+	npn @ 6 lit u< 0=  npn @ 4B1 lit u< and if
+		npay @ c@ 54 lit =  npay @ 1 lit + c@ 42 lit = and  npay @ 2 lit + c@ 52 lit = and
+		npay @ 3 lit + c@ bnet @ if 44 lit else 4E lit then = and
+		npay @ 4 lit + c@ C lit = and
+	else 0 lit then
+;
+
+\ ── Keys, nonces, cookies ──
+
+: pkv variable ;  : pkey ( -- a )  pkv 30 lit lazy ;     \ 32-byte secret, then input room
+: pstv variable ;  : pst ( -- a )  pstv 60 lit lazy ;
+: pctr variable ;
+
+\ pkinit ( -- )   the secret: a hash of the clock (nanoseconds) and MAC.
+: pkinit ( -- )
+	pkey 30 lit nzero
+	101000 lit @ pkey !  101004 lit @ pkey 4 lit + !  nmac pkey 8 lit + 6 lit ncpy
+	pst pkey 20 lit p2hashb  pst pkey 8 lit cpy
+;
+
+\ phk ( tag a n -- lo hi )   a keyed hash of n bytes (n <= 15), tagged: the
+\        first two words of hash(secret, tag, bytes).
+: phkn variable ;
+: phk ( tag a n -- lo hi )
+	phkn !  pkey 20 lit + 10 lit nzero  pkey 21 lit + phkn @ ncpy  pkey 20 lit + c!
+	pst pkey 30 lit p2hashb  pst @ pst 4 lit + @
+;
+
+: ptv variable ;  : ptmp ( -- a )  ptv 10 lit lazy ;
+
+: pnonce ( -- lo hi )   pctr @ 1 lit + dup pctr !  ptmp be!  1 lit ptmp 4 lit phk ;
+
+\ pcookie ( ip port -- lo hi )   the cookie we issue that address.
+: pcookie ( ip port -- lo hi )   ptmp 4 lit + nb16!  ptmp be!  2 lit ptmp 6 lit phk ;
+
+\ ── Peers ──
+\ 16 hosts, 0x50 bytes each: 0 address  4 port  8 state (0 none, 1 known, 2
+\ answered)  C, 10 the cookie it issued us  14, 18 our request's nonce  1C a
+\ request out  20 when sent  24 when last asked  28 its tip's height  2C
+\ whether known  30 failures in a row  34 when its height was heard  38
+\ whether a seed  3C strikes (bad pieces)  40 when last asked its height.
+
+: ppv variable ;  : pp ( k -- a )  50 lit * ppv 500 lit lazy + ;
+: ppn ( -- n )   10 lit ;
+
+\ pfind ( ip port -- k | -1 )
+: pfk variable ;
+: pfind ( ip port -- k | -1 )
+	-1 lit pfk !
+	ppn 0 lit do
+		i pp 8 lit + @ if
+			over i pp @ =  over i pp 4 lit + @ = and if i pfk ! then
+		then
+	loop 2drop pfk @
+;
+
+\ padd ( ip port -- k | -1 )   a host (kept, if there's room).
+: padd ( ip port -- k | -1 )
+	2dup pfind dup 0< 0= if nip nip else drop
+		over 0= over 0= or if 2drop -1 lit else
+		-1 lit pfk !
+		ppn 0 lit do i pp 8 lit + @ 0= pfk @ 0< and if i pfk ! then loop
+		pfk @ 0< if 2drop -1 lit else
+			pfk @ pp 50 lit nzero
+			pfk @ pp 4 lit + !  pfk @ pp !  1 lit pfk @ pp 8 lit + !
+			pfk @
+		then then
+	then
+;
+
+: pseed ( ip port -- )   padd dup 0< if drop else 1 lit swap pp 38 lit + ! then ;
+
+\ psendk ( k n -- )   send the packet built (n bytes) to peer k.
+: psendk ( k n -- )   swap pp dup @ swap 4 lit + @ rot nsend drop ;
+
+\ preply ( n -- )   send it to whoever sent the datagram.
+: preply ( n -- )   nsrc @ nsport @ rot nsend drop ;
+
+\ pfrom ( -- k | -1 )   the peer the datagram came from.
+: pfrom ( -- k | -1 )   nsrc @ nsport @ pfind ;
+
+\ pbest ( h -- k | -1 )   the answered peer furthest ahead, at h or beyond.
+: pbh variable ;
+: pbest ( h -- k | -1 )
+	pbh !  -1 lit pfk !
+	ppn 0 lit do
+		i pp 8 lit + @ 2 lit =  i pp 2C lit + @ and  i pp 28 lit + @ pbh @ u< 0= and if
+			pfk @ 0< if i pfk ! else i pp 28 lit + @ pfk @ pp 28 lit + @ u> if i pfk ! then then
+		then
+	loop pfk @
+;
+
+\ ── Discovery ──
+
+: pk variable ;
+
+\ pprobe ( k -- )   GET_HOSTS: our nonce; up to 8 hosts, padded so the answer
+\        stays within three times the request.
+: pprobe ( k -- )
+	pk !
+	pnonce 2dup pk @ pp 18 lit + !  pk @ pp 14 lit + !
+	1 lit phdr qbe!
+	8 lit npkt E lit + nb16!  npkt 10 lit + 8 lit nzero
+	1 lit pk @ pp 1C lit + !  pms pk @ pp 20 lit + !  pms pk @ pp 24 lit + !
+	pk @ 18 lit psendk
+;
+
+\ pghosts ( -- )   GET_HOSTS: HOSTS, with the asker's cookie (no hosts).
+: pghosts ( -- )
+	pbn @ A lit u< 0= if
+		0 lit  pbn @ A lit u> if pbn @ A lit do pbd @ i + c@ or loop then
+		0= if                                                           \ zero padding
+			nsrc @ nsport @ padd drop
+			2 lit phdr  pbd @ swap 8 lit ncpy
+			nsrc @ nsport @ pcookie npkt E lit + qbe!
+			0 lit npkt 16 lit + nb16!
+			18 lit preply
+		then
+	then
+;
+
+\ phosts ( -- )   HOSTS: the answer to our request, if it is one.
+: phosts ( -- )
+	pbn @ 12 lit u< 0= if
+		pfrom dup pk ! 0< 0= if
+			pbd @ 10 lit + nb16@ dup 6 lit * 12 lit + pbn @ =
+			pk @ pp 1C lit + @ and
+			pbd @ qbe@ pk @ pp 18 lit + @ = swap pk @ pp 14 lit + @ = and and if
+				pbd @ 8 lit + qbe@ pk @ pp 10 lit + !  pk @ pp C lit + !
+				2 lit pk @ pp 8 lit + !  0 lit pk @ pp 1C lit + !  0 lit pk @ pp 30 lit + !
+				?dup if 0 lit do
+					pbd @ 12 lit + i 6 lit * + dup be32 swap 4 lit + nb16@ padd drop
+				loop then
+			else drop then
+		then
+	then
+;
+
+\ pdisc ( -- )   time requests out; ask every host due (a minute since).
+: pdisc ( -- )
+	ppn 0 lit do
+		i pp 8 lit + @ if
+			i pp 1C lit + @ i pp 20 lit + @ pago 1388 lit u> and if          \ 5 s: a failure
+				0 lit i pp 1C lit + !  i pp 30 lit + @ 1 lit + i pp 30 lit + !
+				i pp 30 lit + @ 5 lit u< 0= i pp 38 lit + @ 0= and if 0 lit i pp 8 lit + ! then
+			then
+			i pp 8 lit + @ i pp 1C lit + @ 0= and if
+				i pp 24 lit + @ 0=  i pp 24 lit + @ pago EA60 lit u> or if i pprobe then
+			then
+		then
+	loop
+;
+
+\ ── Heights ──
+
+\ pgetinv ( k h -- )   GET_INV by height.
+: pgetinv ( k h -- )
+	4 lit phdr  0 lit over c!  1 lit + dup 18 lit nzero  18 lit +  0 lit swap qbe!
+	27 lit psendk
+;
+
+\ pheights ( -- )   ask each answered peer whose height we haven't heard
+\        in a minute (at most every 5 s).
+: pheights ( -- )
+	ppn 0 lit do
+		i pp 8 lit + @ 2 lit =  i pp 2C lit + @ 0=  i pp 34 lit + @ pago EA60 lit u> or and
+		i pp 40 lit + @ pago 1388 lit u> and if
+			pms i pp 40 lit + !  i dbtip ?dup if 20 lit + @ 1 lit + else 0 lit then pgetinv
+		then
+	loop
+;
+
+\ ── Block downloads (one at a time) ──
+
+: dlon variable ;  : dlk variable ;  : dlsize variable ;  : dlnc variable ;
+: dlnext variable ;  : dlgot variable ;  : dllast variable ;  : dlretry variable ;
+: dlfor variable ;  : dlh variable ;
+: dlhv variable ;  : dlhash ( -- a )  dlhv 20 lit lazy ;
+: dlbv variable ;  : dlbuf ( -- a )   dlbv 200000 lit lazy ;   \ 2 MiB: the largest block
+: dlrv variable ;  : dlrcv ( -- a )   dlrv 800 lit lazy ;      \ a byte a chunk
+
+\ dlreq ( first count -- )   GET_CHUNKS.
+: dlreq ( first count -- )
+	5 lit phdr  dlk @ pp C lit + @ dlk @ pp 10 lit + @ 2 lit pick qbe!
+	dlhash over 8 lit + 20 lit ncpy
+	rot over 28 lit + be!  2C lit + nb16!
+	dlk @ 34 lit psendk  pms dllast !
+;
+
+\ dlask ( -- )   the next window.
+: dlask ( -- )
+	dlnext @  pwin dlnc @ dlnext @ - 2dup u> if nip else drop then   ( first count )
+	2dup + dlnext !  dlreq
+;
+
+\ dlstart ( k hash height size purpose -- )   download a block (from an
+\        answered peer, of a plausible size); purpose: 0 the chain, 1 fast
+\        sync's H, 2 its H + 1.
+: dlstart ( k hash height size purpose -- )
+	dlfor !  dlsize !  dlh !  dlhash 20 lit ncpy  dlk !
+	dlsize @ 0= 0=  dlsize @ 200001 lit u< and  dlk @ pp 8 lit + @ 2 lit = and if
+		dlsize @ 3FF lit + A lit rshift dlnc !
+		dlrcv dlnc @ nzero
+		0 lit dlnext !  0 lit dlgot !  0 lit dlretry !  -1 lit dlon !
+		dlask
+	then
+;
+
+\ dltick ( -- )   a download silent for a second: ask again from the first
+\        chunk missing; abandoned after 5 tries.
+: dlf variable ;
+: dltick ( -- )
+	dlon @ if dllast @ pago 3E8 lit u> if
+		dlretry @ 1 lit + dup dlretry !  5 lit u> if 0 lit dlon ! else
+			dlnext @ dlf !
+			dlnext @ 0 lit do dlrcv i + c@ 0= dlf @ dlnext @ = and if i dlf ! then loop
+			dlf @ dlnext @ = if dlask else
+				dlf @  dlnext @ dlf @ -  dup pwin u> if drop pwin then  dlreq
+			then
+		then
+	then then
+;
+
+: pfsv variable ;                                    \ fast sync's phase
+: phv variable ;   : phb ( -- a )  phv 200000 lit lazy ;   : phn variable ;   \ H
+: pnv variable ;   : pnb ( -- a )  pnv 200000 lit lazy ;   : pnn variable ;   \ H + 1
+: pq variable ;  : pqh variable ;  : pqk variable ;  : pqat variable ;
+: pidv variable ;  : pid ( -- a )  pidv 20 lit lazy ;
+
+\ pnext ( -- h )   the height after our tip.
+: pnext ( -- h )   dbtip ?dup if 20 lit + @ 1 lit + else 0 lit then ;
+
+\ pblock ( a n -- )   a block for the chain: taken if its parent is known;
+\        if not, look one height lower (the peer's on another branch).
+: pblock ( a n -- )
+	2dup bparse if
+		bheight drop  bhdr @ 4 lit + dbfind 0<  over 0= 0= and if          \ an unknown parent
+			nip nip 1 lit -  dup pgm 7C lit + @ u< if drop pnext then  pq !
+		else
+			drop acblock if pnext pq ! else
+				0 lit dlk @ pp 2C lit + !                               \ invalid: forget its height
+			then
+		then
+		0 lit pqat !
+	else 2drop then
+;
+
+\ pdone ( -- )   a download finished: checked against the hash announced.
+: pdone ( -- )
+	0 lit dlon !
+	dlbuf pid hdrid  pid dlhash 20 lit mcmp 0= if
+		dlfor @ 0= if dlbuf dlsize @ pblock then
+		dlfor @ 1 lit = if dlbuf phb dlsize @ ncpy  dlsize @ phn ! then
+		dlfor @ 2 lit = if dlbuf pnb dlsize @ ncpy  dlsize @ pnn ! then
+	then
+;
+
+\ pchunk ( -- )   CHUNK: a piece of the block downloading, from its peer,
+\        asked for, at exactly its length.
+: pci variable ;
+: pchunk ( -- )
+	pbn @ 24 lit u> dlon @ and if
+		pbd @ dlhash 20 lit mcmp 0=  pfrom dlk @ = and if
+			pbd @ 20 lit + be32 pci !
+			pci @ dlnext @ u<
+			pbn @ 24 lit -  dlsize @ pci @ A lit lshift -  dup pchl u> if drop pchl then  = and
+			dlrcv pci @ + c@ 0= and if
+				pbd @ 24 lit + dlbuf pci @ A lit lshift + pbn @ 24 lit - ncpy
+				1 lit dlrcv pci @ + c!  dlgot @ 1 lit + dlgot !
+				pms dllast !  0 lit dlretry !
+				dlgot @ dlnc @ = if pdone else
+					dlgot @ dlnext @ = if dlask then
+				then
+			then
+		then
+	then
+;
+
+\ pinv ( -- )   INV: the peer's height; and the block we asked it for.
+: pinv ( -- )
+	pbn @ 34 lit = if
+		pfrom dup pk ! 0< 0= if
+			pbd @ 20 lit + qbe@ drop  pbd @ 2C lit + qbe@ drop  2dup u< if nip else drop then
+			pk @ pp 28 lit + !  -1 lit pk @ pp 2C lit + !  pms pk @ pp 34 lit + !
+			dlon @ 0= pk @ pqk @ = and  pbd @ 20 lit + qbe@ drop pqh @ = and if
+				pfsv @ 2 lit = if
+					pk @ pbd @ pqh @ pbd @ 28 lit + be32  phn @ if 2 lit else 1 lit then dlstart
+				else pfsv @ 0= if
+					pbd @ dbfind 0< if
+						pk @ pbd @ pqh @ pbd @ 28 lit + be32 0 lit dlstart
+					else pq @ 1 lit + pq !  0 lit pqat ! then                   \ have it: the next one up
+				then then
+			then
+		then
+	then
+;
+
+\ psync ( -- )   block by block: ask the peer furthest ahead for block pq
+\        (once a second).
+: psync ( -- )
+	pnext pq @ u< if pnext pq ! then
+	dlon @ 0= if
+		pq @ pbest dup 0< if drop else
+			pqat @ 0=  pqat @ pago 3E8 lit u> or if
+				dup pqk !  pq @ dup pqh ! pgetinv  pms pqat !
+			else drop then
+		then
+	then
+;
+
+\ ── Fast sync ──
+
+: pfdep variable ;                                   \ how far back H is; 0: none
+: pcp variable ;  : pcl variable ;
+
+\ pfs ( -- )   phases: 1 waiting for a height; 2 blocks H and H + 1; 3 H's sync
+\        point; 4 the state.
+: pfs ( -- )
+	pfsv @ 1 lit = if
+		0 lit pbest dup 0< if drop else
+			pp 28 lit + @ dup pfdep @ 1 lit + u> if
+				pfdep @ - pq !  0 lit phn !  0 lit pnn !  0 lit pqat !  2 lit pfsv !
+			else drop 0 lit pfsv ! then                       \ a short chain: block by block
+		then
+	then
+	pfsv @ 2 lit = dlon @ 0= and if
+		phn @ pnn @ and if
+			phb pid hdrid  pnb 4 lit + pid 20 lit mcmp 0= if
+				0 lit pqat !  3 lit pfsv !
+			else 1 lit pfsv ! then                             \ from two branches: again
+		else
+			phn @ if pq @ 1 lit + else pq @ then            ( the height wanted )
+			pqat @ 0=  pqat @ pago 3E8 lit u> or if
+				dup pbest dup 0< if 2drop else
+					dup pqk !  swap dup pqh ! pgetinv  pms pqat !
+				then
+			else drop then
+		then
+	then
+	pfsv @ 3 lit = if
+		pqat @ 0=  pqat @ pago 3E8 lit u> or if
+			pms pqat !  phb pid hdrid
+			ppn 0 lit do
+				i pp 8 lit + @ 2 lit = if
+					B lit phdr pid swap 20 lit ncpy  i 26 lit psendk
+				then
+			loop
+		then
+	then
+;
+
+\ ── Fast sync's state: one piece at a time ──
+
+: pcon variable ;  : pck variable ;  : pcsize variable ;  : pcnc variable ;  : pcreq variable ;
+: pcgot variable ;  : pclast variable ;  : pcretry variable ;
+: pcv variable ;   : pcur ( -- a )   pcv 28 lit lazy ;          \ the piece
+: pcbv variable ;  : pcbuf ( -- a )  pcbv 36000 lit lazy ;
+: pcrv variable ;  : pcrcv ( -- a )  pcrv E0 lit lazy ;
+: phhv variable ;  : phh ( -- a )    phhv 20 lit lazy ;          \ H's hash
+
+\ psp ( -- )   SYNC_POINT, for H: believed if H + 1's chain proof attests it;
+\        then the state's download starts.
+: psp ( -- )
+	pbn @ 68 lit = pfsv @ 3 lit = and if
+		phb pid hdrid  pbd @ pid 20 lit mcmp 0= if
+			pnb pnn @ bparse drop  bcp @ pcp !  bcl @ pcl !
+			phb phn @  pbd @ 20 lit +  pcp @ pcl @  snpoint if
+				snstart if 4 lit pfsv !  0 lit pcon !  pid phh 20 lit ncpy else 0 lit pfsv ! then
+			then
+		then
+	then
+;
+
+\ pcreqw ( first count -- )   GET_PIECE: chunks of the piece downloading.
+: pcreqw ( first count -- )
+	D lit phdr  pck @ pp C lit + @ pck @ pp 10 lit + @ 2 lit pick qbe!
+	phh over 8 lit + 20 lit ncpy  pcur @ over 28 lit + c!  pcur 4 lit + @ over 29 lit + be!
+	rot over 2D lit + be!  31 lit + nb16!
+	pck @ 39 lit psendk  pms pclast !
+;
+
+\ ppeer ( -- k | -1 )   an answered peer with fewer than 3 strikes.
+: ppeer ( -- k | -1 )
+	-1 lit pfk !
+	ppn 0 lit do
+		i pp 8 lit + @ 2 lit =  i pp 3C lit + @ 3 lit u< and pfk @ 0< and if i pfk ! then
+	loop pfk @
+;
+
+: pstrike ( -- )   pck @ pp 3C lit + dup @ 1 lit + swap !  pcur snretry  0 lit pcon ! ;
+
+\ ppiece ( -- )   fast sync's last phase: fetch the next piece (or ask again
+\        for one gone silent); when none is left, start at H, and take H + 1.
+: pcf variable ;
+: ppiece ( -- )
+	pfsv @ 4 lit = if
+		pcon @ if
+			pclast @ pago 3E8 lit u> if
+				pcretry @ 1 lit + dup pcretry !  5 lit u> if pstrike else
+					pcsize @ -1 lit = if 0 lit pwin pcreqw else
+						pcreq @ pcnc @ pumin  dup pcf !
+						dup 0 lit do pcrcv i + c@ 0= pcf @ 2 lit pick = and if i pcf ! then loop
+						pcf @ tuck - pwin pumin  pcreqw
+					then
+				then
+			then
+		else
+			pcur snnext if
+				ppeer dup 0< if drop pcur snretry else
+					pck !  -1 lit pcsize !  0 lit pcgot !  0 lit pcretry !  -1 lit pcon !
+					pwin pcreq !  0 lit pwin pcreqw
+				then
+			else
+				snfinish if pnb pnn @ acblock drop  0 lit pfsv !  pnext pq !  0 lit pqat !
+				else 1 lit pfsv ! then                              \ the state was wrong: again
+			then
+		then
+	then
+;
+
+\ ppchunk ( -- )   PIECE_CHUNK: a chunk of the piece downloading, from its
+\        peer, asked for, of the size its first chunk said, at exactly its
+\        length.  A whole piece is checked (src/snap.fam's snput): a bad one
+\        is a strike against the peer, and the piece goes back in the plan.
+: ppz variable ;  : ppc variable ;  : ppl variable ;
+: ppchunk ( -- )
+	pbn @ 2D lit u< 0=  pbn @ 42E lit u< and  pfsv @ 4 lit = and  pcon @ and if
+		pbd @ phh 20 lit mcmp 0=  pbd @ 20 lit + c@ pcur @ = and
+		pbd @ 21 lit + be32 pcur 4 lit + @ = and  pfrom pck @ = and if
+			pbd @ 25 lit + be32 ppz !  pbd @ 29 lit + be32 ppc !  pbn @ 2D lit - ppl !
+			pcsize @ -1 lit = ppz @ 36001 lit u< and if
+				ppz @ pcsize !
+				ppz @ 3FF lit + A lit rshift dup 0= if drop 1 lit then pcnc !
+				pcrcv pcnc @ nzero
+			then
+			ppz @ pcsize @ =  ppc @ pcnc @ u< and  ppc @ pcreq @ u< and
+			ppz @ ppc @ A lit lshift - pchl pumin ppl @ = and           \ (size 0: the one empty chunk)
+			pcrcv ppc @ + c@ 0= and if
+				pbd @ 2D lit + pcbuf ppc @ A lit lshift + ppl @ ncpy
+				1 lit pcrcv ppc @ + c!  pcgot @ 1 lit + pcgot !
+				pms pclast !  0 lit pcretry !
+				pcgot @ pcnc @ = if
+					0 lit pcon !
+					pcur pcbuf pcsize @ snput 0= if pstrike then
+				else
+					pcgot @ pcreq @ pcnc @ pumin = pcreq @ pcnc @ u< and if
+						pcreq @  pcnc @ pcreq @ - pwin pumin  2dup + pcreq !  pcreqw
+					then
+				then
+			then
+		then
+	then
+;
+
+\ ── Serving fast sync ──
+
+: psv variable ;  : psbuf ( -- a )  psv 36000 lit lazy ;     \ the piece last served
+: pstv2 variable ;  : psat ( -- a )  pstv2 20 lit lazy ;
+: pslv variable ;  : psix variable ;  : psn variable ;  : psok variable ;
+: pspv variable ;  : pspt ( -- a )  pspv 48 lit lazy ;
+
+\ pgsp ( -- )   GET_SYNC_POINT -> SYNC_POINT, if we can serve that block's.
+: pgsp ( -- )
+	pbn @ 20 lit = if
+		pbd @ pspt snspt if
+			C lit phdr  pbd @ over 20 lit ncpy  pspt swap 20 lit + 48 lit ncpy
+			6E lit preply
+		then
+	then
+;
+
+\ pschunk ( c -- )   PIECE_CHUNK c of the piece last served.
+: psc variable ;
+: pschunk ( c -- )
+	psc !
+	E lit phdr  psat over 20 lit ncpy  pslv @ over 20 lit + c!  psix @ over 21 lit + be!
+	psn @ over 25 lit + be!  psc @ over 29 lit + be!
+	2D lit +  psn @ psc @ A lit lshift - dup 0< if drop 0 lit then pchl pumin    ( a len )
+	psbuf psc @ A lit lshift + 2 lit pick 2 lit pick ncpy  nip
+	33 lit + preply
+;
+
+\ pgpiece ( -- )   GET_PIECE with our cookie -> its chunks (at most 64).
+: pgpiece ( -- )
+	pbn @ 33 lit = if
+		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
+			psok @  pbd @ 8 lit + psat 20 lit mcmp 0= and  pbd @ 28 lit + c@ pslv @ = and
+			pbd @ 29 lit + be32 psix @ = and 0= if
+				pbd @ 8 lit + psat 20 lit ncpy  pbd @ 28 lit + c@ pslv !  pbd @ 29 lit + be32 psix !
+				psat pslv @ psix @ psbuf snserve dup psn !  -1 lit = 0= psok !
+			then
+			psok @ if
+				pbd @ 2D lit + be32                                      ( first )
+				dup pbd @ 31 lit + nb16@ 40 lit pumin +
+				psn @ 3FF lit + A lit rshift dup 0= if drop 1 lit then pumin   ( first end )
+				2dup u< if swap do i pschunk loop else 2drop then
+			then
+		then
+	then
+;
+
+\ ── Running ──
+
+: pbv variable ;  : pbody ( -- a )  pbv 4B0 lit lazy ;
+
+\ pin ( -- )   a datagram arrived: a packet of ours, by type.
+: pin ( -- )
+	pok? if
+		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+		npay @ 5 lit + c@
+		dup 1 lit = if pghosts then  dup 2 lit = if phosts then  dup 3 lit = if pinv then
+		dup 6 lit = if pchunk then  dup B lit = if pgsp then  dup C lit = if psp then
+		dup D lit = if pgpiece then  dup E lit = if ppchunk then
+		drop
+	then
+;
+
+: ptat variable ;
+
+\ ptick ( -- )   every tenth of a second: discovery, heights, timeouts, sync.
+: ptick ( -- )
+	ptat @ pago 64 lit u> if
+		pms ptat !
+		pdisc pheights dltick
+		pfsv @ if pfs ppiece else psync then
+	then
+;
+
+\ pstart ( -- ok )   open the network; fast sync if the node holds nothing
+\        past genesis (and pfdep is set).
+: pstart ( -- ok )
+	nopen dup if
+		pkinit  pnext pq !  0 lit pqat !  0 lit dlon !  0 lit pcon !  0 lit psok !  0 lit ptat !
+		0 lit pfsv !
+		pfdep @ if
+			dbtip ?dup if 20 lit + @ 0= else -1 lit then  stc@ or 0= and if 1 lit pfsv ! then
+		then
+	then
+;
+
+\ pstep ( -- )
+: pstep ( -- )   begin nrecv while pin repeat  ptick ;

@@ -1,0 +1,490 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/block.fam — a block: parsing it, and verifying its proof (see
+\ ../rust/src/block.rs, prover.rs `verify_tree`, aggregate.rs `verify_block`).
+\
+\ Header (188 bytes; integers big-endian): version (4), prev_hash, state_root,
+\ body_hash, aux_hash (32 each), output_count, height, timestamp (8 each),
+\ nonce (32).  Body: inputs, outputs (a 4-byte big-endian count, then 32
+\ bytes each), nonces (count, 16 bytes each), the block proof and the parent's
+\ chain proof (a 4-byte big-endian length, then the bytes).
+\
+\ The block proof is a tree root: kind 1, its amounts A and B (8 bytes each,
+\ little-endian), whether it aggregates (1) or wraps one chunk (0), its data
+\ (32 bytes), then the root's STARK proof.  It's verified as a circuit-VM
+\ proof whose public bus tuples are the tree node's eight public octets:
+\   [vk, data, amounts, root_in, root_out, counts, challenge, product]
+\ -- vk the aggregation key's digest (zeros for a wrap); counts the output
+\ counts in and out and the block's window, as 20-bit limb pairs; challenge
+\ a hash of data and the body; product the body's commitments' product.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ ── The network's tree keys and parameters ──
+
+: bnet variable ;   \ 0: main, 1: dev
+
+\ mwcap ( -- a )   main's wrap circuit's preprocessed cap (32 hashes).
+: mwcap ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004040 ,   \ jal   x0,+1028
+8483463A , E08B0548 , 13B0736C , 9FDB783F , B640D941 , 6C9C841D , 006DDF74 , B0FC973A ,
+A2C86C41 , AE565755 , F1F6313A , 8C21CD64 , 41625B77 , EBC10369 , A8650B75 , 3770B52D ,
+4EDC2A4C , 35D0AF67 , 4F691759 , F596D46D , 60A87B13 , EF82B855 , 042F4C72 , 7AEB4311 ,
+2796C81C , B510044C , 4DC8A469 , 94638F26 , 0EBDBA03 , 436DF270 , D4567004 , FD32CC33 ,
+D75B3413 , 43DBF460 , 43BDB005 , 3CFB9107 , 09367242 , F4CF591E , ED6F1D60 , 2A80D13F ,
+27658A2B , 173BAA19 , 23968434 , F42FC800 , 1D1DAF2F , A98A104F , 6E1EE856 , 8D415B14 ,
+1D64700F , F937E668 , 6036176C , 9FCC4A58 , F8848C54 , 7518E416 , 8A491D27 , CD6DCD52 ,
+89FC435A , 3C24E256 , E709F428 , AC68FF6E , 4396C744 , B4B41C5F , EA70F953 , 727C4530 ,
+B26DC860 , 63F7CA16 , 99B0922F , 5B96380C , 778F1072 , CDB13658 , 2E37A812 , 3D011B13 ,
+6A5C0202 , 9284E05A , A2698424 , 85074602 , AD9E146C , 6F44954E , 8128943E , D7BEBA20 ,
+645E933D , 57A29663 , 488FBF11 , B3E7B104 , 47E4314A , C9930117 , 58E13737 , 9173EC46 ,
+569D310B , 403A451B , ED575A57 , 0AC6AE2C , 46373F71 , 7B6E7074 , 86788B40 , B010C538 ,
+D598A866 , F61F681A , CA22910D , 99072906 , 7FC0594E , 74A81559 , 3509A421 , 172D1042 ,
+1B5EB150 , 5F41CF10 , 70E08976 , 4F6A9853 , 0D176160 , F3903241 , EC9BE715 , AFA12627 ,
+43D1CE36 , 4B412550 , 44F64940 , F69D8A0B , B493286B , 98212B31 , 87F5D330 , 327CD743 ,
+9F2C5C60 , 6DE30F39 , 109F8D5D , A1688546 , 6F7A3347 , A2EC0648 , 8E12EE59 , F07C8A4C ,
+169A3376 , 2E9F1411 , 28880D3C , 7B163842 , 7FAB7941 , 65A83712 , F305AE40 , 34EAA73C ,
+61F3F164 , DB14583D , F968E077 , 28160D44 , 41DF8906 , 24187E6B , 2229B277 , B7B2CC08 ,
+FBDE0250 , AABC635C , 0689971E , 67797202 , E03B2E52 , FA4BE70D , 0BBC2260 , 594C9510 ,
+B6857C31 , E9775E47 , ADBD3329 , 7B39A503 , 0D16F94A , 05859170 , 532EC454 , 47FC0756 ,
+56981076 , F5F9B623 , 9C839B40 , 68765842 , 6CF1D754 , A925C527 , 05DF925A , 76C08757 ,
+545CC901 , 10A93355 , 8CFFFD1F , 08D30D30 , 9BDCBD62 , 0572F83D , 59472B51 , ABD4B619 ,
+BE714F55 , 517D1B51 , 56832C68 , 45871E5C , 52194C63 , 0F65755E , AC614906 , D7744C49 ,
+E1095A59 , D9A8981C , 3A49455A , 936EB239 , 95C07762 , 981DE110 , 3CD23A2D , 38D9DF0C ,
+2CB2A21A , 5E879012 , 3E720E5C , D383053F , B50DE02E , D81A484A , 6BE1CB44 , 71977729 ,
+8DA09624 , 4576F23A , AF0FFD5D , 6BAD064D , A344A938 , 9A94BB69 , 8B88134C , 71420052 ,
+EE39D566 , CFC8B72D , 1473DB64 , D3E9D007 , 32920926 , 40761366 , AB108F3E , AC8B5A01 ,
+B1F2F349 , ADE6E017 , 65ACA10F , 208A3438 , C0CD4A06 , 5AAA194E , EDA3C571 , 5F08A10D ,
+ADF1D914 , 191EF439 , C42EE418 , CCA07254 , C6758A51 , FACF6649 , F1721441 , CC3C6E14 ,
+7858326C , 382D8924 , A7A2A51B , 0E4F621E , 05D8BC73 , 9F88A05C , 521F6810 , 55C8DA33 ,
+7C2D8771 , 48E07331 , EA6C4710 , 7224D175 , 13DEAB08 , 41443907 , 66636E23 , 517ACE0F ,
+F2FDD16B , C518E261 , 76595766 , 087FF74D , 1C12FE17 , F85E4619 , FE50CA49 , 8F330446 ,
+;
+
+\ macap ( -- a )   main's aggregation circuit's.
+: macap ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004040 ,   \ jal   x0,+1028
+341F072A , 4BF59B04 , 4D04AE5C , BAB42B1D , DEFD3304 , 547FAC02 , 4F2C1753 , F36D3F6F ,
+AB296602 , 3BF73607 , C4E20616 , 83DF6141 , 5BCDD429 , A89B6811 , 25D45718 , 7F315027 ,
+46253D2D , 6319333C , 06FD1C46 , 9290A036 , CAB88007 , 29530218 , D1AF1269 , A3D19F4C ,
+77FA0912 , DF9E7320 , 5ACE8254 , 6CEA6E0F , 16FC840D , 8C32A74D , C8217349 , A0327710 ,
+D7A84C44 , C914651E , 88094E1C , 2EFFA630 , 097E6438 , 88784311 , 38C7476D , 2A568627 ,
+32CDE26A , 6AAE604F , 93FF4421 , 03953761 , E3A5CD0D , 8599F606 , 0019805B , 5FF5E640 ,
+41CCEB25 , 0D699730 , 3B67D51C , 4EC2EC31 , B1B3A652 , 63F06677 , EB49D469 , 8C328754 ,
+26B5AD40 , F410E66A , 1BC20706 , 66480A0A , C6DF0643 , 5D7D606F , 4F5F8120 , 9C1C9509 ,
+B38E2E64 , F369891F , 0E40C630 , 998B4054 , 93DA8623 , 51281939 , 4C88F975 , AFE49A21 ,
+96108512 , E00BCF2B , 9DDFCD04 , 366BBA43 , CFA0420C , 9CE13B65 , C0C6E76C , E09CF818 ,
+DCEB3D6D , 38C9284C , CBBFAB64 , 56FC1931 , 3B41B171 , 42E2356C , F6EAE505 , 6FAABF74 ,
+C301994D , B8FD1233 , 223CE974 , 9B9FAE5E , 5E54A10E , 158D3E5D , DDF6A612 , 553DD351 ,
+4F250163 , F8777E33 , 2A378B21 , AC30D554 , 3A5A972D , 35239E66 , 871A2375 , 37718868 ,
+FF3E7442 , 2F1FA23A , 92AA6373 , 09358B21 , 2740CA75 , 40A52101 , B975CD16 , A3B96A6E ,
+03FCD968 , 94E7C66A , CF7B360C , 12C9514A , 9A75120E , 8695055D , F83E103B , 77ECB422 ,
+EB26C65D , 38FC6C38 , 40398B74 , 71DBC662 , 901EB207 , 12FA7717 , 5C363F3D , AA193E51 ,
+E0FCD528 , 91FEA758 , 69352952 , 5A439870 , 3CD86136 , D1F1EC19 , C4499754 , C2CEBA52 ,
+01FCE21A , 75185371 , 6B476421 , BAFD2D24 , 0D835F45 , A4137617 , 99BA500E , 27689615 ,
+70AA556B , AC005A68 , 8B21BF1E , 0874B554 , 67B5A334 , 5FE2FD4E , F81CB835 , 10FBCF31 ,
+EFB55623 , 278C2A57 , DD0C1169 , C9CD1450 , 6DF78435 , 333DAE56 , 51867C4A , 5F8E4B11 ,
+4182851A , 9024C631 , 1037880B , FE8A6A2B , F487191A , 4F247B5C , 84A70F25 , 483B034D ,
+A198C628 , 37BEC473 , 6D5C2441 , 159BA026 , 7813770B , 3FC9946E , EFFDA83B , C33D3B2F ,
+24A6CC1D , CB129960 , 8BBD5430 , ADD34C02 , CDEF1364 , AAF12E4F , A293110F , 1D58C35E ,
+E246C52E , B32B0318 , 0241C45C , EF4AE522 , D0C0F803 , 5B61E257 , D505561F , CF3FBD4E ,
+E32C5033 , A682675D , 9A0EFD3A , E6B67E4B , 7964F245 , FF5D9568 , 54390B08 , 8F4E3641 ,
+F788E518 , 85D8E550 , E99D372C , 8DC1B259 , 9D733B14 , BC6DA33F , 30088636 , EC159571 ,
+5531A871 , 22927071 , 247AFA37 , 49331A0E , 0DEB7843 , 5A2CBC2F , FF34AC38 , F8B8C807 ,
+B5322047 , FBFE7220 , 557EB974 , 9DC46417 , 90BA4E36 , 67AD9B25 , 545D5122 , B961E01D ,
+7C1BA873 , 9E9F4C00 , 3C36A205 , 5D43731A , 78461F4B , B972FF75 , C5205148 , A1059768 ,
+1EAA5C63 , CD78D016 , 6812570C , BEEA513B , 7DBE4F6C , A0497D24 , 2C7B5C26 , 99E2BD1B ,
+8ECF835F , B80CA25F , 857A0A31 , 852E0E4A , 48E8F543 , C4A80107 , 87257F0A , EEAB9008 ,
+0859A920 , ED6E4A01 , 91660103 , A22DA133 , 41CB2417 , 126DBF1E , 6132461B , 07AC9F1D ,
+;
+
+\ dwcap ( -- a )   dev's wrap circuit's.
+: dwcap ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004040 ,   \ jal   x0,+1028
+8C8F3047 , B02E2C5A , 47085C18 , 2FA25370 , DBE7A421 , 8E14C33F , C70DD477 , B3A5EF65 ,
+9E16962F , 29E0DF35 , 73B73C2A , B8056A06 , 29BAA551 , 58E08875 , EBD7C727 , 78183D69 ,
+8D2DB518 , 4FE50728 , AE0B5269 , 3B712839 , BB97F051 , 6D65FC3D , 34702635 , CA014D6D ,
+7F043624 , 9F277A64 , C1206312 , E7C31F1D , B8634606 , 755C1D52 , E9D89E16 , F8ADCF5C ,
+20F8674B , ADD30825 , B91A8711 , 1E203407 , 9D5C791A , 865C114D , 351E3F55 , 699F0663 ,
+C89DD46A , A107E517 , 5B812756 , 3FB2C505 , 70429A70 , 9365A906 , D88B7A6A , 242F272C ,
+568C8D1A , FFD4B355 , AE6EF907 , FB878F55 , D943DA52 , C3DDCC59 , EBBD392B , 5CF7D46C ,
+5C99D30A , 88C73464 , B6DB7417 , 2778305C , F2F4722F , 6313583E , 365B1C59 , B5B7E013 ,
+8AEA9321 , 51D1C236 , 2DA10920 , ABF56F45 , 252E1E6E , 92DCA455 , 87B18B38 , 155EC256 ,
+BD002363 , A83F0415 , 40F00E15 , 787DC51F , A3ECE577 , E9647C58 , 05A68A50 , 184DA517 ,
+0070E92E , 19AC1416 , 28A4674F , E4C02557 , 9689E631 , 92C2E26C , 8E384D2E , E48C2524 ,
+24790A12 , 506A6F06 , 59F2853A , A7C2A51A , 0A4C7D2E , AFAD0310 , 1AF21617 , 8EA0E540 ,
+B5F99C5C , 4E2C0402 , F2CA0918 , 06B82717 , 54C4422A , 8B22452A , D8027D08 , 3940863C ,
+90028407 , 016C942F , FBB22F0D , C8ED816C , 06E7B033 , 52BE9C18 , 89DDDB0F , 010A8131 ,
+53A2226B , 87A97165 , 892AC42D , 36B7270B , DB3C6422 , C065E20D , 10A02550 , 60386867 ,
+368EA060 , 571C903A , 5A8BD80A , 93674225 , D78C3B09 , 04C06E45 , 4510A057 , 1419D51C ,
+08A76045 , D885164C , 5304DF48 , E51F6423 , 769E186E , 9EAFA630 , AC882C1F , EBD5DC19 ,
+82F52704 , 71B4D108 , 96C04824 , 36F77948 , 75765B36 , 89A07E31 , 38682564 , CC790F4C ,
+AC954009 , E0DCEB10 , C1E3A235 , 04A81F59 , DFFEEC49 , 043B2014 , 5A811341 , 46A3352E ,
+5CD02174 , 93B3D326 , FC7D9A31 , 29EF783D , DEB7172D , F83F723D , C78B7022 , D46F7849 ,
+3A235645 , A39EEE65 , 0269E371 , 595E6A75 , E5E96D16 , 19711813 , 4E2A7115 , B35B8069 ,
+D5256F6E , 1338215D , 33B71C69 , DA589474 , 89C2EE0A , 2A8A8511 , AFEFEF67 , 93B1E021 ,
+004A9F5B , 134DEB1A , 17DFF603 , 713D6870 , B4D8C93E , 3CC56428 , FFBD3109 , E4B37661 ,
+1BD4514F , BD9FC43F , 29C6A06A , C021B41B , C47E2B04 , EDA6B908 , 8663CC19 , DFE54E4E ,
+7893FB2B , 968B7862 , 81DC5F5E , B0376D0B , AFBA241C , 4FEE272F , 9930572C , 80504928 ,
+D2325A60 , 50643565 , 1FAB6B6C , C7197854 , 4BE0AF2A , 79D34664 , 0D744D17 , 1675BE64 ,
+0AA8B02C , E213724E , 048F4F4E , DAB91D2F , BF111660 , C3BDC300 , 5B6F3051 , DA800814 ,
+5E7BD743 , AE714A20 , D1B0FB32 , 8F5FC746 , 9E167476 , 33B7F24E , 8521A073 , 54C10F5C ,
+281F4257 , 98AA382B , 06A55C57 , E6D61E0A , 2C238A55 , 93068366 , BF1DB072 , 9848080D ,
+0F174A5C , BD78760B , 0096B426 , 6EC73A12 , EDA3C358 , 910F890E , 66AA9F01 , 6190736C ,
+8547F060 , EC689B01 , F69ADE1C , 9F76503A , 9CD2CE6C , 88106F1A , 1E61A025 , EF61DA62 ,
+B7806312 , 9ADEA81A , D7A12D59 , AF1C7603 , D2366B08 , 05E79A06 , 08C14646 , CBFD2338 ,
+;
+
+\ dacap ( -- a )   dev's aggregation circuit's.
+: dacap ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004040 ,   \ jal   x0,+1028
+545E8C2C , 2FB0A410 , 321EF75D , F1D21071 , 75B21B42 , B579034C , EC67790D , 9329C653 ,
+40A7423D , 222CBD31 , 7B7A1D19 , 4FC6E84C , BC5ECE4C , CDA20561 , 4B9D5250 , E3940B50 ,
+5802181A , 4A78B832 , 45EC1433 , 86D2130B , E6850777 , 21313D10 , 07199140 , E34D296D ,
+7EF3E51A , E8324A02 , 4F972A53 , 44011D44 , 80703B04 , AA03DA74 , 4EEB7521 , 6513A219 ,
+78361D17 , 5E6AC953 , 6CDD4331 , 4B1C153A , A881CA12 , F55EB637 , 6F9FE50A , 94CD755E ,
+D16B230C , 4378346B , 8D713A51 , C51A9907 , 8DDEDC35 , DB019D68 , 3C2EB50F , 40A1D527 ,
+AF0F2A57 , B3610A22 , 23996421 , A8A26610 , C0B29C42 , 791BE414 , 704E111E , CF67DF69 ,
+418F2652 , 567BCF20 , F3614A56 , 8298E253 , 43AACA25 , 39900125 , E2E02F03 , DE7A2F3C ,
+855E0618 , C1E1C15E , 3966066D , 8D06A02F , 9C360301 , 481AA85D , 7651E21B , C7631724 ,
+EC0B692B , DB0E874E , 04B7BC50 , 73A20E02 , 961A7B3A , D21AC004 , 27981053 , 2510485E ,
+69950612 , 92930B56 , 715BF549 , 9C461A52 , 1FB4716D , AD105C6C , 439B8C20 , 3CE3883F ,
+53880F53 , 604F3E0E , D45A3E49 , B1BA5317 , DDB78968 , 0DDCBF01 , 39575E1D , D9464E0A ,
+2E850101 , 581BF83A , F8C5A959 , DA459628 , D262E43E , 9724955C , 40F8CB59 , FF2D5334 ,
+40E7811F , B3B7396D , 3FA9E270 , 99EDDE65 , D4E4AF39 , 13AC3D6C , CE589C39 , 329E4628 ,
+996E7C0C , A3C07E50 , 6A137138 , 6E3D3F26 , 08E3B75C , 77DB3E6B , 99307D12 , CD023C67 ,
+6283F55E , 430A4B2B , DFD9E05C , FBDF1941 , BE4E5B65 , 9D95244F , A7390604 , 2A428572 ,
+3261DE05 , C6C68E5B , 71FDAD19 , 1E5A9B65 , DC331430 , BC3E9B3A , 7B90EE4F , B2721C46 ,
+5632DC04 , 54A7B752 , 24ED4D50 , 11125417 , AB847714 , BC22A316 , 4CB1DC63 , B683575A ,
+D450360C , 3C885B15 , 7B223D41 , 33AA8E12 , 495C9E44 , 8596E557 , DD54426C , 70C4D525 ,
+039D1237 , FCFEF82F , C9FD7719 , EA559D1E , A308B045 , E0E12A47 , 8A634728 , BA96E837 ,
+A0DA8F74 , B786232A , E4E23142 , BA292D50 , 7125555F , 4B64C347 , 69072918 , 75EDF12B ,
+E8B0A262 , 5A5D1C3A , 4CC1FF0A , B8171F63 , 51B8AA1A , 65DA0A6F , 32EA6948 , AC191B61 ,
+9FB47307 , F8A7D81A , 33BC8258 , 834BDD5C , 2F412775 , 5444CF4E , 8D840617 , 0760874D ,
+A5A48524 , 9A8DD834 , A9FD9C41 , 3A955518 , C66A4C00 , FC665A19 , 6859851A , E2CC1054 ,
+C0459013 , 7836D104 , 08688719 , FD50EE4C , 4814AC2F , B1DD5171 , 00CE4D3E , 86706135 ,
+0CD21554 , 06C52C72 , C347BF4D , 6B42074D , F646403A , 035D3708 , B6416420 , 6B59C51B ,
+1DCB2847 , 6387DE5E , D40B966D , 106CB75C , FD188B3A , 8E149059 , A5113725 , BEEDB829 ,
+CCBF2061 , 76B43432 , 564D5417 , 8B57120F , 245F5F0F , FF68095B , 4743651B , A2232A64 ,
+1926E06A , EB186925 , CFF4A42C , 06074648 , BFDC106B , 013F1F22 , 6A80DE0D , 3B12DC62 ,
+A38A8062 , 91227D0A , EBEB1816 , 34FDE147 , 14B4B676 , 1B852826 , 61BCE93F , D7F12E76 ,
+40EB4F4C , 0C6D5B47 , 1C063918 , 3A4C5337 , 17ACD55C , F231C871 , 88B30441 , 08E5EF41 ,
+CF82BB19 , 7BBBAC50 , 274EC66D , B6F7DC65 , 5579EE29 , BA497A31 , 453EAC75 , 10E4B931 ,
+;
+
+\ Tree proofs: 2^19 rows, blowup 16, 26 queries, 24 grinding bits on main
+\ (log_lde 25); 2^17 rows, blowup 4, 4 queries, none on dev (log_lde 21).
+: btlen ( -- n )    bnet @ if 20000 lit else 80000 lit then ;
+: btlde ( -- k )    bnet @ if 15 lit else 19 lit then ;
+: btparm ( -- )
+	bnet @ if 2 lit slb !  4 lit snq !  0 lit sgb !
+	else 4 lit slb !  1A lit snq !  18 lit sgb ! then
+;
+: bwcap ( -- a )   bnet @ if dwcap else mwcap then ;
+: bacap ( -- a )   bnet @ if dacap else macap then ;
+
+\ ── Parsing ──
+
+: blok variable ;
+: bcheck ( flag -- )   0= if 0 lit blok ! then ;
+
+\ be32 ( a -- w )   a big-endian word.   rbe ( -- w )   read one.
+: be32 ( a -- w )
+	dup c@ 8 lit lshift over 1 lit + c@ or 8 lit lshift
+	over 2 lit + c@ or 8 lit lshift swap 3 lit + c@ or
+;
+: rbe ( -- w )   4 lit rtake be32 ;
+
+\ The block last parsed: header; inputs, outputs, nonces (count, address);
+\ the block proof and the chain proof (length, address).
+: bhdr variable ;   : bnin variable ;  : bin variable ;   : bnout variable ;
+: bout variable ;   : bnnon variable ; : bnon variable ;  : bpl variable ;
+: bpr variable ;    : bcl variable ;   : bcp variable ;
+
+\ bparse ( a n -- ok )   parse a block's bytes, exactly.
+: bparse ( a n -- ok )
+	rinit  -1 lit blok !
+	BC lit rtake bhdr !
+	rbe dup bnin ! dup 100000 lit u< bcheck 5 lit lshift rtake bin !
+	rbe dup bnout ! dup 100000 lit u< bcheck 5 lit lshift rtake bout !
+	rbe dup bnnon ! dup 100000 lit u< bcheck 4 lit lshift rtake bnon !
+	rbe dup bpl ! rtake bpr !
+	rbe dup bcl ! rtake bcp !
+	rpos @ rend @ = rbad @ 0= and bcheck
+	blok @
+;
+
+\ Header fields.
+: bver ( -- v )        bhdr @ be32 ;
+: bsroot ( -- a )      bhdr @ 24 lit + ;
+: bbhash ( -- a )      bhdr @ 44 lit + ;
+: bhcnt ( -- lo hi )  bhdr @ 88 lit + be32  bhdr @ 84 lit + be32 ;
+: bheight ( -- lo hi ) bhdr @ 90 lit + be32  bhdr @ 8C lit + be32 ;
+
+\ canon? ( a n -- flag )   whether n words in bytes at a are all below p.
+: canon? ( a n -- flag )
+	-1 lit swap 0 lit do over i 2 lit lshift + u@ 2013265921u lit u< and loop nip
+;
+
+\ ── The root's statement ──
+
+: bch variable ;   \ challenge (r, gamma), as cells
+: bchv variable ;  : bchal ( -- a )  bchv 20 lit lazy ;
+: bstv variable ;  : bst ( -- a )    bstv 60 lit lazy ;     \ a hashing state
+: bxv variable ;   : bx ( -- a )     bxv 100 lit lazy ;     \ scratch ext values
+: b# ( k -- a )    4 lit lshift bx + ;
+: bprod ( -- a )   0 lit b# ;   : bg1 ( -- a ) 1 lit b# ;   : bg2 ( -- a ) 2 lit b# ;
+: bg3 ( -- a )     3 lit b# ;   : bg4 ( -- a ) 4 lit b# ;   : bf ( -- a ) 5 lit b# ;
+: bxt ( -- a )      6 lit b# ;
+
+\ bwords+ ( a n -- )   absorb n words from bytes at a (reduced).
+: bwords+ ( a n -- )   0 lit do dup i 2 lit lshift + u@ fred os+ loop drop ;
+\ bnonce+ ( a -- )   absorb a nonce's 8 limbs (16-bit, little-endian).
+: blimb ( a k -- x )   1 lit lshift + dup c@ swap 1 lit + c@ 8 lit lshift or ;
+: bnonce+ ( a -- )   8 lit 0 lit do dup i blimb os+ loop drop ;
+
+: bdata variable ;   \ the root's data (bytes)
+
+\ bchall ( -- )   hash_octets(10, n, [data, #in, #out, inputs, (output,
+\        nonce)...]) into bchal.
+: bchall ( -- )
+	bst A lit  bnin @ 3 lit lshift bnout @ 4 lit lshift + A lit +  osbeg
+	bdata @ 8 lit bwords+
+	bnin @ os+  bnout @ os+
+	bnin @ ?dup if 0 lit do bin @ i 5 lit lshift + 8 lit bwords+ loop then
+	bnout @ ?dup if 0 lit do
+		bout @ i 5 lit lshift + 8 lit bwords+
+		bnon @ i 4 lit lshift + bnonce+
+	loop then
+	osend
+	bst bchal 8 lit cpy
+;
+
+\ bcom ( a -- )   a commitment's 8 elements (reduced) into bcc: its halves
+\        lo = bcc, hi = bcc + 16, as extension values.
+: bccv variable ;  : bcc ( -- a )   bccv 20 lit lazy ;
+: bcom ( a -- )   bcc 8 lit ucells ;
+\ bnlimbs ( a -- )   a nonce's 8 limbs into bcn (halves likewise).
+: bcnv variable ;  : bcn ( -- a )   bcnv 20 lit lazy ;
+: bnlimbs ( a -- )   8 lit 0 lit do dup i blimb bcn i 2 lit lshift + ! loop drop ;
+
+\ bf+ ( v g -- )   bf += v * g.
+: bf+ ( v g -- )   bxt emul  bf bxt bf eadd ;
+
+\ bterm ( -- )   bprod *= r - bf.
+: bterm ( -- )   bchal bf bxt esub  bprod bxt bprod emul ;
+
+\ bproduct ( -- )   the product over the body: r - (5 + lo g + hi g^2) per
+\        input, r - (6 + lo g + hi g^2 + nlo g^3 + nhi g^4) per output.
+: bproduct ( -- )
+	bchal 10 lit + bg1 4 lit cpy
+	bg1 bg1 bg2 emul  bg2 bg1 bg3 emul  bg2 bg2 bg4 emul
+	bprod 4 lit zero  1 lit bprod !
+	bnin @ ?dup if 0 lit do
+		bin @ i 5 lit lshift + bcom
+		5 lit bf ecst  bcc bg1 bf+  bcc 10 lit + bg2 bf+
+		bterm
+	loop then
+	bnout @ ?dup if 0 lit do
+		bout @ i 5 lit lshift + bcom  bnon @ i 4 lit lshift + bnlimbs
+		6 lit bf ecst  bcc bg1 bf+  bcc 10 lit + bg2 bf+  bcn bg3 bf+  bcn 10 lit + bg4 bf+
+		bterm
+	loop then
+;
+
+\ ── The public octets and tuples ──
+
+: bpvv variable ;  : bpv ( -- a )   bpvv 100 lit lazy ;    \ 8 octets
+: btpv variable ;  : btup ( -- a )  btpv 200 lit lazy ;    \ the bus tuples
+: bo# ( k -- a )   5 lit lshift bpv + ;
+
+\ blimbs16 ( lo hi a -- )   a u64's four 16-bit limbs, low first, into a.
+: blimbs16 ( lo hi a -- )
+	over 10 lit rshift over C lit + !
+	swap FFFF lit and over 8 lit + !
+	over 10 lit rshift over 4 lit + !
+	swap FFFF lit and swap !
+;
+
+\ bwide ( lo hi a -- )   a count's two 20-bit limbs (`aggregate::wide`).
+: bwide ( lo hi a -- )
+	-rot
+	C lit lshift over 14 lit rshift or fred  2 lit pick 4 lit + !
+	FFFFF lit and swap !
+;
+
+\ u64s as (lo hi) word pairs.
+: dal variable ;  : dah variable ;  : dbl variable ;  : dbh variable ;
+: d! ( alo ahi blo bhi -- )   dbh ! dbl ! dah ! dal ! ;
+\ d- ( a b -- a-b )   (mod 2^64).   du< ( a b -- flag )
+: d- ( alo ahi blo bhi -- dlo dhi )
+	d!  dal @ dbl @ -  dah @ dbh @ -  dal @ dbl @ u< if 1 lit - then
+;
+: du< ( alo ahi blo bhi -- flag )
+	d!  dah @ dbh @ u<  dah @ dbh @ = dal @ dbl @ u< and or
+;
+
+\ What a block is checked against: the parent's state root (32 bytes) and
+\ output count, and the reward at the block's height.
+: bproot variable ;  : bpcl variable ;  : bpch variable ;
+: brwl variable ;    : brwh variable ;
+\ The proof's header: amounts A, B; whether it aggregates.
+: bal variable ;  : bah variable ;  : bbl variable ;  : bbh variable ;  : bagg variable ;
+
+\ bvk ( -- )   octet 0: the aggregation key's digest, or zeros for a wrap:
+\        hash_octets(7, 256, its cap's elements).
+: bvk ( -- )
+	0 lit bo# 8 lit zero
+	bagg @ if
+		bst 7 lit 100 lit osbeg  bacap 100 lit bwords+  osend
+		bst 0 lit bo# 8 lit cpy
+	then
+;
+
+\ bpublic ( -- )   the eight public octets, then the bus tuples: each octet
+\        and its index, multiplicity -1.
+: bpublic ( -- )
+	bvk
+	bdata @ 1 lit bo# 8 lit ucells
+	bal @ bah @ 2 lit bo# blimbs16   bbl @ bbh @ 2 lit bo# 10 lit + blimbs16
+	bproot @ 3 lit bo# 8 lit ucells
+	bsroot 4 lit bo# 8 lit ucells
+	bpcl @ bpch @ 5 lit bo# bwide          bhcnt 5 lit bo# 8 lit + bwide
+	bpcl @ bpch @ 5 lit bo# 10 lit + bwide  bhcnt 5 lit bo# 18 lit + bwide
+	bchal 6 lit bo# 8 lit cpy
+	7 lit bo# 8 lit zero  bprod 7 lit bo# 4 lit cpy  bheight drop 7 lit bo# 10 lit + !
+	8 lit btup !
+	8 lit 0 lit do
+		btup i B lit * 1 lit + 2 lit lshift +              ( t )
+		2013265920u lit over !  9 lit over 4 lit + !
+		i bo# over 8 lit + 8 lit cpy
+		i swap 28 lit + !
+	loop
+;
+
+\ bverify ( a n -- ok )   whether the block's bytes parse and its proof
+\        proves its body, its state change from the parent (bproot, bpcl/
+\        bpch) and the reward (brwl/brwh) -- `Block::proof_is_valid`.
+: bverify ( a n -- ok )
+	bparse drop
+	blok @ if
+		bnnon @ bnout @ = bcheck
+		bin @ bnin @ 3 lit lshift canon? bcheck
+		bout @ bnout @ 3 lit lshift canon? bcheck
+		bheight nip 0= bcheck                                 \ a u32 height
+		\ The outputs fill the window from the parent's count to the block's.
+		bhcnt bpcl @ bpch @ du< 0= bcheck
+		bhcnt bpcl @ bpch @ d- 0= swap bnout @ = and bcheck
+		\ The proof's header.
+		bpr @ bpl @ rinit
+		r8 1 lit = bcheck
+		r32 bal ! r32 bah !  r32 bbl ! r32 bbh !
+		r8 dup 2 lit u< bcheck bagg !
+		20 lit rtake dup bdata ! 8 lit canon? bcheck
+		rbad @ 0= bcheck
+		\ It claims exactly the reward: A - B.
+		bal @ bah @ bbl @ bbh @ du< 0= bcheck
+		bal @ bah @ bbl @ bbh @ d- brwh @ = swap brwl @ = and bcheck
+	then
+	blok @ if
+		rpos @ rend @ over -                                  ( stark len )
+		bchall bproduct bpublic
+		btparm
+		btlen  bagg @ if bacap else bwcap then  btlde  btup  cverify bcheck
+	then
+	blok @
+;
+
+\ ── Structure and the body hash (`Block::validate_structure`, but for proof
+\ of work, which the caller checks against the target) ──
+
+\ c32cmp ( a b -- n )   compare two 32-byte strings: -1, 0 or 1.
+: ccr variable ;
+: c32cmp ( a b -- n )
+	0 lit ccr !
+	8 lit 0 lit do
+		ccr @ 0= if
+			over i 2 lit lshift + be32 over i 2 lit lshift + be32
+			2dup u< if 2drop -1 lit ccr ! else u> if 1 lit ccr ! then then
+		then
+	loop
+	2drop ccr @
+;
+
+\ bsorted? ( a n -- flag )   whether n 32-byte commitments at a are strictly
+\        increasing.
+: bsorted? ( a n -- flag )
+	-1 lit swap                                          ( a f n )
+	dup 1 lit u> if
+		1 lit do
+			over i 1 lit - 5 lit lshift +  2 lit pick i 5 lit lshift +
+			c32cmp -1 lit = and
+		loop
+	else drop then
+	nip
+;
+
+\ bselfsp? ( -- flag )   whether an input is also an output: a merge of the
+\        two sorted lists.
+: bspi variable ;   : bspj variable ;   : bspf variable ;
+: bselfsp? ( -- flag )
+	0 lit bspi !  0 lit bspj !  0 lit bspf !
+	begin bspi @ bnin @ u< bspj @ bnout @ u< and bspf @ 0= and while
+		bin @ bspi @ 5 lit lshift +  bout @ bspj @ 5 lit lshift +  c32cmp
+		dup 0= if -1 lit bspf ! then
+		0< if bspi @ 1 lit + bspi ! else bspj @ 1 lit + bspj ! then
+	repeat
+	bspf @
+;
+
+\ bbodyh ( -- )   the body hash (`BlockBody::body_hash`) into bst: hash_bytes
+\        of 3, the counts and lists as they lie in the body, then the hashes
+\        of the block proof and the chain proof.
+: bphv variable ;   : bph ( -- a )   bphv 20 lit lazy ;
+: bcphv variable ;  : bcph ( -- a )  bcphv 20 lit lazy ;
+: bbodyh ( -- )
+	bst bpl @ hbbeg  bpr @ bpl @ hbytes  hbend  bst bph 8 lit cpy
+	bst bcl @ hbbeg  bcp @ bcl @ hbytes  hbend  bst bcph 8 lit cpy
+	bst
+	bnin @ bnout @ + 5 lit lshift  bnnon @ 4 lit lshift +  4D lit +   ( 1 + 12 + 64 bytes more )
+	hbbeg
+	3 lit hb1
+	bhdr @ BC lit +  bnon @ bnnon @ 4 lit lshift + over -  hbytes
+	8 lit 0 lit do bph i 2 lit lshift + @ hbw loop
+	8 lit 0 lit do bcph i 2 lit lshift + @ hbw loop
+	hbend
+;
+
+\ bstruct ( n -- ok )   for a parsed block of n bytes: its version, the size
+\        limit, sorted commitments, no output spent in its own block, and
+\        the body hash.  (Canonical commitments and the nonce count are
+\        bverify's.)
+: bstruct ( n -- ok )
+	200001 lit u<
+	bver 1 lit u< 0= and
+	bin @ bnin @ bsorted? and
+	bout @ bnout @ bsorted? and
+	bselfsp? 0= and
+	dup if bbodyh bbhash bst 8 lit ueq and then
+;
+
+\ bvalid ( a n -- ok )   everything `Block::validate` checks but proof of
+\        work: the structure and body hash first (cheap), then the proof.
+: bvalid ( a n -- ok )
+	2dup bparse if dup bstruct else 0 lit then
+	if bverify else 2drop 0 lit then
+;

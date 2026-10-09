@@ -1,0 +1,83 @@
+\ tests/pager.fam — test-only: src/pager.fam on the test disk (a sparse image
+\ big enough to reach the pages: scripts/test.sh).
+
+\ tpw ( p v -- )   page p's first and last cells := v.   tpr ( p -- v w )
+: tpw ( p v -- )   over pgget 2dup ! FFC lit + !  pgdirty ;
+: tpr ( p -- v w )   pgget dup @ swap FFC lit + @ ;
+
+: tpgs variable ;   : tpg ( k -- p )   2 lit lshift tpgs @ + @ ;   \ pages the tests made
+: tbig ( -- n )   BB8 lit ;                                         \ 3,000: three cachefuls
+
+\ tbigok ( base -- f )   whether pages pgd0 + 4 .. + 3,003 hold base + k.
+: tbigok ( base -- f )
+	-1 lit tbig 0 lit do
+		pgop pgd0 4 lit + i + tpr                            ( base f v w )
+		3 lit pick i + = swap 3 lit pick i + = and and
+	loop
+	nip
+;
+
+Test {
+	pager_format {
+		dbopen assert  pgfmt assert  pgop
+		pgm @ pgmag asrt_eq  pgm C lit + @ pgd0 asrt_eq
+	}
+	pager_commit_reopen {
+		pgfmt assert  pgop
+		10 lit alloc tpgs !
+		4 lit 0 lit do pgnew tpgs @ i 2 lit lshift + ! loop
+		0 lit tpg pgd0 asrt_eq  3 lit tpg pgd0 3 lit + asrt_eq
+		4 lit 0 lit do i tpg i 1000 lit + tpw loop
+		pgcommit assert
+		pgopen assert  pgop                                  \ a restart
+		2 lit tpg tpr 1002 lit asrt_eq 1002 lit asrt_eq
+		pgm C lit + @ pgd0 4 lit + asrt_eq  pgm 8 lit + @ 2 lit asrt_eq   \ two commits so far
+	}
+	pager_abort {
+		pgop  1 lit tpg 77 lit tpw  1 lit tpg tpr 77 lit asrt_eq drop
+		pgabort pgop
+		1 lit tpg tpr 1001 lit asrt_eq drop                  \ back to the commit
+	}
+	pager_free_list {
+		pgop  2 lit tpg pgfree  pgcommit assert
+		pgop  pgnew 2 lit tpg asrt_eq                         \ reused
+		pgnew pgd0 4 lit + asrt_eq                            \ then new
+		pgabort
+	}
+	pager_crash_recovery {
+		pgop  3 lit tpg 55 lit tpw  0 lit tpg 66 lit tpw
+		pgjflush pgjwrite assert                              \ journal written, not applied
+		pgopen assert  pgop                                   \ "crash": restart, replay
+		3 lit tpg tpr 55 lit asrt_eq 55 lit asrt_eq
+		0 lit tpg tpr 66 lit asrt_eq drop
+		pgopen assert  pgop                                   \ replayed once: the journal is spent
+		3 lit tpg tpr 55 lit asrt_eq drop
+	}
+	pager_torn_journal {
+		pgop  3 lit tpg 99 lit tpw
+		pgjflush pgjwrite assert
+		1 lit pgjh 0 lit pgio drop  pgjh C lit + dup @ 1 lit xor swap !  1 lit pgjh -1 lit pgio drop
+		pgopen assert  pgop                                   \ a bad header: nothing replayed
+		3 lit tpg tpr 55 lit asrt_eq drop
+	}
+	pager_big_transaction {
+		pgopen assert
+		tbig 0 lit do pgop pgd0 4 lit + i + 5000 lit i + tpw loop   \ 3,000 pages: the cache spills
+		pgjn @ 0 lit u> assert                                \ (journaled before the commit)
+		pgcommit assert
+		pgopen assert                                         \ a restart: all of it
+		5000 lit tbigok assert
+	}
+	pager_big_abort {
+		tbig 0 lit do pgop pgd0 4 lit + i + 9000 lit i + tpw loop
+		pgabort
+		5000 lit tbigok assert                                \ none of it
+	}
+	pager_big_recovery {
+		tbig 0 lit do pgop pgd0 4 lit + i + A000 lit i + tpw loop
+		pgop pgm 8 lit + @ 1 lit + pgm 8 lit + !  pgmd
+		pgjflush pgjwrite assert                              \ the whole journal, never applied
+		pgopen assert                                         \ restart: replayed
+		A000 lit tbigok assert
+	}
+}

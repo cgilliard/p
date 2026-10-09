@@ -1,0 +1,44 @@
+\ tests/net_sync.fam — test-only: src/peer.fam against a real Rust node
+\ (scripts/test_net.sh) serving the main fixture chain to 3b, at the host's
+\ port 47701 through QEMU's gateway.  Fixtures as tests/main.fam's.
+
+: tsw variable ;  : tst variable ;  : tss variable ;
+: tsrv variable ;  : tsroot ( -- a )  tsrv 20 lit lazy ;
+
+\ tsr? ( tip -- f )   whether the state's root is the tip's state root.
+: tsr? ( tip -- f )   tsroot stroot  50 lit + tsroot 8 lit ceq ;
+
+\ tsrun ( tip ms -- ok )   run the network until our tip is that one (or
+\        the time's up).
+: tsrun ( tip ms -- ok )
+	tsw ! tst !  pms tss !
+	begin
+		pstep
+		dbtip ?dup if tst @ 28 lit ceq else 0 lit then
+		dup 0= tss @ pago tsw @ u< and
+	while drop repeat
+;
+
+Test {
+	net_syncs_block_by_block {
+		0 lit bnet !  acfmt  acopen assert  0 lit pfdep !
+		pstart assert  A000202 lit BA55 lit pseed
+		f3btip 493E0 lit tsrun assert  f3btip tsr? assert
+		dbcnt @ 4 lit asrt_eq
+	}
+	net_reorganizes_onto_the_peers_branch {
+		acfmt  acopen assert
+		0 lit fx acblock assert  1 lit fx acblock assert  2 lit fx acblock assert
+		dbtip f2tip 28 lit ceq assert
+		pnext pq !  0 lit pqat !
+		f3btip 493E0 lit tsrun assert  f3btip tsr? assert
+		dbcnt @ 5 lit asrt_eq                                 \ 0, 1, 2 and the branch
+	}
+	net_fast_syncs {
+		acfmt  acopen assert  1 lit pfdep !
+		pstart assert  pfsv @ 1 lit asrt_eq
+		f3btip 493E0 lit tsrun assert  f3btip tsr? assert
+		pgm 7C lit + @ 2 lit asrt_eq                          \ it started at 2b
+		dbcnt @ 2 lit asrt_eq                                 \ 2b and 3b only
+	}
+}

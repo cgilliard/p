@@ -1,0 +1,236 @@
+\ tests/diff.fam — test-only: src/diff.fam against the Rust node's `asert` and
+\ `work_for_target` (vectors printed by a test run of it), on both networks.
+
+: dtv variable ;   : dt ( -- a )   dtv 40 lit lazy ;    \ result, expected
+
+\ dt= ( w0 .. w7 -- flag )   whether the result (dt) is the 32 bytes whose
+\        little-endian words these are.
+: dt= ( w0 .. w7 -- flag )
+	8 lit 0 lit do dt 20 lit + 1C lit i 2 lit lshift - + ! loop
+	dt dt 20 lit + 8 lit ceq
+;
+
+Test {
+	main_asert_1 {
+		0 lit bnet !  192A71FC lit 1A1 lit 0 lit 0 lit 192A71FC lit 1A1 lit dt asert
+		FF010000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_2 {
+		0 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 193399BC lit 1A1 lit dt asert
+		FF010000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_3 {
+		0 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 192A71FD lit 1A1 lit dt asert
+		FE010000 lit FFFFFFC4 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_4 {
+		0 lit bnet !  192A71FC lit 1A1 lit 2 lit 0 lit 193CF1B5 lit 1A1 lit dt asert
+		20000 lit FFFFFF05 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FEFFFFFF lit dt= assert
+	}
+	main_asert_5 {
+		0 lit bnet !  192A71FC lit 1A1 lit 64 lit 0 lit 1CB21ACB lit 1A1 lit dt asert
+		FE010000 lit FFFFFF68 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_6 {
+		0 lit bnet !  192A71FC lit 1A1 lit 5 lit 0 lit 23A4F0BC lit 1A1 lit dt asert
+		FF030000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FEFFFFFF lit dt= assert
+	}
+	main_asert_7 {
+		0 lit bnet !  192A71FC lit 1A1 lit 5 lit 0 lit 28CB4CBC lit 1A1 lit dt asert
+		A8050000 lit FFFFFF07 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FDFFFFFF lit dt= assert
+	}
+	main_asert_8 {
+		0 lit bnet !  192A71FC lit 1A1 lit 7 lit 0 lit 15FBA03C lit 1A1 lit dt asert
+		96010000 lit FFFFFF5F lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_9 {
+		0 lit bnet !  192A71FC lit 1A1 lit 3E8 lit 0 lit 192A71FC lit 1A1 lit dt asert
+		2E000000 lit FFFF7F21 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_10 {
+		0 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 3109F1FC lit 1B1 lit dt asert
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_11 {
+		0 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 2B1211FC lit 1AD lit dt asert
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_12 {
+		0 lit bnet !  192A71FC lit 1A1 lit 2DC6C0 lit 0 lit 192A71FC lit 1A1 lit dt asert
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	main_asert_13 {
+		0 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit FFFFFFFF lit FFFFFFFF lit dt asert
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_14 {
+		0 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 0 lit 0 lit dt asert
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	main_asert_15 {
+		0 lit bnet !  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt asert
+		FF010000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_16 {
+		0 lit bnet !  192A71FC lit 1A1 lit 77359400 lit 0 lit DEE571FD lit 44505 lit dt asert
+		FF010000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	main_asert_17 {
+		0 lit bnet !  192A71FC lit 1A1 lit C lit 0 lit 1F8E2FFB lit 1A1 lit dt asert
+		FC020000 lit FFFFFF9F lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FEFFFFFF lit dt= assert
+	}
+	main_work_18 {
+		0 lit bnet !
+		FF010000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 8000 lit dt= assert
+	}
+	main_work_19 {
+		0 lit bnet !
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= assert
+	}
+	main_work_20 {
+		0 lit bnet !
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	main_work_21 {
+		0 lit bnet !
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= drop  dt 20 lit + dt dwork
+		80 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= assert
+	}
+	main_work_22 {
+		0 lit bnet !
+		7C020000 lit FFFFFFA1 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FEFFFFFF lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit CF16600 lit dt= assert
+	}
+	main_work_23 {
+		0 lit bnet !
+		80 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	main_work_24 {
+		0 lit bnet !
+		5A5A0300 lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 594C0000 lit dt= assert
+	}
+	dev_asert_25 {
+		1 lit bnet !  192A71FC lit 1A1 lit 0 lit 0 lit 192A71FC lit 1A1 lit dt asert
+		FF0F0000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_26 {
+		1 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 192A990C lit 1A1 lit dt asert
+		FF0F0000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_27 {
+		1 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 192A71FD lit 1A1 lit dt asert
+		D10F0000 lit FFFFFF07 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_28 {
+		1 lit bnet !  192A71FC lit 1A1 lit 2 lit 0 lit 192AF055 lit 1A1 lit dt asert
+		3A100000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FEFFFFFF lit dt= assert
+	}
+	dev_asert_29 {
+		1 lit bnet !  192A71FC lit 1A1 lit 64 lit 0 lit 192DD60B lit 1A1 lit dt asert
+		83060000 lit FFFFFFD3 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_30 {
+		1 lit bnet !  192A71FC lit 1A1 lit 5 lit 0 lit 19345D0C lit 1A1 lit dt asert
+		FF1F0000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FEFFFFFF lit dt= assert
+	}
+	dev_asert_31 {
+		1 lit bnet !  192A71FC lit 1A1 lit 5 lit 0 lit 1938F0EC lit 1A1 lit dt asert
+		402D0000 lit FFFFFF3F lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FDFFFFFF lit dt= assert
+	}
+	dev_asert_32 {
+		1 lit bnet !  192A71FC lit 1A1 lit 7 lit 0 lit 1928762C lit 1A1 lit dt asert
+		B20C0000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_33 {
+		1 lit bnet !  192A71FC lit 1A1 lit 3E8 lit 0 lit 192A71FC lit 1A1 lit dt asert
+		0 lit FF37140A lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_34 {
+		1 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 27788DFC lit 1A1 lit dt asert
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_35 {
+		1 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 23E506FC lit 1A1 lit dt asert
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_36 {
+		1 lit bnet !  192A71FC lit 1A1 lit 2DC6C0 lit 0 lit 192A71FC lit 1A1 lit dt asert
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	dev_asert_37 {
+		1 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit FFFFFFFF lit FFFFFFFF lit dt asert
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_38 {
+		1 lit bnet !  192A71FC lit 1A1 lit 1 lit 0 lit 0 lit 0 lit dt asert
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	dev_asert_39 {
+		1 lit bnet !  0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt asert
+		FF0F0000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_40 {
+		1 lit bnet !  192A71FC lit 1A1 lit 77359400 lit 0 lit B60FB1FD lit 13D1 lit dt asert
+		FF0F0000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_asert_41 {
+		1 lit bnet !  192A71FC lit 1A1 lit C lit 0 lit 1F2227BB lit 1A1 lit dt asert
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= assert
+	}
+	dev_work_42 {
+		1 lit bnet !
+		FF0F0000 lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000 lit dt= assert
+	}
+	dev_work_43 {
+		1 lit bnet !
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= assert
+	}
+	dev_work_44 {
+		1 lit bnet !
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	dev_work_45 {
+		1 lit bnet !
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= drop  dt 20 lit + dt dwork
+		80 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= assert
+	}
+	dev_work_46 {
+		1 lit bnet !
+		FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit FFFFFFFF lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	dev_work_47 {
+		1 lit bnet !
+		80 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 1000000 lit dt= assert
+	}
+	dev_work_48 {
+		1 lit bnet !
+		5A5A0300 lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit 5A5A5A5A lit dt= drop  dt 20 lit + dt dwork
+		0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 0 lit 594C0000 lit dt= assert
+	}
+	reward_schedule {
+		0 lit bnet !
+		1 lit 0 lit drew assert 3B9ACA00 lit asrt_eq
+		59D2F lit 0 lit drew assert 3B9ACA00 lit asrt_eq          \ the last block of the first era
+		59D30 lit 0 lit drew assert 6ACFC0 lit asrt_eq            \ the first of the second
+		3279DAF lit 0 lit drew assert 6ACFC0 lit asrt_eq          \ the last block of all
+		3279DB0 lit 0 lit drew 0 lit asrt_eq drop                 \ the chain has ended
+		0 lit 1 lit drew 0 lit asrt_eq drop
+		1 lit bnet !  3279DB0 lit 0 lit drew assert 3B9ACA00 lit asrt_eq  \ dev: no end
+	}
+	add_256 {
+		0 lit bnet !
+		dt 40 lit nzero  FF lit dt 1F lit + c!  1 lit dt 3F lit + c!    \ 0xff + 1
+		dt dt 20 lit + dadd256
+		dt 1E lit + c@ 1 lit asrt_eq  dt 1F lit + c@ 0 lit asrt_eq
+	}
+}

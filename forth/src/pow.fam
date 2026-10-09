@@ -1,0 +1,116 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/pow.fam — checking a header's proof of work without the dataset (see
+\ ../rust/src/pow.rs, `verify`), and its id (`header_id`).
+\
+\ - prefix: hash_bytes of the header but its nonce (156 bytes).
+\ - attempt: one permutation of [prefix, the nonce's 11 elements (3 bytes
+\   each, little-endian), 0x600, 0...]: its first 8 elements are the block's
+\   id, the other 16 the starting mix.
+\ - `lookups` times: item index = the mix's sum's low `items_log` bits; the
+\   item recomputed from the text (`item_rounds` permutations of a text
+\   block, then 8 squeezes of 16) and folded into the mix:
+\   acc[e] = sum_c item[16c + e] * mix[(e + c) mod 16], t = acc + mix,
+\   mix[e] = t[e] * t[e + 1 mod 16] + K[e].
+\ - the value: hash_octets(0x602, 24, id ++ mix), which must be no larger
+\   than the target (both as 32-byte big-endian numbers).
+\
+\ Parameters (consensus): main 2^17 items, 128 rounds, 64 lookups; dev
+\ 2^15, 128, 12.  A check is about lookups * 135 permutations.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: pwlog ( -- k )    bnet @ if F lit else 11 lit then ;      \ items_log
+: pwrnd ( -- n )    80 lit ;                                \ item_rounds
+: pwlook ( -- n )   bnet @ if C lit else 40 lit then ;      \ lookups
+
+\ pwktab ( -- a )   the mixing constants K (pow.rs).
+: pwktab ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004004 ,   \ jal   x0,+68
+01234567 , 02345678 , 03456789 , 0456789A , 056789AB , 06789ABC , 0789ABCD , 089ABCDE ,
+09ABCDEF , 0ABCDEF0 , 0BCDEF01 , 0CDEF012 , 0DEF0123 , 0EF01234 , 0F012345 , 10123456 ,
+;
+: pwk ( e -- k )   2 lit lshift pwktab + be@ ;
+
+: pwsv variable ;   : pwst ( -- a )   pwsv 60 lit lazy ;   \ a permutation state
+: pwov variable ;   : pwout ( -- a )  pwov 60 lit lazy ;   \ the attempt's output
+: pwiv variable ;   : pwitem ( -- a ) pwiv 200 lit lazy ;  \ an item: 128 elements
+: pwmv variable ;   : pwmix ( -- a )  pwmv 40 lit lazy ;   \ the mix
+: pwtv variable ;   : pwt ( -- a )    pwtv 40 lit lazy ;   \ t
+: pwhv variable ;   : pwh ( -- a )    pwhv 60 lit lazy ;   \ the value's state
+
+\ pwatt ( hdr -- )   the attempt's output for a 188-byte header, into pwout.
+: pwatt ( hdr -- )
+	dup pwout swap 9C lit p2hashb                        \ the prefix, into pwout[0..8]
+	pwout 20 lit + 10 lit zero
+	9C lit +                                             ( nonce )
+	B lit 0 lit do
+		0 lit 3 lit 0 lit do
+			j 3 lit * 2 lit + i - dup 20 lit u< if 2 lit pick + c@ else drop 0 lit then
+			swap 8 lit lshift or
+		loop
+		pwout i 8 lit + 2 lit lshift + !
+	loop
+	drop
+	600 lit pwout 4C lit + !                              \ cell 19
+	pwout p2perm
+;
+
+\ pwitemc ( i -- )   dataset item i, computed, into pwitem.
+: pwitemc ( i -- )
+	pwst 18 lit zero
+	dup wtextn @ 1F lit + 5 lit rshift % 5 lit lshift      ( i block-offset )
+	B lit 0 lit do dup i 3 lit * welem pwst i 2 lit lshift + ! loop
+	drop
+	dup FFFFFF lit and pwst 2C lit + !                    \ cell 11
+	18 lit rshift pwst 30 lit + !                          \ cell 12
+	601 lit pwst 40 lit + !                                \ cell 16
+	pwrnd pwst 44 lit + !                                  \ cell 17
+	pwrnd 0 lit do pwst p2perm loop
+	8 lit 0 lit do
+		i if pwst p2perm then
+		pwst pwitem i 6 lit lshift + 10 lit cpy
+	loop
+;
+
+\ pwfold ( -- )   fold pwitem into the mix.
+: pwfold ( -- )
+	10 lit 0 lit do
+		0 lit
+		8 lit 0 lit do
+			pwitem i 4 lit lshift j + 2 lit lshift + @
+			pwmix j i + F lit and 2 lit lshift + @ fmul fadd
+		loop
+		pwmix i 2 lit lshift + @ fadd  pwt i 2 lit lshift + !
+	loop
+	10 lit 0 lit do
+		pwt i 2 lit lshift + @  pwt i 1 lit + F lit and 2 lit lshift + @ fmul
+		i pwk fadd  pwmix i 2 lit lshift + !
+	loop
+;
+
+\ pwvalue ( hdr -- )   the proof-of-work value of a header, into pwh's first
+\        8 cells (whose bytes are the 32-byte value).
+: pwvalue ( hdr -- )
+	pwatt
+	pwout 20 lit + pwmix 10 lit cpy
+	pwlook 0 lit do
+		0 lit 10 lit 0 lit do pwmix i 2 lit lshift + @ fadd loop
+		1 lit pwlog lshift 1 lit - and
+		pwitemc pwfold
+	loop
+	pwh 602 lit 18 lit osbeg
+	8 lit 0 lit do pwout i 2 lit lshift + @ os+ loop
+	10 lit 0 lit do pwmix i 2 lit lshift + @ os+ loop
+	osend
+;
+
+\ pwok ( hdr target -- flag )   whether the header's proof of work meets the
+\        target (32 bytes, big-endian): value <= target.
+: pwok ( hdr target -- flag )   swap pwvalue pwh swap c32cmp 1 lit < ;
+
+\ hdrid ( hdr out -- )   the header's id (`header_id`): the attempt's first
+\        8 elements, into out (8 cells -- the 32 bytes of the id).
+: hdrid ( hdr out -- )   swap pwatt pwout swap 8 lit cpy ;

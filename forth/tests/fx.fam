@@ -1,0 +1,18 @@
+\ tests/fx.fam — test-only: reading a fixture pack (tools/fxpack) that the test
+\ run loaded into memory at 0x87000000 (`tools/fam --load=PACK@0x87000000`).
+\ The top 16 MiB of the 128 MiB machine: above the heap and the stacks.
+
+: fxbase ( -- a )   87000000 lit ;
+
+\ fx? ( -- flag )   whether a pack is loaded.
+: fx? ( -- flag )   fxbase @ 4B505846 lit = ;            \ "FXPK"
+
+\ fx ( k -- a n )   file k of the pack: its address and length.
+: fx ( k -- a n )
+	fxbase 8 lit +                                     ( k p )
+	swap ?dup if 0 lit do dup @ 3 lit + -4 lit and 4 lit + + loop then
+	dup 4 lit + swap @
+;
+
+\ fxcopy ( k -- a n )   a writable copy of file k (tests that tamper with it).
+: fxcopy ( k -- a n )   fx mcopy ;

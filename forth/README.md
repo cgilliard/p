@@ -3,3 +3,87 @@
 A validating node with no miner, written in Forth so it can be
 bootstrapped from a minimal system. The mining node is in `../rust`; the
 protocol is described in `../docs`.
+
+## Measurements
+
+Under QEMU (`qemu-system-riscv32`, strict RV32I) on the development laptop,
+checking the saved main-network chain (`tests/fixtures/main`, made by the
+Rust node's `forth_fixtures` test; 2026-10-08). Block 2 has one input and
+three outputs; its proofs are each about 166 KB.
+
+| Check of main block 2 (Forth, QEMU) | Time |
+| --- | --- |
+| Body hash (hashes both proofs, about 330 KB) | 5.77 s |
+| Block proof | 4.40 s |
+| Chain proof it carries | 4.40 s |
+| Proof of work (64 lookups, about 8,640 permutations) | 6.74 s |
+| **All of the above** | **21.4 s** |
+| `tipnext`: all of the above plus the header rules and the new tip | 21–27 s |
+
+Timings vary by about a quarter between runs with the laptop's load (QEMU
+emulates on one host thread).
+
+The Rust node, natively on the same laptop (12 threads), making that chain:
+
+| | Block 1 | Block 2 |
+| --- | --- | --- |
+| Block proof | 378.1 s | 311.7 s |
+| Mining | 418.5 s | 29.4 s |
+| Chain proof | 205.0 s | 194.9 s |
+| Validation (`Block::validate`) | under 0.1 s | under 0.1 s |
+
+The genesis chain proof, deriving the chain keys, took 183.5 s.
+
+Primitives (Forth, QEMU): a Poseidon2 permutation about 0.75–0.9 ms, a
+field multiply about 0.26 µs. Nearly all of the time above is permutations,
+so a faster permutation speeds every check.
+
+`tipnext` checks a block on its parent's tip and computes its own: the tips
+it computes for the saved chain match the Rust node's byte for byte. The
+two-hour future-drift rule reads QEMU's Goldfish RTC (`hnow`); real hardware
+will need its own clock there.
+
+`src/store.fam` keeps every validated block's header and tip in an
+append-only log on the virtio disk (one sector each), indexed in memory by
+hash, and chooses the best tip by cumulative work. A validating node keeps no
+blocks, state or undo data -- a block is checked against its parent's tip
+alone -- so a reorganization only moves the best tip. `scripts/test_main.sh`
+reruns the main tests and these timings.
+
+`src/state.fam` keeps the chain's state -- the unspent outputs, the index
+from commitment to position, and the Merkle tree over them -- on B+trees
+(`src/btree.fam`) over a page cache with atomic, journaled commits of any
+size (`src/pager.fam`). `src/accept.fam` takes a block: validates it on its
+parent's tip, keeps its tip and its state delta, and keeps the state at the
+best tip, undoing and reapplying blocks through reorganizations (deltas and
+undo data are kept for 1,000 blocks). `src/snap.fam` is fast sync's state, as
+the Rust node does it: start at a recent block whose chain proof checks out,
+taking the state as of it in pieces each checked against its root on
+arrival -- and serve those pieces, as of any recent block, to others.
+`src/net.fam` is UDP over virtio-net (ARP, IPv4, polled), and `src/peer.fam`
+the Rust node's network protocol over it: discovery with cookies, catching
+up block by block (following a peer onto another branch), fast sync, and
+serving sync points and state pieces. `scripts/test_net.sh` runs it against
+a real Rust node on the host: the Forth node syncs block by block,
+reorganizes onto the Rust node's branch, and fast-syncs from it. Accepting main block 3b -- validating
+it and reorganizing from block 2 to the 2b/3b branch -- took 21.5 s.
+
+## Test fixtures
+
+`tests/fixtures/<network>/` holds a real chain from the Rust node: blocks 0
+(genesis) to 2 and block 2's chain proof, with `info.txt` (each tip,
+target, reward, and the root proofs' challenges and products); and a side
+branch on block 1 -- blocks 2b and 3b, outweighing block 2 -- with 3b's chain
+proof and `fork.txt`. Regenerate them after any consensus change (about 30
+and 20 minutes on main):
+
+    cd ../rust && cargo test --release -- --ignored --nocapture forth_fixtures
+    cd ../rust && cargo test --release -- --ignored --nocapture forth_fork_fixtures
+    cd ../rust && cargo test --release -- --ignored --nocapture forth_snapshot_fixtures
+
+The last (quick) writes `snap1.bin` and `snap2.bin`: the state as of blocks 1
+and 2 as the Rust node serves it -- its sync points and pieces.
+
+Tests load the blocks into memory as a pack (`tools/fxpack`, `tools/fam
+--load`, `tests/fx.fam`) rather than compiling them in; `tools/fxinfo` turns
+`info.txt` into Forth words.

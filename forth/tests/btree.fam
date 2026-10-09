@@ -1,0 +1,91 @@
+\ tests/btree.fam — test-only: src/btree.fam on the test disk, against keys
+\ the test can regenerate (a 32-bit LCG), in a small-key tree and in a tree of
+\ 200-byte keys (19 to a node, so several inner levels).
+
+: tbx variable ;   : tbs variable ;
+\ tbrnd ( -- x )   the next pseudo-random word.
+: tbrnd ( -- x )   tbs @ 41C64E6D lit * 3039 lit + dup tbs ! ;
+
+: tbkv variable ;  : tbk ( -- a )  tbkv 100 lit lazy ;   \ a key
+: tbvv variable ;  : tbv ( -- a )  tbvv 100 lit lazy ;   \ a value
+: tbov variable ;  : tbo ( -- a )  tbov 100 lit lazy ;   \ a value read back
+: tbqv variable ;  : tbq ( -- a )  tbqv 100 lit lazy ;   \ a key read back
+
+\ tbmake ( i -- )   key i (big-endian, pseudo-random from i; the rest zero)
+\        and its value (i, then i's complement).
+: tbmake ( i -- )
+	tbk 100 lit nzero  tbv 100 lit nzero
+	dup 9E3779B9 lit * dup tbk 3 lit + c!  dup 8 lit rshift tbk 2 lit + c!
+	dup 10 lit rshift tbk 1 lit + c!  18 lit rshift tbk c!
+	dup tbk 4 lit + !                                      \ i, after the hashed bytes: unique
+	dup tbv !  invert tbv 4 lit + !
+;
+
+\ tbins ( n -- )   insert keys 0 .. n-1.
+: tbins ( n -- )   0 lit do i tbmake tbk tbv btput loop ;
+
+\ tbhas ( i -- f )   whether key i reads back with its value.
+: tbhas ( i -- f )
+	dup tbmake tbk tbo btget
+	tbo @ rot = and  tbo 4 lit + @ tbv 4 lit + @ = and
+;
+
+\ tbscan ( -- n ok )   walk the whole tree in key order: how many entries,
+\        and whether each key was above the last.
+: tbsn variable ;   : tbsok variable ;
+: tbscan ( -- n ok )
+	0 lit tbsn !  -1 lit tbsok !
+	tbk 100 lit nzero
+	begin tbk tbq tbo btseek while
+		tbsn @ if tbq tbk btks @ mcmp 1 lit = tbsok @ and tbsok ! then
+		tbq tbk btks @ ncpy
+		tbsn @ 1 lit + tbsn !
+		\ the next key: this one plus one (big-endian)
+		-1 lit btks @ 0 lit do
+			dup if
+				tbk btks @ 1 lit - i - + dup c@ 1 lit + dup FF lit and rot c!
+				100 lit < if drop 0 lit then
+			then
+		loop
+		drop
+	repeat
+	tbsn @ tbsok @
+;
+
+Test {
+	btree_small_keys {
+		dbopen assert  pgfmt assert
+		0 lit 8 lit 34 lit btuse
+		7D0 lit tbins                                          \ 2,000 keys
+		-1 lit 7D0 lit 0 lit do i tbhas and loop assert
+		tbscan assert 7D0 lit asrt_eq
+		pgcommit assert
+	}
+	btree_persists {
+		pgopen assert
+		0 lit 8 lit 34 lit btuse
+		-1 lit 7D0 lit 0 lit do i tbhas and loop assert       \ after a restart
+	}
+	btree_deletes {
+		0 lit 8 lit 34 lit btuse
+		7D0 lit 0 lit do i 1 lit and 0= if i tbmake tbk btdel assert then loop   \ the even ones
+		-1 lit 7D0 lit 0 lit do i tbhas i 1 lit and 0= 0= = and loop assert       \ odd ones only
+		tbscan assert 3E8 lit asrt_eq
+		0 lit tbmake tbk btdel 0 lit asrt_eq                   \ already gone
+		7D0 lit 0 lit do i 1 lit and if i tbmake tbk btdel assert then loop
+		tbscan assert 0 lit asrt_eq  btroot 0 lit asrt_eq      \ empty: no root
+		pgcommit assert
+	}
+	btree_big_keys {
+		3 lit C8 lit 8 lit btuse                               \ 200-byte keys: 19 to a node
+		7D0 lit tbins
+		-1 lit 7D0 lit 0 lit do i tbhas and loop assert
+		btroot pgget @ 2 lit asrt_eq                          \ inner levels above the leaves
+		tbscan assert 7D0 lit asrt_eq
+		7D0 lit 0 lit do i 3 lit % 0= if i tbmake tbk btdel assert then loop
+		tbscan assert 535 lit asrt_eq                          \ 2000 - 667
+		pgcommit assert
+		pgopen assert  3 lit C8 lit 8 lit btuse
+		-1 lit 7D0 lit 0 lit do i tbhas i 3 lit % 0= 0= = and loop assert
+	}
+}

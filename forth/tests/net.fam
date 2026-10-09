@@ -1,0 +1,28 @@
+\ tests/net.fam — test-only: src/net.fam on QEMU's user network (scripts/
+\ test.sh runs with it, forwarding host UDP port 47653 to ours): the gateway
+\ answers ARP, and a datagram sent to the host's forwarded port comes back
+\ to us through the forward.
+
+: tnw variable ;
+
+\ tnwait ( -- f )   a datagram within two seconds.
+: tnwait ( -- f )
+	hnow drop tnw !
+	begin nrecv dup 0= hnow drop tnw @ - 7D0 lit u< and while drop repeat
+;
+
+Test {
+	net_opens {
+		nopen assert
+		nmac c@ 52 lit asrt_eq  nhl @ C lit asrt_eq
+	}
+	net_resolves_the_gateway {
+		ngw @ nhop 0= 0= assert
+	}
+	net_udp_round_trip {
+		68 lit npkt c!  65 lit npkt 1 lit + c!  6C lit npkt 2 lit + c!  6C lit npkt 3 lit + c!  6F lit npkt 4 lit + c!
+		A000202 lit BA25 lit 5 lit nsend assert
+		tnwait assert
+		npn @ 5 lit asrt_eq  npay @ c@ 68 lit asrt_eq  npay @ 4 lit + c@ 6F lit asrt_eq
+	}
+}

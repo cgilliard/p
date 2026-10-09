@@ -1,0 +1,12 @@
+#!/bin/sh
+# dupnames [FILE...] -- word names defined more than once (and names over the
+# compiler's 8-character limit) across the stdlib, both harness headers, and
+# the given files (default: the node's and the tests' file lists). The test
+# and bench headers define the same harness words, so those are left out.
+cd "$(dirname "$0")/.." || exit 1
+[ $# -eq 0 ] && set -- $(cat scripts/files.txt) $(cat scripts/tests.txt)
+defs() { grep -ohE '(^|[[:space:]]):[MI]?[[:space:]]+[^[:space:]]+' "$@" | awk '{print $NF}' | grep -v '[.,]$'; }
+defs lib/stdlib.fam lib/test.fam lib/bench.fam "$@" | sort | uniq -d \
+	| grep -v -E '^(\{|\}|asrt_eq|assert|Bench|Test|_.*|bt|bname|bcount|bstart|b0|bopn|bskf|btf|tname|tcount|tstart|bgo|bstop|bops|bskip)$' \
+	| sed 's/^/duplicate: /'
+defs "$@" | awk 'length($0) > 8 { print "too long: " $0 }'

@@ -1,0 +1,410 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/state.fam — the chain's state (../rust/src/state_tree.rs, utxo.rs): the
+\ fixed-depth (40) Merkle tree over output positions, its unspent outputs, and
+\ the index from commitment to position -- on B+trees (src/btree.fam), so one
+\ block's changes are one transaction (src/pager.fam).
+\
+\ A position's leaf: EMPTY before it's appended, leaf(commitment, nonce,
+\ height) while unspent, SPENT after.  The tree follows from the count and the
+\ unspent outputs: every other position below the count is SPENT, every one
+\ from it EMPTY, and all-SPENT or all-EMPTY subtrees have fixed hashes.  Stored,
+\ as in the Rust node: each unspent output's record by position; the index;
+\ and a node only if its subtree holds two or more unspent outputs (at level 4
+\ and up) -- every other node is computed from the records.
+\
+\ Trees: 0 unspent outputs: position (8, big-endian) -> commitment (32),
+\ nonce (16), height (4, big-endian) -- the Rust node's record.  1 the index:
+\ commitment -> position.  2 stored nodes: level (1) and index (8) -> hash.
+\ 3 blocks: block hash -> 0 its undo data's first page, 4 outputs it spent,
+\ 8 outputs it appended, C its delta's first page (src/accept.fam), 10 the
+\ delta's length, 14 whether it's applied.
+\ Meta page: 24 count (two cells)  2C the state root  4C the block it's at
+\ 6C that block's height (two cells)  74 whether it's at a block at all.
+\
+\   stopen ( -- ok )           the disk's state (or an empty one)
+\   stroot ( out -- )          the root (8 cells)
+\   stapply ( hash -- ok )     apply the parsed block (src/block.fam's bparse):
+\                              spend, append, check the header's root and
+\                              count, keep undo data under its hash
+\   stunapl ( hash -- ok )   undo it (it must be the last applied)
+\ Commit (pgcommit) or abort (pgabort) after either.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: stdep ( -- n )    28 lit ;                            \ 40 levels
+: stfrom ( -- n )   4 lit ;                             \ nodes stored from here up
+
+\ ── 64-bit numbers: (lo hi) ──
+
+: qlo variable ;   : qhi variable ;
+
+\ q>> ( lo hi n -- lo' hi' )   shift right, n < 64.
+: q>> ( lo hi n -- lo' hi' )
+	rot rot qhi ! qlo !
+	dup 20 lit u< if
+		?dup if
+			qlo @ over rshift  qhi @ 20 lit 3 lit pick - lshift or
+			qhi @ rot rshift
+		else qlo @ qhi @ then
+	else
+		20 lit - qhi @ swap rshift 0 lit
+	then
+;
+
+\ q<< ( lo hi n -- lo' hi' )   shift left, n < 64.
+: q<< ( lo hi n -- lo' hi' )
+	rot rot qhi ! qlo !
+	dup 20 lit u< if
+		?dup if
+			qlo @ over lshift
+			qhi @ 2 lit pick lshift  qlo @ 20 lit 4 lit pick - rshift or
+			rot drop
+		else qlo @ qhi @ then
+	else
+		20 lit - qlo @ swap lshift 0 lit swap
+	then
+;
+
+\ q1+ ( lo hi -- lo' hi' )
+: q1+ ( lo hi -- lo' hi' )   swap 1 lit + dup 0= if swap 1 lit + swap else swap then ;
+
+\ be! ( w a -- )   a word, big-endian.   qbe! ( lo hi a -- )   qbe@ ( a -- lo hi )
+: be! ( w a -- )
+	over 18 lit rshift over c!  over 10 lit rshift over 1 lit + c!
+	over 8 lit rshift over 2 lit + c!  3 lit + c!
+;
+: qbe! ( lo hi a -- )   tuck be! 4 lit + be! ;
+: qbe@ ( a -- lo hi )   dup 4 lit + be32 swap be32 ;
+
+\ binc ( a n -- )   add one to n bytes, big-endian.
+: bincn variable ;
+: binc ( a n -- )
+	dup bincn ! 1 lit swap 0 lit do
+		over bincn @ 1 lit - i - + dup c@ rot +
+		dup FF lit and rot c!  8 lit rshift
+	loop
+	2drop
+;
+
+\ ── Hashes ──
+
+: sthv variable ;   : sthb ( -- a )   sthv 60 lit lazy ;
+: stno variable ;   : stnl variable ;
+
+\ stnode ( l r level out -- )   the node above l and r.
+: stnode ( l r level out -- )
+	stno ! stnl !
+	sthb 18 lit zero
+	sthb 20 lit + 8 lit cpy
+	sthb 8 lit cpy
+	300 lit stnl @ + sthb 40 lit + !  10 lit sthb 44 lit + !
+	sthb p2perm  sthb stno @ 8 lit cpy
+;
+
+\ stleaf ( comm nonce height out -- )   an unspent output's leaf: its
+\        commitment (32 bytes) and nonce's limbs, its height in the capacity.
+: stleaf ( comm nonce height out -- )
+	stno ! stnl !
+	sthb 18 lit zero
+	8 lit 0 lit do dup i blimb sthb 20 lit + i 2 lit lshift + ! loop drop
+	sthb 8 lit ucells
+	2FF lit sthb 40 lit + !  10 lit sthb 44 lit + !  stnl @ fred sthb 48 lit + !
+	sthb p2perm  sthb stno @ 8 lit cpy
+;
+
+\ The all-EMPTY and all-SPENT subtrees' hashes, levels 0 .. 40.
+: stev variable ;   : stsv variable ;
+: stemp ( l -- a )   5 lit lshift stev @ + ;
+: stspt ( l -- a )   5 lit lshift stsv @ + ;
+: sttabs ( -- )
+	stev @ 0= if
+		520 lit alloc stev !  520 lit alloc stsv !
+		0 lit stemp 8 lit zero  0 lit stspt 8 lit zero  1 lit 0 lit stspt !
+		stdep 0 lit do
+			i stemp i stemp i i 1 lit + stemp stnode
+			i stspt i stspt i i 1 lit + stspt stnode
+		loop
+	then
+;
+
+\ ── The trees ──
+
+: stleaves ( -- )   0 lit 8 lit 34 lit btuse ;
+: stindex ( -- )    1 lit 20 lit 8 lit btuse ;
+: stnodes ( -- )    2 lit 9 lit 20 lit btuse ;
+: stundot ( -- )    3 lit 20 lit 18 lit btuse ;
+
+: stkv variable ;   : stk ( -- a )   stkv 40 lit lazy ;   \ a key
+: stqv variable ;   : stq ( -- a )   stqv 40 lit lazy ;   \ a key read
+: stvv variable ;   : stv ( -- a )   stvv 40 lit lazy ;   \ a value
+: stwv variable ;   : stw ( -- a )   stwv 40 lit lazy ;   \ another
+: sthkv variable ;  : sthk ( -- a )  sthkv 8 lit lazy ;
+
+: stc@ ( -- lo hi )   pgm 24 lit + @ pgm 28 lit + @ ;
+: stc! ( lo hi -- )   pgm 28 lit + ! pgm 24 lit + ! pgmd ;
+
+\ ── Unspent outputs in a range ──
+\ An entry (60 bytes): position (8, big-endian), then the record.
+
+: stenv variable ;  : stent ( -- a )  stenv 400 lit lazy ;   \ up to 16
+: ste ( k -- a )   3C lit * stent + ;
+: stlim variable ;  : stn variable ;
+
+\ stun ( alo ahi blo bhi limit -- n )   the unspent outputs at positions
+\        a .. b-1, in order, at most limit of them, into stent.
+: stun ( alo ahi blo bhi limit -- n )
+	stlim ! sthk qbe! stk qbe!
+	stleaves  0 lit stn !
+	begin
+		stn @ stlim @ u< if
+			stk stq stv btseek if stq sthk 8 lit mcmp 0< else 0 lit then
+		else 0 lit then
+	while
+		stq stn @ ste 8 lit ncpy  stv stn @ ste 8 lit + 34 lit ncpy
+		stn @ 1 lit + stn !
+		stq stk 8 lit ncpy  stk 8 lit binc
+	repeat
+	stn @
+;
+
+\ ── Subtree hashes ──
+\ Frame l (16 cells), for a subtree at level l: 0,1 its index; 2 its entries;
+\ 3 how many; 4,5 its first position; 6,7 one past its last; 8,9 its left
+\ child's index; A how many entries are in the left child.
+
+: stfv variable ;
+: stf ( l k -- a )   2 lit lshift swap 6 lit lshift + stfv A40 lit lazy + ;
+: stresv variable ;   : stres ( l -- a )   5 lit lshift stresv 520 lit lazy + ;
+: stlv variable ;   : stleft ( l -- a )  5 lit lshift stlv 520 lit lazy + ;
+: stll variable ;   : stml variable ;   : stmh variable ;
+
+\ stlohi ( l -- )   frame l's positions, from its index.
+: stlohi ( l -- )
+	stll !
+	stll @ 0 lit stf @  stll @ 1 lit stf @  stll @ q<<  stll @ 5 lit stf !  stll @ 4 lit stf !
+	stll @ 0 lit stf @ stll @ 1 lit stf @ q1+  stll @ q<<  stll @ 7 lit stf !  stll @ 6 lit stf !
+;
+
+\ sthash ( l -- )   the hash of frame l's subtree, into stres l (the Rust
+\        `subtree_hash`).
+: sthash ( l -- )
+	dup stlohi
+	dup 4 lit stf @ over 5 lit stf @ stc@ du< 0= if                \ all past the count: empty
+		dup stemp over stres 8 lit cpy
+	else
+	dup 3 lit stf @ 0=  stc@ 3 lit pick 6 lit stf @ 4 lit pick 7 lit stf @ du< 0= and if
+		dup stspt over stres 8 lit cpy                              \ none unspent, all below: spent
+	else
+	dup 0= if                                                       \ one position
+		dup 3 lit stf @ if
+			dup 2 lit stf @  dup 8 lit +  over 28 lit +  2 lit pick 38 lit + be32  4 lit pick stres  stleaf
+			drop
+		else
+			0 lit stspt over stres 8 lit cpy
+		then
+	else
+		dup 0 lit stf @ over 1 lit stf @ 1 lit q<<  2 lit pick 9 lit stf !  over 8 lit stf !
+		dup 8 lit stf @ 1 lit or over 9 lit stf @ 2 lit pick 1 lit - q<<  stmh ! stml !
+		0 lit
+		over 3 lit stf @ ?dup if 0 lit do
+			over 2 lit stf @ i 3C lit * + qbe@ stml @ stmh @ du< if 1 lit + then
+		loop then
+		over A lit stf !
+		dup 8 lit stf @ over 1 lit - 0 lit stf !  dup 9 lit stf @ over 1 lit - 1 lit stf !
+		dup 2 lit stf @ over 1 lit - 2 lit stf !  dup A lit stf @ over 1 lit - 3 lit stf !
+		dup 1 lit - sthash
+		dup 1 lit - stres over stleft 8 lit cpy
+		dup 8 lit stf @ 1 lit or over 1 lit - 0 lit stf !  dup 9 lit stf @ over 1 lit - 1 lit stf !
+		dup 2 lit stf @ over A lit stf @ 3C lit * + over 1 lit - 2 lit stf !
+		dup 3 lit stf @ over A lit stf @ - over 1 lit - 3 lit stf !
+		dup 1 lit - sthash
+		dup stleft over 1 lit - stres 2 lit pick 1 lit - 3 lit pick stres stnode
+	then then then
+	drop
+;
+
+\ stget ( l ilo ihi out -- )   node (l, i): stored, else computed from the
+\        records (the Rust `get`).
+: stgo variable ;   : stgf variable ;
+: stget ( l ilo ihi out -- )
+	stgo !  2 lit pick 1 lit stf !  over 0 lit stf !
+	0 lit stgf !
+	dup stfrom u< 0= if
+		stnodes  dup stk c!  dup 0 lit stf @ over 1 lit stf @ stk 1 lit + qbe!
+		stk stv btget if stv stgo @ 8 lit cpy  -1 lit stgf ! then
+	then
+	stgf @ 0= if
+		dup stlohi
+		dup 4 lit stf @ over 5 lit stf @ stc@ du< 0= if
+			dup stemp stgo @ 8 lit cpy
+		else
+			dup 4 lit stf @ over 5 lit stf @ 2 lit pick 6 lit stf @ 3 lit pick 7 lit stf @
+			4 lit pick stfrom u< 0= if 2 lit else 10 lit then stun          ( l n )
+			over stfrom u< 0= over 1 lit > and if "corrupt state tree" puts A lit putc bye then
+			over 3 lit stf !  stent over 2 lit stf !
+			dup sthash  dup stres stgo @ 8 lit cpy
+		then
+	then
+	drop
+;
+
+\ stroot ( out -- )   the root.
+: stroot ( out -- )   stdep swap 0 lit swap 0 lit swap stget ;
+
+\ ── Changes ──
+
+: stpl variable ;  : stph variable ;  : stil variable ;  : stih variable ;
+: stLv variable ;  : stL ( -- a )  stLv 20 lit lazy ;
+: stRv variable ;  : stR ( -- a )  stRv 20 lit lazy ;
+: stVv variable ;  : stV ( -- a )  stVv 20 lit lazy ;
+
+\ stupd ( plo phi -- )   after a change at a position (its record, or the
+\        count): bring the stored nodes above it up to date -- each stored
+\        exactly if its subtree holds two or more unspent outputs.
+: stupd ( plo phi -- )
+	stph ! stpl !
+	stdep 1 lit + stfrom do
+		stpl @ stph @ i q>>  stih ! stil !
+		stil @ i 0 lit stf !  stih @ i 1 lit stf !  i stlohi
+		i 4 lit stf @ i 5 lit stf @ i 6 lit stf @ i 7 lit stf @ 2 lit stun 2 lit < if
+			stnodes  i stk c!  stil @ stih @ stk 1 lit + qbe!  stk btdel drop
+		else
+			i 1 lit -  stil @ stih @ 1 lit q<<  stL stget
+			i 1 lit -  stil @ stih @ 1 lit q<< swap 1 lit or swap  stR stget
+			stL stR i 1 lit - stV stnode
+			stnodes  i stk c!  stil @ stih @ stk 1 lit + qbe!  stk stV btput
+		then
+	loop
+;
+
+\ stpush ( comm nonce height -- )   append an output.
+: stht variable ;
+: stpush ( comm nonce height -- )
+	stht !
+	stv 20 lit + 10 lit ncpy
+	dup stv 20 lit ncpy
+	stht @ stv 30 lit + be!
+	stc@ stk qbe!  stleaves stk stv btput
+	stc@ stw qbe!  stindex stw btput
+	stc@ 2dup stph ! stpl !  q1+ stc!
+	stpl @ stph @ stupd
+;
+
+\ Undo data: a chain of pages, each 0 the next page, 4 how many entries, then
+\ entries of 60 bytes: a spent output's position and record.
+: stuf variable ;  : stul variable ;  : stuk variable ;  : stum variable ;
+
+\ stuadd ( key rec -- )   note a spent output.
+: stuadd ( key rec -- )
+	stul @ 0= if pgnew dup stuf ! stul ! else
+		stul @ pgget 4 lit + @ 44 lit = if
+			pgnew dup stul @ pgget !  stul @ pgdirty  stul !
+		then
+	then
+	stul @ pgget dup 4 lit + @ 3C lit * + 8 lit +
+	rot over 8 lit ncpy  8 lit + 34 lit ncpy
+	stul @ pgget 4 lit + dup @ 1 lit + swap !  stul @ pgdirty
+	stuk @ 1 lit + stuk !
+;
+
+\ stspend ( comm -- ok )   spend the unspent output with this commitment.
+: stspend ( comm -- ok )
+	stindex dup stw btget if
+		stw stk 8 lit ncpy
+		stleaves stk stv btget drop
+		stk stv stuadd
+		stleaves stk btdel drop
+		stindex btdel drop
+		stk qbe@ stupd
+		-1 lit
+	else drop 0 lit then
+;
+
+\ ── Blocks ──
+
+: stok variable ;   : stah variable ;
+
+\ stapply ( hash -- ok )   apply the parsed block: spend its inputs (each must
+\        be unspent), append its outputs (none may be a live output's
+\        twin), and check the header's state root and output count.  Keeps
+\        the undo data under the block's hash; the meta page notes the block.
+: stapply ( hash -- ok )
+	stah !  -1 lit stok !  0 lit stuf !  0 lit stul !  0 lit stuk !
+	sttabs
+	bnin @ ?dup if 0 lit do
+		stok @ if bin @ i 5 lit lshift + stspend stok @ and stok ! then
+	loop then
+	stok @ if bnout @ ?dup if 0 lit do
+		stok @ if
+			stindex  bout @ i 5 lit lshift + stw btget if 0 lit stok ! else
+				bout @ i 5 lit lshift +  bnon @ i 4 lit lshift +  bheight drop  stpush
+			then
+		then
+	loop then then
+	stok @ if
+		stV stroot
+		bsroot stV 8 lit ceq  stc@ bhcnt rot = -rot = and and stok !
+	then
+	stok @ if
+		stundot stah @ stw btget 0= if stw 18 lit nzero then
+		stuf @ stw !  stuk @ stw 4 lit + !  bnout @ stw 8 lit + !  -1 lit stw 14 lit + !
+		stundot stah @ stw btput
+		stV pgm 2C lit + 8 lit cpy  stah @ pgm 4C lit + 8 lit cpy
+		bheight pgm 70 lit + ! pgm 6C lit + !  1 lit pgm 74 lit + !  pgmd
+	then
+	stok @
+;
+
+: stuev variable ;  : stue ( -- a )  stuev 40 lit lazy ;   \ an undo entry, copied out
+: stpp variable ;   : stpj variable ;   : stol variable ;   : stoh variable ;
+
+\ stunapl ( hash -- ok )   undo the block with this hash (the last one
+\        applied): drop its outputs, restore the ones it spent.  The caller
+\        notes the parent in the meta page (`stmeta`).
+: stunapl ( hash -- ok )
+	sttabs
+	stundot dup stw btget if stw 14 lit + @ else 0 lit then 0= if drop 0 lit else
+		stw @ stuf !  stw 4 lit + @ stuk !  stw 8 lit + @ stum !
+		\ Its outputs: the last stum positions.
+		stc@ stum @ 0 lit d-  2dup stc!  2dup stph ! stpl !     ( keep )
+		stum @ ?dup if 0 lit do
+			stpl @ stph @ stk qbe!
+			stleaves stk stv btget drop
+			stindex stv btdel drop
+			stleaves stk btdel drop
+			stpl @ stph @ q1+ stph ! stpl !
+		loop then
+		\ The nodes over them: one update per 16 positions they covered.
+		stpl @ stol !  stph @ stoh !                            \ the old count
+		begin 2dup stol @ stoh @ du< while
+			2dup stupd
+			4 lit q>> q1+ 4 lit q<<
+		repeat
+		2drop
+		\ The outputs it spent, back.
+		stuf @ stpp !
+		begin stpp @ while
+			0 lit stpj !
+			begin stpj @ stpp @ pgget 4 lit + @ u< while
+				stpp @ pgget 8 lit + stpj @ 3C lit * + stue 3C lit ncpy
+				stleaves stue stue 8 lit + btput
+				stindex stue 8 lit + stue btput
+				stue qbe@ stupd
+				stpj @ 1 lit + stpj !
+			repeat
+			stpp @ pgget @  stpp @ pgfree  stpp !
+		repeat
+		stundot dup stw btget drop                              \ keep its delta; it's not applied
+		0 lit stw !  0 lit stw 4 lit + !  0 lit stw 8 lit + !  0 lit stw 14 lit + !
+		stw btput
+		-1 lit
+	then
+;
+
+\ stmeta ( hash hlo hhi -- )   the meta page: the state is at this block.
+: stmeta ( hash hlo hhi -- )
+	pgm 70 lit + ! pgm 6C lit + !  pgm 4C lit + 8 lit cpy
+	stV stroot  stV pgm 2C lit + 8 lit cpy  pgmd
+;
+
+\ stopen ( -- ok )   the state on the disk (empty, if the pages are new).
+: stopen ( -- ok )   pgopen sttabs ;

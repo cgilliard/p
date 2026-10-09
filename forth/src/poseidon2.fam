@@ -467,6 +467,66 @@ E39E0EFC ,   \ bnez t4,loop
 	drop
 ;
 
+\ ── hash_octets, streamed ──
+\ The Rust node's `hash_octets(domain, length, elements)` -- the sponge that
+\ *overwrites* the rate's first whole octets with each block of up to 16
+\ elements -- fed one element at a time, for inputs too long to gather:
+\   osbeg ( st domain length -- )   os+ ( x -- )   osend ( -- )
+\ The digest is st's first 8 cells.  Elements must be below p.
+: osst variable ;   : osn variable ;   : osk variable ;
+: osbv variable ;   : osb ( -- a )   osbv 40 lit lazy ;   \ the pending block
+: osbeg ( st domain length -- )
+	rot dup osst ! 18 lit zero
+	osst @ 44 lit + !  osst @ 40 lit + !
+	0 lit osn !  0 lit osk !
+;
+: osflush ( -- )
+	osst @ osn @ 7 lit + 3 lit rshift 3 lit lshift zero
+	osb osst @ osn @ cpy
+	osst @ p2perm
+	0 lit osn !
+;
+: os+ ( x -- )
+	osb osn @ 2 lit lshift + !
+	osn @ 1 lit + osn !  osk @ 1 lit + osk !
+	osn @ 10 lit = if osflush then
+;
+: osend ( -- )
+	osn @ if osflush then
+	osk @ 0= if osst @ p2perm then
+;
+
+\ ── hash_bytes, streamed ──
+\ The Rust node's `hash_bytes` (above, `p2hashb`) fed in pieces: the total
+\ byte length must be known at the start (it goes in the capacity).
+\   hbbeg ( st length -- )   hbytes ( a n -- )   hb1 ( byte -- )   hbend ( -- )
+\ The digest is st's first 8 cells.
+: hbst variable ;   : hbk variable ;   : hbacc variable ;   : hbc variable ;
+: hbel variable ;
+: hbbeg ( st length -- )
+	swap dup hbst ! 18 lit zero
+	hbst @ 44 lit + !  3 lit hbst @ 40 lit + !
+	0 lit hbk !  0 lit hbacc !  0 lit hbc !  0 lit hbel !
+;
+\ hbel+ ( x -- )   add an element into the rate; permute when it's full.
+: hbel+ ( x -- )
+	hbst @ hbk @ 2 lit lshift + dup @ rot fadd swap !
+	hbk @ 1 lit + hbk !  hbel @ 1 lit + hbel !
+	hbk @ 10 lit = if hbst @ p2perm 0 lit hbk ! then
+;
+: hb1 ( byte -- )
+	hbc @ 3 lit lshift lshift hbacc @ or hbacc !
+	hbc @ 1 lit + dup hbc !
+	3 lit = if hbacc @ hbel+ 0 lit hbacc ! 0 lit hbc ! then
+;
+: hbytes ( a n -- )   ?dup if 0 lit do dup i + c@ hb1 loop then drop ;
+\ hbw ( w -- )   a word's 4 bytes, little-endian.
+: hbw ( w -- )   4 lit 0 lit do dup FF lit and hb1 8 lit rshift loop drop ;
+: hbend ( -- )
+	hbc @ if hbacc @ hbel+ then
+	hbk @ hbel @ 0= or if hbst @ p2perm then
+;
+
 \ ── Tests (./tools/fam --test src/poseidon2.fam) ──
 \ Vectors: Plonky3's known answer for width 24, and values printed by the Rust
 \ node's own poseidon2 module.
@@ -701,6 +761,53 @@ Test {
 		dup 14 lit + @ 34873430u lit asrt_eq
 		dup 18 lit + @ 1389336456u lit asrt_eq
 		dup 1C lit + @ 1021951306u lit asrt_eq
+		drop
+	}
+	octets_streamed {
+		\ hash_octets(5, 36, the 9 words of bytes 13i+5) -- merkle.fam's leaf_36 vector
+		60 lit alloc dup 5 lit 24 lit osbeg
+		9 lit 0 lit do
+			0 lit 4 lit 0 lit do j 4 lit * 3 lit + i - D lit * 5 lit + FF lit and swap 8 lit lshift or loop
+			fred os+
+		loop
+		osend
+		dup 0 lit + @ 1119850225u lit asrt_eq
+		dup 4 lit + @ 1892464453u lit asrt_eq
+		dup 8 lit + @ 382549955u lit asrt_eq
+		dup C lit + @ 1515539828u lit asrt_eq
+		dup 10 lit + @ 593465510u lit asrt_eq
+		dup 14 lit + @ 789342952u lit asrt_eq
+		dup 18 lit + @ 377292749u lit asrt_eq
+		dup 1C lit + @ 1672900119u lit asrt_eq
+		drop
+	}
+	bytes_streamed {
+		\ the 50-byte vector above, fed as 1 + 7 + 42 bytes
+		60 lit alloc 40 lit alloc
+		32 lit 0 lit do i 7 lit * 1 lit + over i + c! loop
+		over 32 lit hbbeg
+		dup 1 lit hbytes  dup 1 lit + 7 lit hbytes  dup 8 lit + 2A lit hbytes  drop
+		hbend
+		dup 0 lit + @ 1936706032u lit asrt_eq
+		dup 4 lit + @ 1418895020u lit asrt_eq
+		dup 8 lit + @ 571421219u lit asrt_eq
+		dup C lit + @ 1839519753u lit asrt_eq
+		dup 10 lit + @ 332337588u lit asrt_eq
+		dup 14 lit + @ 1317138386u lit asrt_eq
+		dup 18 lit + @ 1780501116u lit asrt_eq
+		dup 1C lit + @ 393480214u lit asrt_eq
+		drop
+	}
+	bytes_streamed_empty {
+		60 lit alloc dup 0 lit hbbeg hbend
+		dup 0 lit + @ 1133275667u lit asrt_eq
+		dup 4 lit + @ 461544711u lit asrt_eq
+		dup 8 lit + @ 1895306845u lit asrt_eq
+		dup C lit + @ 23423162u lit asrt_eq
+		dup 10 lit + @ 1276277755u lit asrt_eq
+		dup 14 lit + @ 1332227967u lit asrt_eq
+		dup 18 lit + @ 1947193451u lit asrt_eq
+		dup 1C lit + @ 1963375900u lit asrt_eq
 		drop
 	}
 	hash_0 {

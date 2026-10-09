@@ -947,6 +947,239 @@ mod tests {
         );
     }
 
+    /// Test blocks for the Forth validator (`forth/tests/fixtures/<network>/`):
+    /// a real chain of genesis, block 1 (its reward to a known key) and block
+    /// 2 (its reward, and one transaction spending block 1's output: one
+    /// input, two outputs, a fee), with every block's proofs and the chain
+    /// proof that block 2's child would carry -- plus each block's tip, its
+    /// target, and its root proof's challenge and product, and how long each
+    /// step took. Slow (about 25 minutes on main); rerun after any consensus
+    /// change: `[NETWORK=dev] cargo test --release -- --ignored --nocapture forth_fixtures`.
+    #[test]
+    #[ignore]
+    fn forth_fixtures() {
+        let net = if network::current() == network::Network::Dev { "dev" } else { "main" };
+        let out = format!("{}/../forth/tests/fixtures/{net}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::create_dir_all(&out).unwrap();
+        let start = std::time::Instant::now();
+        let mut times = String::new();
+        let mut timed = |what: &str, since: std::time::Instant| times += &format!("TIME {what} {:.1}\n", since.elapsed().as_secs_f64());
+        let (dir, storage) = temp_storage("forth-fixtures");
+        let genesis = genesis_block();
+        let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap();
+        let mut chain_prover = chain_step::ChainProver::new(difficulty_config(), prover::tree());
+        let s = std::time::Instant::now();
+        let mut chain_proof = chain_prover.prove(&chain.chain_proof_inputs(genesis.header.hash()).unwrap(), || None, [1; 32]).unwrap();
+        timed("genesis_chain_proof_with_keys", s);
+        let key = |k: u8| wots::keygen(&[k; 32]);
+        let (sk1, pk1) = key(5);
+        const FEE: u64 = 10_000;
+        let pay = 600_000_000;
+        let mut info = String::new();
+        let j = |v: &[poseidon2::BabyBear]| v.iter().map(|x| x.value().to_string()).collect::<Vec<_>>().join(" ");
+        let h = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let tip_line = |name: &str, t: &chain_step::Tip| {
+            format!(
+                "TIP {name} hash {} height {} timestamp {} target {} state_root {} output_count {} anchor {} work {}\n",
+                h(&t.hash), t.height, t.timestamp, h(&t.target), h(&t.state_root), t.output_count, t.anchor_timestamp, h(&t.work)
+            )
+        };
+        info += &tip_line("0", &chain.chain_proof_inputs(genesis.header.hash()).unwrap().tip);
+        std::fs::write(format!("{out}/block0.bin"), genesis.to_bytes()).unwrap();
+        let mut parent = genesis.header;
+        for height in 1..=2u64 {
+            let reward_amount = prover::schedule().reward(height).unwrap();
+            let mut txs = Vec::new();
+            let mut reward = transaction::Transaction::new();
+            if height == 1 {
+                reward.add_output(output::Output::new(&pk1, reward_amount)).unwrap();
+                txs.push(reward);
+            } else {
+                reward.add_output(output::Output::new(&key(8).1, reward_amount + FEE)).unwrap();
+                let mut spend = transaction::Transaction::new();
+                spend.add_input(&pk1, prover::REWARD).unwrap();
+                spend.add_output(output::Output::new(&key(6).1, pay)).unwrap();
+                spend.add_output(output::Output::new(&key(7).1, prover::REWARD - pay - FEE)).unwrap();
+                assert!(spend.sign_input(&pk1, &sk1));
+                txs.push(reward);
+                txs.push(spend);
+            }
+            let unproven = chain.build_block(&txs).unwrap();
+            let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
+            let s = std::time::Instant::now();
+            let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &txs, &unproven.plan, [2 + height as u8; 32]).unwrap();
+            timed(&format!("block{height}_proof"), s);
+            let mut block = unproven.finish_with_chain_proof(proof, chain_proof);
+            block.header.timestamp = block.header.timestamp.max(min_timestamp);
+            let s = std::time::Instant::now();
+            while !mine_block(&mut block, &target, MINE_BATCH, &difficulty_config().pow) {
+                block.header.timestamp = now_millis();
+            }
+            timed(&format!("block{height}_mining"), s);
+            let parent_state = (parent.state_root, parent.output_count);
+            let s = std::time::Instant::now();
+            assert!(block.validate(&target, &difficulty_config().pow, parent_state, reward_amount));
+            timed(&format!("block{height}_rust_validate"), s);
+            let node = prover::block_root(&block.body.proof, &block.body.inputs, &block.body.outputs, &block.body.nonces, &block.state_change(parent_state), height as u32).unwrap();
+            info += &format!(
+                "BLOCK {height} target {} reward {reward_amount} inputs {} outputs {} challenge {} product {} len {} proof_len {} chain_proof_len {}\n",
+                h(&target), block.body.inputs.len(), block.body.outputs.len(), j(&node.challenge), j(&node.product.0),
+                block.to_bytes().len(), block.body.proof.as_bytes().len(), block.body.chain_proof.len()
+            );
+            let hash = block.header.hash();
+            chain.apply_block(&block).unwrap();
+            let s = std::time::Instant::now();
+            chain_proof = chain_prover.prove(&chain.chain_proof_inputs(hash).unwrap(), || None, [9 + height as u8; 32]).unwrap();
+            timed(&format!("block{height}_chain_proof"), s);
+            info += &tip_line(&height.to_string(), &chain.chain_proof_inputs(hash).unwrap().tip);
+            std::fs::write(format!("{out}/block{height}.bin"), block.to_bytes()).unwrap();
+            parent = block.header;
+        }
+        std::fs::write(format!("{out}/chain2.bin"), &chain_proof).unwrap();
+        timed("total", start);
+        std::fs::write(format!("{out}/info.txt"), format!("NETWORK {net}\n{info}{times}")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A data directory for a Rust node the Forth validator syncs from
+    /// (`forth/scripts/test_net.sh`): `forth/tmp/peer-<network>`, holding the
+    /// fixture chain's genesis, block 1, and the 2b/3b branch
+    /// (`forth_fixtures`, `forth_fork_fixtures`) -- so 3b is its tip. Quick:
+    /// `cargo test --release -- --ignored forth_peer_data`.
+    #[test]
+    #[ignore]
+    fn forth_peer_data() {
+        let net = if network::current() == network::Network::Dev { "dev" } else { "main" };
+        let fixtures = format!("{}/../forth/tests/fixtures/{net}", env!("CARGO_MANIFEST_DIR"));
+        let dir = std::path::PathBuf::from(format!("{}/../forth/tmp/peer-{net}", env!("CARGO_MANIFEST_DIR")));
+        let _ = std::fs::remove_dir_all(&dir);
+        let read = |name: &str| block::Block::from_bytes(&std::fs::read(format!("{fixtures}/{name}")).unwrap()).unwrap();
+        let storage = Storage::open_with_map_size(&dir, storage::NODE_MAP_SIZE).unwrap();
+        let genesis = genesis_block();
+        assert_eq!(genesis.to_bytes(), read("block0.bin").to_bytes(), "the fixtures are from another genesis");
+        let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&genesis)).unwrap();
+        chain.require_chain_proofs(chain_step::consensus_verifier());
+        for name in ["block1.bin", "block2b.bin", "block3b.bin"] {
+            chain.apply_block(&read(name)).unwrap();
+        }
+    }
+
+    /// Fast sync for the Forth validator's tests (`forth/tests/fixtures/<network>/`,
+    /// reading `forth_fixtures`' chain): the state as of blocks 1 and 2, as
+    /// this node serves it, in `snap1.bin` and `snap2.bin` -- the sync point
+    /// (target, window start as a big-endian u64, work), then each piece in
+    /// the order a download takes them: level, index and length (big-endian
+    /// u32s), the bytes, zeros to a multiple of 4. Quick (no proving):
+    /// `[NETWORK=dev] cargo test --release -- --ignored --nocapture forth_snapshot_fixtures`.
+    #[test]
+    #[ignore]
+    fn forth_snapshot_fixtures() {
+        let net = if network::current() == network::Network::Dev { "dev" } else { "main" };
+        let out = format!("{}/../forth/tests/fixtures/{net}", env!("CARGO_MANIFEST_DIR"));
+        let read = |name: &str| block::Block::from_bytes(&std::fs::read(format!("{out}/{name}")).unwrap()).unwrap();
+        let blocks = [read("block0.bin"), read("block1.bin"), read("block2.bin")];
+        let (dir, storage) = temp_storage("forth-snapshot-fixtures");
+        let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&blocks[0])).unwrap();
+        chain.apply_block(&blocks[1]).unwrap();
+        chain.apply_block(&blocks[2]).unwrap();
+        let reader = chain::StateReader::open(&storage).unwrap();
+        for k in [1, 2] {
+            let header = &blocks[k].header;
+            let hash = header.hash();
+            let point = reader.sync_point(hash).unwrap().unwrap();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&point.target);
+            bytes.extend_from_slice(&point.anchor_timestamp.to_be_bytes());
+            bytes.extend_from_slice(&point.work);
+            let mut plan = snapshot::Plan::new(header.state_root, header.output_count);
+            while let Some(piece) = plan.next() {
+                let data = reader.piece(hash, piece.level, piece.index).unwrap().unwrap();
+                assert!(plan.accept(&piece, &data));
+                for v in [piece.level as u32, piece.index as u32, data.len() as u32] {
+                    bytes.extend_from_slice(&v.to_be_bytes());
+                }
+                bytes.extend_from_slice(&data);
+                bytes.resize(bytes.len().next_multiple_of(4), 0);
+            }
+            std::fs::write(format!("{out}/snap{k}.bin"), bytes).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A side branch for the Forth validator's reorganization tests
+    /// (`forth/tests/fixtures/<network>/`, next to `forth_fixtures`' chain,
+    /// which it reads): blocks 2b and 3b on block 1 -- each just a reward, to
+    /// other keys -- so the branch outweighs block 2. Plus 3b's chain proof.
+    /// Slow (about 25 minutes on main):
+    /// `[NETWORK=dev] cargo test --release -- --ignored --nocapture forth_fork_fixtures`.
+    #[test]
+    #[ignore]
+    fn forth_fork_fixtures() {
+        let net = if network::current() == network::Network::Dev { "dev" } else { "main" };
+        let out = format!("{}/../forth/tests/fixtures/{net}", env!("CARGO_MANIFEST_DIR"));
+        let read = |name: &str| block::Block::from_bytes(&std::fs::read(format!("{out}/{name}")).unwrap()).unwrap();
+        let (block0, block1, block2) = (read("block0.bin"), read("block1.bin"), read("block2.bin"));
+        let start = std::time::Instant::now();
+        let mut times = String::new();
+        let mut timed = |what: &str, since: std::time::Instant| times += &format!("TIME {what} {:.1}\n", since.elapsed().as_secs_f64());
+        let (dir, storage) = temp_storage("forth-fork-fixtures");
+        let mut chain = Chain::open(&storage, difficulty_config(), MAX_REORG_DEPTH, Some(&block0)).unwrap();
+        chain.apply_block(&block1).unwrap();
+        let mut chain_prover = chain_step::ChainProver::new(difficulty_config(), prover::tree());
+        // Block 1's chain proof: what block 2 carries. (The prover derives
+        // its keys from block 1's inputs, the chain's second block.)
+        let mut chain_proof = block2.body.chain_proof.clone();
+        let h = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let j = |v: &[poseidon2::BabyBear]| v.iter().map(|x| x.value().to_string()).collect::<Vec<_>>().join(" ");
+        let tip_line = |name: &str, t: &chain_step::Tip| {
+            format!(
+                "TIP {name} hash {} height {} timestamp {} target {} state_root {} output_count {} anchor {} work {}\n",
+                h(&t.hash), t.height, t.timestamp, h(&t.target), h(&t.state_root), t.output_count, t.anchor_timestamp, h(&t.work)
+            )
+        };
+        let mut info = String::new();
+        let block1_hash = block1.header.hash();
+        let mut parent = block1.header;
+        for (height, name, key) in [(2u64, "2b", 9u8), (3, "3b", 10)] {
+            let reward_amount = prover::schedule().reward(height).unwrap();
+            let mut reward = transaction::Transaction::new();
+            reward.add_output(output::Output::new(&wots::keygen(&[key; 32]).1, reward_amount)).unwrap();
+            let txs = [reward];
+            let unproven = chain.build_block(&txs).unwrap();
+            let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
+            let s = std::time::Instant::now();
+            let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &txs, &unproven.plan, [20 + height as u8; 32]).unwrap();
+            timed(&format!("block{name}_proof"), s);
+            let mut block = unproven.finish_with_chain_proof(proof, chain_proof);
+            block.header.timestamp = block.header.timestamp.max(min_timestamp);
+            let s = std::time::Instant::now();
+            while !mine_block(&mut block, &target, MINE_BATCH, &difficulty_config().pow) {
+                block.header.timestamp = now_millis();
+            }
+            timed(&format!("block{name}_mining"), s);
+            let parent_state = (parent.state_root, parent.output_count);
+            assert!(block.validate(&target, &difficulty_config().pow, parent_state, reward_amount));
+            let node = prover::block_root(&block.body.proof, &block.body.inputs, &block.body.outputs, &block.body.nonces, &block.state_change(parent_state), height as u32).unwrap();
+            info += &format!(
+                "BLOCK {name} target {} reward {reward_amount} inputs {} outputs {} challenge {} product {} len {} proof_len {} chain_proof_len {}\n",
+                h(&target), block.body.inputs.len(), block.body.outputs.len(), j(&node.challenge), j(&node.product.0),
+                block.to_bytes().len(), block.body.proof.as_bytes().len(), block.body.chain_proof.len()
+            );
+            let hash = block.header.hash();
+            chain.apply_block(&block).unwrap();
+            let s = std::time::Instant::now();
+            chain_proof = chain_prover.prove(&chain.chain_proof_inputs(hash).unwrap(), || chain.chain_proof_inputs(block1_hash).ok(), [30 + height as u8; 32]).unwrap();
+            timed(&format!("block{name}_chain_proof"), s);
+            info += &tip_line(name, &chain.chain_proof_inputs(hash).unwrap().tip);
+            std::fs::write(format!("{out}/block{name}.bin"), block.to_bytes()).unwrap();
+            parent = block.header;
+        }
+        std::fs::write(format!("{out}/chain3b.bin"), &chain_proof).unwrap();
+        timed("total", start);
+        std::fs::write(format!("{out}/fork.txt"), format!("NETWORK {net}\n{info}{times}")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn u256_to_f64_matches_small_values_exactly() {
         let mut value = [0u8; 32];

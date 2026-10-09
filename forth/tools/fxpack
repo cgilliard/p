@@ -1,0 +1,22 @@
+#!/bin/sh
+# fxpack OUT FILE... -- bundle test fixtures into one file to load into a test
+# VM's memory (`tools/fam --load=OUT@0x87000000`; read with tests/fx.fam):
+#   "FXPK", the file count (4 bytes, little-endian), then for each file its
+#   length (4 bytes, little-endian) and its bytes, zero-padded to a multiple
+#   of 4.
+set -e
+le32() {
+	v=$1
+	printf "$(printf '\\%03o' $((v & 255)) $(((v >> 8) & 255)) $(((v >> 16) & 255)) $(((v >> 24) & 255)))"
+}
+out=$1; shift
+{
+	printf 'FXPK'
+	le32 $#
+	for f in "$@"; do
+		n=$(wc -c < "$f" | tr -d ' \t')
+		le32 "$n"
+		cat "$f"
+		head -c $(((4 - n % 4) % 4)) /dev/zero
+	done
+} > "$out"

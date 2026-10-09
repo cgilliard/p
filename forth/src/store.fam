@@ -1,0 +1,199 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/store.fam — the node's chain: every block it has validated, as its
+\ header and tip, on the virtio disk; and the best tip (the most work).
+\
+\ A validating node needs no blocks, state or undo data: a block is checked
+\ against its parent's tip alone (src/header.fam).  So the store keeps tips,
+\ side branches included, and choosing between forks is choosing the tip with
+\ the most cumulative work -- a reorganization just moves the best tip.
+\
+\ Disk: the first 32 MiB are left for the boot image (scripts/makenode.sh
+\ writes bin/full_node.bin there; tabernacle boots it), so sector numbers here
+\ count from `dbbase`.  Sector 0 is the superblock ("TIPS", version 1, the
+\ network); sector
+\ k + 1 is record k: "TREC", a checksum, the header (188 bytes, at 8) and the
+\ tip (160 bytes, at 0xC4).  Records are appended; the log ends at the first
+\ sector whose magic or checksum doesn't hold (a torn last write included).
+\
+\ Memory: each record's hash's first 8 bytes (a key), and an open-addressing
+\ table of record numbers by key -- room for 2^20 blocks (about 20 years of
+\ ten-minute blocks) in 16 MiB.  A key match is confirmed against the hash on
+\ disk.
+\
+\   dbopen ( -- ok )        attach the disk; read the chain, or start one
+\   dbfmt  ( -- )           start an empty chain
+\   dbacc  ( a n -- ok )    validate a block on its parent and keep it
+\   dbtip  ( -- tip | 0 )   the best tip
+\   dbget  ( hash -- tip | 0 )   a block's tip, by its hash
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: dbcap ( -- n )   100000 lit ;                       \ records: 2^20
+: dbtsz ( -- n )   200000 lit ;                       \ table slots: 2^21
+
+: dbds variable ;     \ the disk's driver state (0 until attached)
+: dbcnt variable ;    \ records in the log
+: dbbr variable ;     \ the best record (-1: none)
+: dbkv variable ;   : dbkeys ( -- a )  dbkv dbcap 3 lit lshift lazy ;
+: dbtv variable ;   : dbtab ( -- a )   dbtv dbtsz 2 lit lshift lazy ;
+: dbbv variable ;   : dbbuf ( -- a )   dbbv 200 lit lazy ;    \ a sector
+: dbbtv variable ;  : dbbt ( -- a )    dbbtv A0 lit lazy ;    \ the best tip
+: dbpv variable ;   : dbpt ( -- a )    dbpv A0 lit lazy ;     \ a parent's tip
+: dbnv variable ;   : dbnt ( -- a )    dbnv A0 lit lazy ;     \ a new tip
+: dbiv variable ;   : dbid ( -- a )    dbiv 20 lit lazy ;     \ a block's id
+
+: dbbase ( -- s )   10000 lit ;                      \ past the boot image: 32 MiB
+: dbtmag ( -- w )   53504954 lit ;                   \ "TIPS"
+: dbrmag ( -- w )   43455254 lit ;                   \ "TREC"
+
+\ ── The disk ──
+
+\ dbio ( sector buf write? -- ok )   one sector, waiting for it.
+: dbio ( sector buf write? -- ok )
+	rot dbbase + -rot
+	if dbds @ -rot vwrite else dbds @ -rot vread then
+	vwait vstat nip 1 lit =
+;
+\ dbsync ( -- )   make what's written durable (if the disk caches writes).
+: dbsync ( -- )   dbds @ vflush dup -1 lit = if 2drop else vwait 2drop then ;
+
+\ dbdev ( -- ok )   find and set up the disk, once.
+: dbdev ( -- ok )
+	dbds @ if -1 lit else
+		bfind ?dup if
+			48 lit alloc swap over !
+			D000 lit alloc FFF lit + FFFFF000 lit and dup qzero over 4 lit + !
+			vblkinit dbds !  -1 lit
+		else 0 lit then
+	then
+;
+
+\ dbsum ( buf -- c )   a record's checksum: over its header and tip, each word
+\        folded in as c = rotl(c, 5) xor w.
+: dbsum ( buf -- c )
+	0 lit 59 lit 2 lit do
+		over i 2 lit lshift + @ swap dup 5 lit lshift swap 1B lit rshift or xor
+	loop
+	nip
+;
+
+\ dbrd ( k -- ok )   read record k into dbbuf; ok if it's a whole record.
+: dbrd ( k -- ok )
+	1 lit + dbbuf 0 lit dbio
+	dbbuf @ dbrmag = and
+	dbbuf 4 lit + @ dbbuf dbsum = and
+;
+
+\ ── The index ──
+
+: dbkey ( k -- a )   3 lit lshift dbkeys + ;
+: dbslot ( hash -- slot )   @ dbtsz 1 lit - and ;
+: dbnext ( slot -- slot' )   1 lit + dbtsz 1 lit - and ;
+: dbt@ ( slot -- v )   2 lit lshift dbtab + @ ;
+
+\ dbins ( k -- )   index record k (its key already set).
+: dbins ( k -- )
+	dup dbkey dbslot
+	begin dup dbt@ while dbnext repeat
+	2 lit lshift dbtab + swap 1 lit + swap !
+;
+
+\ dbfind ( hash -- k )   the record of the block with this hash, or -1.
+: dbfr variable ;
+: dbfind ( hash -- k )
+	-1 lit dbfr !
+	dup dbslot
+	begin dup dbt@ dbfr @ 0< and while                 ( hash slot )
+		dup dbt@ 1 lit -                                ( hash slot k )
+		dup dbkey 3 lit pick 2 lit ceq if
+			dup dbrd if dbbuf C4 lit + 3 lit pick 8 lit ceq if dup dbfr ! then then
+		then
+		drop dbnext
+	repeat
+	2drop dbfr @
+;
+
+\ dbnote ( k tip -- )   record k joins the index; it's the best if its work is
+\        more than the best's (the first seen wins a tie).
+: dbnote ( k tip -- )
+	2dup swap dbkey 2 lit cpy
+	over dbins
+	dbbr @ 0< if -1 lit else dup 80 lit + dbbt 80 lit + c32cmp 1 lit = then
+	if dbbt A0 lit ncpy dbbr ! else 2drop then
+;
+
+\ ── The log ──
+
+\ dbreset ( -- )   an empty index.
+: dbreset ( -- )   0 lit dbcnt !  -1 lit dbbr !  dbtab dbtsz zero ;
+
+\ dbfmt ( -- )   start an empty chain on the disk.
+: dbfmt ( -- )
+	dbreset
+	dbbuf 80 lit zero  dbtmag dbbuf !  1 lit dbbuf 4 lit + !  bnet @ dbbuf 8 lit + !
+	0 lit dbbuf -1 lit dbio drop
+	dbbuf 80 lit zero  1 lit dbbuf -1 lit dbio drop
+	dbsync
+;
+
+\ dbopen ( -- ok )   attach the disk and read its chain, or start one if it
+\        holds none (dbnew set: the caller starts its state afresh too).  A
+\        disk holding the other network's chain is refused (dbwrong set).
+: dbnew variable ;  : dbwrong variable ;
+: dbopen ( -- ok )
+	0 lit dbnew !  0 lit dbwrong !
+	dbdev dup if
+		0 lit dbbuf 0 lit dbio
+		dbbuf @ dbtmag = and  dbbuf 4 lit + @ 1 lit = and
+		if
+			dbbuf 8 lit + @ bnet @ = if
+				dbreset
+				begin dbcnt @ dbcap u< if dbcnt @ dbrd else 0 lit then while
+					dbcnt @ dbbuf C4 lit + dbnote
+					dbcnt @ 1 lit + dbcnt !
+				repeat
+			else -1 lit dbwrong !  drop 0 lit then
+		else dbfmt  -1 lit dbnew ! then
+	then
+;
+
+\ dbput ( hdr tip -- ok )   append a record, durably, and index it.
+: dbput ( hdr tip -- ok )
+	dbcnt @ dbcap u< if
+		dbbuf 80 lit zero  dbrmag dbbuf !
+		swap dbbuf 8 lit + BC lit ncpy
+		dup dbbuf C4 lit + A0 lit ncpy
+		dbbuf dbsum dbbuf 4 lit + !
+		dbcnt @ 1 lit + dbbuf -1 lit dbio
+		dup if
+			dbsync
+			dbcnt @ rot dbnote
+			dbcnt @ 1 lit + dbcnt !
+		else nip then
+	else 2drop 0 lit then
+;
+
+\ ── Blocks ──
+
+: dbtip ( -- tip | 0 )   dbbr @ 0< if 0 lit else dbbt then ;
+: dbget ( hash -- tip | 0 )   dbfind dup 0< if drop 0 lit else dbrd drop dbbuf C4 lit + then ;
+
+\ dbacc ( a n -- ok )   validate a block on its parent (already kept) and keep
+\        it.  Already kept: ok, nothing to do.  Genesis: checked as the
+\        network's.  An unknown parent: refused (the node keeps no orphans).
+: dbok variable ;
+: dbacc ( a n -- ok )
+	0 lit dbok !
+	2dup bparse if
+		bhdr @ dbid hdrid
+		dbid dbfind 0< 0= if -1 lit dbok ! 2drop else
+		bheight or 0= if
+			dbnt tipgen if bhdr @ dbnt dbput dbok ! then
+		else
+			bhdr @ 4 lit + dbfind dup 0< if drop 2drop else
+				dbrd drop  dbbuf C4 lit + dbpt A0 lit ncpy
+				dbpt dbnt tipnext if bhdr @ dbnt dbput dbok ! then
+			then
+		then then
+	else 2drop then
+	dbok @
+;

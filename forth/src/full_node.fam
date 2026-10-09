@@ -1,7 +1,132 @@
-'h' lit  putc
-'e' lit  putc
-'l' lit  putc
-'l' lit  putc
-'o' lit  putc
-'\n' lit putc
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/full_node.fam — the node: read its settings, open the disk (the chain
+\ and state carry over between runs), start the network, and keep in step
+\ with its peers, saying what it's doing.
+\
+\ Settings arrive on the serial input (after tabernacle's own line, when
+\ booted by it), ended by EOT (0x04), separated by spaces:
+\   seed=A.B.C.D:PORT   a host to start from (any number; 127.x.x.x is the
+\                       host machine, reached through QEMU's gateway)
+\   port=N              our UDP port (47653)
+\   depth=N             fast sync: start N blocks behind the best peer, on a
+\                       node with nothing past genesis (25; 0: never)
+\   net=main | net=dev  the network (main)
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: fncv variable ;  : fncfg ( -- a )  fncv 400 lit lazy ;
+: fncn variable ;  : fnp variable ;
+
+\ fnread ( -- )   the settings, up to EOT.
+: fnread ( -- )
+	0 lit fncn !
+	begin getc dup 4 lit = 0= while
+		fncn @ 3FF lit u< if fncfg fncn @ + c!  fncn @ 1 lit + fncn ! else drop then
+	repeat drop
+	0 lit fncfg fncn @ + c!  0 lit fnp !
+;
+
+: fnc ( -- c )   fncfg fnp @ + c@ ;                  \ the next character
+: fn+ ( -- )     fnp @ 1 lit + fnp ! ;
+
+\ fnpre? ( s -- f )   whether the setting at fnp starts with string s (then
+\        skipped).
+: fnpre? ( s -- f )
+	0 lit  begin over over + c@ dup if fncfg fnp @ + 2 lit pick + c@ = else drop 0 lit then while 1 lit + repeat
+	over over + c@ 0= if fnp @ + fnp ! drop -1 lit else 2drop 0 lit then
+;
+
+\ fnnum ( -- n )   a decimal number.
+: fnnum ( -- n )
+	0 lit  begin fnc 30 lit - A lit u< while A lit * fnc 30 lit - + fn+ repeat
+;
+
+\ fnip ( -- ip port )   A.B.C.D:PORT
+: fnip ( -- ip port )
+	fnnum  3 lit 0 lit do fn+ 8 lit lshift fnnum or loop
+	fn+ fnnum
+;
+
+: fnbad ( -- )   "node: a setting it doesn't know: " puts  fncfg fnp @ + puts  A lit putc bye ;
+
+\ fnparse ( -- )
+: fnparse ( -- )
+	begin
+		begin fnc 20 lit = fnc A lit = or fnc D lit = or fnc 9 lit = or while fn+ repeat
+		fnc
+	while
+		"seed=" fnpre? if
+			fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then pseed
+		else "port=" fnpre? if fnnum nport !
+		else "depth=" fnpre? if fnnum pfdep !
+		else "net=dev" fnpre? if 1 lit bnet !
+		else "net=main" fnpre? if 0 lit bnet !
+		else fnbad then then then then then
+	repeat
+;
+
+\ ── Saying what it's doing ──
+
+: fndec ( n -- )   dup A lit u< if 30 lit + putc else dup A lit / fndec A lit % 30 lit + putc then ;
+: fnnib ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then putc ;
+: fnhex ( a n -- )   0 lit do dup i + c@ dup 4 lit rshift fnnib fnnib loop drop ;
+: fnip. ( ip -- )   4 lit 0 lit do dup 18 lit i 3 lit lshift - rshift FF lit and fndec  i 3 lit u< if 2E lit putc then loop drop ;
+
+: fnth variable ;  : fnhv variable ;  : fnhash ( -- a )  fnhv 20 lit lazy ;
+: fnfs variable ;  : fnpc variable ;  : fnph variable ;
+
+\ fnpeers ( -- n )   peers that have answered.
+: fnpeers ( -- n )   0 lit ppn 0 lit do i pp 8 lit + @ 2 lit = if 1 lit + then loop ;
+
+\ fnsay ( -- )   a line whenever the tip, the fast sync's phase or the peers
+\        answering change.
+: fnsay ( -- )
+	dbtip ?dup if
+		dup fnhash 8 lit ceq 0= if
+			dup fnhash 8 lit cpy
+			"tip: height " puts dup 20 lit + @ fndec  "  " puts  dup 6 lit fnhex
+			"  outputs " puts dup 70 lit + @ fndec  A lit putc
+		then drop
+	then
+	pfsv @ fnfs @ = 0= if
+		pfsv @ dup fnfs !
+		dup 1 lit = if "fast sync: waiting to hear a peer's height\n" puts then
+		dup 2 lit = if "fast sync: fetching blocks " puts pq @ fndec " and " puts pq @ 1 lit + fndec A lit putc then
+		dup 3 lit = if "fast sync: checking the sync point's chain proof\n" puts then
+		dup 4 lit = if "fast sync: downloading the state, piece by piece\n" puts then
+		0= if "syncing block by block\n" puts then
+	then
+	fnpeers dup fnpc @ = 0= if dup fnpc ! "peers: " puts fndec A lit putc else drop then
+	0 lit pbest dup 0< if drop else
+		pp 28 lit + @ dup fnph @ = if drop else dup fnph ! "best peer: height " puts fndec A lit putc then
+	then
+;
+
+\ ── Running ──
+
+\ fnclean ( -- )   zero the heap, from here to below the data stack (64 MiB
+\        above the heap's base, `init`): booted by tabernacle, that memory
+\        holds tabernacle's stacks and queues, and the node counts on fresh
+\        memory being zero, as it is when QEMU loads it directly.
+: fnclean ( -- )   gp@  s10@ 5000 lit + 3F00000 lit +  over - 2 lit rshift zero ;
+
+\ fnmain ( -- )
+: fnmain ( -- )
+	fnclean
+	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  BA25 lit nport !
+	19 lit pfdep !  0 lit bnet !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
+	fnread fnparse
+	"node: " puts  bnet @ if "dev" else "main" then puts  " network, UDP port " puts nport @ fndec
+	", fast sync depth " puts pfdep @ fndec A lit putc
+	acopen 0= if
+		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"
+		else "node: no disk" then puts A lit putc bye
+	then
+	dbtip ?dup if "node: resuming at height " puts 20 lit + @ fndec A lit putc else "node: a new chain\n" puts then
+	pstart 0= if "node: no network device" puts A lit putc bye then
+	ppn 0 lit do i pp 8 lit + @ if "node: seed " puts i pp @ fnip. 3A lit putc i pp 4 lit + @ fndec A lit putc then loop
+	begin pstep fnsay 0 lit until
+;
+
+ntext                 \ first: find the Bible text, keep the heap off it (src/text.fam)
+fnmain
 bye

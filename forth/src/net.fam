@@ -1,0 +1,247 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/net.fam — UDP over virtio-net (legacy MMIO, polled): the node's one
+\ datagram socket.  Ethernet, ARP (answering for our address, resolving the
+\ next hop), IPv4 (no options sent, no fragments taken), UDP (no checksum
+\ sent -- optional over IPv4 -- and none checked).
+\
+\ Addressing is static, QEMU user networking's by default: 10.0.2.15/24,
+\ gateway 10.0.2.2 (`nadr`, `ngw`, `nmask`; the port is `nport`).  A peer
+\ off our subnet is reached through the gateway.
+\
+\ Region (page-aligned): 0 the receive queue (descriptors, available ring
+\ at 0x100, used ring at 0x1000), 0x2000 the transmit queue (likewise), 0x4000
+\ 16 receive buffers of 0x600, 0xA000 the transmit buffer, 0xA800 ARP's (so
+\ resolving an address never touches a datagram being built).  Each buffer
+\ starts with the virtio-net header (`nhl`: 12 bytes, or 10 without
+\ mergeable buffers).
+\
+\   nopen ( -- ok )            find and start the device
+\   nrecv ( -- f )             a datagram for us, if one has arrived: then
+\                              nsrc (address) nsport (port) npay (its bytes)
+\                              npn (its length), valid until the next nrecv
+\   npkt ( -- a )              where to build a datagram's bytes
+\   nsend ( ip port n -- ok )  send the n bytes built at npkt
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: ndev variable ;  : nq variable ;  : nhl variable ;
+: nrxc variable ;  : nrxa variable ;  : ntxc variable ;  : nheld variable ;  : nrid variable ;
+: nmacv variable ;  : nmac ( -- a )  nmacv 8 lit lazy ;
+: nadr variable ;  : ngw variable ;  : nmask variable ;  : nport variable ;  : nipid variable ;
+: nsrc variable ;  : nsport variable ;  : npay variable ;  : npn variable ;
+
+: nrxb ( id -- a )   600 lit * 4000 lit + nq @ + ;
+: nfb variable ;                                     \ the transmit buffer in use
+: ntxb ( -- a )      nfb @ nq @ + ;
+
+\ Big-endian halfwords and words in packets.
+: nb16@ ( a -- v )   dup c@ 8 lit lshift swap 1 lit + c@ or ;
+: nb16! ( v a -- )   over 8 lit rshift over c!  1 lit + c! ;
+
+\ nfind ( -- dev | 0 )   the virtio-net device (DeviceID 1).
+: nfd variable ;
+: nfind ( -- dev | 0 )
+	0 lit nfd !  10008000 lit
+	begin dup 10001000 lit u< 0= nfd @ 0= and while
+		dup @ 74726976 lit = over 8 lit + @ 1 lit = and if dup nfd ! then
+		1000 lit -
+	repeat drop nfd @
+;
+
+\ nqueue ( q off n -- )   queue q (0 receive, 1 transmit): n entries at region
+\        offset off.
+: nqueue ( q off n -- )
+	rot ndev @ 30 lit + !  ndev @ 38 lit + !  1000 lit ndev @ 3C lit + !
+	nq @ + C lit rshift ndev @ 40 lit + !
+;
+
+\ nstat ( bits -- )   set device status bits.
+: nstat ( bits -- )   ndev @ 70 lit + @ or ndev @ 70 lit + ! ;
+
+\ npost ( id -- )   hand receive buffer id (back) to the device.
+: npost ( id -- )
+	nq @ 104 lit + nrxa @ F lit and 1 lit lshift + h!
+	nrxa @ 1 lit + dup nrxa !  nq @ 102 lit + h!
+;
+
+\ nopen ( -- ok )   find the device, negotiate (its MAC address; mergeable
+\        receive buffers if offered), set up both queues, and fill the
+\        receive queue.
+: nopen ( -- ok )
+	nfind dup ndev ! if
+		B000 lit alloc FFF lit + FFFFF000 lit and nq !
+		nq @ 2980 lit zero
+		0 lit nrxc !  0 lit nrxa !  0 lit ntxc !  0 lit nheld !  A000 lit nfb !
+		nadr @ 0= if A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  BA25 lit nport ! then
+		0 lit ndev @ 70 lit + !  1 lit nstat  2 lit nstat
+		ndev @ 10 lit + @ 8020 lit and dup ndev @ 20 lit + !
+		8000 lit and if C lit else A lit then nhl !
+		8 lit nstat
+		1000 lit ndev @ 28 lit + !
+		0 lit 0 lit 10 lit nqueue
+		10 lit 0 lit do
+			i nrxb  nq @ i 4 lit lshift + !  0 lit nq @ i 4 lit lshift + 4 lit + !
+			600 lit nq @ i 4 lit lshift + 8 lit + !  2 lit nq @ i 4 lit lshift + C lit + h!
+			i npost
+		loop
+		1 lit 2000 lit 10 lit nqueue
+		6 lit 0 lit do ndev @ 100 lit + i + c@ nmac i + c! loop
+		fence_io  4 lit nstat
+		fence_io  0 lit ndev @ 50 lit + !
+	then
+	ndev @ 0= 0=
+;
+
+\ ── Frames ──
+
+\ ntx ( n -- )   send the frame of n bytes built at ntxb + nhl, and wait for
+\        the device to take it.
+: ntx ( n -- )
+	ntxb nhl @ nzero
+	ntxb nq @ 2000 lit + !  0 lit nq @ 2004 lit + !
+	nhl @ + nq @ 2008 lit + !  0 lit nq @ 200C lit + h!
+	0 lit nq @ 2104 lit + ntxc @ F lit and 1 lit lshift + h!
+	ntxc @ 1 lit + dup ntxc !  nq @ 2102 lit + h!
+	fence_io  1 lit ndev @ 50 lit + !
+	100000 lit begin
+		1 lit -  dup 0= nq @ 3002 lit + h@ ntxc @ FFFF lit and = or
+	until drop
+	fence_r
+;
+
+\ nframe ( -- a )   the frame being built.
+: nframe ( -- a )   ntxb nhl @ + ;
+
+\ neth ( mac type -- a )   an Ethernet header to mac: the payload's address.
+: neth ( mac type -- a )
+	nframe C lit + nb16!  nframe 6 lit ncpy  nmac nframe 6 lit + 6 lit ncpy
+	nframe E lit +
+;
+
+\ ── ARP ──
+\ The cache: 8 entries of (address, MAC), filled round robin.
+
+: nacv variable ;  : nac ( -- a )  nacv 60 lit lazy ;   : nacn variable ;
+: nbcv variable ;  : nbcast ( -- a )  nbcv 8 lit lazy ;
+
+: narp@ ( ip -- mac | 0 )
+	0 lit swap  8 lit 0 lit do
+		nac i C lit * + @ over = if nip nac i C lit * + 4 lit + swap then
+	loop drop
+;
+: narp! ( ip mac -- )
+	over narp@ ?dup if 6 lit ncpy drop else
+		nac nacn @ 7 lit and C lit * +  rot over !  4 lit + 6 lit ncpy
+		nacn @ 1 lit + nacn !
+	then
+;
+
+\ narpout ( op mac ip tmac -- )   an ARP packet: to mac (the frame) and ip
+\        / tmac (in it).
+: nato variable ;  : natm variable ;  : nati variable ;
+: narpout ( op mac ip tmac -- )
+	natm ! nati !  A800 lit nfb !  806 lit neth nato !
+	1 lit nato @ nb16!  800 lit nato @ 2 lit + nb16!  6 lit nato @ 4 lit + c!  4 lit nato @ 5 lit + c!
+	nato @ 6 lit + nb16!
+	nmac nato @ 8 lit + 6 lit ncpy  nadr @ nato @ E lit + be!
+	natm @ nato @ 12 lit + 6 lit ncpy  nati @ nato @ 18 lit + be!
+	nato @ 1C lit + 12 lit nzero
+	3C lit ntx  A000 lit nfb !
+;
+
+\ ── Receiving ──
+
+\ nrx ( -- a n | 0 0 )   the next received frame, if any (held until nfree).
+: nrx ( -- a n )
+	nq @ 1002 lit + h@ nrxc @ FFFF lit and = if 0 lit 0 lit else
+		fence_r
+		nq @ 1004 lit + nrxc @ F lit and 3 lit lshift +
+		dup @ nrid !  4 lit + @ nhl @ -
+		nrid @ nrxb nhl @ + swap
+		nrxc @ 1 lit + nrxc !
+	then
+;
+: nfree ( -- )   nrid @ npost  fence_io  0 lit ndev @ 50 lit + ! ;
+
+\ nin ( a n -- f )   handle a frame: answer ARP for us and learn from ARP;
+\        an IPv4 UDP datagram to our port -> true (nsrc .. npn set).
+: nin ( a n -- f )
+	dup 2A lit u< if 2drop 0 lit else
+	over C lit + nb16@ dup 806 lit = if
+		2drop E lit +
+		dup 18 lit + be32 nadr @ = over 6 lit + nb16@ 1 lit = and if    \ asking for us
+			dup E lit + be32 over 8 lit + narp!
+			2 lit over 8 lit +  2 lit pick E lit + be32  3 lit pick 8 lit + narpout
+		else
+			dup 6 lit + nb16@ 2 lit = if dup E lit + be32 over 8 lit + narp! then
+		then
+		drop 0 lit
+	else 800 lit = if
+		swap E lit + swap E lit -                               ( ip n )
+		over c@ 45 lit =  over 1C lit u< 0= and
+		2 lit pick 9 lit + c@ 11 lit = and
+		2 lit pick 10 lit + be32 nadr @ = and
+		2 lit pick 6 lit + nb16@ 3FFF lit and 0= and            \ not a fragment
+		2 lit pick 2 lit + nb16@ 2 lit pick u> 0= and            \ its length fits
+		if
+			drop  dup C lit + be32 nsrc !
+			dup 14 lit + dup nb16@ nsport !
+			dup 2 lit + nb16@ nport @ =
+			over 4 lit + nb16@ 8 lit -  dup npn !
+			3 lit pick 2 lit + nb16@ 1C lit - u> 0= and          \ the UDP length fits
+			swap 8 lit + npay !  nip
+		else 2drop 0 lit then
+	else 2drop 0 lit then then then
+;
+
+\ nrecv ( -- f )
+: nrecv ( -- f )
+	nheld @ if nfree 0 lit nheld ! then
+	nrx dup if
+		nin dup if -1 lit nheld ! else nfree then
+	else 2drop 0 lit then
+;
+
+\ ── Sending ──
+
+: npkt ( -- a )   nframe 2A lit + ;
+
+\ nhop ( ip -- mac | 0 )   the next hop's MAC: asked for (ARP) if not known,
+\        waiting up to half a second (frames meanwhile: ARP only).
+: nhw variable ;  : nhl0 variable ;  : nhh variable ;
+: nhop ( ip -- mac | 0 )
+	dup nadr @ xor nmask @ and if drop ngw @ then
+	dup narp@ ?dup if nip else
+		FFFFFFFF lit nbcast !  FFFF lit nbcast 4 lit + h!
+		1 lit nbcast 2 lit pick nbcast 8 lit + narpout
+		hnow drop nhw !
+		begin
+			nrx dup if
+				over C lit + nb16@ 806 lit = if nin drop else 2drop then  nfree
+			else 2drop then
+			dup narp@  hnow drop nhw @ - 1F4 lit u> or
+		until
+		narp@
+	then
+;
+
+\ nsend ( ip port n -- ok )   the n bytes at npkt, as a UDP datagram.
+: nsdi variable ;  : nsdp variable ;  : nsdn variable ;  : nsdm variable ;
+: nsend ( ip port n -- ok )
+	nsdn ! nsdp ! nsdi !
+	nheld @ if nfree 0 lit nheld ! then                        \ (its buffer may be reused)
+	nsdi @ nhop dup nsdm ! if
+		nsdm @ 800 lit neth                                     ( ip header )
+		dup 14 lit nzero
+		45 lit over c!  nsdn @ 1C lit + over 2 lit + nb16!
+		nipid @ 1 lit + dup nipid ! over 4 lit + nb16!  4000 lit over 6 lit + nb16!
+		40 lit over 8 lit + c!  11 lit over 9 lit + c!
+		nadr @ over C lit + be!  nsdi @ over 10 lit + be!
+		0 lit  A lit 0 lit do over i 1 lit lshift + nb16@ + loop
+		dup 10 lit rshift + dup 10 lit rshift + FFFF lit and FFFF lit xor
+		over A lit + nb16!
+		14 lit +
+		nport @ over nb16!  nsdp @ over 2 lit + nb16!  nsdn @ 8 lit + over 4 lit + nb16!  0 lit swap 6 lit + nb16!
+		nsdn @ 2A lit + dup 3C lit u< if drop 3C lit then ntx
+		-1 lit
+	else 0 lit then
+;

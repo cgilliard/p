@@ -1,0 +1,64 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/text.fam — the Bible text (data/akjv.txt.gz, exactly as shipped): where
+\ it is in memory, and keeping the heap off it.
+\
+\ The build appends 0x5000 zero bytes and then the text to the node's image
+\ (scripts/build.sh; `tools/fam --append` for test builds).  At startup gp
+\ points just past the image; `init` puts the return-id stack (0x1000 bytes)
+\ and the variables (0x4000) there and starts the heap after them, at
+\ s10 + 0x5000 -- so the zeros become the stack and the (zero-initialized)
+\ variables, and the text starts exactly at the heap's base.
+\
+\ `ntext` must run before anything allocates: it points wtext/wtextn at the
+\ text and moves the heap pointer past it.  The node calls it first; in test
+\ builds this file's test does (it runs before every other test).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ s10@ ( -- a )   the return-id stack's floor: where the image ended.
+:M s10@
+93020D00 ,   \ addi t0,s10,0
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw   t0,0(sp)
+;
+\ gp@ ( -- a )   the heap pointer.   gp! ( a -- )   set it.
+:M gp@
+93820100 ,   \ addi t0,gp,0
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw   t0,0(sp)
+;
+:M gp!
+83220100 ,   \ lw   t0,0(sp)
+13014100 ,   \ addi sp,sp,4
+93810200 ,   \ addi gp,t0,0
+;
+
+: wtext variable ;    \ the text's address
+: wtextn variable ;   \ and length in bytes
+
+\ The text's length: a consensus constant (`scripture::TEXT`).
+: textlen ( -- n )   1291059u lit ;
+
+\ ntext ( -- )   find the text, and keep the heap off it.
+: ntext ( -- )
+	s10@ 5000 lit + wtext !  textlen wtextn !
+	wtext @ wtextn @ + 3 lit + -4 lit and                \ the text's end, aligned
+	dup gp@ u> if gp! else drop then
+;
+
+Test {
+	text_in_place {
+		ntext
+		wtext @ c@ 1F lit asrt_eq                         \ gzip's magic: 1f 8b 08
+		wtext @ 1 lit + c@ 8B lit asrt_eq
+		wtext @ 2 lit + c@ 8 lit asrt_eq
+		gp@ wtext @ wtextn @ + u< 0= assert              \ the heap is past it
+		10 lit alloc wtext @ wtextn @ + u< 0= assert     \ and so is the next allocation
+	}
+}
+
+\ In bench builds, too, before any bench allocates.
+Bench {
+	text_setup {
+		ntext
+	}
+}

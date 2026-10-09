@@ -1,0 +1,143 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/header.fam — a block on its parent: the header rules, and the tip it
+\ makes (../rust/src/chain.rs `apply_block`, `next_retarget`; the tip as
+\ src/chain.fam lays it out).
+\
+\   tipgen  ( a n out -- ok )          the genesis block: its id must be the
+\                                       network's genesis hash
+\   tipnext ( a n parent out -- ok )   any later block, on its parent's tip
+\
+\ A block on its parent must: name the parent (prev_hash), be one higher,
+\ have a later timestamp, claim the reward due at its height (the chain hasn't
+\ ended), meet the parent's target, pass `bvalid` against the parent's state,
+\ and carry a chain proof of the parent's tip.  Its tip: its id, height,
+\ timestamp, the next target (ASERT, from the parent's anchor), its state
+\ root and output count, the anchor (the genesis block's timestamp), and the
+\ parent's work plus the work of the target it met.
+\
+\ And no block may claim a time more than two hours ahead of this node's clock
+\ (`hnow`: QEMU's Goldfish RTC, the host's time; real hardware will need its
+\ own clock here).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ mghash ( -- a )   main's genesis block id.
+: mghash ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004002 ,   \ jal   x0,+36
+0AE6A56B , D798665B , 288B080E , ECCFD663 , F6D50851 , BEED4965 , 082C9D4B , C4E8AD64 ,
+;
+
+\ dghash ( -- a )   dev's genesis block id.
+: dghash ( -- a )
+97020000 ,   \ auipc t0,0
+93824201 ,   \ addi  t0,t0,20
+1301C1FF ,   \ addi  sp,sp,-4
+23205100 ,   \ sw    t0,0(sp)
+6F004002 ,   \ jal   x0,+36
+4E99D03C , D8CCFA71 , 54643B5C , CC700559 , 44E76A34 , 08EDE524 , 76FE2F28 , B3690B74 ,
+;
+
+: ghash ( -- a )   bnet @ if dghash else mghash then ;
+
+\ Header fields: the timestamp (a u64), and the block's state root (bytes).
+: bts ( -- lo hi )   bhdr @ 98 lit + be32  bhdr @ 94 lit + be32 ;
+
+\ ── The clock ──
+
+\ hnov / hnoh: a time set by hand (tests); 0 means read the clock.
+: hnov variable ;   : hnoh variable ;
+: hns variable ;    : hnsv variable ;   : hnsb ( -- a )   hnsv 10 lit lazy ;
+
+\ hnow ( -- lo hi )   now, in milliseconds since the epoch: QEMU virt's Goldfish
+\        RTC (at 0x101000: nanoseconds, the low word first -- reading it
+\        latches the high one), divided by 10^6.
+: hnow ( -- lo hi )
+	hnov @ hnoh @ or if hnov @ hnoh @ else
+		hnsb 10 lit nzero
+		101000 lit @ hnsb !  101004 lit @ hnsb 4 lit + !
+		hnsb 8 lit F4240 lit ndivw drop
+		hnsb @ hnsb 4 lit + @
+	then
+;
+
+\ hdrift? ( tlo thi -- ok )   whether a timestamp is at most two hours ahead
+\        of now.
+: hdl variable ;   : hdh variable ;
+: hdrift? ( tlo thi -- ok )
+	hdh ! hdl !
+	hnow swap 6DDD00 lit + dup 6DDD00 lit u< if swap 1 lit + swap then swap   ( limit: now + 7,200,000 )
+	hdl @ hdh @ du< 0=
+;
+
+: tpar variable ;   : tout variable ;   : hok variable ;
+: hcheck ( flag -- )   0= if 0 lit hok ! then ;
+
+\ t64! ( lo hi a -- )   a u64 into a tip.   t64@ ( a -- lo hi )
+: t64! ( lo hi a -- )   tuck 4 lit + ! ! ;
+: t64@ ( a -- lo hi )   dup @ swap 4 lit + @ ;
+
+\ tbody ( -- )   the tip fields the header gives: its id, height, timestamp,
+\        state root and output count.
+: tbody ( -- )
+	tout @ A0 lit nzero
+	bhdr @ tout @ hdrid
+	bheight tout @ 20 lit + t64!
+	bts tout @ 28 lit + t64!
+	bsroot tout @ 50 lit + 20 lit ncpy
+	bhcnt tout @ 70 lit + t64!
+;
+
+: tipgen ( a n out -- ok )
+	tout !  -1 lit hok !
+	bparse hcheck
+	hok @ if
+		bheight or 0= hcheck
+		bts hdrift? hcheck
+		tbody
+		tout @ ghash c32cmp 0= hcheck                       \ the network's genesis
+		bts tout @ 78 lit + t64!                            \ the anchor: its own timestamp
+		bts 0 lit 0 lit bts tout @ 30 lit + asert           \ the next target (the first)
+	then
+	hok @ if
+		dX dinit  dX tout @ 80 lit + dwork                  \ its work: the first target's
+	then
+	hok @
+;
+
+: tbn variable ;   : tba variable ;
+
+: tipnext ( a n parent out -- ok )
+	tout ! tpar !  2dup tbn ! tba !  -1 lit hok !
+	bparse hcheck
+	\ Cheap rules first: the parent, the height, the time, the reward.
+	hok @ if
+		bhdr @ 4 lit + tpar @ c32cmp 0= hcheck
+		tpar @ 20 lit + t64@                                 ( parent height: plo phi )
+		swap 1 lit + dup 0= if swap 1 lit + swap then swap   ( plo+1 phi', with the carry )
+		bheight rot = -rot = and hcheck                      \ the block is one higher
+		tpar @ 28 lit + t64@ bts du< hcheck
+		bts hdrift? hcheck
+		bheight drew hcheck brwl !  0 lit brwh !
+	then
+	\ Proof of work against the parent's target.
+	hok @ if bhdr @ tpar @ 30 lit + pwok hcheck then
+	\ The body and its proof, against the parent's state.
+	hok @ if
+		tpar @ 50 lit + bproot !  tpar @ 70 lit + t64@ bpch ! bpcl !
+		tba @ tbn @ bvalid hcheck
+	then
+	\ The chain proof it carries: of the parent's tip.
+	hok @ if bcp @ bcl @ tpar @ chverify hcheck then
+	\ Its tip.
+	hok @ if
+		tbody
+		tpar @ 78 lit + t64@ 2dup tout @ 78 lit + t64!       ( anchor )
+		bheight bts tout @ 30 lit + asert
+		tpar @ 30 lit + tout @ 80 lit + dwork
+		tout @ 80 lit + tpar @ 80 lit + dadd256
+	then
+	hok @
+;

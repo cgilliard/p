@@ -1,0 +1,306 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/btree.fam — B+trees on the pager's pages (src/pager.fam): fixed-size
+\ keys (compared as bytes, so big-endian numbers sort) and values.  Up to
+\ eight trees, each rooted in a cell of the meta page (0..3 at 0x14, 4..7 at
+\ 0x100).
+\
+\ Page: 0 type (1 leaf, 2 inner), 4 n, then
+\   leaf:  n entries, key then value, from 8
+\   inner: child 0 at 8, then n (key, child) pairs from C -- n keys,
+\          n + 1 children; child j holds the keys from key j-1 on.
+\ A node may fill to one entry past its maximum, then splits in two.
+\ Deleting: a leaf that empties is freed and unlinked from its parent (and so
+\ on up); a root inner node left with one child is replaced by it.  Nodes
+\ aren't merged, so a tree can be sparser than it need be, never wrong.
+\
+\   btuse ( id ks vs -- )     work on tree id (0..7), keys ks bytes, values vs
+\   btget ( key out -- found )
+\   btput ( key val -- )      insert, or replace the value
+\   btdel ( key -- found )
+\   btseek ( key kout vout -- found )   the first entry with a key >= key
+\   btdrop ( -- )             empty the tree, freeing its pages
+\
+\ Changes are in the page cache until `pgcommit`.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: btid variable ;  : btks variable ;  : btvs variable ;
+: btes variable ;  : btps variable ;  : btlm variable ;  : btim variable ;
+
+: btuse ( id ks vs -- )
+	btvs ! btks ! btid !
+	btks @ btvs @ + btes !  btks @ 4 lit + btps !
+	FF8 lit btes @ / 1 lit - btlm !                        \ entries a leaf holds
+	FF4 lit btps @ / 1 lit - btim !                        \ keys an inner node holds
+;
+
+: btrta ( -- a )      pgm btid @ 2 lit lshift +  btid @ 4 lit u< if 14 lit else F0 lit then + ;
+: btroot ( -- p )     btrta @ ;
+: btroot! ( p -- )    btrta !  pgmd ;
+
+\ mcmp ( a b n -- c )   compare n bytes: -1, 0 or 1.
+: mcr variable ;
+: mcmp ( a b n -- c )
+	0 lit mcr !
+	0 lit do
+		mcr @ 0= if
+			over i + c@ over i + c@
+			2dup u< if 2drop -1 lit mcr ! else u> if 1 lit mcr ! then then
+		then
+	loop
+	2drop mcr @
+;
+
+\ bmove ( src dst n -- )   copy n bytes; the ranges may overlap.
+: bmove ( src dst n -- )
+	dup 0= if drop 2drop else
+	2 lit pick 2 lit pick u< if                            \ dst above src: from the top
+		dup 0 lit do
+			2 lit pick over 1 lit - i - + c@  2 lit pick 2 lit pick 1 lit - i - + c!
+		loop
+	else
+		dup 0 lit do 2 lit pick i + c@ 2 lit pick i + c! loop
+	then
+	drop 2drop then
+;
+
+: btn@ ( a -- n )    4 lit + @ ;
+: btn! ( n a -- )    4 lit + ! ;
+: btleaf? ( a -- f ) @ 1 lit = ;
+: ble ( a j -- e )   btes @ * + 8 lit + ;                 \ leaf entry j
+: bik ( a j -- k )   btps @ * + C lit + ;                 \ inner key j
+: bic ( a j -- c )   dup if 1 lit - bik btks @ + else drop 8 lit + then ;   \ inner child j
+
+\ The path down to a leaf: each level's page and the child taken.
+: btpp variable ;  : btpi variable ;  : btd variable ;
+: btpage ( d -- p )  2 lit lshift btpp @ + @ ;
+: btpidx ( d -- j )  2 lit lshift btpi @ + @ ;
+: btpath ( -- )
+	btpp @ 0= if 40 lit alloc btpp ! 40 lit alloc btpi ! then
+;
+
+\ btkey variable: the key being worked on.
+: btk variable ;
+
+\ btchild ( a -- j )   which child of inner node a the key goes down: the
+\        number of its keys <= the key.
+: btchild ( a -- j )
+	0 lit over btn@ 0 lit do
+		over i bik btk @ btks @ mcmp 1 lit < if 1 lit + then
+	loop
+	nip
+;
+
+\ btdown ( -- leaf )   from the root to the key's leaf, recording the path
+\        (btd: the leaf's depth).  The root must exist.
+: btdown ( -- a )
+	btpath  0 lit btd !
+	btroot
+	begin                                                  ( p )
+		dup btd @ 2 lit lshift btpp @ + !
+		dup pgget dup btleaf? 0=
+	while                                                  ( p a )
+		dup btchild dup btd @ 2 lit lshift btpi @ + !       ( p a j )
+		bic @ nip
+		btd @ 1 lit + btd !
+	repeat
+	nip
+;
+
+\ btpos ( a -- j )   the first entry of leaf a whose key is >= the key (n if
+\        none is).
+: btpr variable ;
+: btpos ( a -- j )
+	dup btn@ btpr !
+	dup btn@ ?dup if 0 lit do
+		btpr @ over btn@ = if
+			dup i ble btk @ btks @ mcmp -1 lit <> if i btpr ! then
+		then
+	loop then
+	drop btpr @
+;
+
+: bta variable ;   : btj variable ;   : btval variable ;   : btgo variable ;
+: btgf variable ;
+
+\ bthit? ( -- f )   whether leaf bta's entry btj is the key.
+: bthit? ( -- f )
+	btj @ bta @ btn@ u< if bta @ btj @ ble btk @ btks @ mcmp 0= else 0 lit then
+;
+
+: btget ( key out -- found )
+	pgop  btgo ! btk !  0 lit btgf !
+	btroot if
+		btdown bta !  bta @ btpos btj !
+		bthit? if bta @ btj @ ble btks @ + btgo @ btvs @ ncpy  -1 lit btgf ! then
+	then
+	btgf @
+;
+
+\ ── Inserting ──
+
+: btsbv variable ;  : btsepb ( -- a )  btsbv 100 lit lazy ;   \ a separator key
+: btrn variable ;   : btra variable ;
+: btud variable ;   : btur variable ;   : btpa variable ;   : btc variable ;
+
+\ btsplit2 ( -- )   split inner node btpa (one key too many): the upper keys
+\        to a new page (btur); the middle key (btsepb) goes up.
+: btsplit2 ( -- )
+	pgnew dup btur ! pgget btra !
+	2 lit btra @ !
+	btpa @ btn@ dup 1 lit rshift                           ( n m )
+	btpa @ over 1 lit + bic @ btra @ 8 lit + !
+	2dup - 1 lit - btra @ btn!
+	btpa @ over 1 lit + bik  btra @ 0 lit bik  btra @ btn@ btps @ * bmove
+	btpa @ over bik btsepb btks @ ncpy
+	btpa @ btn!  drop
+;
+
+\ btupd ( d rp -- )   the node at depth d split off page rp, with separator
+\        btsepb: put them in its parent -- splitting that too if need be, up to
+\        a new root.
+: btupd ( d rp -- )
+	btur ! btud !
+	begin btud @ 0< 0= while
+		btud @ 0= if
+			pgnew dup pgget                                   ( np na )
+			2 lit over !  1 lit over btn!
+			btroot over 8 lit + !
+			btsepb over C lit + btks @ ncpy
+			btur @ swap C lit + btks @ + !
+			btroot!
+			-1 lit btud !
+		else
+			btud @ 1 lit - btud !
+			btud @ btpage pgget btpa !  btud @ btpidx btc !
+			btpa @ btc @ bik  btpa @ btc @ 1 lit + bik  btpa @ btn@ btc @ - btps @ * bmove
+			btsepb btpa @ btc @ bik btks @ ncpy
+			btur @ btpa @ btc @ bik btks @ + !
+			btpa @ btn@ 1 lit + btpa @ btn!
+			btud @ btpage pgdirty
+			btpa @ btn@ btim @ > if btsplit2 else -1 lit btud ! then
+		then
+	repeat
+;
+
+\ btsplitl ( -- )   split leaf bta (one entry too many): its upper half to a
+\        new page, whose first key goes up.
+: btsplitl ( -- )
+	pgnew dup btrn ! pgget btra !
+	1 lit btra @ !
+	bta @ btn@ dup 1 lit rshift                            ( n h )
+	2dup - btra @ btn!
+	bta @ over ble  btra @ 0 lit ble  btra @ btn@ btes @ * bmove
+	bta @ btn!  drop
+	btra @ 0 lit ble btsepb btks @ ncpy
+	btd @ btrn @ btupd
+;
+
+: btput ( key val -- )
+	pgop  btval ! btk !
+	btroot 0= if pgnew dup btroot! pgget 1 lit swap ! then
+	btdown bta !  bta @ btpos btj !
+	bthit? if
+		btval @ bta @ btj @ ble btks @ + btvs @ ncpy
+		btd @ btpage pgdirty
+	else
+		bta @ btj @ ble  bta @ btj @ 1 lit + ble  bta @ btn@ btj @ - btes @ * bmove
+		btk @ bta @ btj @ ble btks @ ncpy
+		btval @ bta @ btj @ ble btks @ + btvs @ ncpy
+		bta @ btn@ 1 lit + bta @ btn!
+		btd @ btpage pgdirty
+		bta @ btn@ btlm @ > if btsplitl then
+	then
+;
+
+\ ── Deleting ──
+
+\ btrm ( -- )   the node at depth btd is empty: free it and unlink it from
+\        its parent (which, if that was its only child, is empty too).
+: btrm ( -- )
+	begin
+		btd @ btpage pgfree
+		btd @ 0= if 0 lit btroot! 0 lit else
+			btd @ 1 lit - btd !
+			btd @ btpage pgget btpa !  btd @ btpidx btc !
+			btpa @ btn@ 0= if -1 lit else
+				btc @ 0= if
+					btpa @ 1 lit bic @ btpa @ 8 lit + !
+					btpa @ 1 lit bik  btpa @ 0 lit bik  btpa @ btn@ 1 lit - btps @ * bmove
+				else
+					btpa @ btc @ bik  btpa @ btc @ 1 lit - bik  btpa @ btn@ btc @ - btps @ * bmove
+				then
+				btpa @ btn@ 1 lit - btpa @ btn!
+				btd @ btpage pgdirty
+				0 lit
+			then
+		then
+	0= until
+;
+
+\ btcolps ( -- )   while the root is an inner node with one child, the
+\        child is the root.
+: btcolps ( -- )
+	begin btroot dup if pgget dup btleaf? 0= swap btn@ 0= and else drop 0 lit then while
+		btroot dup pgget 8 lit + @ btroot! pgfree
+	repeat
+;
+
+: btdf variable ;
+: btdel ( key -- found )
+	pgop  btk !  0 lit btdf !
+	btroot if
+		btdown bta !  bta @ btpos btj !
+		bthit? if
+			-1 lit btdf !
+			bta @ btj @ 1 lit + ble  bta @ btj @ ble  bta @ btn@ btj @ - 1 lit - btes @ * bmove
+			bta @ btn@ 1 lit - bta @ btn!
+			btd @ btpage pgdirty
+			bta @ btn@ 0= if btrm btcolps then
+		then
+	then
+	btdf @
+;
+
+\ ── Seeking ──
+
+\ btnxl ( -- a | 0 )   the leaf after the one btdown reached: up the path to
+\        the first node with a child to the right, then down its leftmost
+\        side.
+: btnd variable ;
+: btnxl ( -- a )
+	btd @ btnd !  0 lit
+	begin btnd @ 0 lit > over 0= and while
+		btnd @ 1 lit - btnd !
+		btnd @ btpage pgget                                   ( res pa )
+		btnd @ btpidx over btn@ u< if
+			btnd @ btpidx 1 lit + bic @                         ( res p )
+			begin dup pgget dup btleaf? 0= while 8 lit + @ nip repeat
+			nip nip
+		else drop then
+	repeat
+;
+
+: btsk variable ;   : btsv variable ;   : btsf variable ;
+: btseek ( key kout vout -- found )
+	pgop  btsv ! btsk ! btk !  0 lit btsf !
+	btroot if
+		btdown dup btpos                                      ( a j )
+		over btn@ over = if 2drop btnxl 0 lit then
+		over if
+			ble dup btsk @ btks @ ncpy  btks @ + btsv @ btvs @ ncpy
+			-1 lit btsf !
+		else 2drop then
+	then
+	btsf @
+;
+
+\ btfreep ( p -- )   free a node and every node below it.
+: btfreep ( p -- )
+	pgop  dup pgget btleaf? 0= if
+		dup pgget btn@ 1 lit + 0 lit do  pgop dup pgget i bic @ btfreep  loop
+	then
+	pgfree
+;
+
+\ btdrop ( -- )   empty the tree, freeing its pages.
+: btdrop ( -- )   pgop btroot ?dup if btfreep 0 lit btroot! then ;

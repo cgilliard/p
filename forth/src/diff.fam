@@ -1,0 +1,269 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/diff.fam — difficulty: the next target (ASERT, ../rust/src/chain.rs
+\ `asert`), a target's work (pow.rs `work_for_target`), and the reward
+\ schedule (prover.rs `Schedule`).
+\
+\ Numbers here are little-endian byte strings ("bn"s) of a stated length,
+\ worked a byte at a time as the Rust code does: every multiplier is below
+\ 2^23, so a byte times it plus a carry fits a word.  Targets and work live in
+\ tips big-endian (32 bytes), as the Rust node keeps them.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ ── Byte-string arithmetic (n >= 1 throughout) ──
+
+: nzero ( a n -- )      0 lit do 0 lit over i + c! loop drop ;
+: ncpy ( src dst n -- ) 0 lit do over i + c@ over i + c! loop 2drop ;
+\ nrev ( src dst n -- )   reversed (big-endian <-> little-endian).
+: nrev ( src dst n -- )
+	dup 0 lit do 2 lit pick i + c@  2 lit pick 2 lit pick 1 lit - i - + c! loop drop 2drop
+;
+
+: nna variable ;   : nnn variable ;   : nnk variable ;
+
+\ nmulk ( a n k -- )   a = a * k mod 2^8n, for k < 2^23.
+: nmulk ( a n k -- )
+	nnk ! nnn ! nna !
+	0 lit nnn @ 0 lit do
+		nna @ i + c@ nnk @ * +
+		dup FF lit and nna @ i + c!
+		8 lit rshift
+	loop
+	drop
+;
+
+\ nadd ( a b n -- )   a = a + b mod 2^8n.   nsub ( a b n -- )   a = a - b.
+: nadd ( a b n -- )
+	0 lit swap 0 lit do                                ( a b carry )
+		2 lit pick i + c@ + over i + c@ +
+		dup FF lit and 3 lit pick i + c!  8 lit rshift
+	loop
+	drop 2drop
+;
+: nsub ( a b n -- )
+	0 lit swap 0 lit do                                ( a b borrow )
+		2 lit pick i + c@ swap - over i + c@ -          ( a b d )
+		dup 0< if 100 lit + 1 lit else 0 lit then      ( a b d' borrow )
+		swap 3 lit pick i + c!
+	loop
+	drop 2drop
+;
+
+\ ncmp ( a b n -- c )   -1, 0 or 1, as unsigned numbers.
+: ncr variable ;   : ncn variable ;
+: ncmp ( a b n -- c )
+	dup ncn ! 0 lit ncr !
+	0 lit do
+		ncr @ 0= if
+			over ncn @ 1 lit - i - + c@  over ncn @ 1 lit - i - + c@
+			2dup u< if 2drop -1 lit ncr ! else u> if 1 lit ncr ! then then
+		then
+	loop
+	2drop ncr @
+;
+
+\ nneg ( a n -- )   two's complement: a = -a mod 2^8n.
+: nneg ( a n -- )
+	2dup 0 lit do dup i + dup c@ FF lit xor swap c! loop drop
+	1 lit                                              ( a n carry )
+	swap 0 lit do over i + c@ + dup FF lit and 2 lit pick i + c! 8 lit rshift loop
+	2drop
+;
+
+\ nbit ( a i -- b )   bit i.   nset ( a i -- )   set it.
+: nbit ( a i -- b )   dup 3 lit rshift rot + c@ swap 7 lit and rshift 1 lit and ;
+: nset ( a i -- )     dup 3 lit rshift rot + dup c@ rot 7 lit and 1 lit swap lshift or swap c! ;
+
+\ nshl1 ( a n -- )   a = a * 2 mod 2^8n.
+: nshl1 ( a n -- )
+	0 lit swap 0 lit do                                ( a carry )
+		over i + c@ 1 lit lshift or dup FF lit and 2 lit pick i + c! 8 lit rshift
+	loop
+	2drop
+;
+
+\ ndivw ( a n d -- r )   a = a / d (quotient, in place), r the remainder, for
+\        a word d below 2^30: a bit at a time, from the top.
+: nnr variable ;
+: ndivw ( a n d -- r )
+	nnk ! nnn ! nna !  0 lit nnr !
+	nnn @ 3 lit lshift 0 lit do
+		nnn @ 3 lit lshift 1 lit - i -                    ( bit )
+		nna @ over nbit  nnr @ 1 lit lshift or nnr !
+		nna @ over 3 lit rshift + dup c@ 2 lit pick 7 lit and 1 lit swap lshift FF lit xor and swap c!
+		nnr @ nnk @ u< 0= if nnr @ nnk @ - nnr !  nna @ swap nset else drop then
+	loop
+	nnr @
+;
+
+\ ── The network's difficulty ──
+\ Main: 10-minute blocks, a two-day half-life, a first target of 23 leading
+\ zero bits; dev: 10 s, 10 minutes, 20 bits.  (`bnet`: 0 main, 1 dev.)
+
+: dtbt ( -- ms )   bnet @ if 2710 lit else 927C0 lit then ;        \ 10,000 / 600,000
+: dhl ( -- ms )    bnet @ if 927C0 lit else A4CB800 lit then ;     \ 600,000 / 172,800,000
+: dzbits ( -- n )  bnet @ if 14 lit else 17 lit then ;             \ 20 / 23
+
+\ dinit ( a -- )   the first target, 32 bytes big-endian: dzbits zero bits,
+\        then ones.
+: dinit ( a -- )
+	20 lit 0 lit do
+		dzbits i 3 lit lshift - dup 8 lit u< if                     ( a z: zero bits left in this byte )
+			FF lit swap rshift
+		else 0< if FF lit else 0 lit then then
+		over i + c!
+	loop
+	drop
+;
+
+\ ── ASERT ──
+
+: dB variable ;   : dBuf ( -- a )   dB 80 lit lazy ;     \ scratch bns
+: d# ( k -- a )   5 lit lshift dBuf + ;                   \ four 32-byte slots
+: dneg variable ;  : dhalv variable ;  : df variable ;  : dfac variable ;  : dsh variable ;
+: dsat variable ;  \ 0, or 1: saturate to all ones, 2: to one
+
+\ dset64 ( lo hi a -- )   a 64-bit value into a 16-byte bn.
+: dset64 ( lo hi a -- )   dup 10 lit nzero  tuck 4 lit + !  ! ;
+
+\ dbehind ( alo ahi hlo hhi tlo thi -- )   behind = t - anchor - T*height, as a
+\        16-byte two's complement number in slot 0; dneg its sign, slot 0 then
+\        its magnitude.
+: dbehind ( alo ahi hlo hhi tlo thi -- )
+	0 lit d# dset64
+	1 lit d# dset64  1 lit d# 10 lit dtbt nmulk
+	2 lit d# dset64
+	0 lit d# 2 lit d# 10 lit nsub
+	0 lit d# 1 lit d# 10 lit nsub
+	0 lit d# F lit + c@ 80 lit and dneg !
+	dneg @ if 0 lit d# 10 lit nneg then
+;
+
+\ dexp ( -- )   e = floor(behind * 2^16 / half-life): its whole halvings
+\        (dhalv, or dsat if out of range) and fraction (df).
+: dexp ( -- )
+	1 lit d# 12 lit nzero  0 lit d# 1 lit d# 2 lit + 10 lit ncpy      \ << 16, in 18 bytes
+	1 lit d# 12 lit dhl ndivw
+	dneg @ if
+		if 1 lit d# 2 lit d# dup 12 lit nzero 1 lit over c! 12 lit nadd then
+		1 lit d# 12 lit nneg
+	else drop then
+	1 lit d# u@ FFFF lit and df !
+	1 lit d# 2 lit + u@ dhalv !                          \ e >> 16, low word
+	0 lit dsat !
+	1 lit d# 6 lit + u@                                  ( the next word )
+	dup 0= dhalv @ 0< 0= and if drop else
+	-1 lit = dhalv @ 0< and if else
+		dneg @ if 2 lit else 1 lit then dsat !
+	then then
+;
+
+\ dfactor ( -- )   dfac = 2^16 + (c1 f + c2 f^2 + c3 f^3 + 2^47) >> 48, the
+\        cubic approximation of 2^16 * 2^(f / 2^16) (aserti3-2d), for f = df.
+: dfactor ( -- )
+	2 lit d# 10 lit nzero  6C1DD0F9 lit 2 lit d# !  B20C lit 2 lit d# 4 lit + !   \ c1
+	2 lit d# 10 lit df @ nmulk
+	3 lit d# 10 lit nzero  39ECD140 lit 3 lit d# !                                 \ c2
+	3 lit d# 10 lit df @ nmulk  3 lit d# 10 lit df @ nmulk
+	2 lit d# 3 lit d# 10 lit nadd
+	3 lit d# 10 lit nzero  1407 lit 3 lit d# !                                     \ c3
+	3 lit d# 10 lit df @ nmulk  3 lit d# 10 lit df @ nmulk  3 lit d# 10 lit df @ nmulk
+	2 lit d# 3 lit d# 10 lit nadd
+	3 lit d# 10 lit nzero  80 lit 3 lit d# 5 lit + c!                              \ 2^47
+	2 lit d# 3 lit d# 10 lit nadd
+	2 lit d# 6 lit + c@  2 lit d# 7 lit + c@ 8 lit lshift or  2 lit d# 8 lit + c@ 10 lit lshift or
+	10000 lit + dfac !
+;
+
+: dXv variable ;   : dX ( -- a )   dXv 28 lit lazy ;     \ the scaled target: 35 bytes
+: dout variable ;
+
+\ dones ( -- )   out = all ones.   done1 ( -- )   out = 1.
+: dones ( -- )   20 lit 0 lit do FF lit dout @ i + c! loop ;
+: done1 ( -- )   dout @ 20 lit nzero  1 lit dout @ 1F lit + c! ;
+
+\ asert ( alo ahi hlo hhi tlo thi out -- )   the target after a block at
+\        height h with timestamp t, the chain's first block having had the
+\        anchor timestamp: 32 bytes, big-endian, into out.
+: asert ( alo ahi hlo hhi tlo thi out -- )
+	dout !
+	dbehind dexp
+	dsat @ 1 lit = if dones else
+	dsat @ 2 lit = if done1 else
+		dfactor
+		dX 23 lit nzero
+		0 lit d# dinit  0 lit d# dX 20 lit nrev           \ the first target, little-endian
+		dX 23 lit dfac @ nmulk
+		dhalv @ 10 lit - dsh !
+		dsh @ FF lit > if dones else                     \ shift >= 256
+		dsh @ -279 lit < if done1 else                   \ shift <= -280
+			0 lit                                          ( overflow: a bit at 256 or above )
+			100 lit dsh @ - dup 0< if drop 0 lit then
+			dup 118 lit u< if 118 lit swap do dX i nbit or loop else drop then
+			if dones else
+				1 lit d# 20 lit nzero                       \ the result, little-endian
+				100 lit 0 lit do
+					i dsh @ - dup 0< 0= over 118 lit < and if
+						dX swap nbit if 1 lit d# i nset then
+					else drop then
+				loop
+				0 lit 20 lit 0 lit do 1 lit d# i + c@ or loop
+				if 1 lit d# dout @ 20 lit nrev else done1 then
+			then
+		then then
+	then then
+;
+
+\ ── Work ──
+
+: dWv variable ;   : dW ( -- a )   dWv 90 lit lazy ;      \ four 36-byte slots
+: w# ( k -- a )    24 lit * dW + ;
+
+\ dwork ( t out -- )   a target's work: floor((2^256 - 1 - t) / (t + 1)) + 1
+\        (0 for t = 0, 1 for t = 2^256 - 1); both 32 bytes, big-endian.
+: dwork ( t out -- )
+	dout !
+	0 lit w# 24 lit nzero  0 lit w# 20 lit nrev               \ slot 0: t, little-endian
+	3 lit w# 24 lit nzero                                      \ (slot 3: zero, to compare)
+	0 lit w# 3 lit w# 20 lit ncmp 0= if
+		dout @ 20 lit nzero
+	else
+		-1 lit 20 lit 0 lit do 0 lit w# i + c@ FF lit = and loop if
+			done1
+		else
+			1 lit w# 24 lit nzero  20 lit 0 lit do 0 lit w# i + c@ FF lit xor 1 lit w# i + c! loop   \ D = ~t
+			3 lit w# 24 lit nzero  1 lit 3 lit w# c!
+			0 lit w# 3 lit w# 24 lit nadd                              \ V = t + 1 (slot 0)
+			2 lit w# 24 lit nzero  3 lit w# 24 lit nzero               \ Q (slot 2), R (slot 3)
+			100 lit 0 lit do
+				FF lit i -                                             ( bit )
+				3 lit w# 24 lit nshl1
+				1 lit w# over nbit if 3 lit w# 0 lit nset then
+				3 lit w# 0 lit w# 24 lit ncmp 0< 0= if
+					3 lit w# 0 lit w# 24 lit nsub  2 lit w# swap nset
+				else drop then
+			loop
+			3 lit w# 24 lit nzero  1 lit 3 lit w# c!  2 lit w# 3 lit w# 24 lit nadd
+			2 lit w# dout @ 20 lit nrev
+		then
+	then
+;
+
+\ dadd256 ( a b -- )   a = a + b, both 32 bytes big-endian (cumulative work).
+: dadd256 ( a b -- )
+	0 lit w# 20 lit nrev
+	dup 1 lit w# 20 lit nrev
+	1 lit w# 0 lit w# 20 lit nadd
+	1 lit w# swap 20 lit nrev
+;
+
+\ ── The reward ──
+
+\ drew ( hlo hhi -- reward ok )   the reward at a height; ok false past the
+\        chain's end (main: 1,007 years of blocks).  Rewards fit a word.
+: drew ( hlo hhi -- reward ok )
+	bnet @ if 2drop 3B9ACA00 lit -1 lit else
+	if drop 0 lit 0 lit else                                \ 2^32 and above: past the end
+		dup 3279DB0 lit u< 0= if drop 0 lit 0 lit else      \ 52,927,920
+		59D30 lit u< if 3B9ACA00 lit else 6ACFC0 lit then -1 lit   \ 367,920: 1e9, else 7e6
+	then then then
+;

@@ -10,8 +10,8 @@
 \ position mod BLOCKS names a 32-byte block of the gzipped AKJV, and that
 \ block's 11 elements are hashed in with the message.
 \
-\ The text: set `wtext` to its address and `wtextn` to its length (1291059
-\ bytes, data/akjv.txt.gz exactly as shipped) before signing or verifying.
+\ The text: `wtext` and `wtextn` (src/text.fam's `ntext` points them at the
+\ text the node carries; tests may point them at a test copy).
 \
 \ Layouts, one element per cell -- the same as the Rust byte encodings (RV32
 \ is little-endian), so wire bytes can be used in place once each element is
@@ -21,9 +21,6 @@
 \   signature   randomizer (7) | values (64 x 8) 519 cells
 \   digest      8 cells
 \ ──────────────────────────────────────────────────────────────────────────────
-
-: wtext variable ;    \ the AKJV text's address
-: wtextn variable ;   \ and length in bytes
 
 \ ── Scratch ──
 
@@ -219,46 +216,16 @@
 ;
 
 \ ── Tests (./tools/fam --test src/poseidon2.fam src/wots.fam) ──
-\ Vectors printed by the Rust node's wots module.  The test text is sparse:
-\ only the block a signature here selects, and the last (partial) block, are
-\ filled in; the rest is zero, and the bytes past the end are 0xFF, to check
-\ they're never read.
+\ Vectors printed by the Rust node's wots module, against the real text
+\ (src/text.fam).
 
 : wtseed variable ;   : wtsk variable ;   : wtpk variable ;   : wtsig variable ;
 : wtdig variable ;
 
-\ wtsetup ( -- )   the test text, a key pair, the test digest, a signature buffer.
+\ wtsetup ( -- )   the text, a key pair, the test digest, a signature buffer.
 : wtsetup ( -- )
-	wtext @ 0= if
-		13B373 lit alloc wtext !  1291059u lit wtextn !
-		FB9C8E70 lit wtext @ 9D6E0 lit + !
-		6A715BF0 lit wtext @ 9D6E4 lit + !
-		A4B2E5E9 lit wtext @ 9D6E8 lit + !
-		204288C lit wtext @ 9D6EC lit + !
-		229DE068 lit wtext @ 9D6F0 lit + !
-		36E8F555 lit wtext @ 9D6F4 lit + !
-		B5C677AA lit wtext @ 9D6F8 lit + !
-		341177BA lit wtext @ 9D6FC lit + !
-		1B lit wtext @ 13B320 lit + c!
-		49 lit wtext @ 13B321 lit + c!
-		CB lit wtext @ 13B322 lit + c!
-		15 lit wtext @ 13B323 lit + c!
-		2F lit wtext @ 13B324 lit + c!
-		FE lit wtext @ 13B325 lit + c!
-		1F lit wtext @ 13B326 lit + c!
-		FF lit wtext @ 13B327 lit + c!
-		F1 lit wtext @ 13B328 lit + c!
-		FF lit wtext @ 13B329 lit + c!
-		1 lit wtext @ 13B32A lit + c!
-		8E lit wtext @ 13B32B lit + c!
-		2 lit wtext @ 13B32C lit + c!
-		9C lit wtext @ 13B32D lit + c!
-		6A lit wtext @ 13B32E lit + c!
-		B5 lit wtext @ 13B32F lit + c!
-		3C lit wtext @ 13B330 lit + c!
-		42 lit wtext @ 13B331 lit + c!
-		0 lit wtext @ 13B332 lit + c!
-		40 lit 0 lit do FF lit wtext @ 13B333 lit + i + c! loop
+	ntext
+	wtseed @ 0= if
 		20 lit alloc wtseed !
 		3712EDC8 lit wtseed @ 0 lit + !
 		CBA6815C lit wtseed @ 4 lit + !

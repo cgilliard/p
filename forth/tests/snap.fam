@@ -1,0 +1,100 @@
+\ tests/snap.fam — test-only: src/snap.fam on a small state (tests/state.fam's
+\ outputs): 30 outputs from position 0xFF0 on -- across two leaf pieces --
+\ three of them spent.  Every piece is served and kept; served again as of
+\ that state after more changes (the output spent since, restored); then the
+\ state is wiped and imported from the pieces, tampered ones refused, and
+\ the same changes give the same root.
+
+: tyv variable ;   : typk ( -- a )  tyv 40000 lit lazy ;   \ the pieces served
+: tyn variable ;   : tyk variable ;
+: tycv variable ;  : typc ( -- a )  tycv 28 lit lazy ;     \ a piece record
+: tybv variable ;  : tyb ( -- a )   tybv 36000 lit lazy ;  \ a piece's bytes
+: tyRv variable ;  : tyR ( -- a )   tyRv 20 lit lazy ;     \ the root served
+: tySv variable ;  : tyS ( -- a )   tySv 20 lit lazy ;     \ the root after the changes
+: tyQv variable ;  : tyQ ( -- a )   tyQv 20 lit lazy ;
+: tyl variable ;   : tyi variable ;   : tya variable ;   : tyln variable ;
+
+\ A kept piece: level, index, length, then its bytes (padded to cells).
+: tyrec ( a -- a' )   dup 8 lit + @ 3 lit + FFFFFFFC lit and + C lit + ;
+
+\ tykeep ( l i a n -- )   keep a piece.
+: tykeep ( l i a n -- )
+	tyln ! tya ! tyi ! tyl !
+	typk tyn @ +  tyl @ over !  tyi @ over 4 lit + !  tyln @ over 8 lit + !
+	C lit + tya @ swap tyln @ ncpy
+	typk tyn @ + tyrec typk - tyn !  tyk @ 1 lit + tyk !
+;
+
+\ tyfind ( l i -- a n )   a kept piece's bytes.
+: tyfind ( l i -- a n )
+	tyi ! tyl !  0 lit tya !
+	typk  tyk @ 0 lit do
+		dup @ tyl @ = over 4 lit + @ tyi @ = and if dup tya ! then  tyrec
+	loop drop
+	tya @ dup 0= if "no such piece" puts A lit putc bye then
+	dup C lit + swap 8 lit + @
+;
+
+\ tychg ( -- )   spend output 5, append outputs 30 and 31.
+: tychg ( -- )   5 lit tsspend assert  1E lit tspush  1F lit tspush ;
+
+Test {
+	snap_pieces {
+		28 lit 0 lit snpc? assert  28 lit 1 lit snpc? 0= assert
+		20 lit FF lit snpc? assert  20 lit 100 lit snpc? 0= assert
+		C lit FFFFFFF lit snpc? assert  14 lit 0 lit snpc? 0= assert  8 lit 0 lit snpc? 0= assert
+		28 lit snchild 20 lit asrt_eq  10 lit snchild C lit asrt_eq
+	}
+	snap_serves {
+		dbopen assert  pgfmt assert  stopen assert
+		0 lit stuf !  0 lit stul !  0 lit stuk !
+		FF0 lit 0 lit stc!
+		1E lit 0 lit do i tspush loop
+		3 lit tsspend assert  4 lit tsspend assert  14 lit tsspend assert
+		pgcommit assert
+		tyR stroot
+		\ Every piece, as the state is now: walked as a fetch would be.
+		snview btdrop  stc@ snvh ! snvl !
+		0 lit tyn !  0 lit tyk !
+		tyR stc@ snbeg
+		begin typc snnext while
+			typc @ typc 4 lit + @ tyb snpiece          ( n )
+			typc @ typc 4 lit + @ tyb 3 lit pick tykeep
+			typc @ C lit = if drop else typc tyb rot snput assert then
+		repeat
+		tyk @ 6 lit asrt_eq                          \ levels 40, 32, 24, 16; two leaf pieces
+		C lit 0 lit tyfind nip E lit snelen * asrt_eq     \ 0xFF0 .. 0xFFF, 0xFF3 and 0xFF4 spent
+		C lit 1 lit tyfind nip D lit snelen * asrt_eq     \ 0x1000 .. 0x100D, 0x1004 spent
+	}
+	snap_serves_as_of {
+		stc@ tychg  tyS stroot
+		\ The view: as of before the changes -- output 5 restored.
+		snview btdrop  snvh ! snvl !
+		5 lit tsdata
+		FF5 lit 0 lit stk qbe!  tscm stv 20 lit ncpy  tsno stv 20 lit + 10 lit ncpy  C lit stv 30 lit + be!
+		snview stk stv btput
+		typk  tyk @ 0 lit do
+			dup @ over 4 lit + @ tyb snpiece  over 8 lit + @ asrt_eq
+			dup C lit + tyb 2 lit pick 8 lit + @ mcmp 0 lit asrt_eq
+			tyrec
+		loop drop
+	}
+	snap_imports {
+		pgfmt assert  stopen assert
+		tyR FF0 lit 1E lit + 0 lit snbeg
+		begin typc snnext while
+			typc @ typc 4 lit + @ tyfind  tyln ! tya !
+			\ tampered: a changed byte; a leaf piece missing an entry
+			tya @ tyb tyln @ ncpy  tyb 7 lit + dup c@ 1 lit xor swap c!
+			typc tyb tyln @ snput 0= assert
+			typc @ C lit = if typc tya @ snelen + tyln @ snelen - snput 0= assert then
+			typc tya @ tyln @ snput assert
+		repeat
+		snend assert
+		tyQ stroot  tyQ tyR 8 lit ceq assert
+		stc@ 0 lit asrt_eq FF0 lit 1E lit + asrt_eq
+	}
+	snap_import_keeps_working {
+		tychg  tyQ stroot  tyQ tyS 8 lit ceq assert
+	}
+}

@@ -1,0 +1,396 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/snap.fam — fast sync's state (../rust/src/snapshot.rs, chain.rs'
+\ `import_snapshot` and `StateReader::piece`): start from a recent block H
+\ instead of replaying the chain, taking the state as of H in pieces any peer
+\ can serve and this node checks one by one -- and serve them to others.
+\
+\ A piece is a subtree (level, index) whose hash is already known: from H's
+\ state root for the first, from its parent piece for the rest.  An inner
+\ piece (levels 40, 32, 24, 16) is its descendants' hashes 8 levels down (or
+\ down to 12), which must hash up to its own; each that's neither all-EMPTY
+\ nor all-SPENT is a piece to fetch.  A leaf piece (level 12, 4,096
+\ positions) is its unspent outputs -- entries of 54 bytes: offset (2,
+\ big-endian), commitment, nonce, height (4, big-endian) -- which with the
+\ output count must hash to its hash.  So a bad piece is caught on arrival,
+\ and fully spent history is never fetched.
+\
+\ H itself is believed through its chain proof (carried by H + 1): the sync
+\ point -- H's target, retarget window start and work, which only the chain
+\ proof attests -- is checked against it, and H's header gives the state
+\ root and count the pieces are checked against.  Each leaf piece is stored
+\ (with the nodes under it) and committed as it comes, so the state can be
+\ any size; the meta page marks an import under way, and one cut short is
+\ wiped at the next start (src/accept.fam's `acopen`).  At the end the nodes
+\ above the leaf pieces are built, the root checked, and H's tip kept: the
+\ node carries on from H + 1 as usual, and never goes below H.
+\
+\ Serving: the state as of any block on the best chain no deeper than the
+\ undo data reaches -- the current tree, plus the outputs spent since (from
+\ the undo data), less the outputs created since.  The outputs spent since
+\ are gathered into a tree of their own (tree 4), kept until the state moves.
+\
+\ Meta page: 78 an import under way  7C the block the node started at's
+\ height (two cells; 0 for genesis)  84 whether it started at one  88 the
+\ block the served view is as of  A8 the state's block then  C8 the view's
+\ output count (two cells).
+\
+\ A sync point (72 bytes, as on the wire): target (32), retarget window
+\ start (8, big-endian), work (32).  A piece record (40 bytes, aligned):
+\ level, index, hash.
+\
+\   snpoint ( a n point proof len -- ok )   check block H (a n) and its
+\                          sync point against H's chain proof
+\   snstart ( -- ok )      start importing the state as of H (the node must
+\                          hold no outputs)
+\   snnext ( piece -- f )  the next piece to fetch, if any is left
+\   snretry ( piece -- )   put back a piece whose fetch failed
+\   snput ( piece a n -- ok )   check and take a piece
+\   snfinish ( -- ok )     every piece taken: build, check, start at H (or
+\                          wipe the node, if the state was wrong)
+\   snspt ( hash out -- ok )             serve a block's sync point
+\   snserve ( hash l i out -- n | -1 )   serve a piece of the state as of a
+\                          block: its length
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: snleaf ( -- l )   C lit ;                            \ leaf pieces' level
+: snelen ( -- n )   36 lit ;                           \ a leaf piece's entry
+
+\ snchild ( l -- l' )   the level a piece at l reaches down to.
+: snchild ( l -- l' )   8 lit - dup snleaf < if drop snleaf then ;
+
+\ snpc? ( l i -- f )   whether (l, i) names a piece.
+: snpc? ( l i -- f )
+	over dup 28 lit = over 20 lit = or over 18 lit = or over 10 lit = or swap C lit = or
+	if 1 lit 28 lit 3 lit pick - lshift u< nip else 2drop 0 lit then
+;
+
+\ ── Pieces to fetch ──
+
+: snpv variable ;  : snpend ( -- a )  snpv A000 lit lazy ;   \ up to 1,024
+: snpn variable ;
+
+\ snwant ( l i hash -- )   fetch (l, i) unless its hash says it's empty.
+: snwant ( l i hash -- )
+	dup 3 lit pick stemp 8 lit ceq  over 4 lit pick stspt 8 lit ceq or if drop 2drop else
+		snpn @ 400 lit u< 0= if "too many pieces" puts A lit putc bye then
+		snpn @ 28 lit * snpend +                         ( l i hash e )
+		tuck 8 lit + 8 lit cpy  tuck 4 lit + !  !
+		snpn @ 1 lit + snpn !
+	then
+;
+
+: snnext ( piece -- f )
+	snpn @ if snpn @ 1 lit - dup snpn !  28 lit * snpend + swap A lit cpy -1 lit else drop 0 lit then
+;
+
+: snretry ( piece -- )   snpn @ 28 lit * snpend + A lit cpy  snpn @ 1 lit + snpn ! ;
+
+\ ── Building stored nodes ──
+
+: snflr variable ;
+: snrsv variable ;  : snres ( l -- a )  5 lit lshift snrsv 520 lit lazy + ;
+: snlv variable ;  : snlft ( l -- a )  5 lit lshift snlv 520 lit lazy + ;
+: snkv variable ;  : snkey ( -- a )   snkv 10 lit lazy ;
+
+\ snrange ( l ilo ihi -- l ilo ihi lo lohi hi hihi )   a subtree's positions.
+: snrange ( l ilo ihi -- l ilo ihi plo phi qlo qhi )
+	2dup 4 lit pick q<<  3 lit pick 3 lit pick q1+ 6 lit pick q<<
+;
+
+\ snbld ( l ilo ihi -- )   node (l, i) into snres l, storing each node above
+\        level snflr with two or more unspent outputs below it (as the
+\        Rust `build`); from the outputs' records and the nodes stored.
+: snbld ( l ilo ihi -- )
+	2 lit pick snflr @ u> if
+		snrange 2 lit stun 2 lit u< if 2 lit pick snres stget else
+			2 lit pick 1 lit -  2 lit pick 2 lit pick 1 lit q<<  snbld
+			2 lit pick 1 lit - snres  3 lit pick snlft  8 lit cpy
+			2 lit pick 1 lit -  2 lit pick 2 lit pick 1 lit q<< swap 1 lit or swap  snbld
+			2 lit pick snlft  3 lit pick 1 lit - snres  4 lit pick 1 lit -  5 lit pick snres  stnode
+			2 lit pick snkey c!  snkey 1 lit + qbe!
+			stnodes snkey swap snres btput
+		then
+	else 2 lit pick snres stget then
+;
+
+\ ── Taking pieces ──
+
+: snpc variable ;  : snda variable ;  : snn variable ;  : snfail variable ;
+: snbv variable ;  : snbuf ( -- a )  snbv 2000 lit lazy ;   \ 256 hashes
+: snwv variable ;  : snwh ( -- a )  snwv 20 lit lazy ;
+: snbl variable ;  : snk variable ;  : snok variable ;
+: snev variable ;  : snent ( -- a )  snev 3C000 lit lazy ;  \ 4,096 entries (`stun`'s form)
+: sncnt variable ;  : snof variable ;
+: snrtv variable ;  : snroot ( -- a )  snrtv 20 lit lazy ;   \ the root to reach
+
+\ sninner ( -- ok )   an inner piece: its hashes hash up to its own; want them.
+: sninner ( -- ok )
+	snpc @ @ dup snchild dup snbl !  -  snk !
+	1 lit snk @ lshift 5 lit lshift snn @ = if
+		snda @ snbuf snn @ ncpy
+		snk @ 0 lit do                                   \ a level up: halve
+			i snok !
+			1 lit snk @ i - 1 lit - lshift 0 lit do
+				snbuf i 6 lit lshift +  dup 20 lit +  snbl @ snok @ +  snbuf i 5 lit lshift +  stnode
+			loop
+		loop
+		snbuf snpc @ 8 lit + 8 lit ceq
+	else 0 lit then
+	dup if
+		1 lit snk @ lshift 0 lit do
+			snda @ i 5 lit lshift + snwh 20 lit ncpy
+			snbl @  snpc @ 4 lit + @ snk @ lshift i +  snwh  snwant
+		loop
+	then
+;
+
+\ snleafp ( -- ok )   a leaf piece: in order, inside the count, hashing to its
+\        hash; then its outputs and the nodes over them are stored, and
+\        committed.
+: snleafp ( -- ok )
+	snn @ 36001 lit u< snn @ snelen / dup sncnt ! snelen * snn @ = and if
+		-1 lit snof !  -1 lit snok !
+		sncnt @ ?dup if 0 lit do
+			snda @ i snelen * +  dup c@ 8 lit lshift swap 1 lit + c@ or       ( offset )
+			dup 1000 lit u< over 1 lit + snof @ 1 lit + u> and snok @ and snok !
+			dup snof !
+			snpc @ 4 lit + @ C lit lshift +  snpc @ 4 lit + @ 14 lit rshift   ( position )
+			2dup stc@ du< snok @ and snok !
+			i 3C lit * snent + qbe!
+			snda @ i snelen * + 2 lit +  i 3C lit * snent + 8 lit +  34 lit ncpy
+		loop then
+		snok @
+	else 0 lit then
+	dup if
+		snpc @ 4 lit + @ snleaf 0 lit stf !  0 lit snleaf 1 lit stf !
+		snent snleaf 2 lit stf !  sncnt @ snleaf 3 lit stf !
+		snleaf sthash  snleaf stres snpc @ 8 lit + 8 lit ceq and
+	then
+	dup if
+		sncnt @ ?dup if 0 lit do
+			i 3C lit * snent +
+			stindex dup 8 lit + stw btget if -1 lit snfail ! then   \ a twin: the state's wrong
+			stleaves dup dup 8 lit + btput
+			stindex dup 8 lit + swap btput
+		loop then
+		3 lit snflr !  snleaf snpc @ 4 lit + @ 0 lit snbld
+		pgcommit and
+	then
+;
+
+\ snput ( piece a n -- ok )
+: snput ( piece a n -- ok )
+	snn ! snda ! snpc !  sttabs  pgop
+	snpc @ @ snleaf = if snleafp else sninner then
+;
+
+\ snbeg ( root clo chi -- )   a state of clo chi outputs, root as given: what
+\        to fetch first.  (The state must be empty.)
+: snbeg ( root clo chi -- )
+	sttabs pgop stc!  dup snroot 8 lit cpy
+	0 lit snpn !  0 lit snfail !
+	28 lit 0 lit rot snwant
+;
+
+\ snend ( -- ok )   everything taken: the nodes above the leaf pieces, and
+\        whether the root is the one wanted.
+: snend ( -- ok )
+	sttabs pgop
+	C lit snflr !  28 lit 0 lit 0 lit snbld
+	snpn @ 0=  snfail @ 0= and  28 lit snres snroot 8 lit ceq and
+;
+
+\ ── Fast sync ──
+
+: sntv variable ;  : sntip ( -- a )  sntv A0 lit lazy ;     \ H's tip
+: snhv variable ;  : snhdr ( -- a )  snhv BC lit lazy ;     \ H's header
+
+\ snpoint ( a n point proof len -- ok )   block H, with its sync point: ok if
+\        it's not the genesis, its body is its header's, and the chain proof
+\        (from H + 1) attests the tip they make.
+: snpt variable ;  : snpp variable ;  : snpl variable ;
+: snpoint ( a n point proof len -- ok )
+	snpl ! snpp ! snpt !
+	bparse if
+		bheight or 0= 0=
+		bbodyh bbhash bst 8 lit ueq and
+		dup if
+			sntip tout !  tbody
+			snpt @ sntip 30 lit + 20 lit ncpy
+			snpt @ 20 lit + qbe@ sntip 78 lit + t64!
+			snpt @ 28 lit + sntip 80 lit + 20 lit ncpy
+			bhdr @ snhdr BC lit ncpy
+			snpp @ snpl @ sntip chverify and
+		then
+	else 0 lit then
+;
+
+\ snstart ( -- ok )   start importing the state as of H (after `snpoint`):
+\        the node must hold no outputs.
+: snstart ( -- ok )
+	sttabs pgop
+	stc@ or 0= dup if
+		sntip 50 lit +  sntip 70 lit + t64@  snbeg
+		1 lit pgm 78 lit + !  pgmd  pgcommit and
+	then
+;
+
+\ snfinish ( -- ok )   every piece taken: if the state is H's, keep H's tip
+\        and start there; else wipe the node.
+: snfinish ( -- ok )
+	snend dup if
+		snhdr sntip dbput and
+	then
+	dup if
+		pgop
+		sntip pgm 4C lit + 8 lit cpy
+		sntip 20 lit + t64@ 2dup pgm 70 lit + ! pgm 6C lit + !  pgm 80 lit + ! pgm 7C lit + !
+		1 lit pgm 74 lit + !  1 lit pgm 84 lit + !  0 lit pgm 78 lit + !
+		snroot pgm 2C lit + 8 lit cpy  pgmd
+		pgcommit and
+	then
+	dup 0= if acfmt then
+;
+
+\ ── Serving ──
+
+: snview ( -- )   4 lit 8 lit 34 lit btuse ;               \ outputs spent since
+: snvl variable ;  : snvh variable ;                       \ the view's count
+: snBv variable ;  : snB ( -- a )  snBv 20 lit lazy ;
+: snbh variable ;  : snhh variable ;  : snup variable ;  : snuj variable ;
+
+\ snasof ( hash -- ok )   the view as of block `hash`, if it's on the best
+\        chain within the undo data's reach.
+: snasof ( hash -- ok )
+	sttabs pgop
+	pgm 74 lit + @ 0= if drop 0 lit else
+	dup pgm 88 lit + 8 lit ceq  pgm 4C lit + pgm A8 lit + 8 lit ceq and if
+		drop pgm C8 lit + t64@ snvh ! snvl !  -1 lit
+	else
+	dup dbget ?dup 0= if drop 0 lit else
+		dup 20 lit + @ snhh !  70 lit + t64@ snvh ! snvl !
+		snhh @ pgm 7C lit + @ u<  snhh @ pgm 6C lit + @ u> or if drop 0 lit else
+			snview btdrop
+			pgm 4C lit + snB 20 lit ncpy  pgm 6C lit + @ snbh !
+			-1 lit snok !
+			begin snbh @ snhh @ u> snok @ and while
+				\ block snB's spent outputs, if they were there then
+				stundot snB stw btget if stw 14 lit + @ else 0 lit then 0= if 0 lit snok ! else
+					stw @ snup !
+					begin snup @ while
+						pgop  0 lit snuj !
+						begin snuj @ snup @ pgget 4 lit + @ u< while
+							snup @ pgget 8 lit + snuj @ 3C lit * + stue 3C lit ncpy
+							stue qbe@ snvl @ snvh @ du< if snview stue stue 8 lit + btput then
+							snuj @ 1 lit + snuj !
+						repeat
+						pgop snup @ pgget @ snup !
+					repeat
+					snB acparent drop  snbh @ 1 lit - snbh !
+				then
+			repeat
+			snok @ if dup snB 8 lit ceq snok ! then
+			snok @ if
+				pgop
+				dup pgm 88 lit + 8 lit cpy  pgm 4C lit + pgm A8 lit + 8 lit cpy
+				snvl @ snvh @ pgm C8 lit + t64!  pgmd
+				pgcommit snok @ and snok !
+			else snview btdrop then
+			drop snok @
+		then
+	then then then
+;
+
+: snLl variable ;  : snLh variable ;  : snHl variable ;  : snHh variable ;
+: sngv variable ;  : sngr ( l -- a )  5 lit lshift sngv 520 lit lazy + ;
+: snglv variable ;  : sngl ( l -- a )  5 lit lshift snglv 520 lit lazy + ;
+
+\ snany ( -- f )   whether the view restores an output in snL .. snH - 1.
+: snany ( -- f )
+	snLl @ snLh @ stk qbe!  snHl @ snHh @ sthk qbe!
+	snview stk stq stv btseek if stq sthk 8 lit mcmp 0< else 0 lit then
+;
+
+\ snnode ( l ilo ihi -- )   node (l, i) as of the view, into sngr l (the
+\        Rust `node_as_of`).
+: snnode ( l ilo ihi -- )
+	snrange snHh ! snHl ! snLh ! snLl !
+	snLl @ snLh @ snvl @ snvh @ du< 0= if 2drop dup stemp swap sngr 8 lit cpy else
+	snvl @ snvh @ snHl @ snHh @ du< 0= snany 0= and if 2 lit pick sngr stget else
+	2 lit pick 0= if
+		snLl @ snLh @ stk qbe!  snview stk stv btget if
+			2drop drop  stv  stv 20 lit +  stv 30 lit + be32  0 lit sngr stleaf
+		else 2 lit pick sngr stget then
+	else
+		2 lit pick 1 lit -  2 lit pick 2 lit pick 1 lit q<<  snnode
+		2 lit pick 1 lit - sngr  3 lit pick sngl  8 lit cpy
+		2 lit pick 1 lit -  2 lit pick 2 lit pick 1 lit q<< swap 1 lit or swap  snnode
+		2 lit pick sngl  3 lit pick 1 lit - sngr  4 lit pick 1 lit -  5 lit pick sngr  stnode
+		2drop drop
+	then then then
+;
+
+: snck variable ;  : snrk variable ;   \ the two cursors' keys
+: snckv variable ;  : snc ( -- a )  snckv 8 lit lazy ;
+: snrkv variable ;  : snr ( -- a )  snrkv 8 lit lazy ;
+: snrqv variable ;  : snrq ( -- a )  snrqv 8 lit lazy ;
+: snrvv variable ;  : snrv ( -- a )  snrvv 40 lit lazy ;
+: snout variable ;  : snon variable ;
+
+\ snemit ( key rec -- )   an entry of the leaf piece being served.
+: snemit ( key rec -- )
+	swap 6 lit + dup c@ F lit and  snout @ snon @ + c!
+	1 lit + c@ snout @ snon @ + 1 lit + c!
+	snout @ snon @ + 2 lit + 34 lit ncpy
+	snon @ snelen + snon !
+;
+
+\ snleafs ( i -- )   leaf piece i as of the view: the outputs unspent now
+\        and those it restores, merged in order, below the view's count.
+: snEv variable ;  : snE ( -- a )  snEv 8 lit lazy ;
+: snleafs ( i -- )
+	dup C lit lshift swap 14 lit rshift  2dup snc qbe!  2dup snr qbe!
+	swap 1000 lit + dup 0= if swap 1 lit + else swap then           ( the end )
+	snvl @ snvh @ 3 lit pick 3 lit pick du< if 2drop snvl @ snvh @ then  snE qbe!
+	begin
+		stleaves snc stq stv btseek if stq snE 8 lit mcmp 0< else 0 lit then  snck !
+		snview snr snrq snrv btseek if snrq snE 8 lit mcmp 0< else 0 lit then  snrk !
+		snck @ snrk @ or
+	while
+		snck @ snrk @ and if stq snrq 8 lit mcmp 0< else snck @ then
+		if stq stv snemit  stq snc 8 lit ncpy  snc 8 lit binc
+		else snrq snrv snemit  snrq snr 8 lit ncpy  snr 8 lit binc then
+	repeat
+;
+
+\ snpiece ( l i out -- n )   piece (l, i) as of the view.
+: snpiece ( l i out -- n )
+	snout ! 0 lit snon !
+	over snleaf = if nip snleafs else
+		over snchild  rot over - snk !                  ( i below )
+		1 lit snk @ lshift 0 lit do
+			dup  2 lit pick snk @ lshift i +  0 lit  snnode
+			dup sngr  snout @ i 5 lit lshift +  8 lit cpy
+		loop
+		2drop  20 lit snk @ lshift snon !
+	then
+	snon @
+;
+
+\ snserve ( hash l i out -- n | -1 )   piece (l, i) of the state as of block
+\        `hash`: its length, or -1 if it's not a piece or not servable.
+: snso variable ;
+: snserve ( hash l i out -- n | -1 )
+	snso !  2dup snpc? if rot snasof if snso @ snpiece else 2drop -1 lit then
+	else 2drop drop -1 lit then
+;
+
+\ snspt ( hash out -- ok )   block `hash`'s sync point, if it's servable.
+: snspt ( hash out -- ok )
+	over snasof if
+		swap dbget
+		dup 30 lit + 2 lit pick 20 lit ncpy
+		dup 78 lit + t64@ 3 lit pick 20 lit + qbe!
+		80 lit + swap 28 lit + 20 lit ncpy  -1 lit
+	else 2drop 0 lit then
+;

@@ -124,6 +124,10 @@ run bin/full_node.bin \
         lib/stdlib.fam \
         lib/build.fam \
         `cat scripts/files.txt`
+# The Bible text (data/akjv.txt.gz), after 0x5000 zero bytes: `init` puts the
+# return-id stack and the variables just past the image, so the text starts
+# exactly at the heap's base and the variables start at zero (src/text.fam).
+head -c 20480 /dev/zero >> bin/full_node.bin
 cat ../data/akjv.txt.gz >> bin/full_node.bin
 patch_config bin/tabernacle.uncompressed bin/full_node.bin
 pack bin/tabernacle.uncompressed bin/tabernacle

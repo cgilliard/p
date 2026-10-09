@@ -1,0 +1,202 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/accept.fam — taking a block into the node: validate it on its parent's
+\ tip (src/header.fam), keep its tip (src/store.fam) and its state delta, and
+\ keep the state (src/state.fam) at the best tip -- through reorganizations.
+\
+\ A block's delta is what the state needs to apply it: its header and its
+\ body without the proofs (the input commitments, the outputs and their
+\ nonces) -- in the shape of a block whose proofs are empty, so `bparse`
+\ reads it.  Every validated block's delta is kept (main chain or not), in a
+\ chain of pages (0 the next, 4 bytes in this one, data from 8), recorded in
+\ the state's block tree; it's committed before the tip is, so every kept tip
+\ has its delta.
+\
+\ Moving the state to the best tip: from the state's block and the best,
+\ walk parents back to where they meet; undo the state's blocks to there
+\ (undo data), then apply the best's branch forward (deltas) -- a commit for
+\ each block, the meta page noting where the state is, so a move cut short
+\ carries on at the next start.  Deltas and undo data more than 1,000 blocks
+\ below the best are dropped (`MAX_REORG_DEPTH`), and no block that deep is
+\ accepted.
+\
+\   acfmt   ( -- )         an empty chain and state
+\   acopen  ( -- ok )      the disk's chain and state, the state moved to the
+\                          best tip (a fast sync cut short: wiped)
+\   acblock ( a n -- ok )  take a block: ok if it's valid (or already kept)
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: acdepth ( -- n )   3E8 lit ;                         \ 1,000 blocks
+
+: acbv variable ;   : acbuf ( -- a )   acbv 200100 lit lazy ;   \ a delta: up to 2 MiB
+
+\ ── Deltas ──
+
+: acdf variable ;  : acdl variable ;  : acdo variable ;  : acdn variable ;
+: acda variable ;  : acdp variable ;  : acdk variable ;
+
+\ acdput ( hash a n -- )   keep n bytes at a as the block's delta.
+: acdput ( hash a n -- )
+	acdn ! acda !  0 lit acdf !  0 lit acdl !  0 lit acdo !
+	begin acdo @ acdn @ u< while
+		pgop  pgnew acdp !
+		acdl @ if acdp @ acdl @ pgget !  acdl @ pgdirty else acdp @ acdf ! then
+		acdp @ acdl !
+		acdn @ acdo @ - dup FF8 lit u> if drop FF8 lit then acdk !
+		acdk @ acdp @ pgget 4 lit + !
+		acda @ acdo @ +  acdp @ pgget 8 lit +  acdk @ ncpy
+		acdp @ pgdirty
+		acdo @ acdk @ + acdo !
+	repeat
+	stundot  dup stw btget 0= if stw 18 lit nzero then
+	acdf @ stw C lit + !  acdn @ stw 10 lit + !
+	stw btput
+;
+
+\ acdget ( hash -- a n )   the block's delta, in acbuf (0 0 if there's none).
+: acdget ( hash -- a n )
+	stundot stw btget if
+		stw C lit + @ acdp !  0 lit acdo !
+		begin acdp @ while
+			pgop  acdp @ pgget dup 4 lit + @ acdk !  8 lit + acbuf acdo @ + acdk @ ncpy
+			acdo @ acdk @ + acdo !
+			acdp @ pgget @ acdp !
+		repeat
+		acbuf acdo @
+	else 0 lit 0 lit then
+;
+
+\ acchain ( p -- )   free a chain of pages.
+: acchain ( p -- )   begin ?dup while pgop dup pgget @ swap pgfree repeat ;
+
+\ acfree ( hash -- )   forget a block's delta and undo data.
+: acfree ( hash -- )
+	stundot dup stw btget if
+		stw C lit + @ acchain  stw @ acchain
+		stundot btdel drop
+	else drop then
+;
+
+\ ── Walking the chain of tips ──
+
+: acAv variable ;  : acA ( -- a )  acAv 20 lit lazy ;   \ a hash on the best's side
+: acBv variable ;  : acB ( -- a )  acBv 20 lit lazy ;   \ one on the state's side
+: acha variable ;  : achb variable ;                    \ their heights
+
+\ acparent ( hash -- h )   replace a hash (32 bytes, in place) by its
+\        parent's; the block's height (from its tip).
+: acparent ( hash -- h )
+	dup dbfind dup 0< if "missing tip" puts A lit putc bye then
+	dbrd drop
+	dbbuf C4 lit + 20 lit + @                               ( hash h )
+	dbbuf 8 lit + 4 lit + rot 20 lit ncpy
+;
+
+\ The branch to apply: hashes, from the best back to the fork.
+: aclv variable ;  : acl ( -- a )  aclv 20000 lit lazy ;    \ up to 4,096
+: acln variable ;
+
+\ acpush ( -- )   the best's side's hash, onto the list.
+: acpush ( -- )
+	acln @ 1000 lit u< 0= if "the state is too far behind: resync" puts A lit putc bye then
+	acA acl acln @ 5 lit lshift + 20 lit ncpy
+	acln @ 1 lit + acln !
+;
+
+\ acundo ( -- )   undo the state's block (acB): it's at the parent now.
+: acundo ( -- )
+	acB stunapl 0= if "state undo failed" puts A lit putc bye then
+	acB acparent drop
+	acB achb @ 1 lit - 0 lit stmeta
+	pgcommit drop
+	achb @ 1 lit - achb !
+;
+
+\ acprune ( -- )   drop the deltas and undo data acdepth + 1 blocks below
+\        the block just applied (acA, at height acha) -- not below where a
+\        fast-synced node started (src/snap.fam).
+: acprune ( -- )
+	acha @ acdepth pgm 7C lit + @ + u> if
+		acA acB 20 lit ncpy
+		acdepth 1 lit + 0 lit do acB acparent drop loop
+		acB acfree  pgcommit drop
+	then
+;
+
+\ acapply ( k -- )   apply list entry k to the state, and commit.
+: acapply ( k -- )
+	5 lit lshift acl + acA 20 lit ncpy
+	acA acdget  2dup or 0= if "missing delta" puts A lit putc bye then
+	bparse drop
+	acA stapply if pgcommit drop else pgabort "the state rejected a valid block" puts A lit putc bye then
+	bheight drop acha !
+	acprune
+;
+
+\ acmove ( -- )   move the state to the best tip.
+: acmove ( -- )
+	dbtip ?dup if
+		dup acA 20 lit ncpy  20 lit + @ acha !  0 lit acln !
+		pgop pgm 74 lit + @ if
+			pgm 4C lit + acB 20 lit ncpy  pgm 6C lit + @ achb !
+			begin acha @ achb @ u> while acpush acA acparent drop  acha @ 1 lit - acha ! repeat
+			begin achb @ acha @ u> while acundo repeat
+			begin acA acB 8 lit ceq 0= while
+				acpush acA acparent drop  acha @ 1 lit - acha !
+				acundo
+			repeat
+		else
+			begin acpush acha @ while acA acparent drop  acha @ 1 lit - acha ! repeat
+		then
+		acln @ ?dup if 0 lit do acln @ 1 lit - i - acapply loop then
+	then
+;
+
+\ ── Blocks ──
+
+: acok variable ;   : acdz variable ;
+
+\ acblock ( a n -- ok )   take a block: if it's new, valid on its parent's tip
+\        (kept), and less than 1,000 below the best, keep its delta and tip
+\        and move the state to the best tip.
+: acblock ( a n -- ok )
+	0 lit acok !
+	2dup bparse if
+		bhdr @ dbid hdrid
+		dbid dbfind 0< 0= if 2drop -1 lit acok ! else
+		dbtip if bheight drop acdepth + dbtip 20 lit + @ u> else -1 lit then
+		pgm 84 lit + @ if pgm 7C lit + @ bheight drop u< and then          \ above where it started
+		0= if 2drop else
+		bheight or 0= if
+			dbnt tipgen
+		else
+			bhdr @ 4 lit + dbfind dup 0< if drop 2drop 0 lit else
+				dbrd drop  dbbuf C4 lit + dbpt A0 lit ncpy
+				dbpt dbnt tipnext
+			then
+		then
+		if
+			\ Its delta: the header and body up to the proofs, then empty proofs.
+			bhdr @ acbuf  bnon @ bnnon @ 4 lit lshift + bhdr @ -  dup acdz !  ncpy
+			acbuf acdz @ + 8 lit nzero
+			dbid acbuf acdz @ 8 lit + acdput
+			pgcommit drop
+			bhdr @ dbnt dbput drop
+			acmove
+			-1 lit acok !
+		then
+		then then
+	else 2drop then
+	acok @
+;
+
+\ acfmt ( -- )   an empty chain and state.
+: acfmt ( -- )   dbdev drop dbfmt pgfmt drop sttabs ;
+
+\ acopen ( -- ok )   the chain and state on the disk, the state moved to the
+\        best tip (finishing a move cut short).
+: acopen ( -- ok )
+	dbopen dup if stopen and then
+	dup dbnew @ and if pgfmt and sttabs then                      \ a new chain: a new state
+	dup if pgop pgm 78 lit + @ if acfmt then then              \ a fast sync cut short
+	dup if acmove then
+;
