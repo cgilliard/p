@@ -17,7 +17,7 @@
 #   q32 program.bin
 #   q32 --net bin/tabernacle
 #   q32 --net --disk=node.bin bin/tabernacle
-#   printf '10.0.2.2:3737\004' | q32 --net bin/tabernacle
+#   printf '47653 0 10000 1 10.0.2.2:7701\004' | q32 --net bin/tabernacle
 
 CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\

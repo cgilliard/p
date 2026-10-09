@@ -79,7 +79,7 @@ def main():
             check=True,
         )
         dis = subprocess.run(
-            [ODUMP, "-dl", elf], check=True, capture_output=True, text=True
+            [ODUMP, "-dlz", elf], check=True, capture_output=True, text=True
         ).stdout
 
     # objdump -dl interleaves source-line markers with instructions, in address

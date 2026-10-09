@@ -98,6 +98,27 @@ A signed transaction is kept before its signature leaves the node, and
 serving it as the Rust node's relay does. Both directions have been run
 against a Rust dev node, end to end.
 
+`src/image.fam` is the node's boot image. Tabernacle boots the node from
+the disk's first 32 MiB when that copy has the hash tabernacle was built
+with, and otherwise fetches it from the network. Either way, the node
+rebuilds its image from memory (the code, the zeros that are its variables
+now, the text), writes it to the disk wherever the disk's copy differs --
+so the next boot is from the disk -- and serves it on its own port:
+`GET_BIN` (type 15: cookie, hash, first chunk, count) is answered with
+`BIN_CHUNK`s (16: hash, index, 1,024 bytes), only with the asker's cookie
+and only for its own hash. Tabernacle (`src/tabernacle.S`, assembled into
+`src/tabernacle.fam0` by `tools/s2fam0_tabernacle.py`) fetches it the same
+way, on the node's port: it asks its seeds for hosts (`GET_HOSTS`), asks
+those hosts in turn (up to 32 peers, each answer carrying a cookie), and
+asks the peers for the image in windows of 32 chunks, spread across those
+that answer -- the seeds only if no other peer has sent any within 3
+seconds, so a new node costs its seeds a few small packets. A hash mismatch
+drops every peer that sent chunks and starts over. `scripts/node.sh` gives
+it the seeds as `BOOT` (default: `SEED`); `scripts/makenode.sh` writes a
+new build to `data/disk.img` by hand. Under QEMU, with a Rust dev node as
+the only seed and one Forth node holding the build, a new node on a blank
+disk booted in about 18 s, every chunk from the Forth node.
+
 The compiler's output uses no `jalr` -- every jump is a `jal`, reaching
 1 MiB either way -- and returns go through a search tree from return-id to
 return site. A program of any size compiles: every 512 KiB or so (at a `:`),

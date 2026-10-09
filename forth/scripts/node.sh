@@ -24,16 +24,21 @@
 #          PORT + 1); tools/wallet talks to it
 #   NET    main or dev (default dev, for now); a disk holds one network's
 #          chain, so switching means a new disk image
+#   BOOT   the seeds tabernacle starts from when the disk's copy isn't the
+#          build it expects: it finds peers through them and fetches the node
+#          from the peers holding it, the seeds only if no one else does
+#          (default SEED; 127.0.0.1 is this machine)
 #
-# After scripts/build.sh, it rewrites the boot image (scripts/makenode.sh) so
-# tabernacle boots the new build.  To start over: rm data/disk.img -- which
-# deletes the wallet too (restore it with --recover).
+# To boot a new build from the disk without fetching it, run
+# scripts/makenode.sh after scripts/build.sh.  To start over: rm
+# data/disk.img -- which deletes the wallet too (restore it with --recover).
 set -e
 SEED=${SEED:-127.0.0.1:7701}
 DEPTH=${DEPTH:-25}
 PORT=${PORT:-47653}
 NET=${NET:-dev}
 API=${API:-$((PORT + 1))}
+BOOT=${BOOT:-$SEED}
 WALLET=""
 for arg in "$@"; do
 	case "$arg" in
@@ -43,7 +48,8 @@ for arg in "$@"; do
 		*) echo "usage: $0 [--recover] [--passphrase] [--api-key]" >&2; exit 1 ;;
 	esac
 done
-./scripts/makenode.sh
+mkdir -p data
+[ -e data/disk.img ] || truncate -s 4G data/disk.img
 # The console: the settings, then the keyboard (for the wallet), through a
 # fifo so the node runs in the foreground (Ctrl-C stops it).  What's typed
 # isn't echoed (words, passphrases); the terminal is put back however the
@@ -69,8 +75,8 @@ fi
 # (src/full_node.fam).
 exec 3<&0
 {
-	printf '3737 0 10000 159.54.172.190:3737 146.235.230.124:3737\004seed=%s depth=%s port=%s api=%s net=%s%s\004' \
-		"$SEED" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET"
+	printf '%s 0 10000 %s %s\004seed=%s depth=%s port=%s api=%s net=%s%s\004' \
+		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$SEED" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET"
 	exec cat <&3
 } > "$FIFO" &
 CAT=$!

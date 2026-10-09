@@ -1,0 +1,145 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/image.fam — the node's own boot image: keeping it on the disk, and
+\ serving it to nodes booting.
+\
+\ Booted by tabernacle, the node runs where tabernacle loaded it -- just past
+\ tabernacle, whose last 40 bytes are [chunks u32][size u32][hash (32)]: the
+\ image's size and Gimli hash, which tabernacle checked it against (from the
+\ disk's copy or the network's).  The image is the code, 0x5000 zero bytes,
+\ and the Bible text (scripts/build.sh).  In memory the zeros are the
+\ return-id stack and the variables now (src/text.fam), so the image is
+\ rebuilt from the code, zeros and the text.  Loaded by QEMU directly (at
+\ 0x80000000, the tests), there's no tabernacle and no image.
+\
+\ The disk's first 32 MiB are the image's (src/store.fam's dbbase): `imsave`
+\ writes it there wherever the disk's copy differs, so tabernacle boots from
+\ the disk next time -- the node keeps itself, as fetched.  And it serves
+\ itself, on the node's port (src/peer.fam's protocol):
+\   GET_BIN (15)    cookie u64, hash (32), first u32, count u16
+\   BIN_CHUNK (16)  hash (32), index u32, up to 1024 bytes
+\ The cookie (from GET_HOSTS) proves the asker's address, as for GET_PIECE;
+\ a hash other than ours isn't answered; at most 32 chunks an ask.
+\
+\   imopen ( -- )      find the image
+\   imsave ( -- )      put it on the disk, where it differs
+\   imin   ( -- f )    handle a datagram for the image, if it is one
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ origin ( -- a )   the address the program was loaded at.  Compiles to
+\        auipc t1,0 ; lw t2,12(t1) ; j +8 ; <offset> ; sub t1,t1,t2 ; push t1
+\        -- the offset being this code's distance from the output's start (s0
+\        while compiling).
+:I origin
+B3828140 ,   \ sub  t0,gp,s0          ( the offset )
+13037031 ,   \ li   t1,0x317          ( auipc t1,0 )
+23A06100 ,   \ sw   t1,0(gp)
+3723C300 ,   \ lui  t1,0xC32
+13033338 ,   \ addi t1,t1,899         ( lw t2,12(t1) )
+23A26100 ,   \ sw   t1,4(gp)
+37038000 ,   \ lui  t1,0x800
+1303F306 ,   \ addi t1,t1,111         ( j +8 )
+23A46100 ,   \ sw   t1,8(gp)
+23A65100 ,   \ sw   t0,12(gp)         ( the offset, as data )
+37037340 ,   \ lui  t1,0x40730
+13033333 ,   \ addi t1,t1,819         ( sub t1,t1,t2 )
+23A86100 ,   \ sw   t1,16(gp)
+3703C1FF ,   \ lui  t1,0xFFC10
+13033311 ,   \ addi t1,t1,275         ( addi sp,sp,-4 )
+23AA6100 ,   \ sw   t1,20(gp)
+37236100 ,   \ lui  t1,0x612
+13033302 ,   \ addi t1,t1,35          ( sw t1,0(sp) )
+23AC6100 ,   \ sw   t1,24(gp)
+9381C101 ,   \ addi gp,gp,28
+;
+
+: imb variable ;   \ where the image starts (the program's origin)
+: imc variable ;   \ the code's length
+: imz variable ;   \ the image's size (0: no image)
+
+\ imopen ( -- )   find the image, if tabernacle booted us.
+: imopen ( -- )
+	0 lit imz !  origin imb !  s10@ imb @ - imc !
+	imb @ 80000000 lit = 0= if
+		imb @ 24 lit - @  dup imc @ 5000 lit + textlen + = if imz ! else drop then
+	then
+;
+
+\ imhash ( -- a )   the image's hash (32 bytes, tabernacle's).
+: imhash ( -- a )   imb @ 20 lit - ;
+
+: imo variable ;  : imd variable ;  : imn variable ;
+
+: imstep ( k -- )   imo @ over + imo !  imd @ over + imd !  imn @ swap - imn ! ;
+
+\ imcopy ( off buf n -- )   n bytes of the image from off (all within it).
+: imcopy ( off buf n -- )
+	imn ! imd ! imo !
+	begin imn @ while
+		imo @ imc @ u< if
+			imc @ imo @ - imn @ pumin  imb @ imo @ + imd @ 2 lit pick ncpy  imstep
+		else imo @ imc @ 5000 lit + u< if
+			imc @ 5000 lit + imo @ - imn @ pumin  imd @ over nzero  imstep
+		else
+			imz @ imo @ - imn @ pumin
+			dup if wtext @ imo @ + imc @ - 5000 lit - imd @ 2 lit pick ncpy imstep else drop 0 lit imn ! then
+		then then
+	repeat
+;
+
+\ ── Keeping it on the disk ──
+
+: imbv variable ;  : imbuf ( -- a )  imbv 8000 lit lazy ;   \ 64 sectors of the image
+: imrv variable ;  : imrd ( -- a )   imrv 8000 lit lazy ;   \ and of the disk
+: ims variable ;  : imk variable ;  : imw variable ;
+
+\ imsave ( -- )   write the image to the disk's first sectors, 64 at a time,
+\        wherever the disk's copy differs.
+: imsave ( -- )
+	imz @ if
+		0 lit ims !  0 lit imw !
+		begin ims @ imz @ u< while
+			imz @ ims @ - 8000 lit pumin  1FF lit + 9 lit rshift imk !    \ sectors
+			imz @ ims @ - 8000 lit u< if imbuf 8000 lit nzero then    \ the last sector's tail
+			ims @ imbuf imz @ ims @ - 8000 lit pumin imcopy
+			ims @ 9 lit rshift imrd imk @ 0 lit dbion
+			if imrd imbuf imk @ 9 lit lshift mcmp else -1 lit then
+			if ims @ 9 lit rshift imbuf imk @ -1 lit dbion drop  -1 lit imw ! then
+			ims @ 8000 lit + ims !
+		repeat
+		imw @ if "node: wrote its boot image to the disk" puts A lit putc then
+	then
+;
+
+\ ── Serving it ──
+
+\ imchunk ( c -- )   BIN_CHUNK c.
+: imchunk ( c -- )
+	10 lit phdr  imhash over 20 lit ncpy  over over 20 lit + be!
+	imz @ 2 lit pick A lit lshift - dup 400 lit u> if drop 400 lit then     ( c body len )
+	rot A lit lshift 2 lit pick 24 lit + 2 lit pick imcopy
+	nip 2A lit + preply
+;
+
+\ imget ( -- )   GET_BIN, with our cookie and our image's hash: the chunks
+\        asked for, at most 32.
+: imget ( -- )
+	pbn @ 2E lit = imz @ and if
+		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
+			pbd @ 8 lit + imhash 20 lit mcmp 0= if
+				imz @ 3FF lit + A lit rshift                          ( chunks )
+				pbd @ 28 lit + be32  pbd @ 2C lit + nb16@ 20 lit pumin over +   ( chunks first end )
+				rot over over u> if nip else drop then              ( first end' )
+				2dup u< if swap do i imchunk loop else 2drop then
+			then
+		then
+	then
+;
+
+: imin ( -- f )
+	pok? if
+		npay @ 5 lit + c@ F lit = if
+			npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+			imget -1 lit
+		else 0 lit then
+	else 0 lit then
+;

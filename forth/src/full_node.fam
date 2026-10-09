@@ -115,9 +115,9 @@
 \ ── Running ──
 
 \ fnstep ( -- )   the datagrams that have come (the peers', the wallet API's,
-\        the transaction relay's), then the timers.
+\        the transaction relay's, the boot image's), then the timers.
 : fnstep ( -- )
-	begin nrecv while ndport @ naport @ = if wain else trin 0= if pin then then repeat
+	begin nrecv while ndport @ naport @ = if wain else trin 0= if imin 0= if pin then then then repeat
 	ptick trtick
 ;
 
@@ -140,6 +140,7 @@
 		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"
 		else "node: no disk" then puts A lit putc bye
 	then
+	imopen imsave
 	wlboot
 	dbtip ?dup if "node: resuming at height " puts 20 lit + @ fndec A lit putc else "node: a new chain\n" puts then
 	pstart 0= if "node: no network device" puts A lit putc bye then

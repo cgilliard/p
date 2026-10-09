@@ -80,7 +80,7 @@ patch_config() {
         bin=$1; data=$2
         echo "Patching $bin (bin_size + hash of $data)" >&2
         N=$(fsize "$data")
-        NCHUNKS=$(( (N + 1399) / 1400 ))
+        NCHUNKS=$(( (N + 1023) / 1024 ))      # tabernacle fetches 1 KiB chunks (src/image.fam)
         TAB_SIZE=$(fsize "$bin")
         # Layout at end of tabernacle: [nchunks 4B][bin_size 4B][hash 32B]
         # Write nchunks (LE) at TAB_SIZE-40
