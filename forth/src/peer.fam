@@ -107,6 +107,19 @@
 : ppv variable ;  : pp ( k -- a )  50 lit * ppv 500 lit lazy + ;
 : ppn ( -- n )   10 lit ;
 
+\ Our own addresses, found out (as the Rust node does): a GET_HOSTS that
+\ arrives with one of our own requests' nonces is us asking ourselves -- the
+\ address it was sent to is ours (a seed list holding us, a NAT looping back).
+\ Never added, shared or asked again.
+: pmev variable ;  : pself ( k -- a )  3 lit lshift pmev 20 lit lazy + ;   \ 4 of them
+: pmen variable ;
+
+\ pisself ( ip port -- f )
+: pisself ( ip port -- f )
+	0 lit  4 lit 0 lit do 2 lit pick i pself @ =  2 lit pick i pself 4 lit + @ = and or loop
+	nip nip
+;
+
 \ pfind ( ip port -- k | -1 )
 : pfk variable ;
 : pfind ( ip port -- k | -1 )
@@ -121,7 +134,7 @@
 \ padd ( ip port -- k | -1 )   a host (kept, if there's room).
 : padd ( ip port -- k | -1 )
 	2dup pfind dup 0< 0= if nip nip else drop
-		over 0= over 0= or if 2drop -1 lit else
+		over 0= over 0= or  2 lit pick 2 lit pick pisself or if 2drop -1 lit else
 		-1 lit pfk !
 		ppn 0 lit do i pp 8 lit + @ 0= pfk @ 0< and if i pfk ! then loop
 		pfk @ 0< if 2drop -1 lit else
@@ -169,6 +182,25 @@
 	pk @ 18 lit psendk
 ;
 
+\ pmine ( -- k | -1 )   the peer our request to which this GET_HOSTS carries
+\        the nonce of -- if it does, we asked ourselves.
+: pmine ( -- k | -1 )
+	-1 lit pfk !
+	ppn 0 lit do
+		i pp 8 lit + @  i pp 1C lit + @ and if
+			pbd @ qbe@ i pp 18 lit + @ = swap i pp 14 lit + @ = and if i pfk ! then
+		then
+	loop pfk @
+;
+
+\ pselfk ( k -- )   peer k is us: forgotten, and remembered as ours.
+: pselfk ( k -- )
+	dup pp @ pmen @ 3 lit and pself !  dup pp 4 lit + @ pmen @ 3 lit and pself 4 lit + !
+	pmen @ 1 lit + pmen !
+	"node: " puts dup pp @ fnip. 3A lit putc dup pp 4 lit + @ fndec " is this node: dropped" puts A lit putc
+	pp 8 lit + 0 lit swap !
+;
+
 \ pghosts ( -- )   GET_HOSTS: HOSTS, with the asker's cookie, and the hosts
 \        that have answered us -- not the asker, not QEMU's gateway (this
 \        machine, 10.0.2.2) -- as many as asked for and the request's size
@@ -178,7 +210,8 @@
 : pghosts ( -- )
 	pbn @ A lit u< 0= if
 		0 lit  pbn @ A lit u> if pbn @ A lit do pbd @ i + c@ or loop then
-		0= if                                                           \ zero padding
+		0= if pmine dup 0< 0= if pselfk 0 lit else drop -1 lit then else 0 lit then   \ zero padding; not us
+		if
 			nsrc @ nsport @ padd drop
 			pbd @ 8 lit + nb16@  pbn @ 6 lit + 3 lit * 18 lit - 6 lit /  pumin  phm !
 			2 lit phdr  pbd @ swap 8 lit ncpy

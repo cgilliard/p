@@ -120,8 +120,12 @@ B3828140 ,   \ sub  t0,gp,s0          ( the offset )
 	nip 2A lit + preply
 ;
 
+\ imsay ( s -- )   "node: <s> its boot image to <the asker>".
+: imsay ( s -- )   "node: " puts puts " its boot image to " puts  nsrc @ fnip. 3A lit putc nsport @ fndec A lit putc ;
+
 \ imget ( -- )   GET_BIN, with our cookie and our image's hash: the chunks
-\        asked for, at most 32.
+\        asked for, at most 32 -- said when it starts (chunk 0) and when the
+\        last chunk goes.
 : imget ( -- )
 	pbn @ 2E lit = imz @ and if
 		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
@@ -129,6 +133,8 @@ B3828140 ,   \ sub  t0,gp,s0          ( the offset )
 				imz @ 3FF lit + A lit rshift                          ( chunks )
 				pbd @ 28 lit + be32  pbd @ 2C lit + nb16@ 20 lit pumin over +   ( chunks first end )
 				rot over over u> if nip else drop then              ( first end' )
+				over 0= if "sending" imsay then
+				imz @ 3FF lit + A lit rshift over = 2 lit pick 2 lit pick u< and if "sent the last of" imsay then
 				2dup u< if swap do i imchunk loop else 2drop then
 			then
 		then

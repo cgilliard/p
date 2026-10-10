@@ -24,6 +24,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 	.text
+	.option norelax                         # an exact layout: the config is the last 40 bytes
 	.globl _start
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -489,6 +490,8 @@ hash_cmp:
 
 	# Match!  Free scratch, set handoff regs, jal over hash data to gp.
 	addi    sp, sp, 32
+	LOAD_ADDRESS a0, msg_disk
+	CALL    put_str
 
 	li      t0, SEED_LIST_OFFSET
 	add     a0, s7, t0                      # a0 = seed list ptr
@@ -503,10 +506,8 @@ hash_cmp:
 
 hash_mismatch:
 	addi    sp, sp, 32
-	li      t6, 'H'
-	sb      t6, 0(s8)
-	li      t6, '\n'
-	sb      t6, 0(s8)
+	LOAD_ADDRESS a0, msg_fetch
+	CALL    put_str
 	# Fall through to scan_net.
 
 
@@ -670,6 +671,7 @@ rx_desc_done:
 	.equ TICKN,                 0x9FB8      # ticks so far (4 B)
 	.equ NONCE,                 0x9FB0      # our GET_HOSTS nonce (8 B)
 	.equ ADDRTMP,               0x9FA8      # a seed's address, as a host's (6 B)
+	.equ LASTPR,                0x9FA4      # chunks when progress was last shown
 	.equ TICK_TK,              2500000      # 250 ms a tick
 	.equ SEED_WAIT_TK,        30000000      # 3 s before asking seeds for chunks
 	.equ WINDOW,                    32      # chunks a GET_BIN
@@ -748,6 +750,8 @@ seed_done:
 	add     t0, s7, t0
 	lw      t0, 0(t0)
 	beqz    t0, halt_no_net                 # no one to ask
+	LOAD_ADDRESS a0, msg_seeds
+	CALL    put_str
 
 # ── The loop: a packet, or else (when it's time) a tick. ────────────────
 net_loop:
@@ -818,6 +822,9 @@ rx_hosts:
 	bne     t0, t1, rx_refill               # only the hosts we asked
 	li      t0, 2
 	sb      t0, 6(a5)                       # a peer
+	LOAD_ADDRESS a0, msg_peer
+	CALL    put_str
+	CALL    put_peer
 	addi    t0, a2, 68
 	addi    t1, a5, 8
 	li      t2, 8
@@ -890,9 +897,17 @@ rx_chunk:
 	or      t6, t6, t1
 	sb      t6, 0(t3)
 	lbu     t0, 7(a5)                       # the peer has sent chunks
-	ori     t0, t0, 2
+	andi    t1, t0, 2
+	bnez    t1, 3f
+	ori     t0, t0, 2                       # its first: say so
 	sb      t0, 7(a5)
-	andi    t0, t0, 1
+	mv      a6, t4
+	LOAD_ADDRESS a0, msg_from
+	CALL    put_str
+	CALL    put_peer
+	mv      t4, a6
+	lbu     t0, 7(a5)
+3:	andi    t0, t0, 1
 	bnez    t0, 1f
 	li      t0, HAVE_NS
 	add     t0, s7, t0
@@ -1014,6 +1029,28 @@ net_idle:
 	bltu    t0, t2, 1f
 	li      a6, 1
 1:
+	# Every eighth tick (2 s), how far the download has got.
+	li      t0, TICKN
+	add     t0, s7, t0
+	lw      t0, 0(t0)
+	andi    t0, t0, 7
+	bnez    t0, 2f
+	li      t0, LASTPR
+	add     t0, s7, t0
+	lw      t1, 0(t0)
+	beq     t1, s1, 2f
+	sw      s1, 0(t0)
+	LOAD_ADDRESS a0, msg_tab
+	CALL    put_str
+	mv      a0, s1
+	CALL    put_dec
+	LOAD_ADDRESS a0, msg_of
+	CALL    put_str
+	mv      a0, s2
+	CALL    put_dec
+	LOAD_ADDRESS a0, msg_chunks
+	CALL    put_str
+2:
 	# Walk the table: discovery, then the image.
 	li      a5, PEERS
 	add     a5, s7, a5
@@ -1092,6 +1129,8 @@ net_hash_cmp:
 
 	# Match!
 	addi    sp, sp, 32
+	LOAD_ADDRESS a0, msg_got
+	CALL    put_str
 	li      t0, SEED_LIST_OFFSET
 	add     a0, s7, t0
 	li      a1, 1                           # boot source = net
@@ -1104,10 +1143,8 @@ net_hash_cmp:
 
 net_hash_mismatch:
 	addi    sp, sp, 32
-	li      t6, 'H'
-	sb      t6, 0(s8)
-	li      t6, '\n'
-	sb      t6, 0(s8)
+	LOAD_ADDRESS a0, msg_bad
+	CALL    put_str
 	# Drop every peer that sent chunks; forget the chunks; again.
 	li      a5, PEERS
 	add     a5, s7, a5
@@ -1140,18 +1177,18 @@ net_hash_mismatch:
 	j       net_loop
 halt_no_disk:
 panic:
-	li      t6, 'N'
+	LOAD_ADDRESS a0, msg_nodev
 	j       halt_tail
 
 halt_no_net:
-	li      t6, 'N'
-	beqz    s1, halt_tail
-	li      t6, 'H'
+	LOAD_ADDRESS a0, msg_nonet
 halt_tail:
-	sb      t6, 0(s8)
-	li      t6, '\n'
-	sb      t6, 0(s8)
-	lui     t0, %hi(SHUTDOWN_ADDR)
+1:	lbu     t0, 0(a0)                       # (no CALL: a panic may be the RID stack)
+	beqz    t0, 2f
+	sb      t0, 0(s8)
+	addi    a0, a0, 1
+	j       1b
+2:	lui     t0, %hi(SHUTDOWN_ADDR)
 	li      t1, SHUTDOWN_FAIL
 	sw      t1, 0(t0)
 1:	j       1b
@@ -1845,7 +1882,69 @@ tx_submit:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# dispatch — single shared resume point.  Looks up s11 (return ID) in the
+# put_str — a0 = a NUL-terminated string: to the UART.  Trashes t0, a0.
+# put_dec — a0 = an unsigned number: in decimal.  Trashes t0..t4, a0.
+# put_peer — a5 = a peer table entry: "a.b.c.d:port\n".  Trashes t0..t4, a0.
+# ──────────────────────────────────────────────────────────────────────────────
+put_str:
+1:	lbu     t0, 0(a0)
+	beqz    t0, 2f
+	sb      t0, 0(s8)
+	addi    a0, a0, 1
+	j       1b
+2:	j       dispatch
+
+put_dec:
+	LOAD_ADDRESS t2, pow10                  # no divide in RV32I: subtract
+	li      t3, 10                          # places left
+	li      t4, 0                           # a digit shown yet
+1:	lw      t1, 0(t2)
+	li      t0, 0
+2:	bltu    a0, t1, 3f
+	sub     a0, a0, t1
+	addi    t0, t0, 1
+	j       2b
+3:	bnez    t0, 4f
+	bnez    t4, 4f
+	li      t1, 1
+	bne     t3, t1, 5f                      # a leading zero (but not the last place)
+4:	li      t4, 1
+	addi    t0, t0, '0'
+	sb      t0, 0(s8)
+5:	addi    t2, t2, 4
+	addi    t3, t3, -1
+	bnez    t3, 1b
+	j       dispatch
+
+put_peer:
+	lbu     a0, 0(a5)
+	CALL    put_dec
+	li      t0, '.'
+	sb      t0, 0(s8)
+	lbu     a0, 1(a5)
+	CALL    put_dec
+	li      t0, '.'
+	sb      t0, 0(s8)
+	lbu     a0, 2(a5)
+	CALL    put_dec
+	li      t0, '.'
+	sb      t0, 0(s8)
+	lbu     a0, 3(a5)
+	CALL    put_dec
+	li      t0, ':'
+	sb      t0, 0(s8)
+	lbu     a0, 4(a5)
+	slli    a0, a0, 8
+	lbu     t0, 5(a5)
+	or      a0, a0, t0
+	CALL    put_dec
+	li      t0, '\n'
+	sb      t0, 0(s8)
+	j       dispatch
+
+# ──────────────────────────────────────────────────────────────────────────────
+# dispatch — single shared resume point.  (It must follow every CALL in the
+# file: the BST covers the CALLs made before it.)  Looks up s11 (return ID) in the
 # BST and jumps to the corresponding .L_csret_<N> label (which sits right
 # after each CALL site, where execution resumes).
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1853,6 +1952,24 @@ tx_submit:
 dispatch:
 	BST 1, %_CSN
 
+
+	.balign 4
+pow10:
+	.word 1000000000, 100000000, 10000000, 1000000, 100000
+	.word 10000, 1000, 100, 10, 1
+msg_disk:   .asciz "tabernacle: booting the node from the disk\n"
+msg_fetch:  .asciz "tabernacle: the disk does not hold this build of the node: fetching it\n"
+msg_seeds:  .asciz "tabernacle: asking the seeds for peers\n"
+msg_peer:   .asciz "tabernacle: peer "
+msg_from:   .asciz "tabernacle: downloading from "
+msg_tab:    .asciz "tabernacle: "
+msg_of:     .asciz " of "
+msg_chunks: .asciz " chunks\n"
+msg_got:    .asciz "tabernacle: got the node, and its hash checks out: booting it\n"
+msg_bad:    .asciz "tabernacle: what came does not match the hash of the node: again, without those peers\n"
+msg_nodev:  .asciz "tabernacle: no disk or network device\n"
+msg_nonet:  .asciz "tabernacle: no progress fetching the node: giving up\n"
+	.balign 4, 0                            # zeros: nops can't pad odd bytes (no C)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config, patched by scripts/build.sh (patch_config): [nchunks][bin_size][hash].

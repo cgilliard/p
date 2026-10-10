@@ -24,6 +24,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 # 	.text
+# 	.option norelax                         # an exact layout: the config is the last 40 bytes
 # 	.globl _start
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -134,7 +135,7 @@
 13 00 00 00	# nop
 # 	LOAD_ADDRESS gp, end_marker
 97 21 00 00	# auipc gp,0x2
-93 81 C1 90	# addi gp,gp,-1780 # 80001910 <end_marker>
+93 81 01 FC	# addi gp,gp,-64 # 80001fc4 <end_marker>
 
 	# ── §1 Page-align s7, then carve sp / s10 / s9 above it. ─────────
 	# s7 = full_node base (page-aligned).
@@ -145,7 +146,7 @@
 # 	mv      s7, gp
 93 8B 01 00	# mv s7,gp
 # 	lw      t0, -36(gp)
-83 A2 C1 FD	# lw t0,-36(gp) # 800030ec <__BSS_END__+0x7dc>
+83 A2 C1 FD	# lw t0,-36(gp) # 800037a0 <__BSS_END__+0x7dc>
 # 	add     s7, s7, t0
 B3 8B 5B 00	# add s7,s7,t0
 # 	li      t0, PAGE_MASK
@@ -571,10 +572,10 @@ B3 82 5B 00	# add t0,s7,t0
 # 	CALL    scan_disk                       # → s3 = disk MMIO base, or fall to halt_d
 13 0D CD FF	# addi s10,s10,-4
 63 74 9D 01	# bgeu s10,s9,800002dc <ph2_done+0x28>
-6F 00 D0 35	# j 80000e34 <halt_no_disk>
+6F 00 90 59	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
 93 0D 10 00	# li s11,1
-6F 00 50 38	# j 80000e68 <scan_disk>
+6F 00 90 5C	# j 800010ac <scan_disk>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 
@@ -604,7 +605,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	andi    t2, t1, 8
 93 73 83 00	# andi t2,t1,8
 # 	beqz    t2, halt_no_disk                # FEATURES_OK didn't stick
-E3 8A 03 30	# beqz t2,80000e34 <halt_no_disk>
+E3 88 03 54	# beqz t2,80001070 <_base71>
 
 # 	li      t1, PAGE_SIZE
 37 13 00 00	# lui t1,0x1
@@ -637,7 +638,7 @@ E3 8A 03 30	# beqz t2,80000e34 <halt_no_disk>
 # 	mv      s0, gp                          # dest walker = full_node base
 13 84 01 00	# mv s0,gp
 # 	lw      t0, -36(gp)
-83 A2 C1 FD	# lw t0,-36(gp) # 800030ec <__BSS_END__+0x7dc>
+83 A2 C1 FD	# lw t0,-36(gp) # 800037a0 <__BSS_END__+0x7dc>
 # 	mv      s1, t0                          # bytes remaining
 93 84 02 00	# mv s1,t0
 # 	li      s2, 0                           # sector counter
@@ -680,10 +681,10 @@ B3 F6 56 00	# and a3,a3,t0
 # 	CALL    disk_read
 13 0D CD FF	# addi s10,s10,-4
 63 74 9D 01	# bgeu s10,s9,800003a4 <read_loop_top+0x40>
-6F 00 50 29	# j 80000e34 <halt_no_disk>
+6F 00 10 4D	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
 93 0D 20 00	# li s11,2
-6F 00 D0 2E	# j 80000e98 <disk_read>
+6F 00 10 53	# j 800010dc <disk_read>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	lw      t0, 0(sp)
@@ -693,7 +694,7 @@ B3 F6 56 00	# and a3,a3,t0
 
 	# disk_read returns a0 = status byte (0 = success).
 # 	bnez    a0, halt_no_disk
-E3 1A 05 26	# bnez a0,80000e34 <halt_no_disk>
+E3 18 05 4A	# bnez a0,80001070 <_base71>
 
 # 	srli    t1, t0, 9                       # chunk / 512
 13 D3 92 00	# srli t1,t0,0x9
@@ -723,14 +724,14 @@ B3 84 54 40	# sub s1,s1,t0
 # 	mv      a0, gp                          # data = full_node base
 13 85 01 00	# mv a0,gp
 # 	lw      a1, -36(gp)
-83 A5 C1 FD	# lw a1,-36(gp) # 800030ec <__BSS_END__+0x7dc>
+83 A5 C1 FD	# lw a1,-36(gp) # 800037a0 <__BSS_END__+0x7dc>
 # 	CALL    gimli_hash
 13 0D CD FF	# addi s10,s10,-4
 63 74 9D 01	# bgeu s10,s9,800003fc <read_done+0x1c>
-6F 00 D0 23	# j 80000e34 <halt_no_disk>
+6F 00 90 47	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
 93 0D 30 00	# li s11,3
-6F 00 D0 44	# j 80001050 <gimli_hash>
+6F 00 10 69	# j 80001294 <gimli_hash>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 
@@ -738,7 +739,7 @@ B3 84 54 40	# sub s1,s1,t0
 # 	mv      t0, sp
 93 02 01 00	# mv t0,sp
 # 	addi    t1, gp, -32
-13 83 01 FE	# addi t1,gp,-32 # 800030f0 <__BSS_END__+0x7e0>
+13 83 01 FE	# addi t1,gp,-32 # 800037a4 <__BSS_END__+0x7e0>
 # 	li      t2, 8                           # 8 words
 93 03 80 00	# li t2,8
 # hash_cmp:
@@ -747,7 +748,7 @@ B3 84 54 40	# sub s1,s1,t0
 # 	lw      t4, 0(t1)
 83 2E 03 00	# lw t4,0(t1) # 1000 <PAGE_SIZE>
 # 	bne     t3, t4, hash_mismatch
-63 1E DE 03	# bne t3,t4,80000460 <hash_mismatch>
+63 12 DE 07	# bne t3,t4,80000488 <hash_mismatch>
 # 	addi    t0, t0, 4
 93 82 42 00	# addi t0,t0,4
 # 	addi    t1, t1, 4
@@ -760,6 +761,18 @@ E3 94 03 FE	# bnez t2,8000041c <hash_cmp>
 	# Match!  Free scratch, set handoff regs, jal over hash data to gp.
 # 	addi    sp, sp, 32
 13 01 01 02	# addi sp,sp,32
+# 	LOAD_ADDRESS a0, msg_disk
+17 25 00 00	# auipc a0,0x2
+13 05 45 98	# addi a0,a0,-1660 # 80001dc0 <msg_disk>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000450 <_base7+0x14>
+6F 00 50 42	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 40 00	# li s11,4
+6F 10 00 58	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
 
 # 	li      t0, SEED_LIST_OFFSET
 B7 A2 00 00	# lui t0,0xa
@@ -778,20 +791,24 @@ B7 A2 00 00	# lui t0,0xa
 # 	nop                                     # layout pad
 13 00 00 00	# nop
 # 	j       end_marker                      # gp = end_marker = full_node entry
-6F 10 40 4B	# j 80001910 <end_marker>
+6F 10 10 34	# j 80001fc4 <end_marker>
 
 
 # hash_mismatch:
 # 	addi    sp, sp, 32
 13 01 01 02	# addi sp,sp,32
-# 	li      t6, 'H'
-93 0F 80 04	# li t6,72
-# 	sb      t6, 0(s8)
-23 00 FC 01	# sb t6,0(s8)
-# 	li      t6, '\n'
-93 0F A0 00	# li t6,10
-# 	sb      t6, 0(s8)
-23 00 FC 01	# sb t6,0(s8)
+# 	LOAD_ADDRESS a0, msg_fetch
+17 25 00 00	# auipc a0,0x2
+13 05 05 96	# addi a0,a0,-1696 # 80001dec <msg_fetch>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,800004a0 <_base10+0x14>
+6F 00 50 3D	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 50 00	# li s11,5
+6F 10 00 53	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
 	# Fall through to scan_net.
 
 
@@ -808,11 +825,11 @@ B7 A2 00 00	# lui t0,0xa
 
 # 	CALL    scan_net                        # → s3 = virtio-net MMIO base
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000480 <hash_mismatch+0x20>
-6F 00 90 1B	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,800004c0 <_base10+0x34>
+6F 00 50 3B	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 40 00	# li s11,4
-6F 00 90 1E	# j 80000e70 <scan_net>
+93 0D 60 00	# li s11,6
+6F 00 D0 3E	# j 800010b4 <scan_net>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 
@@ -895,7 +912,7 @@ B3 83 FB 01	# add t2,s7,t6
 # 	li      t6, 16
 93 0F 00 01	# li t6,16
 # 	bge     t3, t6, rx_desc_done
-63 5E FE 03	# bge t3,t6,80000548 <rx_desc_done>
+63 5E FE 03	# bge t3,t6,80000588 <rx_desc_done>
 # 	sw      t2, 0(t0)                       # desc[i].addr = buffer
 23 A0 72 00	# sw t2,0(t0)
 # 	sw      zero, 4(t0)                     # addr_hi = 0
@@ -925,14 +942,14 @@ B3 83 E3 01	# add t2,t2,t5
 # 	addi    t3, t3, 1
 13 0E 1E 00	# addi t3,t3,1
 # 	j       rx_desc_top
-6F F0 5F FC	# j 80000508 <rx_desc_top>
+6F F0 5F FC	# j 80000548 <rx_desc_top>
 # rx_desc_done:
 # 	li      t1, 16
 13 03 00 01	# li t1,16
 # 	addi    t6, s7, 258                     # avail.idx
 93 8F 2B 10	# addi t6,s7,258
 # 	sh      t1, 0(t6)
-23 90 6F 00	# sh t1,0(t6) # 2000 <_offset0+0x6f4>
+23 90 6F 00	# sh t1,0(t6) # 2000 <_offset0+0x40>
 
 	# ── TX queue (queue 1, SIZE = 1) ──────────────────────────────────
 	# V_QNUM = 1 forces every TX to drain before the next is posted.
@@ -1026,6 +1043,7 @@ B7 8F 00 00	# lui t6,0x8
 # 	.equ TICKN,                 0x9FB8      # ticks so far (4 B)
 # 	.equ NONCE,                 0x9FB0      # our GET_HOSTS nonce (8 B)
 # 	.equ ADDRTMP,               0x9FA8      # a seed's address, as a host's (6 B)
+# 	.equ LASTPR,                0x9FA4      # chunks when progress was last shown
 # 	.equ TICK_TK,              2500000      # 250 ms a tick
 # 	.equ SEED_WAIT_TK,        30000000      # 3 s before asking seeds for chunks
 # 	.equ WINDOW,                    32      # chunks a GET_BIN
@@ -1047,7 +1065,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	li      s1, 0
 93 04 00 00	# li s1,0
 # 	lw      s2, -40(gp)                     # NCHUNKS
-03 A9 81 FD	# lw s2,-40(gp) # 800030e8 <__BSS_END__+0x7d8>
+03 A9 81 FD	# lw s2,-40(gp) # 8000379c <__BSS_END__+0x7d8>
 
 	# Our magic: dev ("TBRD") or main ("TBRN").
 # 	li      t0, NETFLAG
@@ -1061,7 +1079,7 @@ B3 82 5B 00	# add t0,s7,t0
 B7 43 52 4E	# lui t2,0x4e524
 93 83 43 25	# addi t2,t2,596 # 4e524254 <UART_BASE+0x3e524254>
 # 	beqz    t1, 1f
-63 06 03 00	# beqz t1,800005d4 <rx_desc_done+0x8c>
+63 06 03 00	# beqz t1,80000614 <rx_desc_done+0x8c>
 # 	li      t2, 0x44524254                  # "TBRD"
 B7 43 52 44	# lui t2,0x44524
 93 83 43 25	# addi t2,t2,596 # 44524254 <UART_BASE+0x34524254>
@@ -1130,7 +1148,7 @@ B3 82 5B 00	# add t0,s7,t0
 13 0B 00 00	# li s6,0
 # seed_top:
 # 	bge     s6, s5, seed_done
-63 54 5B 09	# bge s6,s5,800006e0 <seed_done>
+63 54 5B 09	# bge s6,s5,80000720 <seed_done>
 # 	li      t0, SEED_LIST_OFFSET
 B7 A2 00 00	# lui t0,0xa
 # 	add     t0, s7, t0
@@ -1172,17 +1190,17 @@ A3 02 65 00	# sb t1,5(a0)
 93 05 10 00	# li a1,1
 # 	CALL    add_peer
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,800006c4 <seed_top+0x6c>
-6F 00 40 77	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000704 <seed_top+0x6c>
+6F 00 10 17	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 50 00	# li s11,5
-6F 00 D0 33	# j 80001208 <add_peer>
+93 0D 70 00	# li s11,7
+6F 00 10 54	# j 8000144c <add_peer>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	addi    s6, s6, 1
 13 0B 1B 00	# addi s6,s6,1
 # 	j       seed_top
-6F F0 DF F7	# j 80000658 <seed_top>
+6F F0 DF F7	# j 80000698 <seed_top>
 # seed_done:
 # 	li      t0, NPEERS
 B7 A2 00 00	# lui t0,0xa
@@ -1192,12 +1210,24 @@ B3 82 5B 00	# add t0,s7,t0
 # 	lw      t0, 0(t0)
 83 A2 02 00	# lw t0,0(t0)
 # 	beqz    t0, halt_no_net                 # no one to ask
-63 86 02 74	# beqz t0,80000e3c <halt_no_net>
+E3 86 02 14	# beqz t0,8000107c <_base72>
+# 	LOAD_ADDRESS a0, msg_seeds
+17 15 00 00	# auipc a0,0x1
+13 05 05 70	# addi a0,a0,1792 # 80001e34 <msg_seeds>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000748 <_base17+0x14>
+6F 00 D0 12	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 80 00	# li s11,8
+6F 10 80 28	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
 
 # ── The loop: a packet, or else (when it's time) a tick. ────────────────
 # net_loop:
 # 	bge     s1, s2, net_done
-63 D6 24 61	# bge s1,s2,80000d00 <net_done>
+63 D0 24 7B	# bge s1,s2,80000efc <net_done>
 # 	fence   iorw, iorw
 0F 00 F0 0F	# fence
 # 	li      t6, 0x1000
@@ -1207,7 +1237,7 @@ B3 82 FB 01	# add t0,s7,t6
 # 	lhu     t1, 2(t0)
 03 D3 22 00	# lhu t1,2(t0)
 # 	beq     t1, s0, net_idle
-63 02 83 42	# beq t1,s0,80000b2c <net_idle>
+63 04 83 4C	# beq t1,s0,80000c38 <net_idle>
 # 	andi    t2, s0, 15
 93 73 F4 00	# andi t2,s0,15
 # 	slli    t2, t2, 3
@@ -1230,11 +1260,11 @@ B3 83 72 00	# add t2,t0,t2
 # 	li      t5, 0x0608
 13 0F 80 60	# li t5,1544
 # 	beq     t4, t5, arp_reply
-63 8E EE 2D	# beq t4,t5,80000a10 <arp_reply>
+63 80 EE 39	# beq t4,t5,80000b1c <arp_reply>
 # 	li      t5, 0x0008
 13 0F 80 00	# li t5,8
 # 	bne     t4, t5, rx_refill
-63 90 EE 3D	# bne t4,t5,80000afc <rx_refill>
+63 92 EE 47	# bne t4,t5,80000c08 <rx_refill>
 # 	lbu     t4, 48(a2)                      # UDP destination port
 83 4E 06 03	# lbu t4,48(a2)
 # 	slli    t4, t4, 8
@@ -1244,11 +1274,11 @@ B3 83 72 00	# add t2,t0,t2
 # 	or      t4, t4, t5
 B3 EE EE 01	# or t4,t4,t5
 # 	bne     t4, s4, rx_refill
-63 96 4E 3B	# bne t4,s4,80000afc <rx_refill>
+63 98 4E 45	# bne t4,s4,80000c08 <rx_refill>
 # 	addi    t0, a1, -60                     # at least our header
 93 82 45 FC	# addi t0,a1,-60
 # 	bltz    t0, rx_refill
-63 C2 02 3A	# bltz t0,80000afc <rx_refill>
+63 C4 02 44	# bltz t0,80000c08 <rx_refill>
 # 	li      t0, NETMAGIC
 B7 A2 00 00	# lui t0,0xa
 93 82 42 FD	# addi t0,t0,-44 # 9fd4 <NETMAGIC>
@@ -1259,38 +1289,38 @@ B3 82 5B 00	# add t0,s7,t0
 # 	lhu     t4, 54(a2)
 83 5E 66 03	# lhu t4,54(a2)
 # 	bne     t4, t1, rx_refill
-63 96 6E 38	# bne t4,t1,80000afc <rx_refill>
+63 98 6E 42	# bne t4,t1,80000c08 <rx_refill>
 # 	lhu     t1, 2(t0)
 03 D3 22 00	# lhu t1,2(t0)
 # 	lhu     t4, 56(a2)
 83 5E 86 03	# lhu t4,56(a2)
 # 	bne     t4, t1, rx_refill
-63 90 6E 38	# bne t4,t1,80000afc <rx_refill>
+63 92 6E 42	# bne t4,t1,80000c08 <rx_refill>
 # 	lbu     t4, 58(a2)
 83 4E A6 03	# lbu t4,58(a2)
 # 	li      t5, 12                          # version
 13 0F C0 00	# li t5,12
 # 	bne     t4, t5, rx_refill
-63 9A EE 37	# bne t4,t5,80000afc <rx_refill>
+63 9C EE 41	# bne t4,t5,80000c08 <rx_refill>
 # 	lbu     t4, 59(a2)                      # type
 83 4E B6 03	# lbu t4,59(a2)
 # 	li      t5, 2
 13 0F 20 00	# li t5,2
 # 	beq     t4, t5, rx_hosts
-63 88 EE 01	# beq t4,t5,800007a4 <rx_hosts>
+63 88 EE 01	# beq t4,t5,8000080c <rx_hosts>
 # 	li      t5, 16
 13 0F 00 01	# li t5,16
 # 	beq     t4, t5, rx_chunk
-63 8C EE 11	# beq t4,t5,800008b4 <rx_chunk>
+63 80 EE 17	# beq t4,t5,80000964 <rx_chunk>
 # 	j       rx_refill
-6F 00 C0 35	# j 80000afc <rx_refill>
+6F 00 00 40	# j 80000c08 <rx_refill>
 
 # HOSTS: nonce 60, cookie 68, count 76, hosts 78.
 # rx_hosts:
 # 	addi    t0, a1, -78
 93 82 25 FB	# addi t0,a1,-78
 # 	bltz    t0, rx_refill
-63 CA 02 34	# bltz t0,80000afc <rx_refill>
+63 CC 02 3E	# bltz t0,80000c08 <rx_refill>
 # 	li      t0, NONCE
 B7 A2 00 00	# lui t0,0xa
 93 82 02 FB	# addi t0,t0,-80 # 9fb0 <NONCE>
@@ -1305,7 +1335,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	lbu     t4, 0(t1)
 83 4E 03 00	# lbu t4,0(t1)
 # 	bne     t3, t4, rx_refill               # not our nonce
-63 1A DE 33	# bne t3,t4,80000afc <rx_refill>
+63 1C DE 3D	# bne t3,t4,80000c08 <rx_refill>
 # 	addi    t0, t0, 1
 93 82 12 00	# addi t0,t0,1
 # 	addi    t1, t1, 1
@@ -1313,28 +1343,49 @@ B3 82 5B 00	# add t0,s7,t0
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 94 03 FE	# bnez t2,800007c0 <rx_hosts+0x1c>
+E3 94 03 FE	# bnez t2,80000828 <rx_hosts+0x1c>
 # 	CALL    find_src
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,800007e8 <rx_hosts+0x44>
-6F 00 00 65	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000850 <rx_hosts+0x44>
+6F 00 50 02	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 60 00	# li s11,6
-6F 00 D0 2D	# j 800012cc <find_src>
+93 0D 90 00	# li s11,9
+6F 00 90 4B	# j 80001510 <find_src>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	beqz    a5, rx_refill
-63 80 07 30	# beqz a5,80000afc <rx_refill>
+63 82 07 3A	# beqz a5,80000c08 <rx_refill>
 # 	lbu     t0, 6(a5)
 83 C2 67 00	# lbu t0,6(a5)
 # 	li      t1, 1
 13 03 10 00	# li t1,1
 # 	bne     t0, t1, rx_refill               # only the hosts we asked
-63 9A 62 2E	# bne t0,t1,80000afc <rx_refill>
+63 9C 62 38	# bne t0,t1,80000c08 <rx_refill>
 # 	li      t0, 2
 93 02 20 00	# li t0,2
 # 	sb      t0, 6(a5)                       # a peer
 23 83 57 00	# sb t0,6(a5)
+# 	LOAD_ADDRESS a0, msg_peer
+17 15 00 00	# auipc a0,0x1
+13 05 05 5E	# addi a0,a0,1504 # 80001e5c <msg_peer>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000890 <_base22+0x14>
+6F 00 40 7E	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D A0 00	# li s11,10
+6F 10 00 14	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	CALL    put_peer
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,800008b0 <_base22+0x34>
+6F 00 40 7C	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D B0 00	# li s11,11
+6F 10 C0 18	# j 80001a44 <put_peer>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
 # 	addi    t0, a2, 68
 93 02 46 04	# addi t0,a2,68
 # 	addi    t1, a5, 8
@@ -1352,7 +1403,7 @@ E3 94 03 FE	# bnez t2,800007c0 <rx_hosts+0x1c>
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 96 03 FE	# bnez t2,80000820 <rx_hosts+0x7c>
+E3 96 03 FE	# bnez t2,800008d0 <_base22+0x54>
 # 	lbu     a3, 76(a2)                      # count
 83 46 C6 04	# lbu a3,76(a2)
 # 	slli    a3, a3, 8
@@ -1367,22 +1418,22 @@ B3 E6 56 00	# or a3,a3,t0
 13 08 E6 04	# addi a6,a2,78
 # rh_host:
 # 	beqz    a3, rh_done
-63 80 06 04	# beqz a3,80000890 <rh_done>
+63 80 06 04	# beqz a3,80000940 <rh_done>
 # 	addi    a4, a4, -6
 13 07 A7 FF	# addi a4,a4,-6
 # 	bltz    a4, rh_done
-63 4C 07 02	# bltz a4,80000890 <rh_done>
+63 4C 07 02	# bltz a4,80000940 <rh_done>
 # 	mv      a0, a6
 13 05 08 00	# mv a0,a6
 # 	li      a1, 0                           # not a seed
 93 05 00 00	# li a1,0
 # 	CALL    add_peer
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000870 <rh_host+0x20>
-6F 00 80 5C	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000920 <rh_host+0x20>
+6F 00 40 75	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 70 00	# li s11,7
-6F 00 10 19	# j 80001208 <add_peer>
+93 0D C0 00	# li s11,12
+6F 00 50 32	# j 8000144c <add_peer>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	addi    a6, a6, 6
@@ -1390,47 +1441,47 @@ B3 E6 56 00	# or a3,a3,t0
 # 	addi    a3, a3, -1
 93 86 F6 FF	# addi a3,a3,-1
 # 	j       rh_host
-6F F0 5F FC	# j 80000850 <rh_host>
+6F F0 5F FC	# j 80000900 <rh_host>
 # rh_done:
 # 	CALL    progress
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,8000089c <rh_done+0xc>
-6F 00 C0 59	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,8000094c <rh_done+0xc>
+6F 00 80 72	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 80 00	# li s11,8
-6F 00 50 14	# j 800011e8 <progress>
+93 0D D0 00	# li s11,13
+6F 00 90 2D	# j 8000142c <progress>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       rx_refill
-6F 00 C0 24	# j 80000afc <rx_refill>
+6F 00 80 2A	# j 80000c08 <rx_refill>
 
 # BIN_CHUNK: hash 60, index 92, data 96.
 # rx_chunk:
 # 	addi    t0, a1, -97
 93 82 F5 F9	# addi t0,a1,-97
 # 	bltz    t0, rx_refill
-63 C2 02 24	# bltz t0,80000afc <rx_refill>
+63 C0 02 2A	# bltz t0,80000c08 <rx_refill>
 # 	CALL    find_src
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,800008c8 <rx_chunk+0x14>
-6F 00 00 57	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000978 <rx_chunk+0x14>
+6F 00 C0 6F	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 90 00	# li s11,9
-6F 00 D0 1F	# j 800012cc <find_src>
+93 0D E0 00	# li s11,14
+6F 00 10 39	# j 80001510 <find_src>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	beqz    a5, rx_refill
-63 80 07 22	# beqz a5,80000afc <rx_refill>
+63 8E 07 26	# beqz a5,80000c08 <rx_refill>
 # 	lbu     t0, 6(a5)
 83 C2 67 00	# lbu t0,6(a5)
 # 	li      t1, 2
 13 03 20 00	# li t1,2
 # 	bne     t0, t1, rx_refill               # only peers (and not dropped)
-63 9A 62 20	# bne t0,t1,80000afc <rx_refill>
+63 98 62 26	# bne t0,t1,80000c08 <rx_refill>
 # 	addi    t0, a2, 60
 93 02 C6 03	# addi t0,a2,60
 # 	addi    t1, gp, -32                     # our hash
-13 83 01 FE	# addi t1,gp,-32 # 800030f0 <__BSS_END__+0x7e0>
+13 83 01 FE	# addi t1,gp,-32 # 800037a4 <__BSS_END__+0x7e0>
 # 	li      t2, 32
 93 03 00 02	# li t2,32
 # 1:	lbu     t3, 0(t0)
@@ -1438,7 +1489,7 @@ B3 E6 56 00	# or a3,a3,t0
 # 	lbu     t4, 0(t1)
 83 4E 03 00	# lbu t4,0(t1)
 # 	bne     t3, t4, rx_refill               # another build
-63 1E DE 1F	# bne t3,t4,80000afc <rx_refill>
+63 1C DE 25	# bne t3,t4,80000c08 <rx_refill>
 # 	addi    t0, t0, 1
 93 82 12 00	# addi t0,t0,1
 # 	addi    t1, t1, 1
@@ -1446,7 +1497,7 @@ B3 E6 56 00	# or a3,a3,t0
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 94 03 FE	# bnez t2,800008f8 <rx_chunk+0x44>
+E3 94 03 FE	# bnez t2,800009a8 <rx_chunk+0x44>
 # 	lbu     t4, 92(a2)                      # index
 83 4E C6 05	# lbu t4,92(a2)
 # 	lbu     t0, 93(a2)
@@ -1468,7 +1519,7 @@ B3 EE 5E 00	# or t4,t4,t0
 # 	or      t4, t4, t0
 B3 EE 5E 00	# or t4,t4,t0
 # 	bgeu    t4, s2, rx_refill
-63 F0 2E 1D	# bgeu t4,s2,80000afc <rx_refill>
+63 FE 2E 21	# bgeu t4,s2,80000c08 <rx_refill>
 # 	srli    t6, t4, 3                       # the bitmap: once each
 93 DF 3E 00	# srli t6,t4,0x3
 # 	li      t3, NB_BMAP
@@ -1489,21 +1540,52 @@ B3 EE 5E 00	# or t4,t4,t0
 # 	and     t2, t6, t1
 B3 F3 6F 00	# and t2,t6,t1
 # 	bnez    t2, rx_refill
-63 9A 03 18	# bnez t2,80000afc <rx_refill>
+63 98 03 1E	# bnez t2,80000c08 <rx_refill>
 # 	or      t6, t6, t1
 B3 EF 6F 00	# or t6,t6,t1
 # 	sb      t6, 0(t3)
 23 00 FE 01	# sb t6,0(t3)
 # 	lbu     t0, 7(a5)                       # the peer has sent chunks
 83 C2 77 00	# lbu t0,7(a5)
-# 	ori     t0, t0, 2
+# 	andi    t1, t0, 2
+13 F3 22 00	# andi t1,t0,2
+# 	bnez    t1, 3f
+63 10 03 06	# bnez t1,80000a8c <_base33+0x50>
+# 	ori     t0, t0, 2                       # its first: say so
 93 E2 22 00	# ori t0,t0,2
 # 	sb      t0, 7(a5)
 A3 83 57 00	# sb t0,7(a5)
-# 	andi    t0, t0, 1
+# 	mv      a6, t4
+13 88 0E 00	# mv a6,t4
+# 	LOAD_ADDRESS a0, msg_from
+17 15 00 00	# auipc a0,0x1
+13 05 25 43	# addi a0,a0,1074 # 80001e6e <msg_from>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000a50 <_base33+0x14>
+6F 00 40 62	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D F0 00	# li s11,15
+6F 00 10 78	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	CALL    put_peer
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000a70 <_base33+0x34>
+6F 00 40 60	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 00 01	# li s11,16
+6F 00 D0 7C	# j 80001a44 <put_peer>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	mv      t4, a6
+93 0E 08 00	# mv t4,a6
+# 	lbu     t0, 7(a5)
+83 C2 77 00	# lbu t0,7(a5)
+# 3:	andi    t0, t0, 1
 93 F2 12 00	# andi t0,t0,1
 # 	bnez    t0, 1f
-63 9C 02 00	# bnez t0,8000099c <rx_chunk+0xe8>
+63 9C 02 00	# bnez t0,80000aa8 <_base33+0x6c>
 # 	li      t0, HAVE_NS
 B7 A2 00 00	# lui t0,0xa
 93 82 C2 FB	# addi t0,t0,-68 # 9fbc <HAVE_NS>
@@ -1524,21 +1606,21 @@ B3 82 5B 00	# add t0,s7,t0
 # 	li      t6, 1024
 93 0F 00 40	# li t6,1024
 # 	ble     a4, t6, 1f
-63 D4 EF 00	# bge t6,a4,800009b8 <rx_chunk+0x104>
+63 D4 EF 00	# bge t6,a4,80000ac4 <_base33+0x88>
 # 	mv      a4, t6
 13 87 0F 00	# mv a4,t6
 # 1:	lw      t6, -36(gp)                     # no further than the image's end
-83 AF C1 FD	# lw t6,-36(gp) # 800030ec <__BSS_END__+0x7dc>
+83 AF C1 FD	# lw t6,-36(gp) # 800037a0 <__BSS_END__+0x7dc>
 # 	add     t6, gp, t6
 B3 8F F1 01	# add t6,gp,t6
 # 	sub     t6, t6, t5
 B3 8F EF 41	# sub t6,t6,t5
 # 	ble     a4, t6, 1f
-63 D4 EF 00	# bge t6,a4,800009cc <rx_chunk+0x118>
+63 D4 EF 00	# bge t6,a4,80000ad8 <_base33+0x9c>
 # 	mv      a4, t6
 13 87 0F 00	# mv a4,t6
 # 1:	blez    a4, 2f
-63 5E E0 00	# blez a4,800009e8 <rx_chunk+0x134>
+63 5E E0 00	# blez a4,80000af4 <_base33+0xb8>
 # 	lbu     t6, 0(a3)
 83 CF 06 00	# lbu t6,0(a3)
 # 	sb      t6, 0(t5)
@@ -1550,20 +1632,20 @@ B3 8F EF 41	# sub t6,t6,t5
 # 	addi    a4, a4, -1
 13 07 F7 FF	# addi a4,a4,-1
 # 	j       1b
-6F F0 9F FE	# j 800009cc <rx_chunk+0x118>
+6F F0 9F FE	# j 80000ad8 <_base33+0x9c>
 # 2:	addi    s1, s1, 1
 93 84 14 00	# addi s1,s1,1
 # 	CALL    progress
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,800009f8 <rx_chunk+0x144>
-6F 00 00 44	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000b04 <_base33+0xc8>
+6F 00 00 57	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D A0 00	# li s11,10
-6F 00 80 7E	# j 800011e8 <progress>
+93 0D 10 01	# li s11,17
+6F 00 10 12	# j 8000142c <progress>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       rx_refill
-6F 00 00 0F	# j 80000afc <rx_refill>
+6F 00 00 0F	# j 80000c08 <rx_refill>
 
 # arp_reply:
 	# Build ARP reply directly into the shared TX buffer at s7+0x820C
@@ -1591,7 +1673,7 @@ B7 5E 00 00	# lui t4,0x5
 23 93 D6 01	# sh t4,6(a3)
 # 	li      t4, 0x1200; sh t4, 8(a3)
 B7 1E 00 00	# lui t4,0x1
-93 8E 0E 20	# addi t4,t4,512 # 1200 <PAGE_SIZE+0x200>
+93 8E 0E 20	# addi t4,t4,512 # 1200 <_offset42+0x88>
 23 94 D6 01	# sh t4,8(a3)
 # 	li      t4, 0x5634; sh t4, 10(a3)
 B7 5E 00 00	# lui t4,0x5
@@ -1630,7 +1712,7 @@ B7 5E 00 00	# lui t4,0x5
 23 9E D6 01	# sh t4,28(a3)
 # 	li      t4, 0x0F02; sh t4, 30(a3)
 B7 1E 00 00	# lui t4,0x1
-93 8E 2E F0	# addi t4,t4,-254 # f02 <NB_BMAP_BYTES+0xb02>
+93 8E 2E F0	# addi t4,t4,-254 # f02 <_offset72+0x1a>
 23 9F D6 01	# sh t4,30(a3)
 	# target = incoming sender MAC (pkt+34) + IP (pkt+40) via halfwords.
 # 	lhu     t4, 34(a2); sh t4, 32(a3)
@@ -1652,15 +1734,15 @@ B7 1E 00 00	# lui t4,0x1
 13 05 60 03	# li a0,54
 # 	CALL    tx_submit
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000ae4 <arp_reply+0xd4>
-6F 00 40 35	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000bf0 <arp_reply+0xd4>
+6F 00 40 48	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D B0 00	# li s11,11
-6F 00 10 42	# j 8000170c <tx_submit>
+93 0D 20 01	# li s11,18
+6F 00 90 55	# j 80001950 <tx_submit>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       rx_refill
-6F 00 40 00	# j 80000afc <rx_refill>
+6F 00 40 00	# j 80000c08 <rx_refill>
 
 # rx_refill:
 	# Repost the consumed descriptor (a7).
@@ -1687,7 +1769,7 @@ B3 83 72 00	# add t2,t0,t2
 # 	addi    s0, s0, 1                       # consumed++
 13 04 14 00	# addi s0,s0,1
 # 	j       net_loop
-6F F0 DF BC	# j 800006f4 <net_loop>
+6F F0 9F B2	# j 8000075c <net_loop>
 
 # ── Nothing arrived: the watchdog, and the tick. ─────────────────────────
 # net_idle:
@@ -1713,7 +1795,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	lw      t3, 0(t0)
 03 AE 02 00	# lw t3,0(t0)
 # 	bgeu    t2, t3, halt_no_net             # no progress for the timeout
-63 F0 C3 2F	# bgeu t2,t3,80000e3c <halt_no_net>
+63 FA C3 41	# bgeu t2,t3,8000107c <_base72>
 # 	li      t0, LASTTICK
 B7 A2 00 00	# lui t0,0xa
 93 82 42 FC	# addi t0,t0,-60 # 9fc4 <LASTTICK>
@@ -1727,7 +1809,7 @@ B3 03 73 40	# sub t2,t1,t2
 37 2E 26 00	# lui t3,0x262
 13 0E 0E 5A	# addi t3,t3,1440 # 2625a0 <TICK_TK>
 # 	bltu    t2, t3, net_loop
-E3 EC C3 B7	# bltu t2,t3,800006f4 <net_loop>
+E3 EA C3 AD	# bltu t2,t3,8000075c <net_loop>
 # 	sw      t1, 0(t0)                       # a tick
 23 A0 62 00	# sw t1,0(t0)
 # 	li      t0, TICKN
@@ -1754,7 +1836,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	lw      t0, 0(t0)
 83 A2 02 00	# lw t0,0(t0)
 # 	bnez    t0, 1f
-63 94 02 02	# bnez t0,80000bd8 <net_idle+0xac>
+63 94 02 02	# bnez t0,80000ce4 <net_idle+0xac>
 # 	li      t0, T_START
 B7 A2 00 00	# lui t0,0xa
 93 82 02 FC	# addi t0,t0,-64 # 9fc0 <T_START>
@@ -1768,10 +1850,92 @@ B3 02 53 40	# sub t0,t1,t0
 B7 C3 C9 01	# lui t2,0x1c9c
 93 83 03 38	# addi t2,t2,896 # 1c9c380 <SEED_WAIT_TK>
 # 	bltu    t0, t2, 1f
-63 E4 72 00	# bltu t0,t2,80000bd8 <net_idle+0xac>
+63 E4 72 00	# bltu t0,t2,80000ce4 <net_idle+0xac>
 # 	li      a6, 1
 13 08 10 00	# li a6,1
 # 1:
+	# Every eighth tick (2 s), how far the download has got.
+# 	li      t0, TICKN
+B7 A2 00 00	# lui t0,0xa
+93 82 82 FB	# addi t0,t0,-72 # 9fb8 <TICKN>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lw      t0, 0(t0)
+83 A2 02 00	# lw t0,0(t0)
+# 	andi    t0, t0, 7
+93 F2 72 00	# andi t0,t0,7
+# 	bnez    t0, 2f
+63 9E 02 0C	# bnez t0,80000dd4 <_base52+0x28>
+# 	li      t0, LASTPR
+B7 A2 00 00	# lui t0,0xa
+93 82 42 FA	# addi t0,t0,-92 # 9fa4 <LASTPR>
+# 	add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+# 	lw      t1, 0(t0)
+03 A3 02 00	# lw t1,0(t0)
+# 	beq     t1, s1, 2f
+63 04 93 0C	# beq t1,s1,80000dd4 <_base52+0x28>
+# 	sw      s1, 0(t0)
+23 A0 92 00	# sw s1,0(t0)
+# 	LOAD_ADDRESS a0, msg_tab
+17 15 00 00	# auipc a0,0x1
+13 05 85 17	# addi a0,a0,376 # 80001e8c <msg_tab>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000d28 <_base42+0x14>
+6F 00 C0 34	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 30 01	# li s11,19
+6F 00 90 4A	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	mv      a0, s1
+13 85 04 00	# mv a0,s1
+# 	CALL    put_dec
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000d4c <_base42+0x38>
+6F 00 80 32	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 40 01	# li s11,20
+6F 00 D0 49	# j 800019f0 <_base89>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	LOAD_ADDRESS a0, msg_of
+17 15 00 00	# auipc a0,0x1
+13 05 95 13	# addi a0,a0,313 # 80001e99 <msg_of>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000d74 <_base47+0x14>
+6F 00 00 30	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 50 01	# li s11,21
+6F 00 D0 45	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	mv      a0, s2
+13 05 09 00	# mv a0,s2
+# 	CALL    put_dec
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000d98 <_base47+0x38>
+6F 00 C0 2D	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 60 01	# li s11,22
+6F 00 10 45	# j 800019f0 <_base89>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	LOAD_ADDRESS a0, msg_chunks
+17 15 00 00	# auipc a0,0x1
+13 05 25 0F	# addi a0,a0,242 # 80001e9e <msg_chunks>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000dc0 <_base52+0x14>
+6F 00 40 2B	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 70 01	# li s11,23
+6F 00 10 41	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 2:
 	# Walk the table: discovery, then the image.
 # 	li      a5, PEERS
 B7 B7 00 00	# lui a5,0xb
@@ -1787,21 +1951,21 @@ B3 82 5B 00	# add t0,s7,t0
 03 A7 02 00	# lw a4,0(t0)
 # tick_peer:
 # 	beqz    a4, net_loop
-E3 00 07 B0	# beqz a4,800006f4 <net_loop>
+E3 06 07 96	# beqz a4,8000075c <net_loop>
 # 	lbu     t0, 6(a5)                       # state
 83 C2 67 00	# lbu t0,6(a5)
 # 	beqz    t0, tp_ask                      # new: ask for hosts
-63 86 02 04	# beqz t0,80000c48 <tp_ask>
+63 86 02 04	# beqz t0,80000e44 <tp_ask>
 # 	li      t1, 1
 13 03 10 00	# li t1,1
 # 	beq     t0, t1, tp_asked
-63 88 62 00	# beq t0,t1,80000c14 <tp_asked>
+63 88 62 00	# beq t0,t1,80000e10 <tp_asked>
 # 	li      t1, 2
 13 03 20 00	# li t1,2
 # 	beq     t0, t1, tp_peer
-63 8A 62 06	# beq t0,t1,80000c80 <tp_peer>
+63 8A 62 06	# beq t0,t1,80000e7c <tp_peer>
 # 	j       tp_next
-6F 00 40 0E	# j 80000cf4 <tp_next>
+6F 00 40 0E	# j 80000ef0 <tp_next>
 # tp_asked:
 	# Asked, no answer yet: again every fourth tick, four times in all.
 # 	li      t0, TICKN
@@ -1814,7 +1978,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	andi    t0, t0, 3
 93 F2 32 00	# andi t0,t0,3
 # 	bnez    t0, tp_next
-63 96 02 0C	# bnez t0,80000cf4 <tp_next>
+63 96 02 0C	# bnez t0,80000ef0 <tp_next>
 # 	lbu     t0, 7(a5)
 83 C2 77 00	# lbu t0,7(a5)
 # 	srli    t1, t0, 4
@@ -1822,13 +1986,13 @@ B3 82 5B 00	# add t0,s7,t0
 # 	li      t2, 4
 93 03 40 00	# li t2,4
 # 	bltu    t1, t2, tp_ask
-63 68 73 00	# bltu t1,t2,80000c48 <tp_ask>
+63 68 73 00	# bltu t1,t2,80000e44 <tp_ask>
 # 	li      t0, 3                           # never answered: dropped
 93 02 30 00	# li t0,3
 # 	sb      t0, 6(a5)
 23 83 57 00	# sb t0,6(a5)
 # 	j       tp_next
-6F 00 00 0B	# j 80000cf4 <tp_next>
+6F 00 00 0B	# j 80000ef0 <tp_next>
 # tp_ask:
 # 	li      t0, 1
 93 02 10 00	# li t0,1
@@ -1842,28 +2006,28 @@ B3 82 5B 00	# add t0,s7,t0
 A3 83 57 00	# sb t0,7(a5)
 # 	CALL    send_get_hosts
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000c68 <tp_ask+0x20>
-6F 00 00 1D	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000e64 <tp_ask+0x20>
+6F 00 00 21	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D C0 00	# li s11,12
-6F 00 80 78	# j 800013f8 <send_get_hosts>
+93 0D 80 01	# li s11,24
+6F 00 00 7D	# j 8000163c <send_get_hosts>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       tp_next
-6F 00 80 07	# j 80000cf4 <tp_next>
+6F 00 80 07	# j 80000ef0 <tp_next>
 # tp_peer:
 # 	lbu     t0, 7(a5)
 83 C2 77 00	# lbu t0,7(a5)
 # 	andi    t1, t0, 1
 13 F3 12 00	# andi t1,t0,1
 # 	beqz    t1, 1f
-63 04 03 00	# beqz t1,80000c90 <tp_peer+0x10>
+63 04 03 00	# beqz t1,80000e8c <tp_peer+0x10>
 # 	beqz    a6, tp_next                     # a seed: not yet
-63 04 08 06	# beqz a6,80000cf4 <tp_next>
+63 04 08 06	# beqz a6,80000ef0 <tp_next>
 # 1:	andi    t1, t0, 2
 13 F3 22 00	# andi t1,t0,2
 # 	bnez    t1, 2f                          # has sent chunks: every tick
-63 1E 03 00	# bnez t1,80000cb0 <tp_peer+0x30>
+63 1E 03 00	# bnez t1,80000eac <tp_peer+0x30>
 # 	li      t0, TICKN                       # else every eighth
 B7 A2 00 00	# lui t0,0xa
 93 82 82 FB	# addi t0,t0,-72 # 9fb8 <TICKN>
@@ -1874,25 +2038,25 @@ B3 82 5B 00	# add t0,s7,t0
 # 	andi    t0, t0, 7
 93 F2 72 00	# andi t0,t0,7
 # 	bnez    t0, tp_next
-63 94 02 04	# bnez t0,80000cf4 <tp_next>
+63 94 02 04	# bnez t0,80000ef0 <tp_next>
 # 2:	CALL    next_missing                    # a0 = the first chunk to ask for
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000cbc <tp_peer+0x3c>
-6F 00 C0 17	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000eb8 <tp_peer+0x3c>
+6F 00 C0 1B	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D D0 00	# li s11,13
-6F 00 40 68	# j 80001348 <next_missing>
+93 0D 90 01	# li s11,25
+6F 00 C0 6C	# j 8000158c <next_missing>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	bltz    a0, net_loop                    # nothing missing
-E3 42 05 A2	# bltz a0,800006f4 <net_loop>
+E3 48 05 88	# bltz a0,8000075c <net_loop>
 # 	CALL    send_get_bin
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000ce0 <tp_peer+0x60>
-6F 00 80 15	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000edc <tp_peer+0x60>
+6F 00 80 19	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D E0 00	# li s11,14
-6F 00 80 7B	# j 800014a0 <send_get_bin>
+93 0D A0 01	# li s11,26
+6F 00 10 00	# j 800016e4 <send_get_bin>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # tp_next:
@@ -1901,7 +2065,7 @@ E3 42 05 A2	# bltz a0,800006f4 <net_loop>
 # 	addi    a4, a4, -1
 13 07 F7 FF	# addi a4,a4,-1
 # 	j       tick_peer
-6F F0 9F EF	# j 80000bf4 <tick_peer>
+6F F0 9F EF	# j 80000df0 <tick_peer>
 
 # ── All chunks in: hash, and boot or start over. ──────────────────────────
 # net_done:
@@ -1912,20 +2076,20 @@ E3 42 05 A2	# bltz a0,800006f4 <net_loop>
 # 	mv      a0, gp
 13 85 01 00	# mv a0,gp
 # 	lw      a1, -36(gp)
-83 A5 C1 FD	# lw a1,-36(gp) # 800030ec <__BSS_END__+0x7dc>
+83 A5 C1 FD	# lw a1,-36(gp) # 800037a0 <__BSS_END__+0x7dc>
 # 	CALL    gimli_hash
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000d1c <net_done+0x1c>
-6F 00 C0 11	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80000f18 <net_done+0x1c>
+6F 00 C0 15	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D F0 00	# li s11,15
-6F 00 C0 32	# j 80001050 <gimli_hash>
+93 0D B0 01	# li s11,27
+6F 00 40 37	# j 80001294 <gimli_hash>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	mv      t0, sp
 93 02 01 00	# mv t0,sp
 # 	addi    t1, gp, -32
-13 83 01 FE	# addi t1,gp,-32 # 800030f0 <__BSS_END__+0x7e0>
+13 83 01 FE	# addi t1,gp,-32 # 800037a4 <__BSS_END__+0x7e0>
 # 	li      t2, 8
 93 03 80 00	# li t2,8
 # net_hash_cmp:
@@ -1934,7 +2098,7 @@ E3 42 05 A2	# bltz a0,800006f4 <net_loop>
 # 	lw      t4, 0(t1)
 83 2E 03 00	# lw t4,0(t1)
 # 	bne     t3, t4, net_hash_mismatch
-63 1E DE 03	# bne t3,t4,80000d80 <net_hash_mismatch>
+63 12 DE 07	# bne t3,t4,80000fa4 <net_hash_mismatch>
 # 	addi    t0, t0, 4
 93 82 42 00	# addi t0,t0,4
 # 	addi    t1, t1, 4
@@ -1942,11 +2106,23 @@ E3 42 05 A2	# bltz a0,800006f4 <net_loop>
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, net_hash_cmp
-E3 94 03 FE	# bnez t2,80000d3c <net_hash_cmp>
+E3 94 03 FE	# bnez t2,80000f38 <net_hash_cmp>
 
 	# Match!
 # 	addi    sp, sp, 32
 13 01 01 02	# addi sp,sp,32
+# 	LOAD_ADDRESS a0, msg_got
+17 15 00 00	# auipc a0,0x1
+13 05 F5 F4	# addi a0,a0,-177 # 80001ea7 <msg_got>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000f6c <_base63+0x14>
+6F 00 80 10	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D C0 01	# li s11,28
+6F 00 50 26	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
 # 	li      t0, SEED_LIST_OFFSET
 B7 A2 00 00	# lui t0,0xa
 # 	add     a0, s7, t0
@@ -1964,19 +2140,23 @@ B7 A2 00 00	# lui t0,0xa
 # 	nop                                     # layout pad
 13 00 00 00	# nop
 # 	j       end_marker
-6F 00 50 39	# j 80001910 <end_marker>
+6F 10 40 02	# j 80001fc4 <end_marker>
 
 # net_hash_mismatch:
 # 	addi    sp, sp, 32
 13 01 01 02	# addi sp,sp,32
-# 	li      t6, 'H'
-93 0F 80 04	# li t6,72
-# 	sb      t6, 0(s8)
-23 00 FC 01	# sb t6,0(s8)
-# 	li      t6, '\n'
-93 0F A0 00	# li t6,10
-# 	sb      t6, 0(s8)
-23 00 FC 01	# sb t6,0(s8)
+# 	LOAD_ADDRESS a0, msg_bad
+17 15 00 00	# auipc a0,0x1
+13 05 E5 F3	# addi a0,a0,-194 # 80001ee6 <msg_bad>
+# 	CALL    put_str
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80000fbc <_base66+0x14>
+6F 00 80 0B	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D D0 01	# li s11,29
+6F 00 50 21	# j 800019d8 <put_str>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
 	# Drop every peer that sent chunks; forget the chunks; again.
 # 	li      a5, PEERS
 B7 B7 00 00	# lui a5,0xb
@@ -1991,13 +2171,13 @@ B3 82 5B 00	# add t0,s7,t0
 # 	lw      a4, 0(t0)
 03 A7 02 00	# lw a4,0(t0)
 # 1:	beqz    a4, 2f
-63 06 07 02	# beqz a4,80000ddc <net_hash_mismatch+0x5c>
+63 06 07 02	# beqz a4,80001018 <_base66+0x70>
 # 	lbu     t0, 7(a5)
 83 C2 77 00	# lbu t0,7(a5)
 # 	andi    t1, t0, 2
 13 F3 22 00	# andi t1,t0,2
 # 	beqz    t1, 3f
-63 0A 03 00	# beqz t1,80000dd0 <net_hash_mismatch+0x50>
+63 0A 03 00	# beqz t1,8000100c <_base66+0x64>
 # 	andi    t0, t0, 0xFD
 93 F2 D2 0F	# andi t0,t0,253
 # 	sb      t0, 7(a5)
@@ -2011,7 +2191,7 @@ A3 83 57 00	# sb t0,7(a5)
 # 	addi    a4, a4, -1
 13 07 F7 FF	# addi a4,a4,-1
 # 	j       1b
-6F F0 9F FD	# j 80000db0 <net_hash_mismatch+0x30>
+6F F0 9F FD	# j 80000fec <_base66+0x44>
 # 2:	li      t0, NB_BMAP
 B7 A2 00 00	# lui t0,0xa
 93 82 02 08	# addi t0,t0,128 # a080 <NB_BMAP>
@@ -2026,7 +2206,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	addi    t1, t1, -1
 13 03 F3 FF	# addi t1,t1,-1
 # 	bnez    t1, 1b
-E3 1A 03 FE	# bnez t1,80000dec <net_hash_mismatch+0x6c>
+E3 1A 03 FE	# bnez t1,80001028 <_base66+0x80>
 # 	li      s1, 0
 93 04 00 00	# li s1,0
 # 	li      t0, HAVE_NS
@@ -2038,37 +2218,39 @@ B3 82 5B 00	# add t0,s7,t0
 23 A0 02 00	# sw zero,0(t0)
 # 	CALL    progress
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80000e1c <net_hash_mismatch+0x9c>
-6F 00 C0 01	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80001058 <_base66+0xb0>
+6F 00 C0 01	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 00 01	# li s11,16
-6F 00 40 3C	# j 800011e8 <progress>
+93 0D E0 01	# li s11,30
+6F 00 C0 3C	# j 8000142c <progress>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       net_loop
-6F F0 5F 8C	# j 800006f4 <net_loop>
+6F F0 0F EF	# j 8000075c <net_loop>
 # halt_no_disk:
 # panic:
-# 	li      t6, 'N'
-93 0F E0 04	# li t6,78
+# 	LOAD_ADDRESS a0, msg_nodev
+17 15 00 00	# auipc a0,0x1
+13 05 D5 EC	# addi a0,a0,-307 # 80001f3d <msg_nodev>
 # 	j       halt_tail
-6F 00 00 01	# j 80000e48 <halt_tail>
+6F 00 C0 00	# j 80001084 <halt_tail>
 
 # halt_no_net:
-# 	li      t6, 'N'
-93 0F E0 04	# li t6,78
-# 	beqz    s1, halt_tail
-63 84 04 00	# beqz s1,80000e48 <halt_tail>
-# 	li      t6, 'H'
-93 0F 80 04	# li t6,72
+# 	LOAD_ADDRESS a0, msg_nonet
+17 15 00 00	# auipc a0,0x1
+13 05 85 EE	# addi a0,a0,-280 # 80001f64 <msg_nonet>
 # halt_tail:
-# 	sb      t6, 0(s8)
-23 00 FC 01	# sb t6,0(s8)
-# 	li      t6, '\n'
-93 0F A0 00	# li t6,10
-# 	sb      t6, 0(s8)
-23 00 FC 01	# sb t6,0(s8)
-# 	lui     t0, %hi(SHUTDOWN_ADDR)
+# 1:	lbu     t0, 0(a0)                       # (no CALL: a panic may be the RID stack)
+83 42 05 00	# lbu t0,0(a0)
+# 	beqz    t0, 2f
+63 88 02 00	# beqz t0,80001098 <halt_tail+0x14>
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 	addi    a0, a0, 1
+13 05 15 00	# addi a0,a0,1
+# 	j       1b
+6F F0 1F FF	# j 80001084 <halt_tail>
+# 2:	lui     t0, %hi(SHUTDOWN_ADDR)
 B7 02 10 00	# lui t0,0x100
 # 	li      t1, SHUTDOWN_FAIL
 37 33 01 00	# lui t1,0x13
@@ -2076,7 +2258,7 @@ B7 02 10 00	# lui t0,0x100
 # 	sw      t1, 0(t0)
 23 A0 62 00	# sw t1,0(t0) # 100000 <RID_BASE_OFF>
 # 1:	j       1b
-6F 00 00 00	# j 80000e64 <halt_tail+0x1c>
+6F 00 00 00	# j 800010a8 <halt_tail+0x24>
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2092,7 +2274,7 @@ B7 02 10 00	# lui t0,0x100
 # 	li      t1, 2                           # device_id we want (virtio-blk)
 13 03 20 00	# li t1,2
 # 	j       scan_common
-6F 00 80 00	# j 80000e74 <scan_common>
+6F 00 80 00	# j 800010b8 <scan_common>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # scan_net — same as scan_disk but looking for device_id=1 (virtio-net).
@@ -2110,17 +2292,17 @@ B7 13 00 10	# lui t2,0x10001
 # 	lui     t3, 0xFFFFF                     # -PAGE_SIZE (sign-extended u20<<12)
 37 FE FF FF	# lui t3,0xfffff
 # 1:	bge     s3, t2, 2f
-63 D4 79 00	# bge s3,t2,80000e88 <scan_common+0x14>
+63 D4 79 00	# bge s3,t2,800010cc <scan_common+0x14>
 # 	j       halt_no_disk
-6F F0 1F FB	# j 80000e34 <halt_no_disk>
+6F F0 9F FA	# j 80001070 <_base71>
 # 2:	lw      t0, 8(s3)                       # device_id
 83 A2 89 00	# lw t0,8(s3) # 10008008 <UART_BASE+0x8008>
 # 	beq     t0, t1, dispatch                # found → return
-E3 84 62 10	# beq t0,t1,80001794 <dispatch>
+E3 80 62 26	# beq t0,t1,80001b30 <dispatch>
 # 	add     s3, s3, t3                      # next slot down
 B3 89 C9 01	# add s3,s3,t3
 # 	j       1b
-6F F0 DF FE	# j 80000e80 <scan_common+0xc>
+6F F0 DF FE	# j 800010c4 <scan_common+0xc>
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2141,7 +2323,7 @@ B3 89 C9 01	# add s3,s3,t3
 13 83 0B 00	# mv t1,s7
 # 	li      t3, 0x1200
 37 1E 00 00	# lui t3,0x1
-13 0E 0E 20	# addi t3,t3,512 # 1200 <PAGE_SIZE+0x200>
+13 0E 0E 20	# addi t3,t3,512 # 1200 <_offset42+0x88>
 # 	add     t3, s7, t3                      # t3 = status byte addr
 33 8E CB 01	# add t3,s7,t3
 # 	addi    t2, t3, 2                       # t2 = req hdr addr
@@ -2228,14 +2410,14 @@ B3 89 C9 01	# add s3,s3,t3
 # 	li      t5, 0xFF
 13 0F F0 0F	# li t5,255
 # 	beq     t4, t5, dr_poll
-E3 8C EE FF	# beq t4,t5,80000f28 <dr_poll>
+E3 8C EE FF	# beq t4,t5,8000116c <dr_poll>
 
 # 	fence   ir, iorw
 0F 00 F0 0A	# fence ir,iorw
 # 	mv      a0, t4
 13 85 0E 00	# mv a0,t4
 # 	j       dispatch
-6F 00 90 05	# j 80001794 <dispatch>
+6F 00 10 1B	# j 80001b30 <dispatch>
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2342,12 +2524,12 @@ B3 73 E3 01	# and t2,t1,t5
 # 	addi    t6, t6, -1
 93 8F FF FF	# addi t6,t6,-1
 # 	bnez    t6, gp_col
-E3 9A 0F F8	# bnez t6,80000f5c <gp_col>
+E3 9A 0F F8	# bnez t6,800011a0 <gp_col>
 
 # 	andi    t0, s1, 3
 93 F2 34 00	# andi t0,s1,3
 # 	bnez    t0, gp_check_2
-63 90 02 04	# bnez t0,80001010 <gp_check_2>
+63 90 02 04	# bnez t0,80001254 <gp_check_2>
 	# Small swap.
 # 	lw      t0, 0(s0)
 83 22 04 00	# lw t0,0(s0)
@@ -2368,7 +2550,7 @@ E3 9A 0F F8	# bnez t6,80000f5c <gp_col>
 	# Round constant.
 # 	li      t0, 0x9E377900
 B7 82 37 9E	# lui t0,0x9e378
-93 82 02 90	# addi t0,t0,-1792 # 9e377900 <__global_pointer$+0x1e3747f0>
+93 82 02 90	# addi t0,t0,-1792 # 9e377900 <__global_pointer$+0x1e37413c>
 # 	or      t0, t0, s1
 B3 E2 92 00	# or t0,t0,s1
 # 	lw      t1, 0(s0)
@@ -2378,13 +2560,13 @@ B3 E2 92 00	# or t0,t0,s1
 # 	sw      t1, 0(s0)
 23 20 64 00	# sw t1,0(s0)
 # 	j       gp_next
-6F 00 C0 02	# j 80001038 <gp_next>
+6F 00 C0 02	# j 8000127c <gp_next>
 
 # gp_check_2:
 # 	li      t1, 2
 13 03 20 00	# li t1,2
 # 	bne     t0, t1, gp_next
-63 92 62 02	# bne t0,t1,80001038 <gp_next>
+63 92 62 02	# bne t0,t1,8000127c <gp_next>
 	# Big swap.
 # 	lw      t0, 0(s0)
 83 22 04 00	# lw t0,0(s0)
@@ -2407,7 +2589,7 @@ B3 E2 92 00	# or t0,t0,s1
 # 	addi    s1, s1, -1
 93 84 F4 FF	# addi s1,s1,-1
 # 	bnez    s1, gp_round
-E3 9C 04 F0	# bnez s1,80000f54 <gp_round>
+E3 9C 04 F0	# bnez s1,80001198 <gp_round>
 # 	lw      s0, 0(sp)
 03 24 01 00	# lw s0,0(sp)
 # 	lw      s1, 4(sp)
@@ -2415,7 +2597,7 @@ E3 9C 04 F0	# bnez s1,80000f54 <gp_round>
 # 	addi    sp, sp, 8
 13 01 81 00	# addi sp,sp,8
 # 	j       dispatch
-6F 00 80 74	# j 80001794 <dispatch>
+6F 00 10 0A	# j 80001b30 <dispatch>
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2452,7 +2634,7 @@ E3 9C 04 F0	# bnez s1,80000f54 <gp_round>
 # 	addi    t0, t0, -1
 93 82 F2 FF	# addi t0,t0,-1
 # 	bnez    t0, gh_zero
-E3 9A 02 FE	# bnez t0,8000106c <gh_zero>
+E3 9A 02 FE	# bnez t0,800012b0 <gh_zero>
 
 # 	addi    s0, sp, 16                      # state base
 13 04 01 01	# addi s0,sp,16
@@ -2467,7 +2649,7 @@ E3 9A 02 FE	# bnez t0,8000106c <gh_zero>
 # 	li      t0, 16
 93 02 00 01	# li t0,16
 # 	blt     s2, t0, gh_pad
-63 40 59 06	# blt s2,t0,800010f0 <gh_pad>
+63 40 59 06	# blt s2,t0,80001334 <gh_pad>
 
 # 	mv      t2, s0
 93 03 04 00	# mv t2,s0
@@ -2491,17 +2673,17 @@ E3 9A 02 FE	# bnez t0,8000106c <gh_zero>
 # 	addi    t4, t4, -1
 93 8E FE FF	# addi t4,t4,-1
 # 	bnez    t4, gh_xor_abs
-E3 92 0E FE	# bnez t4,800010a0 <gh_xor_abs>
+E3 92 0E FE	# bnez t4,800012e4 <gh_xor_abs>
 
 # 	mv      a0, s0
 13 05 04 00	# mv a0,s0
 # 	CALL    gimli_permute
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,800010d0 <gh_xor_abs+0x30>
-6F F0 9F D6	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80001314 <gh_xor_abs+0x30>
+6F F0 1F D6	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 10 01	# li s11,17
-6F F0 9F E6	# j 80000f40 <gimli_permute>
+93 0D F0 01	# li s11,31
+6F F0 9F E6	# j 80001184 <gimli_permute>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 
@@ -2510,11 +2692,11 @@ E3 92 0E FE	# bnez t4,800010a0 <gh_xor_abs>
 # 	addi    s2, s2, -16
 13 09 09 FF	# addi s2,s2,-16
 # 	j       gh_absorb
-6F F0 1F FA	# j 8000108c <gh_absorb>
+6F F0 1F FA	# j 800012d0 <gh_absorb>
 
 # gh_pad:
 # 	beqz    s2, gh_pad_skipcopy
-63 08 09 02	# beqz s2,80001120 <gh_pad_skipcopy>
+63 08 09 02	# beqz s2,80001364 <gh_pad_skipcopy>
 # 	mv      t2, s0
 93 03 04 00	# mv t2,s0
 # 	mv      t3, s1
@@ -2537,7 +2719,7 @@ E3 92 0E FE	# bnez t4,800010a0 <gh_xor_abs>
 # 	addi    t4, t4, -1
 93 8E FE FF	# addi t4,t4,-1
 # 	bnez    t4, gh_pad_copy
-E3 92 0E FE	# bnez t4,80001100 <gh_pad_copy>
+E3 92 0E FE	# bnez t4,80001344 <gh_pad_copy>
 # gh_pad_skipcopy:
 
 # 	add     t0, s0, s2
@@ -2567,11 +2749,11 @@ A3 07 64 02	# sb t1,47(s0)
 13 05 04 00	# mv a0,s0
 # 	CALL    gimli_permute
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80001158 <gh_pad_skipcopy+0x38>
-6F F0 1F CE	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,8000139c <gh_pad_skipcopy+0x38>
+6F F0 9F CD	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 20 01	# li s11,18
-6F F0 1F DE	# j 80000f40 <gimli_permute>
+93 0D 00 02	# li s11,32
+6F F0 1F DE	# j 80001184 <gimli_permute>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 
@@ -2597,11 +2779,11 @@ A3 07 64 02	# sb t1,47(s0)
 13 05 04 00	# mv a0,s0
 # 	CALL    gimli_permute
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,8000119c <gh_pad_skipcopy+0x7c>
-6F F0 DF C9	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,800013e0 <gh_pad_skipcopy+0x7c>
+6F F0 5F C9	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 30 01	# li s11,19
-6F F0 DF D9	# j 80000f40 <gimli_permute>
+93 0D 10 02	# li s11,33
+6F F0 DF D9	# j 80001184 <gimli_permute>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 
@@ -2634,7 +2816,7 @@ A3 07 64 02	# sb t1,47(s0)
 # 	addi    sp, sp, 64
 13 01 01 04	# addi sp,sp,64
 # 	j       dispatch
-6F 00 00 5B	# j 80001794 <dispatch>
+6F 00 80 70	# j 80001b30 <dispatch>
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2654,7 +2836,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	sw      t1, 0(t0)
 23 A0 62 00	# sw t1,0(t0)
 # 	j       dispatch
-6F 00 00 59	# j 80001794 <dispatch>
+6F 00 80 6E	# j 80001b30 <dispatch>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # add_peer — a0 = an address (ip 4 B, port 2 B, network order), a1 = flags.
@@ -2676,11 +2858,11 @@ B3 82 5B 00	# add t0,s7,t0
 # 	lbu     t5, 5(a0)
 03 4F 55 00	# lbu t5,5(a0)
 # 	beqz    t0, ap_done
-63 84 02 0A	# beqz t0,800012c8 <ap_done>
+63 84 02 0A	# beqz t0,8000150c <ap_done>
 # 	li      t6, 127
 93 0F F0 07	# li t6,127
 # 	bne     t0, t6, 1f
-63 9A F2 01	# bne t0,t6,8000123c <add_peer+0x34>
+63 9A F2 01	# bne t0,t6,80001480 <add_peer+0x34>
 # 	li      t0, 10
 93 02 A0 00	# li t0,10
 # 	li      t1, 0
@@ -2706,7 +2888,7 @@ B3 E2 C2 01	# or t0,t0,t3
 # 	or      t4, t4, t5                      # the port, likewise
 B3 EE EE 01	# or t4,t4,t5
 # 	beqz    t4, ap_done
-63 86 0E 06	# beqz t4,800012c8 <ap_done>
+63 86 0E 06	# beqz t4,8000150c <ap_done>
 # 	li      t1, PEERS
 37 B3 00 00	# lui t1,0xb
 13 03 03 80	# addi t1,t1,-2048 # a800 <PEERS>
@@ -2722,25 +2904,25 @@ B3 83 7B 00	# add t2,s7,t2
 # 	mv      t5, t3
 13 0F 0E 00	# mv t5,t3
 # 2:	beqz    t5, 3f
-63 00 0F 02	# beqz t5,800012a0 <add_peer+0x98>
+63 00 0F 02	# beqz t5,800014e4 <add_peer+0x98>
 # 	lw      t6, 0(t1)
 83 2F 03 00	# lw t6,0(t1)
 # 	bne     t6, t0, 4f
-63 96 5F 00	# bne t6,t0,80001294 <add_peer+0x8c>
+63 96 5F 00	# bne t6,t0,800014d8 <add_peer+0x8c>
 # 	lhu     t6, 4(t1)
 83 5F 43 00	# lhu t6,4(t1)
 # 	beq     t6, t4, ap_done                 # there already
-63 8C DF 03	# beq t6,t4,800012c8 <ap_done>
+63 8C DF 03	# beq t6,t4,8000150c <ap_done>
 # 4:	addi    t1, t1, 16
 13 03 03 01	# addi t1,t1,16
 # 	addi    t5, t5, -1
 13 0F FF FF	# addi t5,t5,-1
 # 	j       2b
-6F F0 5F FE	# j 80001280 <add_peer+0x78>
+6F F0 5F FE	# j 800014c4 <add_peer+0x78>
 # 3:	li      t6, MAX_PEERS
 93 0F 00 02	# li t6,32
 # 	bge     t3, t6, ap_done                 # full
-63 52 FE 03	# bge t3,t6,800012c8 <ap_done>
+63 52 FE 03	# bge t3,t6,8000150c <ap_done>
 # 	sw      t0, 0(t1)
 23 20 53 00	# sw t0,0(t1)
 # 	sh      t4, 4(t1)
@@ -2759,7 +2941,7 @@ A3 03 B3 00	# sb a1,7(t1)
 23 A0 C3 01	# sw t3,0(t2)
 # ap_done:
 # 	j       dispatch
-6F 00 C0 4C	# j 80001794 <dispatch>
+6F 00 40 62	# j 80001b30 <dispatch>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # find_src — a2 = an RX buffer.  a5 = the peer table's entry for the packet's
@@ -2807,26 +2989,26 @@ B3 87 FB 00	# add a5,s7,a5
 # 	lw      t3, 0(t3)
 03 2E 0E 00	# lw t3,0(t3)
 # 1:	beqz    t3, 2f
-63 00 0E 02	# beqz t3,80001340 <find_src+0x74>
+63 00 0E 02	# beqz t3,80001584 <find_src+0x74>
 # 	lw      t1, 0(a5)
 03 A3 07 00	# lw t1,0(a5)
 # 	bne     t1, t0, 3f
-63 16 53 00	# bne t1,t0,80001334 <find_src+0x68>
+63 16 53 00	# bne t1,t0,80001578 <find_src+0x68>
 # 	lhu     t1, 4(a5)
 03 D3 47 00	# lhu t1,4(a5)
 # 	beq     t1, t2, fs_done
-63 0A 73 00	# beq t1,t2,80001344 <fs_done>
+63 0A 73 00	# beq t1,t2,80001588 <fs_done>
 # 3:	addi    a5, a5, 16
 93 87 07 01	# addi a5,a5,16
 # 	addi    t3, t3, -1
 13 0E FE FF	# addi t3,t3,-1
 # 	j       1b
-6F F0 5F FE	# j 80001320 <find_src+0x54>
+6F F0 5F FE	# j 80001564 <find_src+0x54>
 # 2:	li      a5, 0
 93 07 00 00	# li a5,0
 # fs_done:
 # 	j       dispatch
-6F 00 00 45	# j 80001794 <dispatch>
+6F 00 80 5A	# j 80001b30 <dispatch>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # next_missing — a0 = the first chunk not yet received at or after CURSOR
@@ -2848,9 +3030,9 @@ B7 AE 00 00	# lui t4,0xa
 # 	add     t4, s7, t4
 B3 8E DB 01	# add t4,s7,t4
 # 1:	beqz    t5, nm_none
-63 00 0F 04	# beqz t5,800013a8 <nm_none>
+63 00 0F 04	# beqz t5,800015ec <nm_none>
 # 	bltu    a0, s2, 2f
-63 64 25 01	# bltu a0,s2,80001374 <next_missing+0x2c>
+63 64 25 01	# bltu a0,s2,800015b8 <next_missing+0x2c>
 # 	li      a0, 0
 13 05 00 00	# li a0,0
 # 2:	srli    t1, a0, 3
@@ -2866,24 +3048,24 @@ B3 8E DB 01	# add t4,s7,t4
 # 	andi    t1, t1, 1
 13 73 13 00	# andi t1,t1,1
 # 	beqz    t1, 3f
-63 08 03 00	# beqz t1,8000139c <next_missing+0x54>
+63 08 03 00	# beqz t1,800015e0 <next_missing+0x54>
 # 	addi    a0, a0, 1
 13 05 15 00	# addi a0,a0,1
 # 	addi    t5, t5, -1
 13 0F FF FF	# addi t5,t5,-1
 # 	j       1b
-6F F0 1F FD	# j 80001368 <next_missing+0x20>
+6F F0 1F FD	# j 800015ac <next_missing+0x20>
 # 3:	addi    t1, a0, WINDOW
 13 03 05 02	# addi t1,a0,32
 # 	sw      t1, 0(t0)
 23 A0 62 00	# sw t1,0(t0)
 # 	j       dispatch
-6F 00 00 3F	# j 80001794 <dispatch>
+6F 00 80 54	# j 80001b30 <dispatch>
 # nm_none:
 # 	li      a0, -1
 13 05 F0 FF	# li a0,-1
 # 	j       dispatch
-6F 00 80 3E	# j 80001794 <dispatch>
+6F 00 00 54	# j 80001b30 <dispatch>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # put_hdr — a0 = type: our header (magic, version 12, type) at PKT.
@@ -2923,7 +3105,7 @@ A3 81 62 00	# sb t1,3(t0)
 # 	sb      a0, 5(t0)
 A3 82 A2 00	# sb a0,5(t0)
 # 	j       dispatch
-6F 00 00 3A	# j 80001794 <dispatch>
+6F 00 80 4F	# j 80001b30 <dispatch>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # send_get_hosts — a5 = a peer table entry: GET_HOSTS (our nonce, 16 hosts),
@@ -2934,11 +3116,11 @@ A3 82 A2 00	# sb a0,5(t0)
 13 05 10 00	# li a0,1
 # 	CALL    put_hdr
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80001408 <send_get_hosts+0x10>
-6F F0 1F A3	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,8000164c <send_get_hosts+0x10>
+6F F0 9F A2	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 40 01	# li s11,20
-6F F0 1F FA	# j 800013b0 <put_hdr>
+93 0D 20 02	# li s11,34
+6F F0 1F FA	# j 800015f4 <put_hdr>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	li      t0, PKT + 6
@@ -2964,7 +3146,7 @@ B3 82 5B 00	# add t0,s7,t0
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 96 03 FE	# bnez t2,80001438 <send_get_hosts+0x40>
+E3 96 03 FE	# bnez t2,8000167c <send_get_hosts+0x40>
 # 	sb      zero, 0(t0)                     # max = 16
 23 80 02 00	# sb zero,0(t0)
 # 	li      t1, 16
@@ -2982,22 +3164,22 @@ A3 80 62 00	# sb t1,1(t0)
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 9A 03 FE	# bnez t2,80001464 <send_get_hosts+0x6c>
+E3 9A 03 FE	# bnez t2,800016a8 <send_get_hosts+0x6c>
 # 	mv      a0, a5
 13 85 07 00	# mv a0,a5
 # 	li      a1, 48
 93 05 00 03	# li a1,48
 # 	CALL    tx_udp
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80001488 <send_get_hosts+0x90>
-6F F0 1F 9B	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,800016cc <send_get_hosts+0x90>
+6F F0 9F 9A	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 50 01	# li s11,21
-6F 00 00 0E	# j 80001570 <tx_udp>
+93 0D 30 02	# li s11,35
+6F 00 00 0E	# j 800017b4 <tx_udp>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       dispatch
-6F 00 80 2F	# j 80001794 <dispatch>
+6F 00 00 45	# j 80001b30 <dispatch>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # send_get_bin — a5 = a peer table entry, a0 = the first chunk: GET_BIN (its
@@ -3033,11 +3215,11 @@ A3 82 62 00	# sb t1,5(t0)
 13 05 F0 00	# li a0,15
 # 	CALL    put_hdr
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,800014e4 <send_get_bin+0x44>
-6F F0 5F 95	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80001728 <send_get_bin+0x44>
+6F F0 DF 94	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 60 01	# li s11,22
-6F F0 5F EC	# j 800013b0 <put_hdr>
+93 0D 40 02	# li s11,36
+6F F0 5F EC	# j 800015f4 <put_hdr>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	li      t0, PKT + 6
@@ -3060,9 +3242,9 @@ B3 82 5B 00	# add t0,s7,t0
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 96 03 FE	# bnez t2,8000150c <send_get_bin+0x6c>
+E3 96 03 FE	# bnez t2,80001750 <send_get_bin+0x6c>
 # 	addi    t1, gp, -32                     # our hash
-13 83 01 FE	# addi t1,gp,-32 # 800030f0 <__BSS_END__+0x7e0>
+13 83 01 FE	# addi t1,gp,-32 # 800037a4 <__BSS_END__+0x7e0>
 # 	li      t2, 32
 93 03 00 02	# li t2,32
 # 1:	lbu     t3, 0(t1)
@@ -3076,22 +3258,22 @@ E3 96 03 FE	# bnez t2,8000150c <send_get_bin+0x6c>
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 96 03 FE	# bnez t2,8000152c <send_get_bin+0x8c>
+E3 96 03 FE	# bnez t2,80001770 <send_get_bin+0x8c>
 # 	mv      a0, a5
 13 85 07 00	# mv a0,a5
 # 	li      a1, 52
 93 05 40 03	# li a1,52
 # 	CALL    tx_udp
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,80001558 <send_get_bin+0xb8>
-6F F0 1F 8E	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,8000179c <send_get_bin+0xb8>
+6F F0 9F 8D	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 70 01	# li s11,23
-6F 00 00 01	# j 80001570 <tx_udp>
+93 0D 50 02	# li s11,37
+6F 00 00 01	# j 800017b4 <tx_udp>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       dispatch
-6F 00 80 22	# j 80001794 <dispatch>
+6F 00 00 38	# j 80001b30 <dispatch>
 
 # ──────────────────────────────────────────────────────────────────────────────
 # tx_udp — a0 = a peer table entry, a1 = the payload's length (at PKT): the
@@ -3215,7 +3397,7 @@ B3 EE EE 01	# or t4,t4,t5
 # 	addi    t2, t2, -1
 93 83 F3 FF	# addi t2,t2,-1
 # 	bnez    t2, 1b
-E3 92 03 FE	# bnez t2,80001660 <tx_udp+0xf0>
+E3 92 03 FE	# bnez t2,800018a4 <tx_udp+0xf0>
 # 	srli    t4, t3, 16
 93 5E 0E 01	# srli t4,t3,0x10
 # 	li      t5, 0xFFFF
@@ -3268,15 +3450,15 @@ A3 82 62 00	# sb t1,5(t0)
 13 85 65 03	# addi a0,a1,54
 # 	CALL    tx_submit
 13 0D CD FF	# addi s10,s10,-4
-63 74 9D 01	# bgeu s10,s9,800016f4 <tx_udp+0x184>
-6F F0 4F F4	# j 80000e34 <halt_no_disk>
+63 74 9D 01	# bgeu s10,s9,80001938 <tx_udp+0x184>
+6F F0 CF F3	# j 80001070 <_base71>
 23 20 BD 01	# sw s11,0(s10)
-93 0D 80 01	# li s11,24
-6F 00 00 01	# j 8000170c <tx_submit>
+93 0D 60 02	# li s11,38
+6F 00 00 01	# j 80001950 <tx_submit>
 83 2D 0D 00	# lw s11,0(s10)
 13 0D 4D 00	# addi s10,s10,4
 # 	j       dispatch
-6F 00 C0 08	# j 80001794 <dispatch>
+6F 00 40 1E	# j 80001b30 <dispatch>
 # ──────────────────────────────────────────────────────────────────────────────
 # tx_submit — post the shared TX buffer (s7+0x8200) as desc[0], bump
 # avail.idx, fence+notify, and spin-wait for the device to drain.
@@ -3344,108 +3526,454 @@ B3 8E DB 01	# add t4,s7,t4
 # 1:	lhu     t1, 2(t3)                       # used.idx
 03 53 2E 00	# lhu t1,2(t3) # 9002 <PKT+0xdcc>
 # 	beq     t1, t0, 2f
-63 06 53 00	# beq t1,t0,80001790 <tx_submit+0x84>
+63 06 53 00	# beq t1,t0,800019d4 <tx_submit+0x84>
 # 	addi    t5, t5, -1
 13 0F FF FF	# addi t5,t5,-1
 # 	bnez    t5, 1b
-E3 1A 0F FE	# bnez t5,80001780 <tx_submit+0x74>
+E3 1A 0F FE	# bnez t5,800019c4 <tx_submit+0x74>
 # 2:	j       dispatch
-6F 00 40 00	# j 80001794 <dispatch>
+6F 00 C0 15	# j 80001b30 <dispatch>
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# dispatch — single shared resume point.  Looks up s11 (return ID) in the
+# put_str — a0 = a NUL-terminated string: to the UART.  Trashes t0, a0.
+# put_dec — a0 = an unsigned number: in decimal.  Trashes t0..t4, a0.
+# put_peer — a5 = a peer table entry: "a.b.c.d:port\n".  Trashes t0..t4, a0.
+# ──────────────────────────────────────────────────────────────────────────────
+# put_str:
+# 1:	lbu     t0, 0(a0)
+83 42 05 00	# lbu t0,0(a0)
+# 	beqz    t0, 2f
+63 88 02 00	# beqz t0,800019ec <put_str+0x14>
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 	addi    a0, a0, 1
+13 05 15 00	# addi a0,a0,1
+# 	j       1b
+6F F0 1F FF	# j 800019d8 <put_str>
+# 2:	j       dispatch
+6F 00 40 14	# j 80001b30 <dispatch>
+
+# put_dec:
+# 	LOAD_ADDRESS t2, pow10                  # no divide in RV32I: subtract
+97 03 00 00	# auipc t2,0x0
+93 83 83 3A	# addi t2,t2,936 # 80001d98 <pow10>
+# 	li      t3, 10                          # places left
+13 0E A0 00	# li t3,10
+# 	li      t4, 0                           # a digit shown yet
+93 0E 00 00	# li t4,0
+# 1:	lw      t1, 0(t2)
+03 A3 03 00	# lw t1,0(t2)
+# 	li      t0, 0
+93 02 00 00	# li t0,0
+# 2:	bltu    a0, t1, 3f
+63 68 65 00	# bltu a0,t1,80001a18 <_base89+0x28>
+# 	sub     a0, a0, t1
+33 05 65 40	# sub a0,a0,t1
+# 	addi    t0, t0, 1
+93 82 12 00	# addi t0,t0,1
+# 	j       2b
+6F F0 5F FF	# j 80001a08 <_base89+0x18>
+# 3:	bnez    t0, 4f
+63 98 02 00	# bnez t0,80001a28 <_base89+0x38>
+# 	bnez    t4, 4f
+63 96 0E 00	# bnez t4,80001a28 <_base89+0x38>
+# 	li      t1, 1
+13 03 10 00	# li t1,1
+# 	bne     t3, t1, 5f                      # a leading zero (but not the last place)
+63 18 6E 00	# bne t3,t1,80001a34 <_base89+0x44>
+# 4:	li      t4, 1
+93 0E 10 00	# li t4,1
+# 	addi    t0, t0, '0'
+93 82 02 03	# addi t0,t0,48
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 5:	addi    t2, t2, 4
+93 83 43 00	# addi t2,t2,4
+# 	addi    t3, t3, -1
+13 0E FE FF	# addi t3,t3,-1
+# 	bnez    t3, 1b
+E3 12 0E FC	# bnez t3,80001a00 <_base89+0x10>
+# 	j       dispatch
+6F 00 00 0F	# j 80001b30 <dispatch>
+
+# put_peer:
+# 	lbu     a0, 0(a5)
+03 C5 07 00	# lbu a0,0(a5)
+# 	CALL    put_dec
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80001a54 <put_peer+0x10>
+6F F0 0F E2	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 70 02	# li s11,39
+6F F0 5F F9	# j 800019f0 <_base89>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	li      t0, '.'
+93 02 E0 02	# li t0,46
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 	lbu     a0, 1(a5)
+03 C5 17 00	# lbu a0,1(a5)
+# 	CALL    put_dec
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80001a80 <put_peer+0x3c>
+6F F0 4F DF	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 80 02	# li s11,40
+6F F0 9F F6	# j 800019f0 <_base89>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	li      t0, '.'
+93 02 E0 02	# li t0,46
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 	lbu     a0, 2(a5)
+03 C5 27 00	# lbu a0,2(a5)
+# 	CALL    put_dec
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80001aac <put_peer+0x68>
+6F F0 8F DC	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D 90 02	# li s11,41
+6F F0 DF F3	# j 800019f0 <_base89>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	li      t0, '.'
+93 02 E0 02	# li t0,46
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 	lbu     a0, 3(a5)
+03 C5 37 00	# lbu a0,3(a5)
+# 	CALL    put_dec
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80001ad8 <put_peer+0x94>
+6F F0 CF D9	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D A0 02	# li s11,42
+6F F0 1F F1	# j 800019f0 <_base89>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	li      t0, ':'
+93 02 A0 03	# li t0,58
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 	lbu     a0, 4(a5)
+03 C5 47 00	# lbu a0,4(a5)
+# 	slli    a0, a0, 8
+13 15 85 00	# slli a0,a0,0x8
+# 	lbu     t0, 5(a5)
+83 C2 57 00	# lbu t0,5(a5)
+# 	or      a0, a0, t0
+33 65 55 00	# or a0,a0,t0
+# 	CALL    put_dec
+13 0D CD FF	# addi s10,s10,-4
+63 74 9D 01	# bgeu s10,s9,80001b10 <put_peer+0xcc>
+6F F0 4F D6	# j 80001070 <_base71>
+23 20 BD 01	# sw s11,0(s10)
+93 0D B0 02	# li s11,43
+6F F0 9F ED	# j 800019f0 <_base89>
+83 2D 0D 00	# lw s11,0(s10)
+13 0D 4D 00	# addi s10,s10,4
+# 	li      t0, '\n'
+93 02 A0 00	# li t0,10
+# 	sb      t0, 0(s8)
+23 00 5C 00	# sb t0,0(s8)
+# 	j       dispatch
+6F 00 40 00	# j 80001b30 <dispatch>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# dispatch — single shared resume point.  (It must follow every CALL in the
+# file: the BST covers the CALLs made before it.)  Looks up s11 (return ID) in the
 # BST and jumps to the corresponding .L_csret_<N> label (which sits right
 # after each CALL site, where execution resumes).
 # ──────────────────────────────────────────────────────────────────────────────
 
 # dispatch:
 # 	BST 1, %_CSN
-93 02 C0 00	# li t0,12
-63 D4 5D 00	# bge s11,t0,800017a0 <dispatch+0xc>
-6F 00 00 01	# j 800017ac <dispatch+0x18>
-63 D4 B2 01	# bge t0,s11,800017a8 <dispatch+0x14>
-6F 00 00 0A	# j 80001844 <dispatch+0xb0>
-6F F0 CF CC	# j 80000c74 <tp_ask+0x2c>
-93 02 60 00	# li t0,6
-63 D4 5D 00	# bge s11,t0,800017b8 <dispatch+0x24>
-6F 00 00 01	# j 800017c4 <dispatch+0x30>
-63 D4 B2 01	# bge t0,s11,800017c0 <dispatch+0x2c>
-6F 00 80 04	# j 80001804 <dispatch+0x70>
-6F F0 4F 83	# j 800007f4 <rx_hosts+0x50>
+93 02 60 01	# li t0,22
+63 D4 5D 00	# bge s11,t0,80001b3c <dispatch+0xc>
+6F 00 00 01	# j 80001b48 <dispatch+0x18>
+63 D4 B2 01	# bge t0,s11,80001b44 <dispatch+0x14>
+6F 00 00 13	# j 80001c70 <dispatch+0x140>
+6F F0 0F A6	# j 80000da4 <_base47+0x44>
+93 02 B0 00	# li t0,11
+63 D4 5D 00	# bge s11,t0,80001b54 <dispatch+0x24>
+6F 00 00 01	# j 80001b60 <dispatch+0x30>
+63 D4 B2 01	# bge t0,s11,80001b5c <dispatch+0x2c>
+6F 00 00 09	# j 80001be8 <dispatch+0xb8>
+6F E0 1F D6	# j 800008bc <_base22+0x40>
+93 02 50 00	# li t0,5
+63 D4 5D 00	# bge s11,t0,80001b6c <dispatch+0x3c>
+6F 00 00 01	# j 80001b78 <dispatch+0x48>
+63 D4 B2 01	# bge t0,s11,80001b74 <dispatch+0x44>
+6F 00 80 03	# j 80001ba8 <dispatch+0x78>
+6F E0 9F 93	# j 800004ac <_base10+0x20>
+93 02 20 00	# li t0,2
+63 D4 5D 00	# bge s11,t0,80001b84 <dispatch+0x54>
+6F 00 00 01	# j 80001b90 <dispatch+0x60>
+63 D4 B2 01	# bge t0,s11,80001b8c <dispatch+0x5c>
+6F 00 C0 00	# j 80001b94 <dispatch+0x64>
+6F E0 5F 82	# j 800003b0 <read_loop_top+0x4c>
+6F E0 8F F5	# j 800002e8 <ph2_done+0x34>
 93 02 30 00	# li t0,3
-63 D4 5D 00	# bge s11,t0,800017d0 <dispatch+0x3c>
-6F 00 00 01	# j 800017dc <dispatch+0x48>
-63 D4 B2 01	# bge t0,s11,800017d8 <dispatch+0x44>
-6F 00 C0 01	# j 800017f0 <dispatch+0x5c>
-6F E0 1F C3	# j 80000408 <read_done+0x28>
-93 02 10 00	# li t0,1
-63 D4 B2 01	# bge t0,s11,800017e8 <dispatch+0x54>
-6F 00 80 00	# j 800017ec <dispatch+0x58>
-6F E0 1F B0	# j 800002e8 <ph2_done+0x34>
-6F E0 5F BC	# j 800003b0 <read_loop_top+0x4c>
-93 02 40 00	# li t0,4
-63 D4 B2 01	# bge t0,s11,800017fc <dispatch+0x68>
-6F 00 80 00	# j 80001800 <dispatch+0x6c>
-6F E0 1F C9	# j 8000048c <hash_mismatch+0x2c>
-6F E0 1F ED	# j 800006d0 <seed_top+0x78>
+63 D4 B2 01	# bge t0,s11,80001ba0 <dispatch+0x70>
+6F 00 80 00	# j 80001ba4 <dispatch+0x74>
+6F E0 9F 86	# j 80000408 <read_done+0x28>
+6F E0 9F 8B	# j 8000045c <_base7+0x20>
+93 02 80 00	# li t0,8
+63 D4 5D 00	# bge s11,t0,80001bb4 <dispatch+0x84>
+6F 00 00 01	# j 80001bc0 <dispatch+0x90>
+63 D4 B2 01	# bge t0,s11,80001bbc <dispatch+0x8c>
+6F 00 C0 01	# j 80001bd4 <dispatch+0xa4>
+6F E0 9F B9	# j 80000754 <_base17+0x20>
+93 02 60 00	# li t0,6
+63 D4 B2 01	# bge t0,s11,80001bcc <dispatch+0x9c>
+6F 00 80 00	# j 80001bd0 <dispatch+0xa0>
+6F E0 1F 90	# j 800004cc <_base10+0x40>
+6F E0 1F B4	# j 80000710 <seed_top+0x78>
 93 02 90 00	# li t0,9
-63 D4 5D 00	# bge s11,t0,80001810 <dispatch+0x7c>
-6F 00 00 01	# j 8000181c <dispatch+0x88>
-63 D4 B2 01	# bge t0,s11,80001818 <dispatch+0x84>
-6F 00 C0 01	# j 80001830 <dispatch+0x9c>
-6F F0 CF 8B	# j 800008d4 <rx_chunk+0x20>
-93 02 70 00	# li t0,7
-63 D4 B2 01	# bge t0,s11,80001828 <dispatch+0x94>
-6F 00 80 00	# j 8000182c <dispatch+0x98>
-6F F0 4F 85	# j 8000087c <rh_host+0x2c>
-6F F0 CF 87	# j 800008a8 <rh_done+0x18>
-93 02 A0 00	# li t0,10
-63 D4 B2 01	# bge t0,s11,8000183c <dispatch+0xa8>
-6F 00 80 00	# j 80001840 <dispatch+0xac>
-6F F0 8F 9C	# j 80000a04 <rx_chunk+0x150>
-6F F0 0F AB	# j 80000af0 <arp_reply+0xe0>
-93 02 20 01	# li t0,18
-63 D4 5D 00	# bge s11,t0,80001850 <dispatch+0xbc>
-6F 00 00 01	# j 8000185c <dispatch+0xc8>
-63 D4 B2 01	# bge t0,s11,80001858 <dispatch+0xc4>
-6F 00 80 04	# j 8000189c <dispatch+0x108>
-6F F0 DF 90	# j 80001164 <gh_pad_skipcopy+0x44>
-93 02 F0 00	# li t0,15
-63 D4 5D 00	# bge s11,t0,80001868 <dispatch+0xd4>
-6F 00 00 01	# j 80001874 <dispatch+0xe0>
-63 D4 B2 01	# bge t0,s11,80001870 <dispatch+0xdc>
-6F 00 C0 01	# j 80001888 <dispatch+0xf4>
-6F F0 8F CB	# j 80000d28 <net_done+0x28>
-93 02 D0 00	# li t0,13
-63 D4 B2 01	# bge t0,s11,80001880 <dispatch+0xec>
-6F 00 80 00	# j 80001884 <dispatch+0xf0>
-6F F0 8F C4	# j 80000cc8 <tp_peer+0x48>
-6F F0 8F C6	# j 80000cec <tp_peer+0x6c>
+63 D4 B2 01	# bge t0,s11,80001be0 <dispatch+0xb0>
+6F 00 80 00	# j 80001be4 <dispatch+0xb4>
+6F E0 DF C7	# j 8000085c <rx_hosts+0x50>
+6F E0 9F CB	# j 8000089c <_base22+0x20>
 93 02 00 01	# li t0,16
-63 D4 B2 01	# bge t0,s11,80001894 <dispatch+0x100>
-6F 00 80 00	# j 80001898 <dispatch+0x104>
-6F F0 4F D9	# j 80000e28 <net_hash_mismatch+0xa8>
-6F F0 5F 84	# j 800010dc <gh_xor_abs+0x3c>
-93 02 50 01	# li t0,21
-63 D4 5D 00	# bge s11,t0,800018a8 <dispatch+0x114>
-6F 00 00 01	# j 800018b4 <dispatch+0x120>
-63 D4 B2 01	# bge t0,s11,800018b0 <dispatch+0x11c>
-6F 00 C0 01	# j 800018c8 <dispatch+0x134>
-6F F0 5F BE	# j 80001494 <send_get_hosts+0x9c>
+63 D4 5D 00	# bge s11,t0,80001bf4 <dispatch+0xc4>
+6F 00 00 01	# j 80001c00 <dispatch+0xd0>
+63 D4 B2 01	# bge t0,s11,80001bfc <dispatch+0xcc>
+6F 00 80 03	# j 80001c30 <dispatch+0x100>
+6F E0 1F E8	# j 80000a7c <_base33+0x40>
+93 02 D0 00	# li t0,13
+63 D4 5D 00	# bge s11,t0,80001c0c <dispatch+0xdc>
+6F 00 00 01	# j 80001c18 <dispatch+0xe8>
+63 D4 B2 01	# bge t0,s11,80001c14 <dispatch+0xe4>
+6F 00 C0 00	# j 80001c1c <dispatch+0xec>
+6F E0 5F D4	# j 80000958 <rh_done+0x18>
+6F E0 5F D1	# j 8000092c <rh_host+0x2c>
+93 02 E0 00	# li t0,14
+63 D4 B2 01	# bge t0,s11,80001c28 <dispatch+0xf8>
+6F 00 80 00	# j 80001c2c <dispatch+0xfc>
+6F E0 DF D5	# j 80000984 <rx_chunk+0x20>
+6F E0 1F E3	# j 80000a5c <_base33+0x20>
 93 02 30 01	# li t0,19
-63 D4 B2 01	# bge t0,s11,800018c0 <dispatch+0x12c>
-6F 00 80 00	# j 800018c4 <dispatch+0x130>
-6F F0 9F 8E	# j 800011a8 <gh_pad_skipcopy+0x88>
-6F F0 1F B5	# j 80001414 <send_get_hosts+0x1c>
-93 02 70 01	# li t0,23
-63 D4 5D 00	# bge s11,t0,800018d4 <dispatch+0x140>
-6F 00 00 01	# j 800018e0 <dispatch+0x14c>
-63 D4 B2 01	# bge t0,s11,800018dc <dispatch+0x148>
-6F 00 C0 00	# j 800018e4 <dispatch+0x150>
-6F F0 9F C8	# j 80001564 <send_get_bin+0xc4>
-6F F0 1F C1	# j 800014f0 <send_get_bin+0x50>
-6F F0 DF E1	# j 80001700 <tx_udp+0x190>
+63 D4 5D 00	# bge s11,t0,80001c3c <dispatch+0x10c>
+6F 00 00 01	# j 80001c48 <dispatch+0x118>
+63 D4 B2 01	# bge t0,s11,80001c44 <dispatch+0x114>
+6F 00 C0 01	# j 80001c5c <dispatch+0x12c>
+6F F0 0F 8F	# j 80000d34 <_base42+0x20>
+93 02 10 01	# li t0,17
+63 D4 B2 01	# bge t0,s11,80001c54 <dispatch+0x124>
+6F 00 80 00	# j 80001c58 <dispatch+0x128>
+6F E0 DF EB	# j 80000b10 <_base33+0xd4>
+6F E0 5F FA	# j 80000bfc <arp_reply+0xe0>
+93 02 40 01	# li t0,20
+63 D4 B2 01	# bge t0,s11,80001c68 <dispatch+0x138>
+6F 00 80 00	# j 80001c6c <dispatch+0x13c>
+6F F0 0F 8F	# j 80000d58 <_base42+0x44>
+6F F0 4F 91	# j 80000d80 <_base47+0x20>
+93 02 10 02	# li t0,33
+63 D4 5D 00	# bge s11,t0,80001c7c <dispatch+0x14c>
+6F 00 00 01	# j 80001c88 <dispatch+0x158>
+63 D4 B2 01	# bge t0,s11,80001c84 <dispatch+0x154>
+6F 00 00 09	# j 80001d10 <dispatch+0x1e0>
+6F F0 8F F6	# j 800013ec <gh_pad_skipcopy+0x88>
+93 02 B0 01	# li t0,27
+63 D4 5D 00	# bge s11,t0,80001c94 <dispatch+0x164>
+6F 00 00 01	# j 80001ca0 <dispatch+0x170>
+63 D4 B2 01	# bge t0,s11,80001c9c <dispatch+0x16c>
+6F 00 80 03	# j 80001cd0 <dispatch+0x1a0>
+6F F0 8F A8	# j 80000f24 <net_done+0x28>
+93 02 80 01	# li t0,24
+63 D4 5D 00	# bge s11,t0,80001cac <dispatch+0x17c>
+6F 00 00 01	# j 80001cb8 <dispatch+0x188>
+63 D4 B2 01	# bge t0,s11,80001cb4 <dispatch+0x184>
+6F 00 C0 00	# j 80001cbc <dispatch+0x18c>
+6F F0 CF 9B	# j 80000e70 <tp_ask+0x2c>
+6F F0 4F 91	# j 80000dcc <_base52+0x20>
+93 02 90 01	# li t0,25
+63 D4 B2 01	# bge t0,s11,80001cc8 <dispatch+0x198>
+6F 00 80 00	# j 80001ccc <dispatch+0x19c>
+6F F0 CF 9F	# j 80000ec4 <tp_peer+0x48>
+6F F0 CF A1	# j 80000ee8 <tp_peer+0x6c>
+93 02 E0 01	# li t0,30
+63 D4 5D 00	# bge s11,t0,80001cdc <dispatch+0x1ac>
+6F 00 00 01	# j 80001ce8 <dispatch+0x1b8>
+63 D4 B2 01	# bge t0,s11,80001ce4 <dispatch+0x1b4>
+6F 00 C0 01	# j 80001cfc <dispatch+0x1cc>
+6F F0 0F B8	# j 80001064 <_base66+0xbc>
+93 02 C0 01	# li t0,28
+63 D4 B2 01	# bge t0,s11,80001cf4 <dispatch+0x1c4>
+6F 00 80 00	# j 80001cf8 <dispatch+0x1c8>
+6F F0 4F A8	# j 80000f78 <_base63+0x20>
+6F F0 0F AD	# j 80000fc8 <_base66+0x20>
+93 02 F0 01	# li t0,31
+63 D4 B2 01	# bge t0,s11,80001d08 <dispatch+0x1d8>
+6F 00 80 00	# j 80001d0c <dispatch+0x1dc>
+6F F0 8F E1	# j 80001320 <gh_xor_abs+0x3c>
+6F F0 CF E9	# j 800013a8 <gh_pad_skipcopy+0x44>
+93 02 60 02	# li t0,38
+63 D4 5D 00	# bge s11,t0,80001d1c <dispatch+0x1ec>
+6F 00 00 01	# j 80001d28 <dispatch+0x1f8>
+63 D4 B2 01	# bge t0,s11,80001d24 <dispatch+0x1f4>
+6F 00 80 03	# j 80001d58 <dispatch+0x228>
+6F F0 1F C2	# j 80001944 <tx_udp+0x190>
+93 02 30 02	# li t0,35
+63 D4 5D 00	# bge s11,t0,80001d34 <dispatch+0x204>
+6F 00 00 01	# j 80001d40 <dispatch+0x210>
+63 D4 B2 01	# bge t0,s11,80001d3c <dispatch+0x20c>
+6F 00 C0 00	# j 80001d44 <dispatch+0x214>
+6F F0 DF 99	# j 800016d8 <send_get_hosts+0x9c>
+6F F0 9F 91	# j 80001658 <send_get_hosts+0x1c>
+93 02 40 02	# li t0,36
+63 D4 B2 01	# bge t0,s11,80001d50 <dispatch+0x220>
+6F 00 80 00	# j 80001d54 <dispatch+0x224>
+6F F0 5F 9E	# j 80001734 <send_get_bin+0x50>
+6F F0 5F A5	# j 800017a8 <send_get_bin+0xc4>
+93 02 90 02	# li t0,41
+63 D4 5D 00	# bge s11,t0,80001d64 <dispatch+0x234>
+6F 00 00 01	# j 80001d70 <dispatch+0x240>
+63 D4 B2 01	# bge t0,s11,80001d6c <dispatch+0x23c>
+6F 00 C0 01	# j 80001d84 <dispatch+0x254>
+6F F0 DF D4	# j 80001ab8 <put_peer+0x74>
+93 02 70 02	# li t0,39
+63 D4 B2 01	# bge t0,s11,80001d7c <dispatch+0x24c>
+6F 00 80 00	# j 80001d80 <dispatch+0x250>
+6F F0 5F CE	# j 80001a60 <put_peer+0x1c>
+6F F0 DF D0	# j 80001a8c <put_peer+0x48>
+93 02 A0 02	# li t0,42
+63 D4 B2 01	# bge t0,s11,80001d90 <dispatch+0x260>
+6F 00 80 00	# j 80001d94 <dispatch+0x264>
+6F F0 5F D5	# j 80001ae4 <put_peer+0xa0>
+6F F0 9F D8	# j 80001b1c <put_peer+0xd8>
+00 CA 9A 3B	# .word 0x3b9aca00
+00 E1 F5 05	# .word 0x05f5e100
+80 96 98 00	# .word 0x00989680
+40 42 0F 00	# .word 0x000f4240
+A0 86 01 00	# .word 0x000186a0
+10 27 00 00	# .word 0x00002710
+E8 03 00 00	# .word 0x000003e8
+64 00 00 00	# .word 0x00000064
+0A 00 00 00	# .word 0x0000000a
+01 00 00 00	# .word 0x00000001
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+62 6F 6F 74	# .word 0x746f6f62
+69 6E 67 20	# .word 0x20676e69
+74 68 65 20	# .word 0x20656874
+6E 6F 64 65	# .word 0x65646f6e
+20 66 72 6F	# .word 0x6f726620
+6D 20 74 68	# .word 0x6874206d
+65 20 64 69	# .word 0x69642065
+73 6B 0A 00	# .word 0x000a6b73
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+74 68 65 20	# .word 0x20656874
+64 69 73 6B	# .word 0x6b736964
+20 64 6F 65	# .word 0x656f6420
+73 20 6E 6F	# .word 0x6f6e2073
+74 20 68 6F	# .word 0x6f682074
+6C 64 20 74	# .word 0x7420646c
+68 69 73 20	# .word 0x20736968
+62 75 69 6C	# .word 0x6c697562
+64 20 6F 66	# .word 0x666f2064
+20 74 68 65	# .word 0x65687420
+20 6E 6F 64	# .word 0x646f6e20
+65 3A 20 66	# .word 0x66203a65
+65 74 63 68	# .word 0x68637465
+69 6E 67 20	# .word 0x20676e69
+69 74 0A 00	# .word 0x000a7469
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+61 73 6B 69	# .word 0x696b7361
+6E 67 20 74	# .word 0x7420676e
+68 65 20 73	# .word 0x73206568
+65 65 64 73	# .word 0x73646565
+20 66 6F 72	# .word 0x726f6620
+20 70 65 65	# .word 0x65657020
+72 73 0A 00	# .word 0x000a7372
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+70 65 65 72	# .word 0x72656570
+20 00 74 61	# .word 0x61740020
+62 65 72 6E	# .word 0x6e726562
+61 63 6C 65	# .word 0x656c6361
+3A 20 64 6F	# .word 0x6f64203a
+77 6E 6C 6F	# .word 0x6f6c6e77
+61 64 69 6E	# .word 0x6e696461
+67 20 66 72	# .word 0x72662067
+6F 6D 20 00	# .word 0x00206d6f
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+00 20 6F 66	# .word 0x666f2000
+20 00 20 63	# .word 0x63200020
+68 75 6E 6B	# .word 0x6b6e7568
+73 0A 00 74	# .word 0x74000a73
+61 62 65 72	# .word 0x72656261
+6E 61 63 6C	# .word 0x6c63616e
+65 3A 20 67	# .word 0x67203a65
+6F 74 20 74	# .word 0x7420746f
+68 65 20 6E	# .word 0x6e206568
+6F 64 65 2C	# .word 0x2c65646f
+20 61 6E 64	# .word 0x646e6120
+20 69 74 73	# .word 0x73746920
+20 68 61 73	# .word 0x73616820
+68 20 63 68	# .word 0x68632068
+65 63 6B 73	# .word 0x736b6365
+20 6F 75 74	# .word 0x74756f20
+3A 20 62 6F	# .word 0x6f62203a
+6F 74 69 6E	# .word 0x6e69746f
+67 20 69 74	# .word 0x74692067
+0A 00 74 61	# .word 0x6174000a
+62 65 72 6E	# .word 0x6e726562
+61 63 6C 65	# .word 0x656c6361
+3A 20 77 68	# .word 0x6877203a
+61 74 20 63	# .word 0x63207461
+61 6D 65 20	# .word 0x20656d61
+64 6F 65 73	# .word 0x73656f64
+20 6E 6F 74	# .word 0x746f6e20
+20 6D 61 74	# .word 0x74616d20
+63 68 20 74	# .word 0x74206863
+68 65 20 68	# .word 0x68206568
+61 73 68 20	# .word 0x20687361
+6F 66 20 74	# .word 0x7420666f
+68 65 20 6E	# .word 0x6e206568
+6F 64 65 3A	# .word 0x3a65646f
+20 61 67 61	# .word 0x61676120
+69 6E 2C 20	# .word 0x202c6e69
+77 69 74 68	# .word 0x68746977
+6F 75 74 20	# .word 0x2074756f
+74 68 6F 73	# .word 0x736f6874
+65 20 70 65	# .word 0x65702065
+65 72 73 0A	# .word 0x0a737265
+00 74 61 62	# .word 0x62617400
+65 72 6E 61	# .word 0x616e7265
+63 6C 65 3A	# .word 0x3a656c63
+20 6E 6F 20	# .word 0x206f6e20
+64 69 73 6B	# .word 0x6b736964
+20 6F 72 20	# .word 0x20726f20
+6E 65 74 77	# .word 0x7774656e
+6F 72 6B 20	# .word 0x206b726f
+64 65 76 69	# .word 0x69766564
+63 65 0A 00	# .word 0x000a6563
+74 61 62 65	# .word 0x65626174
+72 6E 61 63	# .word 0x63616e72
+6C 65 3A 20	# .word 0x203a656c
+6E 6F 20 70	# .word 0x70206f6e
+72 6F 67 72	# .word 0x72676f72
+65 73 73 20	# .word 0x20737365
+66 65 74 63	# .word 0x63746566
+68 69 6E 67	# .word 0x676e6968
+20 74 68 65	# .word 0x65687420
+20 6E 6F 64	# .word 0x646f6e20
+65 3A 20 67	# .word 0x67203a65
+69 76 69 6E	# .word 0x6e697669
+67 20 75 70	# .word 0x70752067
+0A 00 00 00	# .word 0x0000000a
 00 00 00 00	# .word 0x00000000
 00 00 00 00	# .word 0x00000000
 15 36 62 B8	# .word 0xb8623615

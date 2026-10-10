@@ -412,15 +412,13 @@
 	wlin 40 lit zero
 ;
 
-: wlclear ( -- )   1B lit putc "[2J" puts  1B lit putc "[3J" puts  1B lit putc "[H" puts ;
-
 : wlshow ( -- )
 	"\nnode: a new wallet.  Its 24 backup words -- write them down, in order, and keep\nthem safe:\n\n" puts
 	pgop wlm 30 lit + mnshow
 	"\nThey" puts  wlflags 1 lit and if " and the passphrase" puts then
 	" are the only way to restore the wallet, and anyone holding\nthem can spend everything in it.  The wallet lives on this disk: deleting\ndata/disk.img deletes it.  Press Enter once they're written down.\n" puts
 	wlin FF lit wlline drop
-	wlclear  mnb 9 lit zero
+	mnb 9 lit zero
 ;
 
 : wlrec variable ;   \ restore from the words (setting `recover`)

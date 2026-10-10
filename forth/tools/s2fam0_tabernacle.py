@@ -48,6 +48,7 @@ import tempfile
 AS = "riscv64-unknown-elf-as"
 LD = "riscv64-unknown-elf-ld"
 ODUMP = "riscv64-unknown-elf-objdump"
+OBJCOPY = "riscv64-unknown-elf-objcopy"
 MARCH = "rv32i"
 MABI = "ilp32"
 # tabernacle is loaded here by QEMU.  Its LOAD_ADDRESS/auipc relocations are
@@ -81,23 +82,50 @@ def main():
         dis = subprocess.run(
             [ODUMP, "-dlz", elf], check=True, capture_output=True, text=True
         ).stdout
+        # The bytes come from the linked image itself: objdump can't decode
+        # data (strings) in .text, so it only supplies the comments.
+        binf = os.path.join(td, "t.bin")
+        subprocess.run([OBJCOPY, "-O", "binary", elf, binf], check=True)
+        image = open(binf, "rb").read()
 
     # objdump -dl interleaves source-line markers with instructions, in address
     # order.  A `file:NNN` line sets the current source line; instruction lines
     # look like:  "80000004:\t00001197          \tauipc\tgp,0x1"
+    # Every line objdump prints for an address notes that address's source
+    # line; a whole instruction there also gives its disassembly.
     line_re = re.compile(r"^(\S*):(\d+)$")
-    insn_re = re.compile(r"^\s*[0-9a-f]+:\t([0-9a-f]{8})\s+(.*)$")
-    insns = []  # (src_file, src_line, value_hex, disasm)
+    addr_re = re.compile(r"^\s*([0-9a-f]+):\t(.*)$")
+    insn_re = re.compile(r"^([0-9a-f]{8})\s+(.*)$")
+    where = {}  # address -> (src_file, src_line)
+    asms = {}   # address -> disasm
     cur_file, cur_line = src_abs, 0
     for ln in dis.splitlines():
         m = line_re.match(ln)
         if m:
             cur_file, cur_line = m.group(1), int(m.group(2))
             continue
-        m = insn_re.match(ln)
+        m = addr_re.match(ln)
         if m:
-            asm = re.sub(r"\s+", " ", m.group(2)).strip()
-            insns.append((cur_file, cur_line, m.group(1), asm))
+            a = int(m.group(1), 16)
+            where.setdefault(a, (cur_file, cur_line))
+            mi = insn_re.match(m.group(2))
+            if mi:
+                asms[a] = re.sub(r"\s+", " ", mi.group(2)).strip()
+    # Each word of the image: its source line (that of the last address at or
+    # before it that objdump placed) and disassembly (".word" for data).
+    base = int(TEXT_BASE, 16)
+    insns = []  # (src_file, src_line, value_hex, disasm)
+    if len(image) % 4:
+        image += bytes(4 - len(image) % 4)
+    known = sorted(where)
+    k, cur = 0, (src_abs, 0)
+    for off in range(0, len(image), 4):
+        a = base + off
+        while k < len(known) and known[k] <= a:
+            cur = where[known[k]]
+            k += 1
+        val = image[off:off + 4][::-1].hex()
+        insns.append((cur[0], cur[1], val, asms.get(a, f".word 0x{val}")))
 
     if not insns:
         sys.exit("s2fam0_tabernacle: objdump produced no instructions")

@@ -77,10 +77,8 @@
 
 \ ── Saying what it's doing ──
 
-: fndec ( n -- )   dup A lit u< if 30 lit + putc else dup A lit / fndec A lit % 30 lit + putc then ;
 : fnnib ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then putc ;
 : fnhex ( a n -- )   0 lit do dup i + c@ dup 4 lit rshift fnnib fnnib loop drop ;
-: fnip. ( ip -- )   4 lit 0 lit do dup 18 lit i 3 lit lshift - rshift FF lit and fndec  i 3 lit u< if 2E lit putc then loop drop ;
 
 : fnth variable ;  : fnhv variable ;  : fnhash ( -- a )  fnhv 20 lit lazy ;
 : fnfs variable ;  : fnpc variable ;  : fnph variable ;

@@ -74,7 +74,9 @@ active chain by height), served (`GET_INV` by hash or height, `GET_CHUNKS`
 with the asker's cookie), and a new best block is announced (`INV`) to every
 peer but the one it came from; an announced next block is fetched at once.
 Its `HOSTS` answers share the peers that have answered it (not 10.0.2.2,
-QEMU's view of this machine). So Forth nodes alone can sync each other and
+QEMU's view of this machine). A node that asks itself -- a seed list holding
+it, a NAT looping back -- knows by the nonce (a `GET_HOSTS` carrying one of
+its own), and drops that address for good, as the Rust node does. So Forth nodes alone can sync each other and
 fast-sync new ones. Blocks are kept from where a node started -- a
 fast-synced node's sync point, or, on a disk from before this, its next
 block -- and nothing is pruned. Run against a mining Rust dev node: a Forth

@@ -37,6 +37,10 @@
 : nfb variable ;                                     \ the transmit buffer in use
 : ntxb ( -- a )      nfb @ nq @ + ;
 
+\ fndec ( n -- )   n in decimal.   fnip. ( ip -- )   an address, dotted.
+: fndec ( n -- )   dup A lit u< if 30 lit + putc else dup A lit / fndec A lit % 30 lit + putc then ;
+: fnip. ( ip -- )   4 lit 0 lit do dup 18 lit i 3 lit lshift - rshift FF lit and fndec  i 3 lit u< if 2E lit putc then loop drop ;
+
 \ Big-endian halfwords and words in packets.
 : nb16@ ( a -- v )   dup c@ 8 lit lshift swap 1 lit + c@ or ;
 : nb16! ( v a -- )   over 8 lit rshift over c!  1 lit + c! ;
