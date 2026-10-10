@@ -1,21 +1,607 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/txrelay.fam — getting the wallet's transactions to the network, as the
-\ Rust node relays them (../rust/src/txrelay.rs): announce each signed,
-\ unconfirmed one (TX_INV: count u8, then txid (32) and size u32 each) to
-\ every peer that's answered, every 30 seconds until it's confirmed; serve it
-\ to a peer that asks (GET_TX: cookie u64, txid, first u32, count u16 ->
-\ TX_CHUNKs: txid, index u32, up to 1024 bytes); and answer GET_TX_INV
-\ (cookie u64) with the announcement.  A transaction is confirmed once the
-\ input its record names (src/slate.fam) is no longer unspent.
+\ src/txrelay.fam — the mempool, and relaying everyone's transactions, as the
+\ Rust node does (../rust/src/mempool.rs, txrelay.rs).
 \
-\   trin   ( -- f )   handle a datagram for the relay, if it is one
-\   trtick ( -- )     announce, when it's time
-\   trsoon ( -- )     announce at the next tick
+\ The pool holds up to txmax transactions this node accepted, in arrival
+\ order, until they're mined.  A transaction is accepted (txadmit) only if
+\ it's fully checked here: every signature (WOTS, src/wots.fam), by a one-time
+\ key or a key in a key tree (../rust/src/keytree.rs), over its message;
+\ inputs sorted by commitment, outputs by their bytes; 1..8 inputs,
+\ at most 20 outputs (a block chunk's shape); outputs no more than the
+\ inputs; no output repeated, or spent by its own transaction, or already on
+\ chain, or made by another pool transaction; every input unspent on chain
+\ and not spent by another pool transaction (first seen wins).  Policy spends
+\ (contracts, ../rust/src/policy.rs) are checked as fully: the branch valid
+\ and in the policy (its lock), its signers (threshold of the branch's keys),
+\ hashlock preimage, REBIND state and named outputs, and its timelocks holding
+\ in the next block.  Whenever the best tip changes the pool is checked again,
+\ in arrival order, dropping what was mined or now conflicts.
+\
+\ Relaying (wire types, numbers big-endian):
+\   TX_INV (7)      count u8, then id (32) and size u32 each
+\   GET_TX (8)      cookie u64, id, first u32, count u16 -> TX_CHUNKs
+\   TX_CHUNK (9)    id, index u32, up to 1024 bytes
+\   GET_TX_INV (10) cookie u64 -> TX_INV of the pool
+\ An announced id not in the pool and not seen recently is fetched (one at a
+\ time, the rest queued), must hash to its id, and is relayed onward only if
+\ accepted.  A new peer is asked once for its pool (GET_TX_INV).  The pool
+\ is announced to every peer every 30 seconds.  The wallet's own signed
+\ transactions join the pool when finalized, and again at every start
+\ until they're confirmed.
+\
+\   txin   ( -- f )   handle a datagram for the relay, if it is one
+\   txtick ( -- )     downloads, announcements, the pool after a new tip
+\   trsoon ( -- )     the wallet's transaction just finalized (wtx): admit it
 \ ──────────────────────────────────────────────────────────────────────────────
 
-: trwhen variable ;  : trc variable ;
-: trkv variable ;  : trk ( -- a )  trkv 20 lit lazy ;    \ a slate id, and one read
-: trcv variable ;  : trcid ( -- a )  trcv 20 lit lazy ;   \ the one loaded
+: txmax ( -- n )   40 lit ;                          \ pool slots
+: txcap ( -- n )   10000 lit ;                       \ the largest: 64 chunks
+
+: txav variable ;  : txarena ( -- a )  txav 400000 lit lazy ;
+: txmv variable ;  : txmeta ( -- a )   txmv 10000 lit lazy ;
+: txs ( k -- a )   10 lit lshift txarena + ;          \ slot k's bytes
+: txm ( k -- a )   A lit lshift txmeta + ;            \ slot k's record (0x400)
+\ record: 0 used  4 size  8 arrival  C inputs  10 outputs  20 id (32)
+\         40 the inputs' commitments (8 x 32)  140 the outputs' (20 x 32)
+: txseq variable ;
+
+\ ── Reading one ──
+
+: tpa variable ;  : tpn variable ;  : tpo variable ;  : tpok variable ;
+: tpv variable ;  : txrec ( -- a )  tpv 400 lit lazy ;     \ the record being made
+
+\ tptake ( n -- a )   the next n bytes (fails past the end).
+: tptake ( n -- a )
+	tpo @ over + tpn @ u> if drop 0 lit tpok ! tpa @ else tpa @ tpo @ + swap tpo @ + tpo ! then
+;
+: tpu8 ( -- b )    1 lit tptake c@ ;
+: tpu16 ( -- v )   2 lit tptake dup c@ swap 1 lit + c@ 8 lit lshift or ;
+: tple32 ( a -- w )   dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or ;
+: tpu32 ( -- w )   4 lit tptake tple32 ;
+\ tpopt ( -- f )   an optional's flag: 0 absent, 1 present (else it fails).
+: tpopt ( -- f )   tpu8 dup 1 lit u> if 0 lit tpok ! then 0= 0= ;
+
+\ Per input (0x50): 0 where its amount is  4 kind (0 key, 1 policy)  44 its
+\ first signer  48 how many.  A policy spend's branch: 8 threshold  C keys
+\ 10 where they are  14 after height  18 after age  1C where its hashlock is
+\ (or 0)  20 REBIND?  24 its state;  then 28 its index  2C path length
+\ 30 where the path is  34 where the preimage is (or 0)  38 the state
+\ declared  3C how many outputs named  40 where they are.
+: tpiv variable ;  : tpin ( k -- a )  50 lit * tpiv 280 lit lazy + ;
+\ Per signer (0x20; at most 12, as a block chunk): 0 its input  4 where its
+\ key is  8 the key's index in its tree  C where its path is  10 its length
+\ 14 where its signature is  18 its place among a branch's keys.  A key
+\ spend has one signer, a policy spend its branch's threshold.
+: tpsv variable ;  : tps ( s -- a )  5 lit lshift tpsv 1A0 lit lazy + ;
+: tpns variable ;  : tpsa variable ;  : tpb variable ;
+: tpoa variable ;                                     \ the outputs
+
+\ tpsign ( k slot -- )   read a signer of input k: key, its place in its
+\        tree (index, path), signature (required).
+: tpsign ( k slot -- )
+	tpns @ C lit u< if tpns @ tps tpsa !  tpns @ 1 lit + tpns ! else 0 lit tpok !  C lit tps tpsa ! then
+	tpsa @ 18 lit + !  tpsa @ !
+	814 lit tptake tpsa @ 4 lit + !
+	tpu32 tpsa @ 8 lit + !
+	tpu8 dup tpsa @ 10 lit + !  dup 14 lit u> if 0 lit tpok ! then
+	5 lit lshift tptake tpsa @ C lit + !
+	tpu8 1 lit = 0= if 0 lit tpok ! then
+	81C lit tptake tpsa @ 14 lit + !
+;
+
+\ tppol ( k -- )   read a policy spend's rest: the branch, its place in the
+\        policy, preimage, declared state and named outputs, signers.
+: tppol ( k -- )
+	tpin tpb !
+	tpu8 tpb @ 8 lit + !
+	tpu8 dup tpb @ C lit + !  dup C lit u> if 0 lit tpok ! then
+	5 lit lshift tptake tpb @ 10 lit + !
+	tpu32 tpb @ 14 lit + !  tpu32 tpb @ 18 lit + !
+	tpopt if 20 lit tptake else 0 lit then tpb @ 1C lit + !
+	tpopt dup tpb @ 20 lit + !  if tpu32 else 0 lit then tpb @ 24 lit + !
+	tpu32 tpb @ 28 lit + !
+	tpu8 dup tpb @ 2C lit + !  dup 8 lit u> if 0 lit tpok ! then
+	5 lit lshift tptake tpb @ 30 lit + !
+	tpopt if 20 lit tptake else 0 lit then tpb @ 34 lit + !
+	tpu32 tpb @ 38 lit + !
+	tpu8 dup tpb @ 3C lit + !  dup 14 lit u> if 0 lit tpok ! then
+	5 lit lshift tptake tpb @ 40 lit + !
+	tpns @ tpb @ 44 lit + !
+	tpu8 tpb @ 48 lit + !
+;
+
+\ txread ( a n -- ok )   parse a transaction into txrec (its counts) and the
+\        tables above.
+: txread ( a n -- ok )
+	tpn ! tpa !  0 lit tpo !  -1 lit tpok !  0 lit tpns !
+	tpu8 6 lit = 0= if 0 lit tpok ! then
+	tpu16 dup txrec C lit + !
+	dup 1 lit u< over 8 lit u> or if 0 lit tpok ! then
+	tpok @ if
+		0 lit do
+			i tpin 50 lit nzero
+			8 lit tptake i tpin !
+			tpu8 dup i tpin 4 lit + !
+			dup 1 lit u> if 0 lit tpok ! then
+			if
+				i tppol
+				i tpin 48 lit + @ ?dup if 0 lit do j tpu8 tpsign loop then
+			else
+				tpns @ i tpin 44 lit + !  1 lit i tpin 48 lit + !
+				i 0 lit tpsign
+			then
+		loop
+	else drop then
+	tpok @ if
+		tpu16 dup txrec 10 lit + !  14 lit u> if 0 lit tpok ! then
+		txrec 10 lit + @ 38 lit * tptake tpoa !
+		tpo @ tpn @ = 0= if 0 lit tpok ! then          \ nothing after
+	then
+	tpok @
+;
+
+\ ── Checking it ──
+
+: tkv variable ;  : tkpk ( -- a )  tkv 814 lit lazy ;      \ a key, aligned
+: tgv variable ;  : tksig ( -- a )  tgv 81C lit lazy ;     \ a signature
+: tnv variable ;  : tknode ( -- a )  tnv 60 lit lazy ;     \ a tree node's state
+: tlv variable ;  : tklock ( -- a )  tlv 20 lit lazy ;     \ a key id, or a lock
+: tdv variable ;  : tkdig ( -- a )  tdv 20 lit lazy ;      \ the signing digest
+: trv variable ;  : tkrd ( -- a )  trv 20 lit lazy ;       \ a REBIND message's
+: tev variable ;  : tkel ( -- a )  tev 800 lit lazy ;      \ a hash's elements
+: thv variable ;  : tkst ( -- a )  thv 60 lit lazy ;       \ a sponge's state
+: tkb variable ;                                           \ the input's record
+
+\ tkcanon ( a -- f )   the 8 words at a are field elements (< p).
+: tkcanon ( a -- f )   -1 lit  8 lit 0 lit do over i 2 lit lshift + @ 2013265921u lit u< and loop nip ;
+
+\ tkup ( ix path n dom -- ok )   climb from the digest in tklock to its
+\        tree's root, in place: each level a node, one permutation of left,
+\        right, dom + the level and 16 in the capacity.  The siblings must be
+\        field elements, and the index fit the path.
+: tkux variable ;  : tkud variable ;
+: tkup ( ix path n dom -- ok )
+	tkud ! rot tkux !
+	-1 lit  over ?dup if
+		0 lit do                                         ( path n ok )
+			tknode 60 lit nzero
+			2 lit pick i 5 lit lshift +                   ( path n ok sibling )
+			tkux @ i rshift 1 lit and if
+				tknode 20 lit ncpy  tklock tknode 20 lit + 20 lit ncpy
+			else
+				tknode 20 lit + 20 lit ncpy  tklock tknode 20 lit ncpy
+			then
+			tknode tkcanon tknode 20 lit + tkcanon and and
+			tkud @ i + tknode 40 lit + !  10 lit tknode 44 lit + !
+			tknode p2perm  tknode tklock 8 lit cpy
+		loop
+	then
+	over dup 20 lit u< if 1 lit swap lshift tkux @ swap u< and else drop then
+	nip nip
+;
+
+\ tkid ( s -- ok )   signer s's key id, into tklock: its key's hash, up its
+\        key tree (../rust/src/keytree.rs: nodes 0x900 + level).
+: tkid ( s -- ok )
+	tps dup 4 lit + @ tkpk 814 lit ncpy  tkpk tklock wpkhash
+	dup 8 lit + @ over C lit + @ rot 10 lit + @ 900 lit tkup
+;
+
+\ tkleaf ( k -- ok )   policy input k's branch: valid (1..12 keys, threshold
+\        1..keys, locks and state below 2^30, keys and hashlock field
+\        elements), its leaf into tklock: hash_elements(11, header ++ keys),
+\        the header [threshold, keys, after height, after age, hashlock?,
+\        REBIND?, its state, 0, the hashlock (or zeros)].
+: tkleaf ( k -- ok )
+	tpin tkb !
+	tkel 10 lit zero
+	tkb @ 8 lit + @ tkel !  tkb @ C lit + @ tkel 4 lit + !
+	tkb @ 14 lit + @ tkel 8 lit + !  tkb @ 18 lit + @ tkel C lit + !
+	tkb @ C lit + @ dup 1 lit u< 0= swap D lit u< and
+	tkb @ 8 lit + @ dup 1 lit u< 0= swap tkb @ C lit + @ u> 0= and and
+	tkb @ 14 lit + @ 40000000 lit u< and  tkb @ 18 lit + @ 40000000 lit u< and
+	tkb @ 24 lit + @ 40000000 lit u< and
+	tkb @ 1C lit + @ ?dup if 1 lit tkel 10 lit + !  tkel 20 lit + 20 lit ncpy  tkel 20 lit + tkcanon and then
+	tkb @ 20 lit + @ if 1 lit tkel 14 lit + !  tkb @ 24 lit + @ tkel 18 lit + ! then
+	tkb @ C lit + @ ?dup if 0 lit do
+		tkb @ 10 lit + @ i 5 lit lshift +  tkel 40 lit + i 5 lit lshift + 20 lit ncpy
+		tkel 40 lit + i 5 lit lshift + tkcanon and
+	loop then
+	tkst tkel 10 lit tkb @ C lit + @ 3 lit lshift + B lit p2hash  tkst tklock 8 lit cpy
+;
+
+\ tkhl ( -- f )   the preimage a field element hashing to the hashlock:
+\        hash_elements(12, preimage).
+: tkhl ( -- f )
+	tkb @ 34 lit + @ tkel 20 lit ncpy  tkel tkcanon
+	tkst tkel 8 lit C lit p2hash  tkst tkb @ 1C lit + @ 20 lit mcmp 0= and
+;
+
+\ tkpol ( k -- ok )   policy input k: its branch valid and satisfied -- the
+\        state it declares (a REBIND branch: above the branch's, below 2^30,
+\        naming outputs, ascending; else 0, none), the preimage if and only
+\        if a hashlock, as many signers as the threshold, in ascending place
+\        -- and its lock, into tklock: the leaf up the policy's tree (nodes
+\        0x800 + level, at most 8 levels).  The signatures are tksigner's.
+: tkpol ( k -- ok )
+	tkleaf
+	tkb @ 20 lit + @ if
+		tkb @ 38 lit + @ tkb @ 24 lit + @ u> and  tkb @ 38 lit + @ 40000000 lit u< and
+		tkb @ 3C lit + @ 0= 0= and
+		tkb @ 3C lit + @ 1 lit u> if
+			tkb @ 3C lit + @ 1 lit do tkb @ 40 lit + @ i 1 lit - 5 lit lshift + dup 20 lit + 20 lit mcmp 0< and loop
+		then
+	else
+		tkb @ 38 lit + @ 0= and  tkb @ 3C lit + @ 0= and
+	then
+	tkb @ 1C lit + @ 0= tkb @ 34 lit + @ 0= = and
+	tkb @ 34 lit + @ if tkhl and then
+	tkb @ 48 lit + @ tkb @ 8 lit + @ = and
+	tkb @ 48 lit + @ 1 lit u> if
+		tkb @ 48 lit + @ 1 lit do tkb @ 44 lit + @ i + dup 1 lit - tps 18 lit + @ swap tps 18 lit + @ u< and loop
+	then
+	tkb @ 28 lit + @ tkb @ 30 lit + @ tkb @ 2C lit + @ 800 lit tkup and
+;
+
+\ tklimbs ( o x -- x' )   output o's nonce as eight 16-bit limbs, into tkel
+\        from element x.
+: tklimbs ( o x -- x' )
+	8 lit 0 lit do
+		over 38 lit * tpoa @ + 28 lit + i 1 lit lshift +  dup c@ swap 1 lit + c@ 8 lit lshift or
+		over 2 lit lshift tkel + !  1 lit +
+	loop
+	nip
+;
+
+\ tkmsg ( -- )   the signing message's digest, into tkdig: hash_elements(2,
+\        [inputs, 0 x 15] ++ each input's commitment, 8 zeros ++ each
+\        output's commitment and its nonce's 8 16-bit limbs).
+: tkmsg ( -- )
+	tkel 40 lit zero  txrec C lit + @ tkel !
+	10 lit
+	txrec C lit + @ 0 lit do
+		txrec 40 lit + i 5 lit lshift + over 2 lit lshift tkel + 8 lit cpy  8 lit +
+		dup 2 lit lshift tkel + 8 lit zero  8 lit +
+	loop
+	txrec 10 lit + @ ?dup if 0 lit do
+		txrec 140 lit + i 5 lit lshift + over 2 lit lshift tkel + 8 lit cpy  8 lit +
+		i swap tklimbs
+	loop then
+	tkst tkel rot 2 lit p2hash  tkst tkdig 8 lit cpy
+;
+
+\ tkout ( c -- o | -1 )   the output with commitment c.
+: tkfo variable ;
+: tkout ( c -- o | -1 )
+	-1 lit tkfo !
+	txrec 10 lit + @ ?dup if 0 lit do dup txrec 140 lit + i 5 lit lshift + 20 lit mcmp 0= if i tkfo ! then loop then
+	drop tkfo @
+;
+
+\ tkrmsg ( -- ok )   the REBIND message of the input at tkb, into tkrd:
+\        hash_elements(13, [named, state, 0 x 14] ++ each named output's
+\        commitment and nonce limbs) -- every one named among the outputs.
+: tkrmsg ( -- ok )
+	tkel 40 lit zero  tkb @ 3C lit + @ tkel !  tkb @ 38 lit + @ tkel 4 lit + !
+	-1 lit 10 lit
+	tkb @ 3C lit + @ ?dup if 0 lit do
+		tkb @ 40 lit + @ i 5 lit lshift + tkout                 ( ok x o )
+		dup 0< if drop swap drop 0 lit swap else
+			dup 5 lit lshift txrec 140 lit + +  2 lit pick 2 lit lshift tkel + 8 lit cpy
+			swap 8 lit + tklimbs
+		then
+	loop then
+	tkst tkel rot D lit p2hash  tkst tkrd 8 lit cpy
+;
+
+\ tksigner ( s -- ok )   signer s: its key a policy branch's key at its
+\        place (a key spend's is its input's lock already), and its signature
+\        over its input's message (a REBIND branch's own, else tkdig).
+: tksigner ( s -- ok )
+	dup tkid                                               ( s ok )
+	over tps @ tpin tkb !
+	tkb @ 4 lit + @ if
+		over tps 18 lit + @ dup tkb @ C lit + @ u< if
+			5 lit lshift tkb @ 10 lit + @ + tklock 20 lit mcmp 0= and
+		else drop drop 0 lit then
+	then
+	tkdig  tkb @ 20 lit + @ if drop tkrmsg and tkrd then        ( s ok msg )
+	rot tps 14 lit + @ tksig 81C lit ncpy
+	tkpk swap tksig wverify and
+;
+
+\ tk64+ ( lo hi a -- lo' hi' )   add the 64-bit little-endian amount at a.
+: tka variable ;  : tklo variable ;  : tkhi variable ;
+: tk64+ ( lo hi a -- lo hi )
+	tka ! tkhi ! tklo !
+	tka @ tple32 tklo @ +  dup tklo @ u< if 1 lit else 0 lit then     ( lo' carry )
+	tka @ 4 lit + tple32 +  tkhi @ +
+;
+
+\ txcheck ( a n -- ok )   a transaction's own correctness: parsed, its
+\        commitments (into txrec), sorted, balanced, nothing repeated, and every
+\        input authorized; each input's timelocks (txrec 3C0 + 8k: after
+\        height, after age; a key spend's 0, 0).  Not the chain or the pool
+\        (txfits).
+: tksum variable ;  : tksih variable ;  : tksol variable ;  : tksoh variable ;
+: txcheck ( a n -- ok )
+	2dup txread dup if
+		\ the inputs' locks, then their commitments
+		txrec C lit + @ 0 lit do
+			i tpin 4 lit + @ if
+				i tkpol and
+				tkb @ 14 lit + @ txrec 3C0 lit + i 3 lit lshift + !  tkb @ 18 lit + @ txrec 3C4 lit + i 3 lit lshift + !
+			else
+				i tpin 44 lit + @ tkid and
+				0 lit txrec 3C0 lit + i 3 lit lshift + !  0 lit txrec 3C4 lit + i 3 lit lshift + !
+			then
+			tklock  i tpin @ tple32  i tpin @ 4 lit + tple32  txrec 40 lit + i 5 lit lshift + wlcommit
+		loop
+		\ the outputs' commitments (an output: lock, amount, nonce)
+		txrec 10 lit + @ ?dup if 0 lit do
+			tpoa @ i 38 lit * +  tklock 20 lit ncpy
+			tklock  tpoa @ i 38 lit * + 20 lit + dup tple32 swap 4 lit + tple32  txrec 140 lit + i 5 lit lshift + wlcommit
+		loop then
+		\ inputs strictly ascending by commitment; outputs by their bytes
+		txrec C lit + @ 1 lit u> if
+			txrec C lit + @ 1 lit do txrec 40 lit + i 1 lit - 5 lit lshift +  dup 20 lit +  20 lit mcmp 0< and loop
+		then
+		txrec 10 lit + @ 1 lit u> if
+			txrec 10 lit + @ 1 lit do tpoa @ i 1 lit - 38 lit * +  dup 38 lit +  38 lit mcmp 1 lit < and loop
+		then
+		\ outputs no more than inputs
+		0 lit 0 lit  txrec C lit + @ 0 lit do i tpin @ tk64+ loop  tksih ! tksum !
+		0 lit 0 lit  txrec 10 lit + @ ?dup if 0 lit do tpoa @ i 38 lit * + 20 lit + tk64+ loop then  tksoh ! tksol !
+		tksoh @ tksih @ u< tksoh @ tksih @ =  tksol @ tksum @ u> 0= and or and
+		\ no output repeated, or spent by its own transaction
+		txrec 10 lit + @ ?dup if 0 lit do
+			txrec 140 lit + i 5 lit lshift +
+			txrec 10 lit + @ ?dup if 0 lit do i j = 0= if dup txrec 140 lit + i 5 lit lshift + 20 lit mcmp 0= if swap drop 0 lit swap then then loop then
+			txrec C lit + @ 0 lit do dup txrec 40 lit + i 5 lit lshift + 20 lit mcmp 0= if swap drop 0 lit swap then loop
+			drop
+		loop then
+		\ every signer's signature
+		dup if
+			tkmsg
+			tpns @ 0 lit do i tksigner and loop
+		then
+	then
+	nip nip
+;
+
+\ ── The pool ──
+
+\ txhas ( id -- k | -1 )   the slot holding this transaction.
+: txhk variable ;
+: txhas ( id -- k | -1 )
+	-1 lit txhk !
+	txmax 0 lit do i txm @ if dup i txm 20 lit + 20 lit mcmp 0= if i txhk ! then then loop
+	drop txhk @
+;
+
+\ txfits ( r upto -- ok )   the transaction with record r against the chain
+\        and the pool's slots arrived before upto (all: -1): its outputs not
+\        on chain, its inputs unspent there (and their timelocks holding in
+\        the next block), nothing it spends or makes spent or made by those.
+: txfr variable ;  : txfu variable ;  : txfok variable ;  : txfs variable ;  : txfn variable ;
+
+\ txfconf ( -- )   against pool slot txfs: nothing spent, or made, by both.
+: txfconf ( -- )
+	txfr @ C lit + @ 0 lit do
+		txfs @ txm C lit + @ 0 lit do
+			txfr @ 40 lit + j 5 lit lshift +  txfs @ txm 40 lit + i 5 lit lshift +  20 lit mcmp 0= if 0 lit txfok ! then
+		loop
+	loop
+	txfr @ 10 lit + @ ?dup if 0 lit do
+		txfs @ txm 10 lit + @ ?dup if 0 lit do
+			txfr @ 140 lit + j 5 lit lshift +  txfs @ txm 140 lit + i 5 lit lshift +  20 lit mcmp 0= if 0 lit txfok ! then
+		loop then
+	loop then
+;
+
+: txfits ( r upto -- ok )
+	txfu ! txfr !  -1 lit txfok !
+	txfr @ 10 lit + @ ?dup if 0 lit do txfr @ 140 lit + i 5 lit lshift + wlon if drop 0 lit txfok ! then loop then
+	wltip 1 lit + txfn !
+	txfr @ C lit + @ 0 lit do
+		txfr @ 40 lit + i 5 lit lshift + wlon if                     \ unspent, made at height h:
+			txfn @ txfr @ 3C0 lit + i 3 lit lshift + @ u< if 0 lit txfok ! then
+			dup txfn @ u> if drop 0 lit txfok ! else              \ its locks hold in the next block
+				txfn @ swap - txfr @ 3C4 lit + i 3 lit lshift + @ u< if 0 lit txfok ! then
+			then
+		else 0 lit txfok ! then
+	loop
+	txmax 0 lit do
+		i txm @  i txm txfr @ = 0= and  i txm 8 lit + @ txfu @ u< and if i txfs ! txfconf then
+	loop
+	txfok @
+;
+
+: txidv variable ;  : txid ( -- a )  txidv 20 lit lazy ;
+
+\ txadmit ( a n -- k | -1 )   check a transaction and take it into the pool:
+\        its slot, or -1 (refused: invalid, conflicting, known, or no room).
+: txak variable ;
+: txadmit ( a n -- k | -1 )
+	-1 lit txak !
+	dup txcap u> 0= if
+		tkst 2 lit pick 2 lit pick p2hashb  tkst txid 8 lit cpy
+		txid txhas 0< if
+			-1 lit txmax 0 lit do i txm @ 0= over 0< and if drop i then loop      ( a n slot )
+			dup 0< 0= if
+				2 lit pick 2 lit pick txcheck if
+					txrec -1 lit txfits if
+						dup txak !
+						txrec over txm 400 lit ncpy
+						2 lit pick over txs 3 lit pick ncpy
+						1 lit over txm !  over over txm 4 lit + !  txseq @ 1 lit + dup txseq ! over txm 8 lit + !
+						txid over txm 20 lit + 20 lit ncpy
+					then
+				then
+			then
+			drop
+		then
+	then
+	2drop txak @
+;
+
+\ txreval ( -- )   the pool against a changed chain, in arrival order: what
+\        was mined, or now conflicts, is dropped.
+: txrk variable ;  : txrs variable ;
+: txreval ( -- )
+	0 lit txrs !
+	begin
+		-1 lit txrk !
+		txmax 0 lit do
+			i txm @ i txm 8 lit + @ txrs @ u> and if
+				txrk @ 0< if i txrk ! else i txm 8 lit + @ txrk @ txm 8 lit + @ u< if i txrk ! then then
+			then
+		loop
+		txrk @ 0< 0=
+	while
+		txrk @ txm 8 lit + @ txrs !
+		txrk @ txm  txrs @ txfits 0= if 0 lit txrk @ txm ! then
+	repeat
+;
+
+\ ── Relaying ──
+
+\ Ids seen lately (fetched, or being): not fetched again.
+: txsnv variable ;  : txseen ( -- a )  txsnv 800 lit lazy ;  : txsnn variable ;
+: txsee ( id -- )   txseen txsnn @ 3F lit and 5 lit lshift + 20 lit ncpy  txsnn @ 1 lit + txsnn ! ;
+: txseen? ( id -- f )   0 lit  40 lit 0 lit do over txseen i 5 lit lshift + 20 lit mcmp 0= or loop  nip ;
+
+\ txinv ( k peer -- )   a TX_INV of the pool's slots from k on, to a peer (-1:
+\        all answering peers, but txskip); the next slot not sent, -1 if none.
+: txskip variable ;
+: txinvp ( k -- k' n )                                   \ build: slots from k, up to 33
+	7 lit phdr drop  0 lit                                ( k count )
+	begin over txmax u< over 21 lit u< and while
+		over txm @ if
+			over txm 20 lit + npkt 7 lit + 2 lit pick 24 lit * + 20 lit ncpy
+			over txm 4 lit + @ npkt 27 lit + 2 lit pick 24 lit * + be!
+			1 lit +
+		then
+		swap 1 lit + swap
+	repeat
+	dup npkt 6 lit + c!
+;
+: txann ( k -- )   \ the TX_INV for slot k alone, to every answering peer but txskip
+	7 lit phdr  1 lit over c!
+	over txm 20 lit + over 1 lit + 20 lit ncpy  swap txm 4 lit + @ swap 21 lit + be!
+	ppn 0 lit do i pp 8 lit + @ 2 lit =  i txskip @ = 0= and if i 2B lit psendk then loop
+;
+: txannall ( -- )   \ the whole pool, to every answering peer
+	0 lit begin dup txmax u< while
+		txinvp ?dup if
+			24 lit * 7 lit +  ppn 0 lit do i pp 8 lit + @ 2 lit = if i over psendk then loop drop
+		then
+	repeat drop
+;
+
+\ One transaction downloading; the rest queued (16).
+: tdon variable ;  : tdk variable ;  : tdsize variable ;  : tdnc variable ;  : tdgot variable ;
+: tdlast variable ;  : tdtry variable ;
+: tdiv variable ;  : tdid ( -- a )  tdiv 20 lit lazy ;
+: tdbv variable ;  : tdbuf ( -- a )  tdbv 10000 lit lazy ;
+: tdrv variable ;  : tdrcv ( -- a )  tdrv 40 lit lazy ;
+: tqv variable ;  : tq ( k -- a )  28 lit * tqv 280 lit lazy + ;   \ id, size, peer
+: tqh variable ;  : tqt variable ;
+
+: tdask ( -- )   \ GET_TX: all of it, of the peer it came from
+	8 lit phdr  tdk @ pp C lit + @ tdk @ pp 10 lit + @ 2 lit pick qbe!
+	tdid over 8 lit + 20 lit ncpy  0 lit over 28 lit + be!  tdnc @ swap 2C lit + nb16!
+	tdk @ 34 lit psendk  pms tdlast !
+;
+: tdnext ( -- )   \ start the next queued download, if any
+	tdon @ 0= tqh @ tqt @ = 0= and if
+		tqh @ F lit and tq dup tdid 20 lit ncpy  dup 20 lit + @ tdsize !  24 lit + @ tdk !
+		tqh @ 1 lit + tqh !
+		tdsize @ 3FF lit + A lit rshift tdnc !  tdrcv 40 lit nzero  0 lit tdgot !  0 lit tdtry !
+		-1 lit tdon !  tdask
+	then
+;
+
+\ txgot ( -- )   a download finished: its id, then the pool -- and onward.
+: txgot ( -- )
+	0 lit tdon !
+	tkst tdbuf tdsize @ p2hashb  tkst tdid 8 lit ceq if
+		tdbuf tdsize @ txadmit dup 0< if drop else
+			"tx: accepted a transaction (" puts tdsize @ fndec " bytes), relaying it" puts A lit putc
+			tdk @ txskip !  txann
+		then
+	then
+;
+
+\ The datagrams.
+: txtinv ( -- )   \ TX_INV: queue what we don't have and haven't seen
+	pfrom dup pk ! 0< 0= if pk @ pp 8 lit + @ 2 lit = if
+		pbd @ c@  dup 24 lit * 1 lit + pbn @ = if
+			?dup if 0 lit do
+				pbd @ 1 lit + i 24 lit * +                     ( entry )
+				dup txhas 0<  over txseen? 0= and  over 20 lit + be32 dup 0= 0= swap txcap u> 0= and and
+				tqt @ tqh @ - 10 lit u< and if
+					dup txsee
+					dup tqt @ F lit and tq 20 lit ncpy  dup 20 lit + be32 tqt @ F lit and tq 20 lit + !
+					pk @ tqt @ F lit and tq 24 lit + !  tqt @ 1 lit + tqt !
+				then
+				drop
+			loop then
+		else drop then
+	then then
+;
+: txcook? ( -- f )   pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and ;
+: txchunk ( k c -- )   \ TX_CHUNK c of slot k
+	9 lit phdr  2 lit pick txm 20 lit + over 20 lit ncpy  over over 20 lit + be!     ( k c body )
+	2 lit pick txm 4 lit + @ 2 lit pick A lit lshift - dup 400 lit u> if drop 400 lit then   ( k c body len )
+	3 lit pick txs 3 lit pick A lit lshift + 2 lit pick 24 lit + 2 lit pick ncpy
+	nip nip nip 2A lit + preply
+;
+: txgtx ( -- )   \ GET_TX: with our cookie, the chunks asked for
+	pbn @ 2E lit = if txcook? if
+		pbd @ 8 lit + txhas dup 0< if drop else
+			dup txm 4 lit + @ 3FF lit + A lit rshift                       ( k chunks )
+			pbd @ 28 lit + be32  pbd @ 2C lit + nb16@ 40 lit pumin over +   ( k chunks first end )
+			rot over over u> if nip else drop then                         ( k first end )
+			2dup u< if swap do dup i txchunk loop else 2drop then  drop
+		then
+	then then
+;
+: txtchunk ( -- )   \ TX_CHUNK: of the one downloading, from its peer
+	tdon @ pbn @ 24 lit u> and if
+		pbd @ tdid 20 lit mcmp 0=  pfrom tdk @ = and if
+			pbd @ 20 lit + be32                                             ( c )
+			dup tdnc @ u<  pbn @ 24 lit -  tdsize @ 3 lit pick A lit lshift - 400 lit pumin = and
+			over tdrcv + c@ 0= and if
+				pbd @ 24 lit + tdbuf 2 lit pick A lit lshift + pbn @ 24 lit - ncpy
+				1 lit over tdrcv + c!  tdgot @ 1 lit + tdgot !  pms tdlast !
+				tdgot @ tdnc @ = if txgot then
+			then
+			drop
+		then
+	then
+;
+: txginv ( -- )   \ GET_TX_INV: with our cookie, the pool (its first 33)
+	pbn @ 8 lit = if txcook? if
+		0 lit txinvp nip ?dup if 24 lit * 7 lit + preply then
+	then then
+;
+
+: txin ( -- f )
+	pok? if
+		npay @ 5 lit + c@ dup 7 lit u< 0= swap A lit u> 0= and if
+			npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+			npay @ 5 lit + c@
+			dup 7 lit = if txtinv then  dup 8 lit = if txgtx then
+			dup 9 lit = if txtchunk then  A lit = if txginv then
+			-1 lit
+		else 0 lit then
+	else 0 lit then
+;
+
+\ ── The wallet's own ──
+
+: trkv variable ;  : trk ( -- a )  trkv 20 lit lazy ;   \ a slate id, and one read (src/wapi.fam too)
 
 \ treach ( -- f )   the next slate record (from trk) into wsr.
 : treach ( -- f )
@@ -25,86 +611,48 @@
 ;
 
 \ trpend? ( -- f )   the record at wsr is a transaction of ours not yet
-\        confirmed.
+\        confirmed (the input its record names still unspent).
 : trpend? ( -- f )
 	wsr @ 0=  wsr 4 lit + @ 2 lit = and if wsr 48 lit + wlon dup if nip then else 0 lit then
 ;
 
-\ trinv ( a -- n )   a TX_INV body at a (up to 8): its length (0: nothing).
-: trinv ( a -- n )
-	trk 20 lit nzero  0 lit trc !
-	begin treach trc @ 8 lit u< and while
-		trpend? if
-			wsr 28 lit + over 1 lit + trc @ 24 lit * + 20 lit ncpy
-			wsr 14 lit + @ over 21 lit + trc @ 24 lit * + be!
-			trc @ 1 lit + trc !
-		then
+\ trsoon ( -- )   the wallet's transaction just finalized (wtx, wtn): into the
+\        pool, and announced.
+: trsoon ( -- )
+	wtx wtn @ txadmit dup 0< if drop else -1 lit txskip ! txann then
+;
+
+\ trmine ( -- )   at a start: the wallet's signed, unconfirmed transactions
+\        back into the pool.
+: trmine ( -- )
+	trk 20 lit nzero
+	begin treach while
+		trpend? if wsr 10 lit + @ wtx sbget wtn !  wtx wtn @ txadmit drop then
 	repeat
-	trc @ swap c!  trc @ dup if 24 lit * 1 lit + then
 ;
 
-\ trfind ( txid -- f )   load our transaction with this id into wtx (wtn),
-\        its id into trcid.
-: trfind ( txid -- f )
-	trk 20 lit nzero  0 lit trc !
-	begin trc @ 0= if treach else 0 lit then while
-		wsr 4 lit + @ 2 lit =  wsr 28 lit + 2 lit pick 20 lit mcmp 0= and if
-			wsr 10 lit + @ wtx sbget wtn !  -1 lit trc !
+\ ── The timers ──
+
+: txwhen variable ;  : txtip variable ;  : txtv variable ;  : txtipid ( -- a )  txtv 20 lit lazy ;
+
+: txtick ( -- )
+	\ a download silent a second: ask again; abandoned after 5 tries
+	tdon @ if tdlast @ pago 3E8 lit u> if
+		tdtry @ 1 lit + dup tdtry !  5 lit u> if 0 lit tdon ! else tdask then
+	then then
+	tdnext
+	\ new peers: their pools (once each; pp +4C)
+	ppn 0 lit do
+		i pp 8 lit + @ 2 lit =  i pp 4C lit + @ 0= and if
+			-1 lit i pp 4C lit + !
+			A lit phdr  i pp C lit + @ i pp 10 lit + @ rot qbe!  i E lit psendk
 		then
-	repeat
-	trc @ if trcid 20 lit ncpy -1 lit else drop 0 lit then
+	loop
+	\ a new best tip: the pool again
+	dbtip ?dup if dup txtipid 20 lit mcmp if txtipid 20 lit ncpy txreval else drop then then
+	\ every 30 s, the pool to every peer
+	txwhen @ 0= txwhen @ pago 7530 lit u> or if pms 1 lit or txwhen ! txannall then
 ;
 
-\ trchunk ( c -- )   TX_CHUNK c of the transaction loaded.
-: trchunk ( c -- )
-	9 lit phdr  trcid over 20 lit ncpy  over over 20 lit + be!
-	wtn @ 2 lit pick A lit lshift - dup 400 lit u> if drop 400 lit then     ( c body len )
-	rot A lit lshift wtx + 2 lit pick 24 lit + 2 lit pick ncpy
-	nip 2A lit + preply
-;
-
-\ trget ( -- )   GET_TX, with our cookie: the chunks asked for.
-: trget ( -- )
-	pbn @ 2E lit = if
-		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
-			pbd @ 8 lit + trfind if
-				wtn @ 3FF lit + A lit rshift                      ( chunks )
-				pbd @ 28 lit + be32  pbd @ 2C lit + nb16@ over +  ( chunks first end )
-				rot over over u> if nip else drop then          ( first end' )
-				2dup u< if swap do i trchunk loop else 2drop then
-			then
-		then
-	then
-;
-
-\ trginv ( -- )   GET_TX_INV, with our cookie: what we hold.
-: trginv ( -- )
-	pbn @ 8 lit = if
-		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
-			7 lit phdr trinv ?dup if 6 lit + preply then
-		then
-	then
-;
-
-: trin ( -- f )
-	pok? if
-		npay @ 5 lit + c@ dup 8 lit = swap A lit = or if
-			npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
-			npay @ 5 lit + c@ 8 lit = if trget else trginv then
-			-1 lit
-		else 0 lit then
-	else 0 lit then
-;
-
-: trsoon ( -- )   0 lit trwhen ! ;
-
-: trtick ( -- )
-	trwhen @ 0= trwhen @ pago 7530 lit u> or if
-		pms 1 lit or trwhen !
-		wl? if
-			7 lit phdr trinv ?dup if
-				6 lit +  ppn 0 lit do i pp 8 lit + @ 2 lit = if i over psendk then loop drop
-			then
-		then
-	then
-;
+\ txstart ( -- )   at the start, once the wallet is open.
+: txstart ( -- )   wl? if trmine then ;

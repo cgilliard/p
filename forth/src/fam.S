@@ -45,7 +45,7 @@ _base\@:
 .endm
 
 .set    N_CALLS, 0
-.equ    ISLAND_GAP, 0x80000         # 512 KiB of output between islands
+.equ    ISLAND_GAP, 0x40000         # 256 KiB of output between islands
 
 # --- call-site emission --------------------------------------------------
 
@@ -270,6 +270,7 @@ _start:
     #   +12 the first return-id of the current segment
     #   +16 output address of the last island (where the spacing counts from)
     #   +20 the return entry the current segment's `;` jumps to
+    #   +24 where the input starts (for __panic's report)
     addi    t2, t1, 32                  # first entry slot
     sw      t2, 0(t1)                   # init call-site cursor = base + 32
     sw      zero, 4(t1)
@@ -285,6 +286,9 @@ _start:
     add     sp, sp, gp                 # sp = stack top
     mv      s3, sp                     # s3 = stack top (FIXED); heap top = s3-0x400
     mv      a0, gp                      # input start
+    li      t0, 0x100000
+    add     t0, s7, t0
+    sw      a0, 24(t0)                  # (kept, for __panic's report: call-site table +24)
     CALL    read_all_bytes              # slurp stdin into the heap until EOT
     mv      a1, gp                      # input end
     CALL    compile
@@ -1016,6 +1020,10 @@ exit:
     sw      t1, 0(t0)
 1:  j       1b
 
+# __panic -- '?', then where: "? src XXXXXXXX out XXXXXXXX" -- the source
+#   byte the compiler had reached (s1, from the input's start; in a macro, its
+#   body's) and the output byte (gp from s0), in hex.  No CALL: a panic may be
+#   the return-id stack itself.
 __panic:
     li      t0, 0x10000000              # UART base
     li      a0, '?'
@@ -1023,6 +1031,42 @@ __panic:
     andi    t1, t1, 0x20
     beqz    t1, 1b
     sb      a0, 0(t0)
+    li      t3, 0x100000
+    add     t3, s7, t3
+    lw      t3, 24(t3)
+    sub     a1, s1, t3                  # the source offset
+    li      a2, 0x63727320              # " src"
+    li      t4, 2                       # two fields: src, then out
+3:  li      t5, 4                       # the label's 4 bytes
+4:  lbu     t1, 5(t0)
+    andi    t1, t1, 0x20
+    beqz    t1, 4b
+    sb      a2, 0(t0)
+    srli    a2, a2, 8
+    addi    t5, t5, -1
+    bnez    t5, 4b
+    li      a0, ' '
+5:  lbu     t1, 5(t0)
+    andi    t1, t1, 0x20
+    beqz    t1, 5b
+    sb      a0, 0(t0)
+    li      t5, 8                       # 8 hex digits
+6:  srli    a0, a1, 28
+    slli    a1, a1, 4
+    li      t2, 10
+    blt     a0, t2, 7f
+    addi    a0, a0, 'A' - '0' - 10
+7:  addi    a0, a0, '0'
+8:  lbu     t1, 5(t0)
+    andi    t1, t1, 0x20
+    beqz    t1, 8b
+    sb      a0, 0(t0)
+    addi    t5, t5, -1
+    bnez    t5, 6b
+    sub     a1, gp, s0                  # then the output offset
+    li      a2, 0x74756F20              # " out"
+    addi    t4, t4, -1
+    bnez    t4, 3b
     li      a0, '\n'
 2:  lbu     t1, 5(t0)
     andi    t1, t1, 0x20

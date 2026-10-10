@@ -18,6 +18,13 @@
 ;
 
 \ twfill ( c n -- a n )   n bytes of c, at tw.
+\ twflip ( a -- )   flip a byte's low bit.
+: twflip ( a -- )   dup c@ 1 lit xor swap c! ;
+\ tvk ( r -- k | -1 )   the parsed transaction's policy input: REBIND (r
+\        true) or not.
+: tvk ( r -- k )
+	-1 lit  txrec C lit + @ 0 lit do i tpin 4 lit + @ i tpin 20 lit + @ 3 lit pick = and if drop i then loop nip
+;
 : twfill ( c n -- a n )   dup 0 lit do over tw i + c! loop nip tw swap ;
 
 \ twput ( hex a n -- )   n bytes from hex.
@@ -191,6 +198,53 @@ Test {
 		acfmt  acopen assert                            \ the chain started over
 		wl? assert  wlload  wlseed two 8 lit ceq assert  pgop wlm 30 lit + two 8 lit ceq assert
 		pgop wlm 1C lit zero  pgmd pgcommit assert
+	}
+	tx_rust_checks {
+		\ The Rust node's transaction (tests/txvec.fam): a one-time key's input
+		\ and a key tree's; every commitment and the id as the Rust node has them.
+		txv txcheck assert
+		txrec 40 lit + 20 lit "4F34BF0E1CCF4334DC79D84F6A40EB52B0DB090DD40C7772EC6A3967B2334B64" twhex assert
+		txrec 60 lit + 20 lit "54FFE0213583A9463125741157627153C09EFC1ECB3BC36005093859C4ABD11E" twhex assert
+		txrec 140 lit + 20 lit "BA32F40BE78DE6713CC8C42522BDF750B51E721FDAD1BE0E2D254718DA4FAA21" twhex assert
+		txrec 160 lit + 20 lit "2A76207357E0B811905D823565B3A467533F04420125B714B940BE60A9C54760" twhex assert
+		tkst txv p2hashb  tkst 20 lit "37422304DF3B86408C026A49F31A6A0971D8E00020DF06425411F836994DDD13" twhex assert
+	}
+	tx_tampered_fails {
+		txv wtx swap ncpy  wtx 2153 lit txcheck assert
+		wtx 2152 lit + dup c@ 1 lit xor swap c!  wtx 2153 lit txcheck 0= assert       \ a nonce's byte
+		txv wtx swap ncpy  wtx 2153 lit txread drop
+		0 lit tps 14 lit + @ 100 lit + twflip  wtx 2153 lit txcheck 0= assert           \ a signature's
+		txv wtx swap ncpy  wtx 2153 lit txread drop
+		0 lit tps 10 lit + @ 0= if 1 lit else 0 lit then                          \ the key tree's signer
+		tps C lit + @ 5 lit + twflip  wtx 2153 lit txcheck 0= assert                       \ its path's
+	}
+	tx_rust_policy {
+		\ The Rust node's policy spends (tests/txvec.fam, txv2): a 2-of-3 branch
+		\ with a hashlock and timelocks, a REBIND branch, and a key spend.
+		txv2 txcheck assert
+		txrec 40 lit + 20 lit "3C273B45222C3E2332DD415E293E29672BC9F1007F11171681D97775510A5C4D" twhex assert
+		txrec 60 lit + 20 lit "6E725B57437EE21A6C4FB84DCD556928C1BCCA5C9B72D04A5642C90B46907F69" twhex assert
+		txrec 80 lit + 20 lit "8E5DDE757F2460120A6750217C079508470A4949986D6A1DF7FCF501CE69E503" twhex assert
+		txrec 140 lit + 20 lit "E29A050EC97FD5603BF13204906AAC591C09A05DB8DBD81F5D2B491BD124A032" twhex assert
+		txrec 160 lit + 20 lit "DAB4626AE6ABAE00A86A9F0D486F2C61EC9E01777C353C55E332A0296E5DC23B" twhex assert
+		tkst txv2 p2hashb  tkst 20 lit "D02FC7194441BA3064E05735FF1F8865E1C5B8556265A65D0ADD6860576D3C6B" twhex assert
+		tpns @ 4 lit asrt_eq                                 \ 2 + 1 + 1 signatures
+		0 lit tvk dup 0< 0= assert                           \ the 2-of-3's timelocks: height 2, age 1
+		3 lit lshift txrec 3C0 lit + + dup @ 2 lit asrt_eq  4 lit + @ 1 lit asrt_eq
+	}
+	tx_policy_tampered_fails {
+		txv2 wtx swap ncpy  wtx 42FF lit txcheck assert
+		0 lit tvk tpin 34 lit + @ twflip  wtx 42FF lit txcheck 0= assert        \ the preimage
+		txv2 wtx swap ncpy  wtx 42FF lit txread drop
+		-1 lit tvk tpin 40 lit + @ twflip  wtx 42FF lit txcheck 0= assert       \ a named output
+		txv2 wtx swap ncpy  wtx 42FF lit txread drop
+		0 lit tvk tpin 30 lit + @ 1 lit + twflip  wtx 42FF lit txcheck 0= assert   \ the policy's path
+		txv2 wtx swap ncpy  wtx 42FF lit txread drop
+		0 lit tvk tpin 44 lit + @ 1 lit + tps 4 lit + @ 1 lit -                  \ the second signer's
+		dup c@ 1 lit + swap c!  wtx 42FF lit txcheck 0= assert                    \ place: key 1 as key 2
+		txv2 wtx swap ncpy  wtx 42FF lit txread drop
+		0 lit tvk tpin 44 lit + @ 1 lit + tps 14 lit + @ 200 lit + twflip         \ its signature
+		wtx 42FF lit txcheck 0= assert
 	}
 }
 

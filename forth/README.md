@@ -145,10 +145,29 @@ Payments are slates, as in the Rust wallet and in the same armored files, so
 either can pay the other: `tools/wallet send AMOUNT [FEE]` writes S1,
 `receive FILE` answers one with S2, `finalize FILE` signs and submits,
 `cancel ID` undoes an unsigned one, `slates` lists them (`src/slate.fam`).
-A signed transaction is kept before its signature leaves the node, and
-`src/txrelay.fam` announces it to the node's peers until it's confirmed,
-serving it as the Rust node's relay does. Both directions have been run
-against a Rust dev node, end to end.
+A signed transaction is kept before its signature leaves the node.
+
+`src/txrelay.fam` is the mempool, and relays everyone's transactions as the
+Rust node does (`TX_INV`, `GET_TX`, `TX_CHUNK`, `GET_TX_INV`): an announced
+transaction is fetched, must hash to its id, and is accepted -- and relayed
+on -- only if it checks out entirely here: every signature (by a one-time
+key, or a key in a key tree, its path checked) over its message; every
+policy spend (contract) valid -- its branch in the policy, the threshold of
+the branch's keys signing, the hashlock's preimage, a REBIND branch's state
+and named outputs, and its timelocks holding in the next block; sorted; 1 to 8 inputs and at most 20 outputs; outputs no
+more than inputs; nothing repeated; inputs unspent on chain and not spent by
+another pool transaction (first seen wins); outputs new. The pool is checked again whenever the best
+tip changes. `tests/txvec.fam` holds two transactions the Rust node made --
+one-time and key-tree key spends; and policy spends (a 2-of-3 branch with a
+hashlock and timelocks, a REBIND branch) -- that the Forth check must accept,
+and reject tampered.
+End to end, under QEMU: a Rust dev miner paid a Forth node that knew only
+another Forth node -- the payment crossed both Forth mempools -- and that
+node paid the miner back, its transaction reaching the miner through the
+other Forth node, and mined. And the miner's wallet locked coins to two
+policies and spent them (2 of 3 keys, one a key tree's, with a hashlock and
+an age lock; a REBIND branch): both Forth nodes accepted and relayed the
+spends, and dropped them once mined.
 
 `src/image.fam` is the node's boot image. Tabernacle boots the node from
 the disk's first 32 MiB when that copy has the hash tabernacle was built

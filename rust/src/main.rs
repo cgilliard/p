@@ -1138,6 +1138,99 @@ mod tests {
         println!("nonce      {}", hex(&recovery::seal(&keychain.view_key(), &commitment, 7, 5_000_000_123)));
     }
 
+    /// A transaction for the Forth mempool's tests (`forth/tests/txvec.fam`):
+    /// two inputs -- a one-time key's, and leaf 2 of a height-3 key tree's --
+    /// and two outputs, signed; written as a Forth table, with its id and its
+    /// inputs' and outputs' commitments. Quick:
+    /// `cargo test --release -- --ignored --nocapture forth_tx_vectors`.
+    #[test]
+    #[ignore]
+    fn forth_tx_vectors() {
+        let keys = keychain::Keychain::from_seed([0x7f; 32]);
+        let (sk1, pk1) = keys.derive(keychain::KeyId::new(0, 3));
+        let tree = keytree::KeyTree::generate(&[0x42; 32], 3);
+        let (sk2, pk2) = tree.leaf(2);
+        let mut tx = transaction::Transaction::new();
+        tx.add_input(&pk1, 7_000_000_000).unwrap();
+        tx.add_tree_input(&pk2, tree.proof(2), 3_000_000_123).unwrap();
+        tx.add_output(keys.output(keychain::KeyId::new(0, 9), 6_000_000_000)).unwrap();
+        tx.add_output(keys.output(keychain::KeyId::new(0, 10), 3_999_000_123)).unwrap();
+        assert!(tx.sign_input(&pk1, &sk1) && tx.sign_input(&pk2, &sk2) && tx.verify());
+        let bytes = tx.to_bytes();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
+        let mut out = String::from("\\ Made by the Rust node: `cargo test --release -- --ignored forth_tx_vectors`.\n");
+        out += &format!("\\ txv ( -- a n ): a signed transaction, {} bytes: a one-time key's input and\n\\ a key tree's (leaf 2 of 8), two outputs.\n", bytes.len());
+        out += ": txv ( -- a n )\n97020000 ,   \\ auipc t0,0\n93824201 ,   \\ addi t0,t0,20\n1301C1FF ,   \\ addi sp,sp,-4\n23205100 ,   \\ sw t0,0(sp)\n";
+        let mut padded = bytes.clone();
+        padded.resize(bytes.len().div_ceil(4) * 4, 0);
+        let off = padded.len() + 4;
+        let jal = 0x6Fu32 | (((off as u32 >> 1) & 0x3FF) << 21) | (((off as u32 >> 11) & 1) << 20) | (((off as u32 >> 12) & 0xFF) << 12);
+        out += &format!("{} ,\n", hex(&jal.to_le_bytes()));
+        for w in padded.chunks(4) {
+            out += &format!("{} ,\n", hex(w));
+        }
+        out += &format!("{:X} lit\n;\n", bytes.len());
+        out += &format!("\\ id {}\n", hex(&tx.id()));
+        for i in &tx.inputs {
+            out += &format!("\\ input commitment {}\n", hex(&i.commitment()));
+        }
+        for o in &tx.outputs {
+            out += &format!("\\ output commitment {}\n", hex(&o.commitment()));
+        }
+        std::fs::write(format!("{}/../forth/tests/txvec.fam", env!("CARGO_MANIFEST_DIR")), out).unwrap();
+        // A second: policy spends -- branch 0 (2 of 3 keys, one of them a key
+        // tree's, a hashlock and a height lock) of a two-branch policy, and a
+        // REBIND branch naming an output -- and a key spend.
+        let key_id = |pk: &wots::PublicKey| keytree::KeyProof::one_time().key_id(pk);
+        let (ska, pka) = keys.derive(keychain::KeyId::new(0, 20));
+        let (skc, pkc) = keys.derive(keychain::KeyId::new(0, 22));
+        let (skr, pkr) = keys.derive(keychain::KeyId::new(0, 23));
+        let (skk, pkk) = keys.derive(keychain::KeyId::new(0, 24));
+        let tree2 = keytree::KeyTree::generate(&[0x43; 32], 3);
+        let (skb, pkb) = tree2.leaf(5);
+        let preimage = poseidon2::digest_to_bytes(keys.public_key(keychain::KeyId::new(0, 30)).hash());
+        let branch0 = policy::Branch { threshold: 2, keys: vec![key_id(&pka), tree2.id(), key_id(&pkc)], after_height: 2, after_age: 1, hashlock: policy::hashlock(&preimage), rebind: None };
+        let branch1 = policy::Branch { threshold: 1, keys: vec![key_id(&pkk)], after_height: 0, after_age: 0, hashlock: None, rebind: None };
+        let pol = policy::Policy { branches: vec![branch0.clone(), branch1] };
+        let rbranch = policy::Branch { threshold: 1, keys: vec![key_id(&pkr)], after_height: 0, after_age: 0, hashlock: None, rebind: Some(1) };
+        let mut tx2 = transaction::Transaction::new();
+        let out_a = keys.output(keychain::KeyId::new(0, 40), 4_000_000_000);
+        let out_b = keys.output(keychain::KeyId::new(0, 41), 2_999_000_000);
+        tx2.add_policy_input(branch0, 0, pol.path(0).into_iter().map(poseidon2::digest_to_bytes).collect(), Some(preimage), 3_000_000_000).unwrap();
+        tx2.add_rebind_input(rbranch, 0, vec![], None, 2_000_000_000, 2, vec![out_a.commitment()]).unwrap();
+        tx2.add_input(&pkk, 2_000_000_000).unwrap();
+        tx2.add_output(out_a.clone()).unwrap();
+        tx2.add_output(out_b).unwrap();
+        let commit_of = |tx: &transaction::Transaction, rebinds: bool| tx.inputs.iter().find(|i| i.rebinds() == rebinds && i.key().is_none()).unwrap().commitment();
+        let (rc, pc) = (commit_of(&tx2, true), commit_of(&tx2, false));
+        assert!(tx2.sign_policy_input(&rc, 0, &pkr, keytree::KeyProof::one_time(), &skr));
+        assert!(tx2.sign_policy_input(&pc, 0, &pka, keytree::KeyProof::one_time(), &ska));
+        assert!(tx2.sign_policy_input(&pc, 1, &pkb, tree2.proof(5), &skb));
+        assert!(tx2.sign_input(&pkk, &skk) && tx2.verify());
+        let _ = (&skc, &pkc);
+        let bytes = tx2.to_bytes();
+        let mut out = std::fs::read_to_string(format!("{}/../forth/tests/txvec.fam", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        out += &format!("\n\\ txv2 ( -- a n ): {} bytes: a policy spend (branch 0 of 2: 2 of 3 keys, one a key\n\\ tree's; a hashlock; locked to height 2, age 1), a REBIND spend naming the\n\\ first output, and a key spend; two outputs.\n", bytes.len());
+        out += ": txv2 ( -- a n )\n97020000 ,   \\ auipc t0,0\n93824201 ,   \\ addi t0,t0,20\n1301C1FF ,   \\ addi sp,sp,-4\n23205100 ,   \\ sw t0,0(sp)\n";
+        let mut padded = bytes.clone();
+        padded.resize(bytes.len().div_ceil(4) * 4, 0);
+        let off = padded.len() + 4;
+        let jal = 0x6Fu32 | (((off as u32 >> 1) & 0x3FF) << 21) | (((off as u32 >> 11) & 1) << 20) | (((off as u32 >> 12) & 0xFF) << 12);
+        out += &format!("{} ,\n", hex(&jal.to_le_bytes()));
+        for w in padded.chunks(4) {
+            out += &format!("{} ,\n", hex(w));
+        }
+        out += &format!("{:X} lit\n;\n", bytes.len());
+        out += &format!("\\ id {}\n", hex(&tx2.id()));
+        for i in &tx2.inputs {
+            out += &format!("\\ input commitment {}\n", hex(&i.commitment()));
+        }
+        for o in &tx2.outputs {
+            out += &format!("\\ output commitment {}\n", hex(&o.commitment()));
+        }
+        std::fs::write(format!("{}/../forth/tests/txvec.fam", env!("CARGO_MANIFEST_DIR")), out).unwrap();
+    }
+
     /// Fast sync for the Forth validator's tests (`forth/tests/fixtures/<network>/`,
     /// reading `forth_fixtures`' chain): the state as of blocks 1 and 2, as
     /// this node serves it, in `snap1.bin` and `snap2.bin` -- the sync point

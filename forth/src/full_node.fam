@@ -121,8 +121,8 @@
 \ fnstep ( -- )   the datagrams that have come (the peers', the wallet API's,
 \        the transaction relay's, the boot image's), then the timers.
 : fnstep ( -- )
-	begin nrecv while ndport @ naport @ = if wain else trin 0= if imin 0= if pin then then then repeat
-	ptick trtick
+	begin nrecv while ndport @ naport @ = if wain else txin 0= if imin 0= if pin then then then repeat
+	ptick txtick
 ;
 
 \ ── Time-sharing: the yield ──
@@ -276,7 +276,7 @@ B7021000 ,   \ lui t0,0x100
 		else "node: no disk" then puts A lit putc bye
 	then
 	imopen imsave
-	wlboot
+	wlboot txstart
 	dbtip ?dup if "node: resuming at height " puts 20 lit + @ fndec A lit putc else "node: a new chain\n" puts then
 	pstart 0= if "node: no network device" puts A lit putc bye then
 	ppn 0 lit do i pp 38 lit + @ if "node: seed " puts i pp @ fnip. 3A lit putc i pp 4 lit + @ fndec A lit putc then loop

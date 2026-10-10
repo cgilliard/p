@@ -16,7 +16,7 @@
 \   GET_INV -> INV, GET_CHUNKS -> CHUNKs (cookie checked): the blocks it
 \             keeps (src/blocks.fam); and a new best block is announced (INV)
 \             to every peer but the one it came from, as the Rust node does
-\ Not served: other nodes' transactions (only the wallet's own, src/txrelay.fam).
+\ Transactions -- the mempool, and relaying everyone's -- are src/txrelay.fam.
 \
 \ Discovery: each known host is asked GET_HOSTS (a nonce from a keyed hash)
 \ every minute; an answer within 5 s with that nonce makes it a peer and

@@ -114,7 +114,16 @@ if [ "$TEST" = 1 ] || [ "$BENCH" = 1 ]; then TAIL='_tend
 _tdone
 bye'; else TAIL='bye'; fi
 STREAM="$OUT.in.$$"
-( cat "$STDLIB" "$HEADER" $IN; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
+# --test: after each file, an empty word and an empty `Test { }` -- so the
+# compiler has a `:` at which to put an island (src/fam.S: it does only at
+# definitions, and test files are mostly top-level code), and the chain of
+# jumps linking Test blocks (lib/test.fam) never spans more than one file:
+# a `jal` reaches 1 MiB, and a test program is more than that.
+if [ "$TEST" = 1 ]; then
+	( cat "$STDLIB" "$HEADER"; n=0; for f in $IN; do cat "$f"; n=$((n + 1)); printf '\n: _tf%d ;\nTest { }\n' $n; done; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
+else
+	( cat "$STDLIB" "$HEADER" $IN; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
+fi
 "$Q32" --in="$STREAM" --out="$OUT" "$FAMC"
 rm -f "$STREAM"
 

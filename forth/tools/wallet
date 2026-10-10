@@ -50,7 +50,7 @@ SLATE_END = "-----END TABERNACLE SLATE-----"
 STAGES = {1: "send", 2: "receive"}
 ROLES = {0: "sent", 1: "received"}
 SLATE_STATES = {0: "waiting for the receiver's answer", 1: "answered", 2: "finalized", 3: "cancelled"}
-ATTEMPTS = 4
+ATTEMPTS = 40           # 1.5 s each: up to a minute (signing and checking a payment takes a while)
 TIMEOUT = 1.5
 
 STATUS_ERRORS = {
@@ -173,7 +173,9 @@ class Node:
         head = MAGIC + bytes([kind, 0]) + self.session + struct.pack(">QH", counter, len(body))
         packet = head + body
         packet += self.mac(packet)
-        for _ in range(ATTEMPTS):
+        for attempt in range(ATTEMPTS):
+            if attempt == 4:
+                print("(waiting for the node...)", file=sys.stderr)
             self.sock.sendto(packet, self.addr)
             try:
                 while True:
