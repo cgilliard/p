@@ -426,7 +426,7 @@ mod tests {
         let storage = Storage::open(&dir.0).unwrap();
         let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5, None).unwrap();
         chain.skip_proof_checks();
-        let table = PeerTable::open(&storage, 100, 3).unwrap();
+        let table = PeerTable::open(&storage, 100).unwrap();
         let discovery = Discovery::new(
             discovery::Config {
                 seeds,

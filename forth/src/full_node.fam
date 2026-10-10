@@ -17,6 +17,8 @@
 \   passphrase          a new wallet's passphrase, or a restored one's, typed
 \                       on the console
 \   api=N               the wallet API's UDP port (our port + 1: src/wapi.fam)
+\   peers=N             the most hosts kept (256; at most 1,000: src/peer.fam)
+\   probe=S             every host asked for hosts every S seconds (60)
 \   apikey              show the wallet's API key (tools/wallet asks for it)
 \ ──────────────────────────────────────────────────────────────────────────────
 
@@ -70,8 +72,10 @@
 		else "recover" fnpre? if -1 lit wlrec !
 		else "passphrase" fnpre? if -1 lit wlpass !
 		else "api=" fnpre? if fnnum naport !
+		else "peers=" fnpre? if fnnum 3E8 lit pumin dup 0= if drop 1 lit then ppmx !
+		else "probe=" fnpre? if fnnum 3E8 lit * dup 0= if drop 3E8 lit then pprb !
 		else "apikey" fnpre? if -1 lit wlshowk !
-		else fnbad then then then then then then then then then
+		else fnbad then then then then then then then then then then then
 	repeat
 ;
 
@@ -160,7 +164,9 @@
 	wlboot
 	dbtip ?dup if "node: resuming at height " puts 20 lit + @ fndec A lit putc else "node: a new chain\n" puts then
 	pstart 0= if "node: no network device" puts A lit putc bye then
-	ppn 0 lit do i pp 8 lit + @ if "node: seed " puts i pp @ fnip. 3A lit putc i pp 4 lit + @ fndec A lit putc then loop
+	ppn 0 lit do i pp 38 lit + @ if "node: seed " puts i pp @ fnip. 3A lit putc i pp 4 lit + @ fndec A lit putc then loop
+	0 lit ppn 0 lit do i pp 8 lit + @ i pp 38 lit + @ 0= and if 1 lit + then loop
+	?dup if "node: hosts known from before: " puts fndec A lit putc then
 	begin fnstep fnsay wltick 0 lit until
 ;
 

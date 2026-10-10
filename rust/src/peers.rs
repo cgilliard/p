@@ -5,26 +5,32 @@
 //!
 //! A host enters as a *candidate* (heard about it -- from a `HOSTS`
 //! reply, a configured seed, or because it queried us) and becomes
-//! *verified* the first time it actually answers one of our requests.
-//! Each request that goes unanswered counts as a failure; enough
-//! consecutive failures and the host is removed outright, verified or
-//! not. A success resets the count. Only verified hosts with no
-//! outstanding failures are ever handed out to other peers (`active`),
-//! so this node never repeats an address it hasn't confirmed itself.
+//! *verified* the first time it actually answers one of our requests;
+//! `last_success_ms` is when it last did. Each request that goes
+//! unanswered counts as a failure, and a success resets the count. Only
+//! verified hosts with no outstanding failures are handed out to other
+//! peers (`active`), so this node never repeats an address it hasn't
+//! confirmed itself -- or one that's stopped answering.
+//!
+//! A host is never removed for failing: it's kept, and re-asked (by
+//! `discovery`) however long it's been silent, so a node finds its peers
+//! again when they come back. The table is bounded by `max_hosts`; once
+//! full, a new host takes the place of the one silent longest among those
+//! not answering now (never answered at all, first) -- never one that is
+//! answering, and never a `protect`ed one (the seeds). So a flood of
+//! made-up addresses can only displace each other and dead hosts, not
+//! the network this node is talking to.
 //!
 //! Backed by LMDB via the shared `storage::Storage`, like everything
 //! else that persists, so the table survives restarts: a node that has
-//! run before doesn't need its seeds to find the network again. Bounded
-//! by `max_hosts`: once full, new candidates are simply not added (rather
-//! than evicting anything) -- a flood of made-up addresses can't push
-//! out hosts already verified, and the junk drains away on its own as
-//! it fails its probes.
+//! run before doesn't need its seeds to find the network again.
 
 #![allow(dead_code)]
 
 use crate::storage::Storage;
 use heed::Database;
 use heed::types::Bytes;
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 const PEERS_DB: &str = "peers";
@@ -128,21 +134,59 @@ pub struct PeerTable {
     storage: Storage,
     hosts: Database<Bytes, Bytes>,
     max_hosts: usize,
-    max_failures: u8,
+    protected: HashSet<SocketAddrV4>,
 }
 
 impl PeerTable {
     /// Open (creating if absent) the peer table. `max_hosts` caps how
-    /// many hosts it will ever hold; `max_failures` is how many
-    /// consecutive unanswered requests remove a host.
-    pub fn open(storage: &Storage, max_hosts: usize, max_failures: u8) -> Result<Self> {
+    /// many hosts it will ever hold.
+    pub fn open(storage: &Storage, max_hosts: usize) -> Result<Self> {
         let hosts = storage.database(PEERS_DB)?;
         Ok(PeerTable {
             storage: storage.clone(),
             hosts,
             max_hosts,
-            max_failures,
+            protected: HashSet::new(),
         })
+    }
+
+    /// Hosts never evicted to make room (the seeds).
+    pub fn protect(&mut self, addrs: impl IntoIterator<Item = SocketAddrV4>) {
+        self.protected.extend(addrs);
+    }
+
+    /// Room for one more host in a full table, made by evicting the host
+    /// silent longest among those not answering now -- never answered
+    /// first, then the oldest last success -- if there is one (not
+    /// protected). Whether there's room.
+    fn make_room(&self, wtxn: &mut heed::RwTxn) -> Result<bool> {
+        if (self.hosts.len(wtxn)? as usize) < self.max_hosts {
+            return Ok(true);
+        }
+        let mut victim: Option<([u8; ADDR_LEN], HostRecord)> = None;
+        for entry in self.hosts.iter(wtxn)? {
+            let (key, value) = entry?;
+            let key: [u8; ADDR_LEN] = key.try_into().map_err(|_| Error::Corrupt("host key was not 6 bytes"))?;
+            let record = HostRecord::from_bytes(value)?;
+            if (record.is_verified() && record.failures == 0) || self.protected.contains(&decode_addr(key)) {
+                continue; // answering, or a seed: kept
+            }
+            let older = match victim {
+                None => true,
+                Some((_, v)) => (record.last_success_ms, std::cmp::Reverse(record.failures))
+                    < (v.last_success_ms, std::cmp::Reverse(v.failures)),
+            };
+            if older {
+                victim = Some((key, record));
+            }
+        }
+        match victim {
+            Some((key, _)) => {
+                self.hosts.delete(wtxn, &key)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     pub fn get(&self, addr: SocketAddrV4) -> Result<Option<HostRecord>> {
@@ -159,14 +203,15 @@ impl PeerTable {
     }
 
     /// Add `addr` as a candidate, unless it's already known, not
-    /// `is_plausible`, or the table is full. Returns whether it was added.
+    /// `is_plausible`, or the table is full of hosts that are answering
+    /// (see `make_room`). Returns whether it was added.
     pub fn add_candidate(&self, addr: SocketAddrV4) -> Result<bool> {
         if !is_plausible(addr) {
             return Ok(false);
         }
         let key = encode_addr(addr);
         let mut wtxn = self.storage.write_txn()?;
-        if self.hosts.get(&wtxn, &key)?.is_some() || self.hosts.len(&wtxn)? as usize >= self.max_hosts {
+        if self.hosts.get(&wtxn, &key)?.is_some() || !self.make_room(&mut wtxn)? {
             return Ok(false);
         }
         let record = HostRecord {
@@ -185,7 +230,7 @@ impl PeerTable {
         let key = encode_addr(addr);
         let mut wtxn = self.storage.write_txn()?;
         let known = self.hosts.get(&wtxn, &key)?.is_some();
-        if !known && self.hosts.len(&wtxn)? as usize >= self.max_hosts {
+        if !known && !self.make_room(&mut wtxn)? {
             return Ok(());
         }
         let record = HostRecord {
@@ -197,24 +242,19 @@ impl PeerTable {
         Ok(())
     }
 
-    /// A request to `addr` went unanswered. Returns `true` if this was
-    /// the failure that removed it.
-    pub fn record_failure(&self, addr: SocketAddrV4) -> Result<bool> {
+    /// A request to `addr` went unanswered: one more failure (the host
+    /// is kept, and asked again).
+    pub fn record_failure(&self, addr: SocketAddrV4) -> Result<()> {
         let key = encode_addr(addr);
         let mut wtxn = self.storage.write_txn()?;
         let Some(bytes) = self.hosts.get(&wtxn, &key)? else {
-            return Ok(false);
+            return Ok(());
         };
         let mut record = HostRecord::from_bytes(bytes)?;
         record.failures = record.failures.saturating_add(1);
-        let removed = record.failures >= self.max_failures;
-        if removed {
-            self.hosts.delete(&mut wtxn, &key)?;
-        } else {
-            self.hosts.put(&mut wtxn, &key, &record.to_bytes())?;
-        }
+        self.hosts.put(&mut wtxn, &key, &record.to_bytes())?;
         wtxn.commit()?;
-        Ok(removed)
+        Ok(())
     }
 
     /// Drop `addr` from the table outright, whatever its state.
@@ -277,7 +317,7 @@ mod tests {
     fn open(max_hosts: usize) -> (TempDir, Storage, PeerTable) {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let table = PeerTable::open(&storage, max_hosts, 3).unwrap();
+        let table = PeerTable::open(&storage, max_hosts).unwrap();
         (dir, storage, table)
     }
 
@@ -324,15 +364,15 @@ mod tests {
     }
 
     #[test]
-    fn enough_consecutive_failures_remove_a_host() {
+    fn failures_never_remove_a_host() {
         let (_dir, _storage, table) = open(10);
         table.add_candidate(addr(1, 9000)).unwrap();
         table.record_success(addr(1, 9000), 5_000).unwrap();
-
-        assert!(!table.record_failure(addr(1, 9000)).unwrap());
-        assert!(!table.record_failure(addr(1, 9000)).unwrap());
-        assert!(table.record_failure(addr(1, 9000)).unwrap());
-        assert_eq!(table.get(addr(1, 9000)).unwrap(), None);
+        for _ in 0..100 {
+            table.record_failure(addr(1, 9000)).unwrap();
+        }
+        let record = table.get(addr(1, 9000)).unwrap().unwrap();
+        assert_eq!((record.last_success_ms, record.failures), (5_000, 100));
     }
 
     #[test]
@@ -342,20 +382,54 @@ mod tests {
         table.record_failure(addr(1, 9000)).unwrap();
         table.record_failure(addr(1, 9000)).unwrap();
         table.record_success(addr(1, 9000), 5_000).unwrap();
-
-        // Two more failures are no longer enough.
-        table.record_failure(addr(1, 9000)).unwrap();
-        assert!(!table.record_failure(addr(1, 9000)).unwrap());
-        assert!(table.get(addr(1, 9000)).unwrap().is_some());
+        assert_eq!(table.get(addr(1, 9000)).unwrap().unwrap().failures, 0);
+        assert_eq!(table.active(10, addr(99, 1)).unwrap(), vec![addr(1, 9000)]);
     }
 
     #[test]
-    fn a_full_table_refuses_new_candidates_but_keeps_what_it_has() {
+    fn a_full_table_of_answering_hosts_refuses_new_candidates() {
         let (_dir, _storage, table) = open(2);
         assert!(table.add_candidate(addr(1, 9000)).unwrap());
         assert!(table.add_candidate(addr(2, 9000)).unwrap());
+        table.record_success(addr(1, 9000), 1_000).unwrap();
+        table.record_success(addr(2, 9000), 2_000).unwrap();
         assert!(!table.add_candidate(addr(3, 9000)).unwrap());
         assert_eq!(table.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_full_table_evicts_the_host_silent_longest() {
+        let (_dir, _storage, table) = open(3);
+        for i in 1..=3 {
+            table.add_candidate(addr(i, 9000)).unwrap();
+        }
+        table.record_success(addr(1, 9000), 3_000).unwrap(); // answering: kept
+        table.record_success(addr(2, 9000), 1_000).unwrap();
+        table.record_failure(addr(2, 9000)).unwrap(); // silent since 1,000
+        table.record_success(addr(3, 9000), 2_000).unwrap();
+        table.record_failure(addr(3, 9000)).unwrap(); // silent since 2,000
+
+        assert!(table.add_candidate(addr(4, 9000)).unwrap());
+        assert_eq!(table.get(addr(2, 9000)).unwrap(), None);
+        assert!(table.get(addr(3, 9000)).unwrap().is_some());
+
+        // A host that never answered goes before any that has.
+        table.record_failure(addr(4, 9000)).unwrap();
+        assert!(table.add_candidate(addr(5, 9000)).unwrap());
+        assert_eq!(table.get(addr(4, 9000)).unwrap(), None);
+        assert!(table.get(addr(3, 9000)).unwrap().is_some());
+    }
+
+    #[test]
+    fn protected_hosts_are_never_evicted() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut table = PeerTable::open(&storage, 1).unwrap();
+        table.protect([addr(1, 9000)]);
+        table.add_candidate(addr(1, 9000)).unwrap();
+        table.record_failure(addr(1, 9000)).unwrap(); // a silent seed
+        assert!(!table.add_candidate(addr(2, 9000)).unwrap());
+        assert!(table.get(addr(1, 9000)).unwrap().is_some());
     }
 
     #[test]
@@ -392,7 +466,7 @@ mod tests {
         table.record_success(addr(1, 9000), 5_000).unwrap();
         drop(table);
 
-        let reopened = PeerTable::open(&storage, 10, 3).unwrap();
+        let reopened = PeerTable::open(&storage, 10).unwrap();
         assert_eq!(reopened.get(addr(1, 9000)).unwrap().unwrap().last_success_ms, 5_000);
     }
 }

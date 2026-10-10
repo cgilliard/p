@@ -98,14 +98,25 @@
 : pcookie ( ip port -- lo hi )   ptmp 4 lit + nb16!  ptmp be!  2 lit ptmp 6 lit phk ;
 
 \ ── Peers ──
-\ 16 hosts, 0x50 bytes each: 0 address  4 port  8 state (0 none, 1 known, 2
-\ answered)  C, 10 the cookie it issued us  14, 18 our request's nonce  1C a
-\ request out  20 when sent  24 when last asked  28 its tip's height  2C
-\ whether known  30 failures in a row  34 when its height was heard  38
-\ whether a seed  3C strikes (bad pieces)  40 when last asked its height.
+\ Up to `ppn` hosts (the setting peers=N, 256 by default; room for 1,000),
+\ 0x50 bytes each: 0 address  4 port  8 state (0 none, 1 known, 2 answering)
+\ C, 10 the cookie it issued us  14, 18 our request's nonce  1C a request out
+\ 20 when sent  24 when last asked  28 its tip's height  2C whether known
+\ 30 failures in a row  34 when its height was heard  38 whether a seed
+\ 3C strikes (bad pieces)  40 when last asked its height  44, 48 when it last
+\ answered (ms since the epoch: low, high word; 0 never).
+\
+\ As the Rust node keeps them: a host that stops answering isn't dropped --
+\ it goes back to known (not counted, shared or announced to) and is asked
+\ again every probe interval (probe=S, a minute by default), however long
+\ it's been silent; a full table makes room for a new host by evicting the
+\ one silent longest among those not answering (never answered, first), and
+\ never a seed.  The table is kept on the disk (`psave`, `pload`).
 
-: ppv variable ;  : pp ( k -- a )  50 lit * ppv 500 lit lazy + ;
-: ppn ( -- n )   10 lit ;
+: ppv variable ;  : pp ( k -- a )  50 lit * ppv 13880 lit lazy + ;
+: ppmx variable ;  : pprb variable ;
+: ppn ( -- n )     ppmx @ dup 0= if drop 100 lit then ;              \ peers=N
+: ppint ( -- ms )  pprb @ dup 0= if drop EA60 lit then ;             \ probe=S
 
 \ Our own addresses, found out (as the Rust node does): a GET_HOSTS that
 \ arrives with one of our own requests' nonces is us asking ourselves -- the
@@ -131,12 +142,29 @@
 	loop 2drop pfk @
 ;
 
-\ padd ( ip port -- k | -1 )   a host (kept, if there's room).
+\ pevict ( -- k | -1 )   the host to make room by evicting: the one silent
+\        longest (oldest last answer; never, first) among those not answering
+\        now and not seeds -- if there's one.
+: pvh variable ;  : pvl variable ;
+: pevict ( -- k | -1 )
+	-1 lit pfk !
+	ppn 0 lit do
+		i pp 8 lit + @ 1 lit =  i pp 38 lit + @ 0= and if
+			pfk @ 0< if -1 lit else
+				i pp 48 lit + @ pvh @ u<  i pp 48 lit + @ pvh @ =  i pp 44 lit + @ pvl @ u< and or
+			then
+			if i pfk !  i pp 48 lit + @ pvh !  i pp 44 lit + @ pvl ! then
+		then
+	loop pfk @
+;
+
+\ padd ( ip port -- k | -1 )   a host (kept, if there's room -- see pevict).
 : padd ( ip port -- k | -1 )
 	2dup pfind dup 0< 0= if nip nip else drop
 		over 0= over 0= or  2 lit pick 2 lit pick pisself or if 2drop -1 lit else
 		-1 lit pfk !
 		ppn 0 lit do i pp 8 lit + @ 0= pfk @ 0< and if i pfk ! then loop
+		pfk @ 0< if pevict pfk ! then                                 \ full: make room
 		pfk @ 0< if 2drop -1 lit else
 			pfk @ pp 50 lit nzero
 			pfk @ pp 4 lit + !  pfk @ pp !  1 lit pfk @ pp 8 lit + !
@@ -240,7 +268,7 @@
 			pk @ pp 1C lit + @ and
 			pbd @ qbe@ pk @ pp 18 lit + @ = swap pk @ pp 14 lit + @ = and and if
 				pbd @ 8 lit + qbe@ pk @ pp 10 lit + !  pk @ pp C lit + !
-				2 lit pk @ pp 8 lit + !  0 lit pk @ pp 1C lit + !  0 lit pk @ pp 30 lit + !
+				2 lit pk @ pp 8 lit + !  hnow pk @ pp 48 lit + ! pk @ pp 44 lit + !  0 lit pk @ pp 1C lit + !  0 lit pk @ pp 30 lit + !
 				?dup if 0 lit do
 					pbd @ 12 lit + i 6 lit * + dup be32 swap 4 lit + nb16@ padd drop
 				loop then
@@ -249,19 +277,70 @@
 	then
 ;
 
-\ pdisc ( -- )   time requests out; ask every host due (a minute since).
+\ pdisc ( -- )   time requests out (a host silent 5 s isn't answering: back
+\        to known, kept); ask every host due (a probe interval since).
 : pdisc ( -- )
 	ppn 0 lit do
 		i pp 8 lit + @ if
 			i pp 1C lit + @ i pp 20 lit + @ pago 1388 lit u> and if          \ 5 s: a failure
 				0 lit i pp 1C lit + !  i pp 30 lit + @ 1 lit + i pp 30 lit + !
-				i pp 30 lit + @ 5 lit u< 0= i pp 38 lit + @ 0= and if 0 lit i pp 8 lit + ! then
+				1 lit i pp 8 lit + !
 			then
 			i pp 8 lit + @ i pp 1C lit + @ 0= and if
-				i pp 24 lit + @ 0=  i pp 24 lit + @ pago EA60 lit u> or if i pprobe then
+				i pp 24 lit + @ 0=  i pp 24 lit + @ pago ppint u> or if i pprobe then
 			then
 		then
 	loop
+;
+
+\ ── The table on the disk ──
+\ 32 sectors at 0xFF00, at the end of the boot image's 32 MiB (src/image.fam,
+\ src/store.fam's dbbase): "PEER", the count, a checksum (the sum of the
+\ entries' words), 0; then per host: address, port, when it last answered
+\ (low, high).  Saved every probe interval; loaded at the start.  A torn
+\ save fails its checksum and is ignored.
+
+: ppsec ( -- s )   FF00 lit ;
+: ppbv variable ;  : ppbuf ( -- a )  ppbv 4000 lit lazy ;
+: ppsav variable ;
+
+\ ppsum ( n -- c )   the checksum of n entries in ppbuf.
+: ppsum ( n -- c )
+	0 lit swap 2 lit lshift dup if 0 lit do ppbuf 10 lit + i 2 lit lshift + @ + loop else drop then
+;
+
+\ psave ( -- )
+: psave ( -- )
+	dbds @ if
+		0 lit
+		ppn 0 lit do
+			i pp 8 lit + @  over 3E8 lit u< and if
+				dup 4 lit lshift ppbuf 10 lit + +
+				i pp @ over !  i pp 4 lit + @ over 4 lit + !
+				i pp 44 lit + @ over 8 lit + !  i pp 48 lit + @ swap C lit + !
+				1 lit +
+			then
+		loop
+		dup ppbuf 4 lit + !  ppsum ppbuf 8 lit + !  52454550 lit ppbuf !  0 lit ppbuf C lit + !
+		ppsec ppbuf 20 lit -1 lit dbion drop
+	then
+;
+
+\ pload ( -- )   the hosts saved, known again (with when they last answered).
+: pload ( -- )
+	dbds @ if
+		ppsec ppbuf 20 lit 0 lit dbion
+		ppbuf @ 52454550 lit = and  ppbuf 4 lit + @ 3E9 lit u< and if
+			ppbuf 4 lit + @ ppsum ppbuf 8 lit + @ = if
+				ppbuf 4 lit + @ ?dup if 0 lit do
+					ppbuf 10 lit + i 4 lit lshift +  dup @ over 4 lit + @ padd     ( a k )
+					dup 0< if 2drop else
+						pp  over 8 lit + @ over 44 lit + !  swap C lit + @ swap 48 lit + !
+					then
+				loop then
+			then
+		then
+	then
 ;
 
 \ ── Heights ──
@@ -719,8 +798,10 @@
 
 : ptat variable ;
 
-\ ptick ( -- )   every tenth of a second: discovery, heights, timeouts, sync.
+\ ptick ( -- )   every tenth of a second: discovery, heights, timeouts, sync;
+\        every probe interval, the table to the disk.
 : ptick ( -- )
+	ppsav @ pago ppint u> if pms ppsav ! psave then
 	ptat @ pago 64 lit u> if
 		pms ptat !
 		pdisc pheights dltick
@@ -732,6 +813,7 @@
 \        past genesis (and pfdep is set).
 : pstart ( -- ok )
 	nopen dup if
+		pload  pms ppsav !
 		pkinit  pnext pq !  0 lit pqat !  0 lit dlon !  0 lit pcon !  0 lit psok !  0 lit ptat !
 		0 lit pfsv !
 		pfdep @ if

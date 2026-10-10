@@ -26,6 +26,9 @@
 #          PORT + 1); tools/wallet talks to it
 #   NET    main or dev (default dev, for now); a disk holds one network's
 #          chain, so switching means a new disk image
+#   PEERS  the most hosts the node keeps (default 256)
+#   PROBE  how often every known host is asked for hosts, in seconds
+#          (default 60); a silent host is kept and asked again
 #   BOOT   the seeds tabernacle starts from when the disk's copy isn't the
 #          build it expects: it finds peers through them and fetches the node
 #          from the peers holding it, the seeds only if no one else does
@@ -96,8 +99,9 @@ fi
 # (src/full_node.fam).
 exec 3<&0
 {
-	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s\004' \
-		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET"
+	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s\004' \
+		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
+		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}"
 	exec cat <&3
 } > "$FIFO" &
 CAT=$!

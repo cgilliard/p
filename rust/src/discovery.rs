@@ -6,9 +6,11 @@
 //! learned that way goes into the persistent `peers::PeerTable` as a
 //! candidate, and is itself sent `GET_HOSTS` in turn -- which both
 //! verifies it (an answer proves it's reachable) and learns its hosts.
-//! Every known host is re-probed every `probe_interval_ms`; one that
-//! stops answering accumulates failures and is eventually removed (see
-//! `peers`). That's the whole protocol: two message types.
+//! Every known host is re-probed every `probe_interval_ms`, however long
+//! it's been silent -- a host is only ever displaced by a new one, and
+//! never a seed (see `peers`) -- so a node finds its peers again when they
+//! come back (after a restart, say), not only when it restarts itself.
+//! That's the whole protocol: two message types.
 //!
 //! # Bare-metal shape
 //!
@@ -115,7 +117,8 @@ pub struct Discovery {
 impl Discovery {
     /// `nonce_key` must be secret and unpredictable (fresh random bytes
     /// each run) -- it's what keeps request nonces unguessable.
-    pub fn new(config: Config, table: PeerTable, nonce_key: [u8; 32]) -> Self {
+    pub fn new(config: Config, mut table: PeerTable, nonce_key: [u8; 32]) -> Self {
+        table.protect(config.seeds.iter().copied());
         Discovery {
             config,
             table,
@@ -230,10 +233,7 @@ impl Discovery {
             .collect();
         for addr in expired {
             self.pending.remove(&addr);
-            if self.table.record_failure(addr)? {
-                self.last_probe_ms.remove(&addr);
-                self.peer_cookies.remove(&addr);
-            }
+            self.table.record_failure(addr)?; // kept: asked again next interval
         }
 
         let interval = self.config.probe_interval_ms;
@@ -358,7 +358,7 @@ mod tests {
     fn discovery(config: Config) -> (TempDir, Discovery) {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let table = PeerTable::open(&storage, 100, 3).unwrap();
+        let table = PeerTable::open(&storage, 100).unwrap();
         (dir, Discovery::new(config, table, [7u8; 32]))
     }
 
@@ -437,19 +437,43 @@ mod tests {
     }
 
     #[test]
-    fn a_host_that_never_answers_is_removed_after_enough_timeouts() {
+    fn a_host_that_stops_answering_is_kept_and_asked_again() {
         let seed = addr(1, 9000);
+        let learned = addr(2, 9000);
         let mut cfg = config(vec![seed]);
         cfg.probe_interval_ms = 0; // re-ask as soon as the last one times out
         let (_dir, mut d) = discovery(cfg);
 
         let mut now = 0;
-        d.start(now).unwrap();
-        for _ in 0..3 {
+        let out = d.start(now).unwrap();
+        let nonce = nonce_sent_to(&out, seed);
+        d.handle(SocketAddr::V4(seed), &hosts_reply(nonce, vec![learned]), 10).unwrap();
+        for _ in 0..10 {
             now += 100;
             d.tick(now).unwrap();
         }
-        assert_eq!(d.table().get(seed).unwrap(), None);
+        assert!(d.table().get(learned).unwrap().is_some());
+        now += 100;
+        nonce_sent_to(&d.tick(now).unwrap(), learned);
+    }
+
+    #[test]
+    fn a_seed_that_never_answers_is_kept_and_asked_again() {
+        let seed = addr(1, 9000);
+        let mut cfg = config(vec![seed]);
+        cfg.probe_interval_ms = 0;
+        let (_dir, mut d) = discovery(cfg);
+
+        let mut now = 0;
+        d.start(now).unwrap();
+        for _ in 0..10 {
+            now += 100;
+            d.tick(now).unwrap();
+        }
+        assert!(d.table().get(seed).unwrap().is_some());
+        now += 100;
+        let out = d.tick(now).unwrap();
+        nonce_sent_to(&out, seed); // still asked
     }
 
     #[test]
@@ -637,7 +661,7 @@ mod tests {
 
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let other = Discovery::new(config(vec![]), PeerTable::open(&storage, 100, 3).unwrap(), [8u8; 32]);
+        let other = Discovery::new(config(vec![]), PeerTable::open(&storage, 100).unwrap(), [8u8; 32]);
         assert!(!other.check_cookie(requester, cookie));
     }
 }

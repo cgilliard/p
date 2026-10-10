@@ -139,9 +139,11 @@ const DEFAULT_PORT: u16 = 3739;
 /// and `peers` for what each one does). Starting points, not
 /// calibrations.
 const SHARE_LIMIT: u16 = 100;
-const MAX_KNOWN_HOSTS: usize = 1000;
-const MAX_HOST_FAILURES: u8 = 3;
-const PROBE_INTERVAL_MS: u64 = 60_000;
+/// Defaults of `--max-hosts` and `--probe-interval` (seconds): hosts are
+/// kept however long they're silent, re-asked every interval, and a full
+/// table makes room by evicting the one silent longest (see `peers`).
+const DEFAULT_MAX_HOSTS: usize = 256;
+const DEFAULT_PROBE_INTERVAL_S: u64 = 60;
 const RESPONSE_TIMEOUT_MS: u64 = 5_000;
 /// Block transfer knobs (see `transfer`). Also starting points.
 const CHUNK_WINDOW: u16 = 32;
@@ -280,6 +282,10 @@ struct Args {
     full_sync: bool,
     /// Fast sync starts this many blocks below the best peer's tip.
     sync_depth: u64,
+    /// The most hosts the peer table holds.
+    max_hosts: usize,
+    /// How often every known host is asked for hosts, in seconds.
+    probe_interval_s: u64,
 }
 
 /// Fast sync's default `--sync-depth`: blocks replayed in full after the
@@ -289,7 +295,7 @@ const DEFAULT_SYNC_DEPTH: u64 = 100;
 const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
          [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
          [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]
-         [--full-sync] [--sync-depth BLOCKS]";
+         [--full-sync] [--sync-depth BLOCKS] [--max-hosts N] [--probe-interval SECONDS]";
 
 fn parse_args() -> Args {
     let mut data_dir = None;
@@ -307,6 +313,8 @@ fn parse_args() -> Args {
         passphrase: false,
         full_sync: false,
         sync_depth: DEFAULT_SYNC_DEPTH,
+        max_hosts: DEFAULT_MAX_HOSTS,
+        probe_interval_s: DEFAULT_PROBE_INTERVAL_S,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -357,6 +365,20 @@ fn parse_args() -> Args {
                 let v = value();
                 args.sync_depth = v.parse().ok().filter(|d| (1..=MAX_REORG_DEPTH / 2).contains(d)).unwrap_or_else(|| {
                     eprintln!("invalid --sync-depth {v} (1 to {})\n{USAGE}", MAX_REORG_DEPTH / 2);
+                    std::process::exit(2);
+                });
+            }
+            "--max-hosts" => {
+                let v = value();
+                args.max_hosts = v.parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+                    eprintln!("invalid --max-hosts {v} (at least 1)\n{USAGE}");
+                    std::process::exit(2);
+                });
+            }
+            "--probe-interval" => {
+                let v = value();
+                args.probe_interval_s = v.parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+                    eprintln!("invalid --probe-interval {v} (seconds, at least 1)\n{USAGE}");
                     std::process::exit(2);
                 });
             }
@@ -453,19 +475,19 @@ type Network = (
     std::sync::Arc<std::sync::atomic::AtomicU64>,
 );
 
-fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>) -> Network {
+fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>, max_hosts: usize, probe_interval_s: u64) -> Network {
     let socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
         die(&format!("failed to bind UDP port {port}: {e}"));
     });
     socket
         .set_read_timeout(Some(std::time::Duration::from_millis(SOCKET_READ_TIMEOUT_MS)))
         .expect("failed to set socket read timeout");
-    let table = PeerTable::open(storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
+    let table = PeerTable::open(storage, max_hosts).expect("failed to open peer table");
     let discovery = Discovery::new(
         discovery::Config {
             seeds,
             share_limit: SHARE_LIMIT,
-            probe_interval_ms: PROBE_INTERVAL_MS,
+            probe_interval_ms: probe_interval_s * 1000,
             response_timeout_ms: RESPONSE_TIMEOUT_MS,
         },
         table,
@@ -772,10 +794,10 @@ fn main() {
         info!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
     }
     let standalone = args.seeds.is_empty();
-    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, args.seeds);
+    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, args.seeds, args.max_hosts, args.probe_interval_s);
     let fast_sync = (fresh && !args.full_sync).then(|| fastsync::FastSync::new(args.sync_depth, &commands));
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
-    let peer_table = PeerTable::open(&storage, MAX_KNOWN_HOSTS, MAX_HOST_FAILURES).expect("failed to open peer table");
+    let peer_table = PeerTable::open(&storage, args.max_hosts).expect("failed to open peer table");
     let wallet_dir = args.wallet_dir.clone().unwrap_or_else(|| path.join("wallet"));
     // A wallet made just now (not restored) shows its backup words once.
     let created = !args.recover && !wallet_dir.join("data.mdb").exists();
