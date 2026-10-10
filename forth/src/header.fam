@@ -109,10 +109,12 @@
 
 : tbn variable ;   : tba variable ;
 
-: tipnext ( a n parent out -- ok )
-	tout ! tpar !  2dup tbn ! tba !  -1 lit hok !
-	bparse hcheck
-	\ Cheap rules first: the parent, the height, the time, the reward.
+: hpwv variable ;  : hpid ( -- a )  hpwv 20 lit lazy ;   \ the header whose PoW passed last
+: hpwn variable ;  : hpnow ( -- a )  hpwn 20 lit lazy ;
+: hpok variable ;
+
+\ trules ( -- )   the cheap rules: the parent, the height, the time, the reward.
+: trules ( -- )
 	hok @ if
 		bhdr @ 4 lit + tpar @ c32cmp 0= hcheck
 		tpar @ 20 lit + t64@                                 ( parent height: plo phi )
@@ -122,8 +124,36 @@
 		bts hdrift? hcheck
 		bheight drew hcheck brwl !  0 lit brwh !
 	then
-	\ Proof of work against the parent's target.
-	hok @ if bhdr @ tpar @ 30 lit + pwok hcheck then
+;
+
+\ tpow ( -- )   proof of work against the parent's target -- not again for
+\        the header that passed last (tipcheap, then tipnext on the same
+\        block: the id fixes the header, and so the parent and its target).
+: tpow ( -- )
+	hok @ if
+		bhdr @ hpnow hdrid
+		hpok @ hpnow hpid 8 lit ceq and 0= if
+			bhdr @ tpar @ 30 lit + pwok hcheck
+			hok @ if hpnow hpid 8 lit cpy -1 lit hpok ! then
+		then
+	then
+;
+
+\ tipcheap ( a n parent -- ok )   the block's cheap checks on its parent's tip:
+\        the header rules and its proof of work -- not its proofs.  What a
+\        node relays a block on, before checking the rest (src/peer.fam).
+: tipcheap ( a n parent -- ok )
+	tpar !  2dup tbn ! tba !  -1 lit hok !
+	bparse hcheck  trules tpow
+	hok @
+;
+
+: tipnext ( a n parent out -- ok )
+	tout ! tpar !  2dup tbn ! tba !  -1 lit hok !
+	bparse hcheck
+	\ Cheap rules first: the parent, the height, the time, the reward; then
+	\ the proof of work against the parent's target.
+	trules tpow
 	\ The body and its proof, against the parent's state.
 	hok @ if
 		tpar @ 50 lit + bproot !  tpar @ 70 lit + t64@ bpch ! bpcl !

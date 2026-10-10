@@ -84,11 +84,19 @@
 
 \ phk ( tag a n -- lo hi )   a keyed hash of n bytes (n <= 15), tagged: the
 \        first two words of hash(secret, tag, bytes).
+\        Never interrupted by a yield (p2off): pkey and pst are its own.
 : phkn variable ;
 : phk ( tag a n -- lo hi )
+	p2off @ 1 lit + p2off !
 	phkn !  pkey 20 lit + 10 lit nzero  pkey 21 lit + phkn @ ncpy  pkey 20 lit + c!
 	pst pkey 30 lit p2hashb  pst @ pst 4 lit + @
+	p2off @ 1 lit - p2off !
 ;
+
+\ pyl: set while a datagram is handled inside a yield (src/full_node.fam):
+\ then nothing that touches the disk (the pager may be mid-change) or starts
+\ a download (the block being checked may be the downloaded one).
+: pyl variable ;
 
 : ptv variable ;  : ptmp ( -- a )  ptv 10 lit lazy ;
 
@@ -423,6 +431,18 @@
 	ppn 0 lit do i pp 8 lit + @ 2 lit =  i pas @ = 0= and if i 3A lit psendk then loop
 ;
 
+\ The block last served stays loaded: its peers ask for it a window at a time
+\ (and a block relayed before it's checked is served from here alone).
+: pscv variable ;  : pscid ( -- a )  pscv 20 lit lazy ;  : pscn variable ;
+: pscbv variable ;  : pscb ( -- a )  pscbv 200000 lit lazy ;
+
+\ Blocks found invalid (the last 8): never fetched again.
+: pbdv variable ;  : pbads ( -- a )  pbdv 100 lit lazy ;  : pbdn variable ;
+: pbadd ( hash -- )   pbads pbdn @ 7 lit and 5 lit lshift + 20 lit ncpy  pbdn @ 1 lit + pbdn ! ;
+: pbad? ( hash -- f )
+	0 lit  8 lit 0 lit do over pbads i 5 lit lshift + 20 lit mcmp 0= or loop  nip
+;
+
 \ ── Block downloads (one at a time) ──
 
 : dlon variable ;  : dlk variable ;  : dlsize variable ;  : dlnc variable ;
@@ -485,17 +505,45 @@
 
 \ pblock ( a n -- )   a block for the chain: taken if its parent is known;
 \        if not, look one height lower (the peer's on another branch).
+\ prelay ( a n -- a n )   relay a block on its cheap checks: if it would be
+\        our new best and its header and proof of work check out on its
+\        parent's tip (tipcheap), serve it (the cache) and announce it now --
+\        before its proofs are checked, which takes seconds here.  Every node
+\        checks it all itself; the proof of work is what makes a bad block
+\        too dear to spread.  prl: relayed.
+: prl variable ;  : prpv variable ;  : prpt ( -- a )  prpv A0 lit lazy ;
+: prelay ( a n -- a n )
+	0 lit prl !
+	2dup bparse if
+		bheight drop  dbtip ?dup if 20 lit + @ else -1 lit then  1 lit +  u< 0= if   \ above our best
+			bhdr @ 4 lit + dbfind dup 0< if drop else
+				dbrd if
+					dbbuf C4 lit + prpt A0 lit ncpy
+					2dup prpt tipcheap if
+						over pscb 2 lit pick ncpy  dup pscn !  pid pscid 20 lit ncpy
+						pid  bheight drop  2 lit pick  dlk @ pann
+						-1 lit prl !
+						"relayed block " puts bheight drop fndec " (its proof of work checks out; checking the rest)" puts A lit putc
+					then
+				then
+			then
+		then
+	then
+;
+
 : pblock ( a n -- )
 	2dup bparse if
 		bheight drop  bhdr @ 4 lit + dbfind 0<  over 0= 0= and if          \ an unknown parent
 			nip nip 1 lit -  dup pgm 7C lit + @ u< if drop pnext then  pq !
 		else
-			drop acblock if
+			drop prelay acblock if
 				pnext pq !
-				dbtip ?dup if                                           \ our new best: announce it
+				prl @ 0= if dbtip ?dup if                               \ our new best: announce it
 					dup pid 20 lit mcmp 0= if 20 lit + @ pid swap dlsize @ dlk @ pann else drop then
-				then
+				then then
 			else
+				prl @ if pid pscid 20 lit mcmp 0= if 0 lit pscn ! then  "a block relayed failed its checks: no longer served" puts A lit putc then
+				pid pbadd                                               \ never again
 				0 lit dlk @ pp 2C lit + !                               \ invalid: forget its height
 			then
 		then
@@ -540,18 +588,18 @@
 		pfrom dup pk ! 0< 0= if
 			pbd @ 20 lit + qbe@ drop  pbd @ 2C lit + qbe@ drop  2dup u< if nip else drop then
 			pk @ pp 28 lit + !  -1 lit pk @ pp 2C lit + !  pms pk @ pp 34 lit + !
-			dlon @ 0= pk @ pqk @ = and  pbd @ 20 lit + qbe@ drop pqh @ = and if
+			dlon @ 0= pk @ pqk @ = and  pbd @ 20 lit + qbe@ drop pqh @ = and  pyl @ 0= and if
 				pfsv @ 2 lit = if
 					pk @ pbd @ pqh @ pbd @ 28 lit + be32  phn @ if 2 lit else 1 lit then dlstart
 				else pfsv @ 0= if
-					pbd @ dbfind 0< if
+					pbd @ dbfind 0<  pbd @ pbad? 0= and if
 						pk @ pbd @ pqh @ pbd @ 28 lit + be32 0 lit dlstart
 					else pq @ 1 lit + pq !  0 lit pqat ! then                   \ have it: the next one up
 				then then
 			then
 			\ An announcement of the block after our tip: fetch it now.
-			dlon @ 0= pfsv @ 0= and  pbd @ 20 lit + qbe@ drop pnext = and if
-				pbd @ dbfind 0< if pk @ pbd @ pnext pbd @ 28 lit + be32 0 lit dlstart then
+			dlon @ 0= pfsv @ 0= and  pbd @ 20 lit + qbe@ drop pnext = and  pyl @ 0= and if
+				pbd @ dbfind 0<  pbd @ pbad? 0= and if pk @ pbd @ pnext pbd @ 28 lit + be32 0 lit dlstart then
 			then
 		then
 	then
@@ -774,7 +822,7 @@
 \        chain's -- or, past our tip, our tip (telling the asker our height).
 \        Answered with an INV of a block we hold, or not at all.
 : pginv ( -- )
-	pbn @ 21 lit = if
+	pbn @ 21 lit =  pyl @ 0= and if
 		0 lit pgif !
 		pbd @ c@ 0= if
 			pbd @ 19 lit + qbe@ 0= if
@@ -797,14 +845,13 @@
 	then
 ;
 
-\ The block last served stays loaded: its peers ask for it a window at a time.
-: pscv variable ;  : pscid ( -- a )  pscv 20 lit lazy ;  : pscn variable ;
-: pscbv variable ;  : pscb ( -- a )  pscbv 200000 lit lazy ;
 
 \ pscache ( hash -- n )   a kept block, loaded: its length (0: not kept).
 : pscache ( hash -- n )
 	dup pscid 20 lit mcmp 0= pscn @ and if drop pscn @ else
-		dup pscb blread dup pscn !  swap pscid 20 lit ncpy
+		pyl @ if drop 0 lit else                                      \ (no disk in a yield)
+			dup pscb blread dup pscn !  swap pscid 20 lit ncpy
+		then
 	then
 ;
 

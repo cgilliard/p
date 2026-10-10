@@ -43,40 +43,573 @@
 ;
 
 \ emul ( a b out -- )   the schoolbook product into degree 6, then x^4 = 11
-\        folds terms 4..6 back down.
-: ewv variable ;   : ewide ( -- a )   ewv 1C lit lazy ;
+\        folds terms 4..6 back down.  src/emul.S, assembled by tools/s2words.py
+\        (rerun it, and paste the words here, after editing that): one loop
+\        over the 16 products around a branch-free multiply (src/p2core.S).
 : emul ( a b out -- )
-	ewide 7 lit zero
-	4 lit 0 lit do 4 lit 0 lit do
-		2 lit pick j 2 lit lshift + @ 2 lit pick i 2 lit lshift + @ fmul
-		ewide i j + 2 lit lshift + dup @ rot fadd swap !
-	loop loop
-	ewide 10 lit + @ B lit fmul ewide @ fadd over !
-	ewide 14 lit + @ B lit fmul ewide 4 lit + @ fadd over 4 lit + !
-	ewide 18 lit + @ B lit fmul ewide 8 lit + @ fadd over 8 lit + !
-	ewide C lit + @ over C lit + !
-	2drop drop
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+130101FF ,   \ addi sp,sp,-16
+23200100 ,   \ sw zero,0(sp)
+23220100 ,   \ sw zero,4(sp)
+23240100 ,   \ sw zero,8(sp)
+23260100 ,   \ sw zero,12(sp)
+23280100 ,   \ sw zero,16(sp)
+232A0100 ,   \ sw zero,20(sp)
+232C0100 ,   \ sw zero,24(sp)
+B7030078 ,   \ lui t2,0x78000
+93831300 ,   \ addi t2,t2,1 # 78000001 <__global_pointer$+0x77ffdf8d>
+93060000 ,   \ addi a3,zero,0
+13070000 ,   \ addi a4,zero,0
+330FD500 ,   \ add t5,a0,a3
+83270F00 ,   \ lw a5,0(t5)
+338FE500 ,   \ add t5,a1,a4
+03280F00 ,   \ lw a6,0(t5)
+93121800 ,   \ slli t0,a6,0x1
+130E0000 ,   \ addi t3,zero,0
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+131E1E00 ,   \ slli t3,t3,0x1
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93DEF241 ,   \ srai t4,t0,0x1f
+B3FEFE00 ,   \ and t4,t4,a5
+330EDE01 ,   \ add t3,t3,t4
+B33E7E00 ,   \ sltu t4,t3,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330EDE41 ,   \ sub t3,t3,t4
+93921200 ,   \ slli t0,t0,0x1
+93080E00 ,   \ addi a7,t3,0
+338FE600 ,   \ add t5,a3,a4
+330F2F00 ,   \ add t5,t5,sp
+832F0F00 ,   \ lw t6,0(t5)
+B38F1F01 ,   \ add t6,t6,a7
+B3BE7F00 ,   \ sltu t4,t6,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+B38FDF41 ,   \ sub t6,t6,t4
+2320FF01 ,   \ sw t6,0(t5)
+13074700 ,   \ addi a4,a4,4
+130F0001 ,   \ addi t5,zero,16
+E346E797 ,   \ blt a4,t5,3c <inner>
+93864600 ,   \ addi a3,a3,4
+E3C0E697 ,   \ blt a3,t5,38 <outer>
+83270101 ,   \ lw a5,16(sp)
+3383F700 ,   \ add t1,a5,a5
+B33E7300 ,   \ sltu t4,t1,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+3303D341 ,   \ sub t1,t1,t4
+330F6300 ,   \ add t5,t1,t1
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+330FEF01 ,   \ add t5,t5,t5
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+330F6F00 ,   \ add t5,t5,t1
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+B307FF00 ,   \ add a5,t5,a5
+B3BE7700 ,   \ sltu t4,a5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+B387D741 ,   \ sub a5,a5,t4
+03280100 ,   \ lw a6,0(sp)
+3308F800 ,   \ add a6,a6,a5
+B33E7800 ,   \ sltu t4,a6,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+3308D841 ,   \ sub a6,a6,t4
+83274101 ,   \ lw a5,20(sp)
+3383F700 ,   \ add t1,a5,a5
+B33E7300 ,   \ sltu t4,t1,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+3303D341 ,   \ sub t1,t1,t4
+330F6300 ,   \ add t5,t1,t1
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+330FEF01 ,   \ add t5,t5,t5
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+330F6F00 ,   \ add t5,t5,t1
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+B307FF00 ,   \ add a5,t5,a5
+B3BE7700 ,   \ sltu t4,a5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+B387D741 ,   \ sub a5,a5,t4
+83284100 ,   \ lw a7,4(sp)
+B388F800 ,   \ add a7,a7,a5
+B3BE7800 ,   \ sltu t4,a7,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+B388D841 ,   \ sub a7,a7,t4
+83278101 ,   \ lw a5,24(sp)
+3383F700 ,   \ add t1,a5,a5
+B33E7300 ,   \ sltu t4,t1,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+3303D341 ,   \ sub t1,t1,t4
+330F6300 ,   \ add t5,t1,t1
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+330FEF01 ,   \ add t5,t5,t5
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+330F6F00 ,   \ add t5,t5,t1
+B33E7F00 ,   \ sltu t4,t5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+330FDF41 ,   \ sub t5,t5,t4
+B307FF00 ,   \ add a5,t5,a5
+B3BE7700 ,   \ sltu t4,a5,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+B387D741 ,   \ sub a5,a5,t4
+832F8100 ,   \ lw t6,8(sp)
+B38FFF00 ,   \ add t6,t6,a5
+B3BE7F00 ,   \ sltu t4,t6,t2
+938EFEFF ,   \ addi t4,t4,-1
+B3FE7E00 ,   \ and t4,t4,t2
+B38FDF41 ,   \ sub t6,t6,t4
+8327C100 ,   \ lw a5,12(sp)
+23200601 ,   \ sw a6,0(a2)
+23221601 ,   \ sw a7,4(a2)
+2324F601 ,   \ sw t6,8(a2)
+2326F600 ,   \ sw a5,12(a2)
+1301C101 ,   \ addi sp,sp,28
 ;
 
-\ einv ( a out -- )   a^(p^4 - 2), the inverse (0 maps to 0); the exponent's
-\        bits, most significant first.
-: eav variable ;   : eacc ( -- a )   eav 10 lit lazy ;
-: eexpw ( k -- w )   \ word k of p^4 - 2, most significant first
-	dup 0= if drop C5C1000 lit else
-	dup 1 lit = if drop 69780001 lit else
-	2 lit = if 51800001 lit else DFFFFFFF lit then then then
-;
+\ einv ( a out -- )   the inverse (0 maps to 0), by the tower F_p(u)(x), u =
+\        x^2, u^2 = 11: a = A + B x with A = c0 + c2 u, B = c1 + c3 u, and
+\        a^-1 = (A - B x) / D, D = A^2 - B^2 u = d0 + d1 u in F_p(u), whose
+\        inverse is (d0 - d1 u) / (d0^2 - 11 d1^2) -- one base-field inverse
+\        and some twenty multiplies, where a^(p^4 - 2) took some 2,900.
+: eic0 variable ;  : eic1 variable ;  : eic2 variable ;  : eic3 variable ;
+: eid0 variable ;  : eid1 variable ;  : eie0 variable ;  : eie1 variable ;
 : einv ( a out -- )
-	eacc 4 lit zero  1 lit eacc !
-	4 lit 0 lit do
-		i eexpw
-		20 lit 0 lit do
-			eacc eacc eacc emul
-			dup 1F lit i - rshift 1 lit and if eacc 3 lit pick eacc emul then
-		loop
-		drop
-	loop
-	eacc swap 4 lit cpy drop
+	swap dup @ eic0 !  dup 4 lit + @ eic1 !  dup 8 lit + @ eic2 !  C lit + @ eic3 !
+	eic0 @ dup fmul  eic2 @ dup fmul B lit fmul fadd                  \ c0^2 + 11 c2^2
+	eic1 @ eic3 @ fmul dup fadd B lit fmul fsub  eid0 !               \ - 11 (2 c1 c3)
+	eic0 @ eic2 @ fmul dup fadd                                       \ 2 c0 c2
+	eic1 @ dup fmul  eic3 @ dup fmul B lit fmul fadd  fsub  eid1 !    \ - (c1^2 + 11 c3^2)
+	eid0 @ dup fmul  eid1 @ dup fmul B lit fmul fsub  finv            ( out 1/n )
+	dup eid0 @ fmul eie0 !
+	eid1 @ fmul 0 lit swap fsub eie1 !                                \ E = D^-1 = e0 + e1 u
+	eic0 @ eie0 @ fmul  eic2 @ eie1 @ fmul B lit fmul fadd  over !            \ A E, then
+	0 lit  eic1 @ eie0 @ fmul  eic3 @ eie1 @ fmul B lit fmul fadd  fsub  over 4 lit + !
+	eic0 @ eie1 @ fmul  eic2 @ eie0 @ fmul fadd  over 8 lit + !               \ - B E x
+	0 lit  eic1 @ eie1 @ fmul  eic3 @ eie0 @ fmul fadd  fsub  swap C lit + !
 ;
 
 \ epow ( a e out -- )   a^e for a 32-bit e (out may be a).

@@ -125,6 +125,119 @@
 	ptick trtick
 ;
 
+\ ── Time-sharing: the yield ──
+\ Every 256th permutation (src/poseidon2.fam: p2hook, every few tens of ms
+\ while a block is checked or applied) comes here: the datagrams waiting are
+\ handled -- only what needs no disk and starts nothing big (hosts, peers'
+\ heights, the boot image, the block cached for serving); the rest is
+\ dropped, and asked again -- and the timers that ask peers, before going
+\ back.  The datagram (and its body) the interrupted code may be in the
+\ middle of is put back as it was.
+
+: fnlive variable ;                                   \ the node is running (not the tests)
+: pybsy variable ;  : pyt variable ;
+: pysv variable ;  : pysave ( -- a )  pysv 4F0 lit lazy ;   \ the datagram, and its body
+
+\ pyhold / pyback ( -- )   save / restore the received datagram's state.
+: pyhold ( -- )
+	nsrc @ pysave !  nsport @ pysave 4 lit + !  ndport @ pysave 8 lit + !
+	npay @ pysave C lit + !  npn @ pysave 10 lit + !  nheld @ pysave 14 lit + !
+	nrid @ pysave 18 lit + !  nsfrom @ pysave 1C lit + !
+	pbd @ pysave 20 lit + !  pbn @ pysave 24 lit + !
+	pbody pysave 40 lit + 4B0 lit ncpy
+	0 lit nheld !                                     \ not ours to free
+;
+: pyback ( -- )
+	nheld @ if nfree then                             \ our last datagram
+	pysave @ nsrc !  pysave 4 lit + @ nsport !  pysave 8 lit + @ ndport !
+	pysave C lit + @ npay !  pysave 10 lit + @ npn !  pysave 14 lit + @ nheld !
+	pysave 18 lit + @ nrid !  pysave 1C lit + @ nsfrom !
+	pysave 20 lit + @ pbd !  pysave 24 lit + @ pbn !
+	pysave 40 lit + pbody 4B0 lit ncpy
+;
+
+\ pydgram ( -- )   a datagram, in a yield.
+: pydgram ( -- )
+	ndport @ naport @ = 0= if                         \ (the wallet's: dropped)
+		imin 0= if                                    \ the boot image
+			pok? if
+				npay @ 5 lit + c@  dup 1 lit = over 2 lit = or over 3 lit = or swap 5 lit = or
+				if pin then                               \ hosts, heights, a cached block
+			then
+		then
+	then
+;
+
+: pyield ( -- )
+	fnlive @ pybsy @ 0= and if
+		-1 lit pybsy !  -1 lit pyl !  p2off @ 1 lit + p2off !
+		pyhold
+		begin nrecv while pydgram repeat
+		pyback
+		pyt @ pago 64 lit u> if pms pyt !  pdisc pheights then   \ asking peers, a tenth of a second apart
+		p2off @ 1 lit - p2off !  0 lit pyl !  0 lit pybsy !
+	then
+;
+
+\ hookp2 ( C: -- )   compile time: point p2hook here (src/hookp2.S, assembled
+\        by tools/s2words.py).
+:I hookp2
+373F686F ,   \ lui t5,0x6f683
+130F0F27 ,   \ addi t5,t5,624 # 6f683270 <__global_pointer$+0x6f6819a4>
+B77F0000 ,   \ lui t6,0x7
+938FFFB6 ,   \ addi t6,t6,-1169 # 6b6f <__global_pointer$+0x52a3>
+93820B00 ,   \ addi t0,s7,0
+63F86209 ,   \ bgeu t0,s6,a4 <fail>
+03A30200 ,   \ lw t1,0(t0)
+6310E303 ,   \ bne t1,t5,3c <next>
+03A34200 ,   \ lw t1,4(t0)
+631CF301 ,   \ bne t1,t6,3c <next>
+03A38200 ,   \ lw t1,8(t0)
+93031000 ,   \ addi t2,zero,1
+63167300 ,   \ bne t1,t2,3c <next>
+83A2C200 ,   \ lw t0,12(t0)
+6F00C000 ,   \ jal zero,44 <found>
+93824201 ,   \ addi t0,t0,20
+6FF05FFD ,   \ jal zero,14 <look>
+33835140 ,   \ sub t1,gp,t0
+93534341 ,   \ srai t2,t1,0x14
+63860300 ,   \ beq t2,zero,58 <ok>
+130EF0FF ,   \ addi t3,zero,-1
+6398C305 ,   \ bne t2,t3,a4 <fail>
+9303F006 ,   \ addi t2,zero,111
+135EC300 ,   \ srli t3,t1,0xc
+137EFE0F ,   \ andi t3,t3,255
+131ECE00 ,   \ slli t3,t3,0xc
+B3E3C301 ,   \ or t2,t2,t3
+135EB300 ,   \ srli t3,t1,0xb
+137E1E00 ,   \ andi t3,t3,1
+131E4E01 ,   \ slli t3,t3,0x14
+B3E3C301 ,   \ or t2,t2,t3
+135E1300 ,   \ srli t3,t1,0x1
+137EFE3F ,   \ andi t3,t3,1023
+131E5E01 ,   \ slli t3,t3,0x15
+B3E3C301 ,   \ or t2,t2,t3
+135E4301 ,   \ srli t3,t1,0x14
+137E1E00 ,   \ andi t3,t3,1
+131EFE01 ,   \ slli t3,t3,0x1f
+B3E3C301 ,   \ or t2,t2,t3
+23A07200 ,   \ sw t2,0(t0)
+6F00C002 ,   \ jal zero,cc <end>
+B7020010 ,   \ lui t0,0x10000
+1303F003 ,   \ addi t1,zero,63
+23806200 ,   \ sb t1,0(t0) # 10000000 <__global_pointer$+0xfffe734>
+1303A000 ,   \ addi t1,zero,10
+23806200 ,   \ sb t1,0(t0)
+B7021000 ,   \ lui t0,0x100
+37330100 ,   \ lui t1,0x13
+13033333 ,   \ addi t1,t1,819 # 13333 <__global_pointer$+0x11a67>
+23A06200 ,   \ sw t1,0(t0) # 100000 <__global_pointer$+0xfe734>
+6F000000 ,   \ jal zero,c8 <spin>
+;
+
+\ p2yhk -- where p2hook now jumps: the yield, then back to p2hook's caller.
+: p2yhk  hookp2 pyield ;
+
 \ fnclean ( -- )   zero the heap, from here to below the data stack (64 MiB
 \        above the heap's base, `init`): booted by tabernacle, that memory
 \        holds tabernacle's stacks and queues, and the node counts on fresh
@@ -169,6 +282,7 @@
 	ppn 0 lit do i pp 38 lit + @ if "node: seed " puts i pp @ fnip. 3A lit putc i pp 4 lit + @ fndec A lit putc then loop
 	0 lit ppn 0 lit do i pp 8 lit + @ i pp 38 lit + @ 0= and if 1 lit + then loop
 	?dup if "node: hosts known from before: " puts fndec A lit putc then
+	-1 lit fnlive !                                   \ yields may answer the network now
 	begin fnstep fnsay wltick 0 lit until
 ;
 

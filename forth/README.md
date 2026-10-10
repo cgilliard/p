@@ -11,14 +11,34 @@ checking the saved main-network chain (`tests/fixtures/main`, made by the
 Rust node's `forth_fixtures` test; 2026-10-08). Block 2 has one input and
 three outputs; its proofs are each about 166 KB.
 
-| Check of main block 2 (Forth, QEMU) | Time |
-| --- | --- |
-| Body hash (hashes both proofs, about 330 KB) | 5.77 s |
-| Block proof | 4.40 s |
-| Chain proof it carries | 4.40 s |
-| Proof of work (64 lookups, about 8,640 permutations) | 6.74 s |
-| **All of the above** | **21.4 s** |
-| `tipnext`: all of the above plus the header rules and the new tip | 21–27 s |
+| Check of main block 2 (Forth, QEMU) | 2026-10-08 | Now |
+| --- | --- | --- |
+| Body hash (hashes both proofs, about 330 KB) | 5.77 s | 1.18 s |
+| Block proof | 4.40 s | 0.75 s |
+| Chain proof it carries | 4.40 s | 0.72 s |
+| Proof of work (64 lookups, about 8,640 permutations) | 6.74 s | 0.90 s |
+| **All of the above** | **21.4 s** | **3.45 s** |
+| `tipnext`: all of the above plus the header rules and the new tip | 21–27 s | 3.52 s |
+| Accepting block 3b, reorganizing to it | 21.5 s | 3.58 s |
+
+What made the difference, without the M extension: the Poseidon2
+permutation in one piece of RV32I (`src/p2core.S`: 915 to about 120 µs),
+its arithmetic without branches (under QEMU a branch ends a block of
+translated code, and that, not the instructions, was the cost), the
+internal layer's multiplications -- all by small numbers or powers of 1/2
+-- as additions and shifts, the extension field's product in RV32I
+(`src/emul.S`) and its inverse through the tower F_p(u)(x), u = x^2 (one
+base-field inverse, where a^(p^4 - 2) took some 2,900 multiplies).
+
+While it works the node still answers: every 256th permutation yields to
+the network (`p2hook` in `src/poseidon2.fam`, pointed at the yield in
+`src/full_node.fam` when the node is compiled), handling what needs no disk
+-- hosts, heights, the boot image, the block it's serving -- and the probes
+it owes. Syncing blocks, a node answered every one of 600 pings, the slowest
+in 0.54 s. And it relays a block on its cheap checks -- the header rules and
+the proof of work, which is what makes a bad block too dear to spread -- then
+checks the rest; a block that fails is no longer served and never fetched
+again.
 
 Timings vary by about a quarter between runs with the laptop's load (QEMU
 emulates on one host thread).
@@ -66,7 +86,8 @@ up block by block (following a peer onto another branch), fast sync, and
 serving sync points and state pieces. `scripts/test_net.sh` runs it against
 a real Rust node on the host: the Forth node syncs block by block,
 reorganizes onto the Rust node's branch, and fast-syncs from it. Accepting main block 3b -- validating
-it and reorganizing from block 2 to the 2b/3b branch -- took 21.5 s.
+it and reorganizing from block 2 to the 2b/3b branch -- took 21.5 s (3.6 s
+now: see the measurements above).
 
 It propagates blocks as the Rust node does, short of mining them: every
 block it validates is kept whole (`src/blocks.fam`, on the pager, with the
