@@ -9,7 +9,8 @@
 #                 node asks (on a disk without a wallet: a new data/disk.img)
 #   --passphrase  a new wallet's passphrase, or the restored one's, typed when
 #                 the node asks
-#   --api-key     show the wallet's API key (tools/wallet asks for it once)
+#   --api-key     show the wallet's API key (tools/wallet asks for it once) and
+#                 exit: read from data/disk.img, so the node may be running
 #
 # The first run makes a wallet and shows its backup words once.  Words and
 # passphrases go straight to the node over the console, never in settings or
@@ -41,14 +42,24 @@ NET=${NET:-dev}
 API=${API:-$((PORT + 1))}
 BOOT=${BOOT:-$SEED}
 WALLET=""
+APIKEY=""
 for arg in "$@"; do
 	case "$arg" in
 		--recover) WALLET="$WALLET recover" ;;
 		--passphrase) WALLET="$WALLET passphrase" ;;
-		--api-key) WALLET="$WALLET apikey" ;;
+		--api-key) APIKEY=1 ;;
 		*) echo "usage: $0 [--recover] [--passphrase] [--api-key]" >&2; exit 1 ;;
 	esac
 done
+# --api-key: the node (this build, loaded directly -- not booted from the
+# disk's image, which may be another build), with the disk read only and no
+# network, shows the key and stops (src/full_node.fam, fnkey).  The node itself
+# may be running.
+if [ -n "$APIKEY" ]; then
+	[ -e data/disk.img ] || { echo "node.sh: no data/disk.img yet (start the node first)" >&2; exit 1; }
+	printf 'apikey net=%s\004' "$NET" | ./tools/q32 bin/full_node.bin --disk-ro=./data/disk.img
+	exit 0
+fi
 mkdir -p data
 [ -e data/disk.img ] || truncate -s 4G data/disk.img
 # QEMU can't forward a port something else holds, and quits without a word.

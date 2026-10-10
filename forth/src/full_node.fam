@@ -125,12 +125,30 @@
 \        memory being zero, as it is when QEMU loads it directly.
 : fnclean ( -- )   gp@  s10@ 5000 lit + 3F00000 lit +  over - 2 lit rshift zero ;
 
+\ fnkey ( -- )   the `apikey` setting: the wallet's API key, read straight off
+\        the disk -- the pager's meta page (src/pager.fam), the wallet from
+\        0x200, the key at 0x50 in it (src/wallet.fam) -- and stop: no chain
+\        opened, nothing written, no network.  So it runs (on the disk, read
+\        only) while the node itself does.
+: fnkv variable ;  : fnkb ( -- a )  fnkv 1000 lit lazy ;
+: fnkey ( -- )
+	dbdev if
+		pgbase fnkb 8 lit 0 lit dbion  fnkb 200 lit + @ 544C4157 lit = and if
+			0 lit  20 lit 0 lit do fnkb 250 lit + i + c@ or loop if
+				"node: the wallet's API key: " puts  fnkb 250 lit + 20 lit wlhex A lit putc
+			else "node: the wallet has no API key yet (the node makes one when it starts)\n" puts then
+		else "node: no wallet on the disk yet (the node makes one when it starts)\n" puts then
+	else "node: no disk\n" puts then
+	bye
+;
+
 \ fnmain ( -- )
 : fnmain ( -- )
 	fnclean
 	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  E99 lit nport !
 	19 lit pfdep !  0 lit bnet !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
 	fnread fnparse
+	wlshowk @ if fnkey then
 	naport @ 0= if nport @ 1 lit + naport ! then
 	"node: " puts  bnet @ if "dev" else "main" then puts  " network, UDP port " puts nport @ fndec
 	", fast sync depth " puts pfdep @ fndec  ", wallet API port " puts naport @ fndec A lit putc

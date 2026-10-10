@@ -101,8 +101,9 @@ recovery nonces in the state, as the Rust node's restore does.
 HMAC-SHA256 under the wallet's API key, with sessions and counters so
 nothing can be replayed. `tools/wallet` (Python, no dependencies) is its
 client: `tools/wallet status | balance | outputs`. It asks for the API key
-once -- the node shows it when the wallet is made, or with
-`scripts/node.sh --api-key` -- and keeps it in `data/wallet.key`.
+once -- the node shows it when the wallet is made, and
+`scripts/node.sh --api-key` reads it from `data/disk.img` (the node may be
+running) -- and keeps it in `data/wallet.key`.
 
 Payments are slates, as in the Rust wallet and in the same armored files, so
 either can pay the other: `tools/wallet send AMOUNT [FEE]` writes S1,

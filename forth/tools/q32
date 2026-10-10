@@ -5,6 +5,8 @@
 #   --cpu=CPU     CPU model (default: rv32i strict)
 #   --net         Enable virtio-net (user-mode NAT)
 #   --disk=FILE   Attach FILE as virtio-blk disk
+#   --disk-ro=FILE  the same, read only and unlocked (another QEMU may be
+#                 writing it)
 #                 (with --disk or --net, an entropy device too: src/rng.fam)
 #   --load=FILE@ADDR  Load FILE's raw bytes into memory at ADDR (repeatable):
 #                 test fixtures, e.g. --load=tests/fixtures/main.pack@0x87000000
@@ -25,6 +27,7 @@ zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
 FILE=""
 NET=0
 DISK=""
+DISKRO=""
 HOSTFWD=""
 NETDEV=""
 MAC=""
@@ -37,6 +40,7 @@ for arg in "$@"; do
 		--cpu=*) CPU="${arg#--cpu=}" ;;
 		--net) NET=1 ;;
 		--disk=*) DISK="${arg#--disk=}" ;;
+		--disk-ro=*) DISK="${arg#--disk-ro=}"; DISKRO=1 ;;
 		--load=*) LOADS="$LOADS ${arg#--load=}" ;;
 		--hostfwd=*) HOSTFWD="${arg#--hostfwd=}" ;;
 		--netdev=*) NETDEV="${arg#--netdev=}" ;;
@@ -128,7 +132,13 @@ if [ -n "$DISK" ]; then
 		exit 1
 	fi
 	ARGS="$ARGS -global virtio-mmio.force-legacy=true"
-	ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0"
+	if [ -n "$DISKRO" ]; then
+		# read only, and without QEMU's image lock: another QEMU (the node)
+		# may have it open for writing
+		ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0,readonly=on,file.locking=off"
+	else
+		ARGS="$ARGS -drive file=$DISK,format=raw,if=none,id=d0"
+	fi
 	ARGS="$ARGS -device virtio-blk-device,drive=d0"
 fi
 
