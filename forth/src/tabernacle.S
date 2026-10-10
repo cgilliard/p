@@ -635,21 +635,31 @@ rx_desc_done:
 # seeds, then the hosts they name (127.x becomes 10.0.2.2, this machine under
 # QEMU, as the node does for its seed), up to MAX_PEERS.  A HOSTS answer
 # (with our nonce, from the host asked) makes it a peer and carries its
-# cookie.  Then the image, in windows of WINDOW chunks: every tick, each peer
+# cookie.  Then the image, in windows of WINDOW chunks: every tick, each pick
 # that has sent chunks is asked for the next window still missing, and the
-# rest are tried every eighth tick (Rust nodes, and nodes with another build,
-# never answer).  The seeds are asked only once SEED_WAIT has passed with no
-# other peer sending any -- the image comes from the network, not the seeds,
+# rest every fourth tick.  The image comes from the network, not the seeds,
 # whenever anyone else has it.  Chunks are taken only from peers, only for
 # our hash, each once (the bitmap).  When all are in, the image is hashed:
 # a match boots it; a mismatch drops every peer that sent chunks and starts
 # over.  No progress for the timeout (discovery or chunks) halts 'N'.
 #
-# Peer table at s7 + PEERS, MAX_PEERS x 16 B:
+# Which peers: a HOSTS answer may end with a trailer about the answering host
+# -- flags (bit 0: serves its boot image) and the first 8 bytes of that
+# image's hash; a host whose trailer names our hash has this build.  Nothing
+# is asked for in the first DISC_WAIT (discovery fills the table), then up to
+# MAX_PICKS of the hosts with this build are picked at random (xorshift32,
+# seeded by the clock -- spreading load, not secrecy) and only they are
+# asked; a pick that sends nothing after 8 asks is dropped and another picked.
+# Seeds are never picked: they're asked (if they have this build) only once
+# SEED_WAIT has passed with no other peer sending any.
+#
+# Peer table at s7 + PEERS, MAX_PEERS x 32 B:
 #     +0 ip (4 B, network order)  +4 port (2 B, network order)
 #     +6 state: 0 new, 1 asked for hosts, 2 a peer (cookie), 3 dropped
-#     +7 flags: bit 0 seed, bit 1 sent chunks; bits 4..7 GET_HOSTS asks
+#     +7 flags: bit 0 seed, bit 1 sent chunks, bit 2 has this build, bit 3
+#        picked; bits 4..7 GET_HOSTS asks
 #     +8 cookie (8 B, as received)
+#     +16 GET_BINs asked with nothing back (1 B)
 #
 # Pinned registers:
 #     s0 = consumed RX used.idx       s1 = chunks received
@@ -672,8 +682,12 @@ rx_desc_done:
 	.equ NONCE,                 0x9FB0      # our GET_HOSTS nonce (8 B)
 	.equ ADDRTMP,               0x9FA8      # a seed's address, as a host's (6 B)
 	.equ LASTPR,                0x9FA4      # chunks when progress was last shown
+	.equ RNDS,                  0x9FA0      # xorshift32 state (4 B)
 	.equ TICK_TK,              2500000      # 250 ms a tick
-	.equ SEED_WAIT_TK,        30000000      # 3 s before asking seeds for chunks
+	.equ DISC_WAIT_TK,        20000000      # 2 s of discovery before asking for chunks
+	.equ SEED_WAIT_TK,        50000000      # 5 s before asking seeds for chunks
+	.equ MAX_PICKS,                 16      # peers fetched from at once
+	.equ PEER_SZ,                   32      # a peer table entry
 	.equ WINDOW,                    32      # chunks a GET_BIN
 	.equ PKT,                   0x8236      # the TX payload (frame + 42)
 
@@ -706,6 +720,12 @@ rx_desc_done:
 	sw      t1, 0(t0)
 	li      t1, 0x4E424154
 	sw      t1, 4(t0)
+	li      t0, MTIME_ADDR                  # the random picks' seed
+	lw      t1, 0(t0)
+	ori     t1, t1, 1
+	li      t0, RNDS
+	add     t0, s7, t0
+	sw      t1, 0(t0)
 
 	# Clocks: the start, the watchdog; the first tick is now.
 	li      t0, MTIME_ADDR
@@ -838,7 +858,31 @@ rx_hosts:
 	slli    a3, a3, 8
 	lbu     t0, 77(a2)
 	or      a3, a3, t0
-	addi    a4, a1, -78                     # bytes of hosts
+	# The trailer (after the hosts): does it have this build?
+	slli    t0, a3, 2
+	slli    t1, a3, 1
+	add     t0, t0, t1
+	addi    t0, t0, 78                      # where it'd start
+	addi    t1, t0, 9
+	blt     a1, t1, 1f                      # no trailer
+	add     t1, a2, t0
+	lbu     t2, 0(t1)
+	andi    t2, t2, 1
+	beqz    t2, 1f                          # doesn't serve its image
+	addi    t1, t1, 1
+	addi    t3, gp, -32                     # our hash
+	li      t4, 8
+2:	lbu     t5, 0(t1)
+	lbu     t6, 0(t3)
+	bne     t5, t6, 1f                      # another build
+	addi    t1, t1, 1
+	addi    t3, t3, 1
+	addi    t4, t4, -1
+	bnez    t4, 2b
+	lbu     t0, 7(a5)
+	ori     t0, t0, 4                       # has this build
+	sb      t0, 7(a5)
+1:	addi    a4, a1, -78                     # bytes of hosts
 	addi    a6, a2, 78                      # the next host
 rh_host:
 	beqz    a3, rh_done
@@ -1029,6 +1073,20 @@ net_idle:
 	bltu    t0, t2, 1f
 	li      a6, 1
 1:
+	# Discovery done (DISC_WAIT since the start)?  s6 = 1 if so; then top
+	# up the picks.
+	li      s6, 0
+	li      t0, MTIME_ADDR
+	lw      t1, 0(t0)
+	li      t0, T_START
+	add     t0, s7, t0
+	lw      t0, 0(t0)
+	sub     t0, t1, t0
+	li      t2, DISC_WAIT_TK
+	bltu    t0, t2, 1f
+	li      s6, 1
+	CALL    pick_peers
+1:
 	# Every eighth tick (2 s), how far the download has got.
 	li      t0, TICKN
 	add     t0, s7, t0
@@ -1067,13 +1125,16 @@ tick_peer:
 	beq     t0, t1, tp_peer
 	j       tp_next
 tp_asked:
-	# Asked, no answer yet: again every fourth tick, four times in all.
+	# Asked, no answer yet: again every fourth tick, four times in all (a
+	# seed, until the timeout).
 	li      t0, TICKN
 	add     t0, s7, t0
 	lw      t0, 0(t0)
 	andi    t0, t0, 3
 	bnez    t0, tp_next
 	lbu     t0, 7(a5)
+	andi    t1, t0, 1
+	bnez    t1, tp_ask                      # a seed: asked until the timeout
 	srli    t1, t0, 4
 	li      t2, 4
 	bltu    t1, t2, tp_ask
@@ -1089,22 +1150,37 @@ tp_ask:
 	CALL    send_get_hosts
 	j       tp_next
 tp_peer:
+	beqz    s6, tp_next                     # still discovering
 	lbu     t0, 7(a5)
+	andi    t1, t0, 4
+	beqz    t1, tp_next                     # doesn't have this build
+	andi    t1, t0, 8
+	bnez    t1, 1f                          # one of our picks
 	andi    t1, t0, 1
-	beqz    t1, 1f
-	beqz    a6, tp_next                     # a seed: not yet
+	beqz    t1, tp_next                     # neither picked nor a seed
+	beqz    a6, tp_next                     # a seed: only as the last resort
 1:	andi    t1, t0, 2
 	bnez    t1, 2f                          # has sent chunks: every tick
-	li      t0, TICKN                       # else every eighth
-	add     t0, s7, t0
-	lw      t0, 0(t0)
-	andi    t0, t0, 7
-	bnez    t0, tp_next
+	li      t1, TICKN                       # else every fourth
+	add     t1, s7, t1
+	lw      t1, 0(t1)
+	andi    t1, t1, 3
+	bnez    t1, tp_next
+	lbu     t1, 16(a5)                      # one more ask with nothing back
+	addi    t1, t1, 1
+	sb      t1, 16(a5)
+	li      t2, 8
+	bltu    t1, t2, 2f
+	li      t1, 3                           # 8 of them: dropped (picked anew)
+	sb      t1, 6(a5)
+	andi    t0, t0, 0xF7
+	sb      t0, 7(a5)
+	j       tp_next
 2:	CALL    next_missing                    # a0 = the first chunk to ask for
 	bltz    a0, net_loop                    # nothing missing
 	CALL    send_get_bin
 tp_next:
-	addi    a5, a5, 16
+	addi    a5, a5, PEER_SZ
 	addi    a4, a4, -1
 	j       tick_peer
 
@@ -1159,7 +1235,7 @@ net_hash_mismatch:
 	sb      t0, 7(a5)
 	li      t0, 3
 	sb      t0, 6(a5)
-3:	addi    a5, a5, 16
+3:	addi    a5, a5, PEER_SZ
 	addi    a4, a4, -1
 	j       1b
 2:	li      t0, NB_BMAP
@@ -1579,7 +1655,7 @@ add_peer:
 	bne     t6, t0, 4f
 	lhu     t6, 4(t1)
 	beq     t6, t4, ap_done                 # there already
-4:	addi    t1, t1, 16
+4:	addi    t1, t1, PEER_SZ
 	addi    t5, t5, -1
 	j       2b
 3:	li      t6, MAX_PEERS
@@ -1590,6 +1666,7 @@ add_peer:
 	sb      a1, 7(t1)
 	sw      zero, 8(t1)
 	sw      zero, 12(t1)
+	sw      zero, 16(t1)
 	addi    t3, t3, 1
 	sw      t3, 0(t2)
 ap_done:
@@ -1624,11 +1701,88 @@ find_src:
 	bne     t1, t0, 3f
 	lhu     t1, 4(a5)
 	beq     t1, t2, fs_done
-3:	addi    a5, a5, 16
+3:	addi    a5, a5, PEER_SZ
 	addi    t3, t3, -1
 	j       1b
 2:	li      a5, 0
 fs_done:
+	j       dispatch
+
+# ──────────────────────────────────────────────────────────────────────────────
+# rand — a0 = the next xorshift32 number.  Trashes t0.
+# ──────────────────────────────────────────────────────────────────────────────
+rand:
+	li      t0, RNDS
+	add     t0, s7, t0
+	lw      a0, 0(t0)
+	slli    t0, a0, 13
+	xor     a0, a0, t0
+	srli    t0, a0, 17
+	xor     a0, a0, t0
+	slli    t0, a0, 5
+	xor     a0, a0, t0
+	li      t0, RNDS
+	add     t0, s7, t0
+	sw      a0, 0(t0)
+	j       dispatch
+
+# ──────────────────────────────────────────────────────────────────────────────
+# pick_peers — top the picks up to MAX_PICKS: each, a random one of the
+#   peers with this build not yet picked (not seeds, not dropped) -- the
+#   first such from a random place in the table.  Trashes t0..t6, a0, a3.
+# ──────────────────────────────────────────────────────────────────────────────
+pick_peers:
+	li      t5, 0                           # picks now
+	li      a3, PEERS
+	add     a3, s7, a3
+	li      t0, NPEERS
+	add     t0, s7, t0
+	lw      t4, 0(t0)
+1:	beqz    t4, 2f
+	lbu     t0, 6(a3)
+	li      t1, 2
+	bne     t0, t1, 3f
+	lbu     t0, 7(a3)
+	andi    t0, t0, 8
+	beqz    t0, 3f
+	addi    t5, t5, 1
+3:	addi    a3, a3, PEER_SZ
+	addi    t4, t4, -1
+	j       1b
+2:	li      t0, MAX_PICKS
+	bgeu    t5, t0, pp_done
+	CALL    rand                            # a random place to start
+	li      t0, NPEERS
+	add     t0, s7, t0
+	lw      t4, 0(t0)
+	beqz    t4, pp_done
+	andi    t6, a0, 31
+4:	bltu    t6, t4, 5f
+	sub     t6, t6, t4
+	j       4b
+5:	mv      t3, t4                          # entries to look at
+6:	beqz    t3, pp_done                     # none left to pick
+	slli    t0, t6, 5                       # PEER_SZ
+	li      a3, PEERS
+	add     a3, s7, a3
+	add     a3, a3, t0
+	lbu     t0, 6(a3)
+	li      t1, 2
+	bne     t0, t1, 7f
+	lbu     t0, 7(a3)
+	andi    t1, t0, 13                      # picked, seed, or no build?
+	li      t2, 4
+	bne     t1, t2, 7f
+	ori     t0, t0, 8                       # picked
+	sb      t0, 7(a3)
+	addi    t5, t5, 1
+	j       2b
+7:	addi    t6, t6, 1
+	bltu    t6, t4, 8f
+	li      t6, 0
+8:	addi    t3, t3, -1
+	j       6b
+pp_done:
 	j       dispatch
 
 # ──────────────────────────────────────────────────────────────────────────────

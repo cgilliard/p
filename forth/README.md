@@ -133,11 +133,17 @@ so the next boot is from the disk -- and serves it on its own port:
 and only for its own hash. Tabernacle (`src/tabernacle.S`, assembled into
 `src/tabernacle.fam0` by `tools/s2fam0_tabernacle.py`) fetches it the same
 way, on the node's port: it asks its seeds for hosts (`GET_HOSTS`), asks
-those hosts in turn (up to 32 peers, each answer carrying a cookie), and
-asks the peers for the image in windows of 32 chunks, spread across those
-that answer -- the seeds only if no other peer has sent any within 3
-seconds, so a new node costs its seeds a few small packets. A hash mismatch
-drops every peer that sent chunks and starts over. `scripts/node.sh` gives
+those hosts in turn (up to 32 peers, each answer carrying a cookie). A
+`HOSTS` answer may end with a trailer about the answering host: whether it
+serves its boot image, and that image's hash (the first 8 bytes) -- a Forth
+node and `tools/server.py` send it; the Rust node accepts and ignores it.
+After 2 seconds of discovery, tabernacle picks up to 16 of the hosts with
+*this* build at random and asks only them for the image, in windows of 32
+chunks (a pick that sends nothing after 8 asks is replaced by another);
+the seeds only if no other peer has sent any within 5 seconds, so a new
+node costs its seeds a few small packets. Nodes hand out their hosts in a
+random order, so new nodes spread across the network. A hash mismatch drops
+every peer that sent chunks and starts over. `scripts/node.sh` gives
 it the seeds as `BOOT` (default: `SEED`); `scripts/makenode.sh` writes a
 new build to `data/disk.img` by hand. Under QEMU, with a Rust dev node as
 the only seed and one Forth node holding the build, a new node on a blank

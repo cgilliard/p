@@ -96,6 +96,8 @@ pub struct Discovery {
     table: PeerTable,
     nonce_key: [u8; 32],
     nonce_counter: u64,
+    /// xorshift64 state, for handing out hosts in a random order.
+    shuffle_state: u64,
     /// The secret behind the cookies this node issues -- derived from
     /// `nonce_key`, under a different domain, so the two never coincide.
     cookie_key: [u8; 32],
@@ -124,11 +126,25 @@ impl Discovery {
             table,
             nonce_key,
             nonce_counter: 0,
+            shuffle_state: u64::from_be_bytes(nonce_key[24..].try_into().unwrap()) | 1,
             cookie_key: crate::poseidon2::hash_bytes_32(&[&nonce_key[..], b"discovery cookie key"].concat()),
             peer_cookies: HashMap::new(),
             pending: HashMap::new(),
             last_probe_ms: HashMap::new(),
             self_addrs: HashSet::new(),
+        }
+    }
+
+    /// Shuffle `items` (Fisher-Yates, xorshift64): spreading load, not
+    /// secrecy.
+    fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let mut x = self.shuffle_state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.shuffle_state = x;
+            items.swap(i, (x % (i as u64 + 1)) as usize);
         }
     }
 
@@ -288,7 +304,11 @@ impl Discovery {
                 let limit = (max as usize)
                     .min(self.share_limit())
                     .min(wire::hosts_amplification_limit(packet_len));
-                let hosts = self.table.active(limit, from)?;
+                // A random sample of the answering hosts, so different
+                // askers are introduced to different parts of the network.
+                let mut hosts = self.table.active(usize::MAX, from)?;
+                self.shuffle(&mut hosts);
+                hosts.truncate(limit);
                 let reply = Message::Hosts {
                     nonce,
                     cookie: self.issue_cookie(from),
@@ -506,14 +526,32 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].to, requester);
-        assert_eq!(
-            Message::decode(&out[0].bytes),
-            Some(Message::Hosts {
-                nonce: 5,
-                cookie: d.issue_cookie(requester),
-                hosts: vec![addr(2, 9000), addr(1, 9000)]
-            })
-        );
+        match Message::decode(&out[0].bytes) {
+            Some(Message::Hosts { nonce, cookie, mut hosts }) => {
+                assert_eq!((nonce, cookie), (5, d.issue_cookie(requester)));
+                hosts.sort();
+                assert_eq!(hosts, vec![addr(1, 9000), addr(2, 9000)]); // in a random order
+            }
+            other => panic!("expected HOSTS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replies_sample_the_answering_hosts_at_random() {
+        let (_dir, mut d) = discovery(config(vec![]));
+        for i in 1..=20 {
+            d.table().add_candidate(addr(i, 9000)).unwrap();
+            d.table().record_success(addr(i, 9000), i as u64).unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..10 {
+            let request = Message::GetHosts { nonce: n, max: 3 }.encode();
+            let out = d.handle(SocketAddr::V4(addr(99, 9000)), &request, 1_000).unwrap();
+            if let Some(Message::Hosts { hosts, .. }) = Message::decode(&out[0].bytes) {
+                seen.extend(hosts);
+            }
+        }
+        assert!(seen.len() > 3, "always the same three hosts: {seen:?}");
     }
 
     #[test]

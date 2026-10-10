@@ -683,8 +683,8 @@ impl Node {
                 crate::print_block(&block);
                 crate::print_mining_stats(hashes, elapsed, &target);
                 if let Ok(hosts) = self.peer_table.all() {
-                    let verified = hosts.iter().filter(|(_, record)| record.is_verified()).count();
-                    info!("  peers:       {} known, {verified} verified", hosts.len());
+                    let answering = hosts.iter().filter(|(_, record)| record.is_answering()).count();
+                    info!("  peers:       {answering} answering, {} known", hosts.len());
                 }
                 crate::announce_tip(&self.reader, &self.commands, None);
             }
@@ -887,7 +887,9 @@ impl Node {
             }
             Request::Status => {
                 let tip_hash = self.reader.tip().ok().flatten().map(|(_, h)| crate::hex(&h[..8])).unwrap_or_default();
-                let peers = self.peer_table.all().map(|h| h.len()).unwrap_or(0);
+                let hosts = self.peer_table.all().unwrap_or_default();
+                let answering = hosts.iter().filter(|(_, record)| record.is_answering()).count();
+                let peers = format!("{answering} ({} known)", hosts.len());
                 let miner = match (&self.miner, self.mining) {
                     (_, false) => "off".to_string(),
                     (Miner::Idle, true) => "starting".into(),

@@ -112,6 +112,12 @@ impl HostRecord {
         self.last_success_ms > 0
     }
 
+    /// Answering now: it has answered, and no request since has gone
+    /// unanswered. What counts as a peer (shared, counted).
+    pub fn is_answering(&self) -> bool {
+        self.is_verified() && self.failures == 0
+    }
+
     fn to_bytes(self) -> [u8; RECORD_LEN] {
         let mut out = [0u8; RECORD_LEN];
         out[..8].copy_from_slice(&self.last_success_ms.to_be_bytes());
@@ -284,7 +290,7 @@ impl PeerTable {
         let mut hosts: Vec<_> = self
             .all()?
             .into_iter()
-            .filter(|(addr, record)| record.is_verified() && record.failures == 0 && *addr != exclude)
+            .filter(|(addr, record)| record.is_answering() && *addr != exclude)
             .collect();
         hosts.sort_by_key(|(_, record)| std::cmp::Reverse(record.last_success_ms));
         Ok(hosts.into_iter().take(limit).map(|(addr, _)| addr).collect())

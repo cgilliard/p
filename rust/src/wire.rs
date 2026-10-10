@@ -88,6 +88,9 @@ const TYPE_PIECE_CHUNK: u8 = 14;
 pub const HEADER_LEN: usize = MAGIC.len() + 2;
 const GET_HOSTS_MIN: usize = HEADER_LEN + 8 + 2;
 const HOSTS_MIN: usize = HEADER_LEN + 8 + 8 + 2;
+/// The optional end of a `HOSTS`: flags (bit 0: serves its boot image) and
+/// the first 8 bytes of that image's hash.
+pub const HOSTS_TRAILER: usize = 9;
 const INV_LEN: usize = HEADER_LEN + 32 + 8 + 4 + 8;
 const GET_INV_LEN: usize = HEADER_LEN + 1 + 32;
 const GET_CHUNKS_LEN: usize = HEADER_LEN + 8 + 32 + 4 + 2;
@@ -370,10 +373,15 @@ impl Message {
             }
             TYPE_HOSTS if bytes.len() >= HOSTS_MIN => {
                 let count = read_u16(&body[16..]) as usize;
-                let addrs = &body[18..];
-                if addrs.len() != count * ADDR_LEN {
+                let rest = &body[18..];
+                // The hosts, then optionally HOSTS_TRAILER bytes about the
+                // answering host itself (a Forth node: whether it serves its
+                // boot image, and that image's hash) -- for tabernacle,
+                // ignored here.
+                if rest.len() != count * ADDR_LEN && rest.len() != count * ADDR_LEN + HOSTS_TRAILER {
                     return None;
                 }
+                let addrs = &rest[..count * ADDR_LEN];
                 let hosts = addrs
                     .chunks_exact(ADDR_LEN)
                     .map(|chunk| peers::decode_addr(chunk.try_into().unwrap()))
@@ -592,6 +600,17 @@ mod tests {
             },
             Message::GetTxInv { cookie: 11 },
         ]
+    }
+
+    #[test]
+    fn hosts_may_end_with_the_answering_hosts_trailer() {
+        let hosts = vec![SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, 1), 3737)];
+        let mut bytes = Message::Hosts { nonce: 1, cookie: 2, hosts: hosts.clone() }.encode();
+        bytes.push(1); // serves its boot image
+        bytes.extend_from_slice(&[7; 8]); // that image's hash, the first 8 bytes
+        assert_eq!(Message::decode(&bytes), Some(Message::Hosts { nonce: 1, cookie: 2, hosts }));
+        bytes.push(0); // anything else after the hosts is malformed
+        assert_eq!(Message::decode(&bytes), None);
     }
 
     #[test]

@@ -62,6 +62,7 @@ B3828140 ,   \ sub  t0,gp,s0          ( the offset )
 	imb @ 80000000 lit = 0= if
 		imb @ 24 lit - @  dup imc @ 5000 lit + textlen + = if imz ! else drop then
 	then
+	imz @ if imb @ 20 lit - pimg ! then                      \ HOSTS answers say we serve it (src/peer.fam)
 ;
 
 \ imhash ( -- a )   the image's hash (32 bytes, tabernacle's).

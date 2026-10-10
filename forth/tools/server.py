@@ -15,7 +15,8 @@ tabernacle computes it).
 Protocol (the node's, src/peer.fam): magic "TBRN" ("TBRD" on dev), version
 12, type, body; numbers big-endian.
   GET_HOSTS (1)   nonce u64, max u16, zero padding
-  HOSTS (2)       nonce u64, cookie u64, count u16 (0: no hosts shared)
+  HOSTS (2)       nonce u64, cookie u64, count u16 (0: no hosts shared), then
+                  flags 1 (serves its boot image) and its hash's first 8 bytes
   GET_BIN (15)    cookie u64, hash (32), first u32, count u16
   BIN_CHUNK (16)  hash (32), index u32, up to 1024 bytes
 The cookie (from HOSTS) proves the asker's address; at most 32 chunks an ask.
@@ -127,7 +128,9 @@ while True:
     kind, body = pkt[5], pkt[6:]
     now = time.monotonic()
     if kind == 1 and len(body) >= 10 and not any(body[10:]):  # GET_HOSTS
-        sock.sendto(MAGIC + bytes([VERSION, 2]) + body[:8] + cookie(addr) + b'\0\0', addr)
+        reload_if_changed()
+        sock.sendto(MAGIC + bytes([VERSION, 2]) + body[:8] + cookie(addr) + b'\0\0'
+                    + b'\x01' + state['hash'][:8], addr)
         print(f"[{now:.3f}] GET_HOSTS from {addr}")
     elif kind == 15 and len(body) == 46:  # GET_BIN
         reload_if_changed()

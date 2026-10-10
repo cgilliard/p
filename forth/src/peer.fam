@@ -230,32 +230,41 @@
 ;
 
 \ pghosts ( -- )   GET_HOSTS: HOSTS, with the asker's cookie, and the hosts
-\        that have answered us -- not the asker, not QEMU's gateway (this
-\        machine, 10.0.2.2) -- as many as asked for and the request's size
-\        allows (the answer at most three times it, as the Rust node bounds
-\        it).
-: phm variable ;  : phc variable ;
+\        answering us -- not the asker, not QEMU's gateway (this machine,
+\        10.0.2.2) -- as many as asked for and the request's size allows (the
+\        answer at most three times it, as the Rust node bounds it), from a
+\        random place in the table (different askers, different hosts).  And
+\        after them, if we serve our boot image (src/image.fam sets pimg to
+\        its hash): flags 1, the hash's first 8 bytes -- tabernacle picks the
+\        hosts it fetches from by that.
+: phm variable ;  : phc variable ;  : pimg variable ;  : phi variable ;
 : pghosts ( -- )
 	pbn @ A lit u< 0= if
 		0 lit  pbn @ A lit u> if pbn @ A lit do pbd @ i + c@ or loop then
 		0= if pmine dup 0< 0= if pselfk 0 lit else drop -1 lit then else 0 lit then   \ zero padding; not us
 		if
 			nsrc @ nsport @ padd drop
-			pbd @ 8 lit + nb16@  pbn @ 6 lit + 3 lit * 18 lit - 6 lit /  pumin  phm !
+			pbd @ 8 lit + nb16@  pbn @ 6 lit + 3 lit * 18 lit - pimg @ if 9 lit - then 6 lit /  pumin  phm !
 			2 lit phdr  pbd @ swap 8 lit ncpy
 			nsrc @ nsport @ pcookie npkt E lit + qbe!
 			0 lit phc !
+			pms pkey @ xor ppn %                                    \ a random place to start
 			ppn 0 lit do
-				phc @ phm @ u<  i pp 8 lit + @ 2 lit = and
-				i pp @ nsrc @ =  i pp 4 lit + @ nsport @ = and 0= and
-				i pp @ A000202 lit = 0= and if
-					i pp @ npkt 18 lit + phc @ 6 lit * + be!
-					i pp 4 lit + @ npkt 1C lit + phc @ 6 lit * + nb16!
+				dup i + dup ppn u< 0= if ppn - then phi !
+				phc @ phm @ u<  phi @ pp 8 lit + @ 2 lit = and
+				phi @ pp @ nsrc @ =  phi @ pp 4 lit + @ nsport @ = and 0= and
+				phi @ pp @ A000202 lit = 0= and if
+					phi @ pp @ npkt 18 lit + phc @ 6 lit * + be!
+					phi @ pp 4 lit + @ npkt 1C lit + phc @ 6 lit * + nb16!
 					phc @ 1 lit + phc !
 				then
-			loop
+			loop drop
 			phc @ npkt 16 lit + nb16!
-			phc @ 6 lit * 18 lit + preply
+			pimg @ if                                               \ we serve our boot image
+				1 lit npkt 18 lit + phc @ 6 lit * + c!
+				pimg @ npkt 19 lit + phc @ 6 lit * + 8 lit ncpy
+			then
+			phc @ 6 lit * 18 lit + pimg @ if 9 lit + then preply
 		then
 	then
 ;
@@ -264,13 +273,15 @@
 : phosts ( -- )
 	pbn @ 12 lit u< 0= if
 		pfrom dup pk ! 0< 0= if
-			pbd @ 10 lit + nb16@ dup 6 lit * 12 lit + pbn @ =
+			pbd @ 10 lit + nb16@ dup 6 lit * 12 lit + dup pbn @ =  swap 9 lit + pbn @ = or    \ (a trailer may follow)
 			pk @ pp 1C lit + @ and
 			pbd @ qbe@ pk @ pp 18 lit + @ = swap pk @ pp 14 lit + @ = and and if
 				pbd @ 8 lit + qbe@ pk @ pp 10 lit + !  pk @ pp C lit + !
 				2 lit pk @ pp 8 lit + !  hnow pk @ pp 48 lit + ! pk @ pp 44 lit + !  0 lit pk @ pp 1C lit + !  0 lit pk @ pp 30 lit + !
 				?dup if 0 lit do
-					pbd @ 12 lit + i 6 lit * + dup be32 swap 4 lit + nb16@ padd drop
+					pbd @ 12 lit + i 6 lit * + dup be32 swap 4 lit + nb16@
+					over 18 lit rshift 7F lit = if nip A000202 lit swap then    \ 127.x: this machine (QEMU's 10.0.2.2)
+					padd drop
 				loop then
 			else drop then
 		then
