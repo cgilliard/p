@@ -12,23 +12,39 @@
 	sub     \dst, \dst, t4
 	.endm
 
-	.macro FMUL dst, ra, rb         # dst = ra * rb mod p; uses t0, t3, t4
-	slli    t0, \rb, 1
+	.macro CSUB x                   # x = x - p if x >= p (x < 2p); uses t4
+	sltu    t4, \x, t2
+	addi    t4, t4, -1
+	and     t4, t4, t2
+	sub     \x, \x, t4
+	.endm
+
+	.macro FTAB ra, off             # 0, a, 2a, 3a at off(sp); uses t3, t4
+	sw      zero, \off(sp)
+	sw      \ra, \off+4(sp)
+	add     t3, \ra, \ra
+	CSUB    t3
+	sw      t3, \off+8(sp)
+	add     t3, t3, \ra
+	CSUB    t3
+	sw      t3, \off+12(sp)
+	.endm
+
+	.macro FMULT dst, rb, off       # dst = (the table's a) * rb mod p, 2 bits at a time
+	mv      t0, \rb
 	li      t3, 0
-	.rept 31
+	.rept 16
 	slli    t3, t3, 1
-	sltu    t4, t3, t2
-	addi    t4, t4, -1
-	and     t4, t4, t2
-	sub     t3, t3, t4
-	srai    t4, t0, 31
-	and     t4, t4, \ra
+	CSUB    t3
+	slli    t3, t3, 1
+	CSUB    t3
+	srli    t4, t0, 30
+	slli    t4, t4, 2
+	add     t4, t4, sp
+	lw      t4, \off(t4)
 	add     t3, t3, t4
-	sltu    t4, t3, t2
-	addi    t4, t4, -1
-	and     t4, t4, t2
-	sub     t3, t3, t4
-	slli    t0, t0, 1
+	CSUB    t3
+	slli    t0, t0, 2
 	.endr
 	mv      \dst, t3
 	.endm
@@ -56,13 +72,14 @@
 	addi    t2, t2, 1               # p
 	li      a3, 0                   # i (bytes)
 outer:
-	li      a4, 0                   # j (bytes)
-inner:
 	add     t5, a0, a3
 	lw      a5, 0(t5)
+	FTAB    a5, -16                 # a[i]'s multiples, for its 4 products
+	li      a4, 0                   # j (bytes)
+inner:
 	add     t5, a1, a4
 	lw      a6, 0(t5)
-	FMUL    a7, a5, a6
+	FMULT   a7, a6, -16
 	add     t5, a3, a4
 	add     t5, t5, sp
 	lw      t6, 0(t5)

@@ -13,22 +13,26 @@ three outputs; its proofs are each about 166 KB.
 
 | Check of main block 2 (Forth, QEMU) | 2026-10-08 | Now |
 | --- | --- | --- |
-| Body hash (hashes both proofs, about 330 KB) | 5.77 s | 1.18 s |
-| Block proof | 4.40 s | 0.75 s |
-| Chain proof it carries | 4.40 s | 0.72 s |
-| Proof of work (64 lookups, about 8,640 permutations) | 6.74 s | 0.90 s |
-| **All of the above** | **21.4 s** | **3.45 s** |
-| `tipnext`: all of the above plus the header rules and the new tip | 21–27 s | 3.52 s |
-| Accepting block 3b, reorganizing to it | 21.5 s | 3.58 s |
+| Body hash (hashes both proofs, about 330 KB) | 5.77 s | 0.57 s |
+| Block proof | 4.40 s | 0.60 s |
+| Chain proof it carries | 4.40 s | 0.60 s |
+| Proof of work (64 lookups, about 8,640 permutations) | 6.74 s | 0.70 s |
+| **All of the above** | **21.4 s** | **2.52 s** |
+| `tipnext`: all of the above plus the header rules and the new tip | 21–27 s | 2.47 s |
+| Accepting block 3b, reorganizing to it | 21.5 s | 2.62 s |
 
 What made the difference, without the M extension: the Poseidon2
-permutation in one piece of RV32I (`src/p2core.S`: 915 to about 120 µs),
+permutation in one piece of RV32I (`src/p2core.S`: 915 to about 80–100 µs),
 its arithmetic without branches (under QEMU a branch ends a block of
-translated code, and that, not the instructions, was the cost), the
-internal layer's multiplications -- all by small numbers or powers of 1/2
--- as additions and shifts, the extension field's product in RV32I
-(`src/emul.S`) and its inverse through the tower F_p(u)(x), u = x^2 (one
-base-field inverse, where a^(p^4 - 2) took some 2,900 multiplies).
+translated code, and that, not the instructions, was the cost) and its
+multiplies by 2-bit windows (a table of 0, a, 2a, 3a, shared by the
+S-box's products), the internal layer's multiplications -- all by small
+numbers or powers of 1/2 -- as additions and shifts, the extension field's
+product in RV32I (`src/emul.S`) and its inverse through the tower
+F_p(u)(x), u = x^2 (one base-field inverse, where a^(p^4 - 2) took some
+2,900 multiplies), the byte hasher taking whole elements a block at a time
+(`src/hbadd.S`), and `/` and `%` as long division (they were repeated
+subtraction: n / 3 took n / 3 steps).
 
 While it works the node still answers: every 256th permutation yields to
 the network (`p2hook` in `src/poseidon2.fam`, pointed at the yield in

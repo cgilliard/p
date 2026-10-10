@@ -19,32 +19,55 @@
 	sub     \dst, \dst, s4
 	.endm
 
-	.macro FMUL dst, ra, rb         # dst = ra * rb mod p; uses t0, t3, t4
-	slli    t0, \rb, 1              # rb's bit 30 to the sign bit
+	.macro CSUB x                   # x = x - p if x >= p (x < 2p); uses t4
+	sltu    t4, \x, a0
+	addi    t4, t4, -1
+	and     t4, t4, a0
+	sub     \x, \x, t4
+	.endm
+
+	# Multiplying by 2-bit windows: a table of 0, a, 2a, 3a (mod p) below the
+	# data stack, then r = 4r + table[the multiplier's next 2 bits], from the
+	# top -- 16 windows, the multiplier < 2^31.  All without branches (QEMU
+	# ends a block of translated code at a branch).
+
+	.macro FTAB ra, off             # the table of ra at off(sp); uses t3, t4
+	sw      zero, \off(sp)
+	sw      \ra, \off+4(sp)
+	add     t3, \ra, \ra
+	CSUB    t3
+	sw      t3, \off+8(sp)
+	add     t3, t3, \ra
+	CSUB    t3
+	sw      t3, \off+12(sp)
+	.endm
+
+	.macro FMULT dst, rb, off       # dst = (the table at off's a) * rb mod p; uses t0, t3, t4
+	mv      t0, \rb
 	li      t3, 0
-	.rept 31                        # branch-free (QEMU ends a block at a branch)
-	slli    t3, t3, 1               # r = 2r mod p
-	sltu    t4, t3, a0
-	addi    t4, t4, -1
-	and     t4, t4, a0
-	sub     t3, t3, t4
-	srai    t4, t0, 31              # the bit: r = r + ra mod p
-	and     t4, t4, \ra
+	.rept 16
+	slli    t3, t3, 1               # r = 4r mod p
+	CSUB    t3
+	slli    t3, t3, 1
+	CSUB    t3
+	srli    t4, t0, 30              # + the window's multiple of a
+	slli    t4, t4, 2
+	add     t4, t4, sp
+	lw      t4, \off(t4)
 	add     t3, t3, t4
-	sltu    t4, t3, a0
-	addi    t4, t4, -1
-	and     t4, t4, a0
-	sub     t3, t3, t4
-	slli    t0, t0, 1
+	CSUB    t3
+	slli    t0, t0, 2
 	.endr
 	mv      \dst, t3
 	.endm
 
-	.macro SBOX x                   # x = x^7; uses t0..t4
-	FMUL    t1, \x, \x              # x^2
-	FMUL    t2, t1, \x              # x^3
-	FMUL    t1, t2, t2              # x^6
-	FMUL    \x, t1, \x              # x^7
+	.macro SBOX x                   # x = x^7; uses t0..t4, two tables below sp
+	FTAB    \x, -16
+	FMULT   t1, \x, -16             # x^2
+	FMULT   t2, t1, -16             # x^3 = x x^2
+	FTAB    t2, -32
+	FMULT   t1, t2, -32             # x^6
+	FMULT   \x, t1, -16             # x^7 = x x^6
 	.endm
 
 	lw      a7, 0(sp)               # np

@@ -699,27 +699,45 @@ B3836300 ,   \ add t2,t2,t1
 13014100 ,   \ addi sp,sp,4
 23207100 ,   \ sw t2,0(sp)
 ;
-\ /  ( a b -- a/b )  unsigned; /0 loops forever
+\ /  ( a b -- a/b )  unsigned long division, 32 steps (b = 0: all ones)
 : /
 83220100 ,   \ lw t0,0(sp)
 03234100 ,   \ lw t1,4(sp)
-93030000 ,   \ li t2,0
-63685300 ,   \ bltu t1,t0,1c <.L2^B1>
-33035340 ,   \ sub t1,t1,t0
-93831300 ,   \ addi t2,t2,1
-6FF05FFF ,   \ j c <.L1^B1>
 13014100 ,   \ addi sp,sp,4
+93030000 ,   \ addi t2,zero,0
+130E0000 ,   \ addi t3,zero,0
+930E0002 ,   \ addi t4,zero,32
+131E1E00 ,   \ slli t3,t3,0x1
+135FF301 ,   \ srli t5,t1,0x1f
+336EEE01 ,   \ or t3,t3,t5
+13131300 ,   \ slli t1,t1,0x1
+93931300 ,   \ slli t2,t2,0x1
+63665E00 ,   \ bltu t3,t0,38 <__BSS_END__-0x100c>
+330E5E40 ,   \ sub t3,t3,t0
+93E31300 ,   \ ori t2,t2,1
+938EFEFF ,   \ addi t4,t4,-1
+E39E0EFC ,   \ bne t4,zero,18 <__BSS_END__-0x102c>
 23207100 ,   \ sw t2,0(sp)
 ;
-\ %  ( a b -- a%b )  unsigned
+\ %  ( a b -- a%b )  unsigned long division, 32 steps (b = 0: a)
 : %
 83220100 ,   \ lw t0,0(sp)
 03234100 ,   \ lw t1,4(sp)
-63665300 ,   \ bltu t1,t0,14 <.L2^B1>
-33035340 ,   \ sub t1,t1,t0
-6FF09FFF ,   \ j 8 <.L1^B1>
 13014100 ,   \ addi sp,sp,4
-23206100 ,   \ sw t1,0(sp)
+93030000 ,   \ addi t2,zero,0
+130E0000 ,   \ addi t3,zero,0
+930E0002 ,   \ addi t4,zero,32
+131E1E00 ,   \ slli t3,t3,0x1
+135FF301 ,   \ srli t5,t1,0x1f
+336EEE01 ,   \ or t3,t3,t5
+13131300 ,   \ slli t1,t1,0x1
+93931300 ,   \ slli t2,t2,0x1
+63665E00 ,   \ bltu t3,t0,38 <__BSS_END__-0x100c>
+330E5E40 ,   \ sub t3,t3,t0
+93E31300 ,   \ ori t2,t2,1
+938EFEFF ,   \ addi t4,t4,-1
+E39E0EFC ,   \ bne t4,zero,18 <__BSS_END__-0x102c>
+2320C101 ,   \ sw t3,0(sp)
 ;
 
 
