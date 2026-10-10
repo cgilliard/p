@@ -638,7 +638,7 @@ mod tests {
         let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5, None).unwrap();
         chain.skip_proof_checks();
         let reader = BlockReader::open(&storage).unwrap();
-        let table = PeerTable::open(&storage, 100).unwrap();
+        let table = PeerTable::open(&storage, 100, 4).unwrap();
         let cfg = discovery::Config {
             seeds: vec![],
             share_limit: 10,

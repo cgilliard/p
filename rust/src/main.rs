@@ -144,6 +144,8 @@ const SHARE_LIMIT: u16 = 100;
 /// table makes room by evicting the one silent longest (see `peers`).
 const DEFAULT_MAX_HOSTS: usize = 256;
 const DEFAULT_PROBE_INTERVAL_S: u64 = 60;
+/// Default of `--max-per-ip`: how many hosts may share an IP address.
+const DEFAULT_MAX_PER_IP: usize = 4;
 const RESPONSE_TIMEOUT_MS: u64 = 5_000;
 /// Block transfer knobs (see `transfer`). Also starting points.
 const CHUNK_WINDOW: u16 = 32;
@@ -286,7 +288,16 @@ struct Args {
     max_hosts: usize,
     /// How often every known host is asked for hosts, in seconds.
     probe_interval_s: u64,
+    /// The most hosts in the peer table with one IP address.
+    max_per_ip: usize,
+    /// No seeds (unless `--seed`s are given), and mine without waiting to
+    /// hear a peer: the first node of a new network.
+    standalone: bool,
 }
+
+/// The seeds a node starts from when no `--seed` is given: the public
+/// seeds (Forth nodes, port 3737). `--standalone` starts from none.
+const DEFAULT_SEEDS: [&str; 2] = ["159.54.172.190:3737", "146.235.230.124:3737"];
 
 /// Fast sync's default `--sync-depth`: blocks replayed in full after the
 /// sync point, and how deep a fast-synced node can reorg at first.
@@ -295,7 +306,12 @@ const DEFAULT_SYNC_DEPTH: u64 = 100;
 const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
          [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
          [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]
-         [--full-sync] [--sync-depth BLOCKS] [--max-hosts N] [--probe-interval SECONDS]";
+         [--full-sync] [--sync-depth BLOCKS] [--max-hosts N] [--probe-interval SECONDS]
+         [--max-per-ip N] [--standalone]
+
+Without --seed, the node starts from the public seeds; --standalone starts
+from none (the first node of a new network: it mines without waiting to hear
+a peer).";
 
 fn parse_args() -> Args {
     let mut data_dir = None;
@@ -315,6 +331,8 @@ fn parse_args() -> Args {
         sync_depth: DEFAULT_SYNC_DEPTH,
         max_hosts: DEFAULT_MAX_HOSTS,
         probe_interval_s: DEFAULT_PROBE_INTERVAL_S,
+        max_per_ip: DEFAULT_MAX_PER_IP,
+        standalone: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -348,6 +366,7 @@ fn parse_args() -> Args {
                 }));
             }
             "--no-mine" => args.mine = false,
+            "--standalone" => args.standalone = true,
             "--log-file" => args.log_file = Some(value().into()),
             "--log-level" => {
                 let v = value();
@@ -375,6 +394,13 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 });
             }
+            "--max-per-ip" => {
+                let v = value();
+                args.max_per_ip = v.parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+                    eprintln!("invalid --max-per-ip {v} (at least 1)\n{USAGE}");
+                    std::process::exit(2);
+                });
+            }
             "--probe-interval" => {
                 let v = value();
                 args.probe_interval_s = v.parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
@@ -395,6 +421,9 @@ fn parse_args() -> Args {
     // Everything that differs between networks reads it from here on.
     network::set(args.network);
     args.data_dir = data_dir.unwrap_or_else(|| default_data_dir(args.network));
+    if args.seeds.is_empty() && !args.standalone {
+        args.seeds = DEFAULT_SEEDS.iter().map(|s| s.parse().expect("a default seed")).collect();
+    }
     args
 }
 
@@ -475,14 +504,14 @@ type Network = (
     std::sync::Arc<std::sync::atomic::AtomicU64>,
 );
 
-fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>, max_hosts: usize, probe_interval_s: u64) -> Network {
+fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>, max_hosts: usize, max_per_ip: usize, probe_interval_s: u64) -> Network {
     let socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
         die(&format!("failed to bind UDP port {port}: {e}"));
     });
     socket
         .set_read_timeout(Some(std::time::Duration::from_millis(SOCKET_READ_TIMEOUT_MS)))
         .expect("failed to set socket read timeout");
-    let table = PeerTable::open(storage, max_hosts).expect("failed to open peer table");
+    let table = PeerTable::open(storage, max_hosts, max_per_ip).expect("failed to open peer table");
     let discovery = Discovery::new(
         discovery::Config {
             seeds,
@@ -788,16 +817,16 @@ fn main() {
     }
 
     if args.seeds.is_empty() {
-        info!("Listening on UDP port {} (no seeds given).", args.port);
+        info!("Listening on UDP port {} (standalone: no seeds).", args.port);
     } else {
         let seeds: Vec<String> = args.seeds.iter().map(|s| s.to_string()).collect();
         info!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
     }
-    let standalone = args.seeds.is_empty();
-    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, args.seeds, args.max_hosts, args.probe_interval_s);
+    let standalone = args.standalone;
+    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, args.seeds, args.max_hosts, args.max_per_ip, args.probe_interval_s);
     let fast_sync = (fresh && !args.full_sync).then(|| fastsync::FastSync::new(args.sync_depth, &commands));
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
-    let peer_table = PeerTable::open(&storage, args.max_hosts).expect("failed to open peer table");
+    let peer_table = PeerTable::open(&storage, args.max_hosts, args.max_per_ip).expect("failed to open peer table");
     let wallet_dir = args.wallet_dir.clone().unwrap_or_else(|| path.join("wallet"));
     // A wallet made just now (not restored) shows its backup words once.
     let created = !args.recover && !wallet_dir.join("data.mdb").exists();

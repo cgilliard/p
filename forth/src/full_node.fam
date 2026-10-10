@@ -19,6 +19,7 @@
 \   api=N               the wallet API's UDP port (our port + 1: src/wapi.fam)
 \   peers=N             the most hosts kept (256; at most 1,000: src/peer.fam)
 \   probe=S             every host asked for hosts every S seconds (60)
+\   perip=N             the most hosts kept with one IP address (4)
 \   apikey              show the wallet's API key (tools/wallet asks for it)
 \ ──────────────────────────────────────────────────────────────────────────────
 
@@ -74,8 +75,9 @@
 		else "api=" fnpre? if fnnum naport !
 		else "peers=" fnpre? if fnnum 3E8 lit pumin dup 0= if drop 1 lit then ppmx !
 		else "probe=" fnpre? if fnnum 3E8 lit * dup 0= if drop 3E8 lit then pprb !
+		else "perip=" fnpre? if fnnum dup 0= if drop 1 lit then ppip !
 		else "apikey" fnpre? if -1 lit wlshowk !
-		else fnbad then then then then then then then then then then then
+		else fnbad then then then then then then then then then then then then
 	repeat
 ;
 

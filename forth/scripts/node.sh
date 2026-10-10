@@ -28,7 +28,9 @@
 #          chain, so switching means a new disk image
 #   PEERS  the most hosts the node keeps (default 256)
 #   PROBE  how often every known host is asked for hosts, in seconds
-#          (default 60); a silent host is kept and asked again
+#          (default 60); a silent host is kept and asked again (hourly after
+#          a day; removed after a week, or after 3 tries if it never answered)
+#   PERIP  the most hosts kept with one IP address (default 4)
 #   BOOT   the seeds tabernacle starts from when the disk's copy isn't the
 #          build it expects: it finds peers through them and fetches the node
 #          from the peers holding it, the seeds only if no one else does
@@ -74,10 +76,30 @@ if command -v ss >/dev/null; then
 		fi
 	done
 fi
-# The console: the settings, then the keyboard (for the wallet), through a
-# fifo so the node runs in the foreground (Ctrl-C stops it).  What's typed
-# isn't echoed (words, passphrases); the terminal is put back however the
-# node ends.
+# The console: two lines of settings first -- tabernacle's (its port, debug,
+# timeout, network, and the seeds it would fetch the node from if the disk's
+# copy were bad), then the node's own (src/full_node.fam).
+settings() {
+	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s\004' \
+		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
+		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}" "${PERIP:+ perip=$PERIP}"
+}
+# QEMU's output goes through a pipe (| cat): QEMU makes its output
+# non-blocking, and on a terminal that would be the keyboard's too.
+run() {
+	./tools/q32 bin/tabernacle \
+		--disk=./data/disk.img \
+		--net \
+		--hostfwd=udp::$PORT-:$PORT,hostfwd=udp:127.0.0.1:$API-:$API | cat
+}
+if [ -z "$WALLET" ]; then
+	# Nothing to type: the terminal is left alone (Ctrl-C stops the node).
+	settings | run
+	exit 0
+fi
+# --recover / --passphrase: then the keyboard, for the words or passphrase,
+# through a fifo so the node runs in the foreground; what's typed isn't
+# echoed, and the terminal is put back however the node ends.
 mkdir -p tmp
 FIFO=tmp/console.$$
 rm -f "$FIFO" && mkfifo "$FIFO"
@@ -94,18 +116,10 @@ if [ -t 0 ]; then
 	STTY=$(stty -g)
 	stty -echo
 fi
-# Two lines first: tabernacle's (its port, debug, timeout, and the hosts it
-# would fetch the node from if the disk's copy were bad), then the node's own
-# (src/full_node.fam).
 exec 3<&0
 {
-	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s\004' \
-		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
-		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}"
+	settings
 	exec cat <&3
 } > "$FIFO" &
 CAT=$!
-./tools/q32 bin/tabernacle \
-	--disk=./data/disk.img \
-	--net \
-	--hostfwd=udp::$PORT-:$PORT,hostfwd=udp:127.0.0.1:$API-:$API < "$FIFO"
+run < "$FIFO"

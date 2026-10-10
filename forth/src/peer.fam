@@ -106,17 +106,22 @@
 \ 3C strikes (bad pieces)  40 when last asked its height  44, 48 when it last
 \ answered (ms since the epoch: low, high word; 0 never).
 \
-\ As the Rust node keeps them: a host that stops answering isn't dropped --
-\ it goes back to known (not counted, shared or announced to) and is asked
-\ again every probe interval (probe=S, a minute by default), however long
-\ it's been silent; a full table makes room for a new host by evicting the
-\ one silent longest among those not answering (never answered, first), and
-\ never a seed.  The table is kept on the disk (`psave`, `pload`).
+\ As the Rust node keeps them (../rust/src/peers.rs): a host that stops
+\ answering goes back to known (not counted, shared or announced to) and is
+\ asked again every probe interval (probe=S, a minute by default) -- one
+\ silent over a day, hourly -- until it's removed: one that never answered,
+\ after 3 unanswered asks; one that did, after a week's silence.  A seed is
+\ never removed, and always asked every interval.  At most perip=N (4) hosts
+\ share an IP address.  A full table makes room for a new host by evicting
+\ the one silent longest among those not answering (never answered, first),
+\ and never a seed.  The table is kept on the disk (`psave`, `pload`).
 
 : ppv variable ;  : pp ( k -- a )  50 lit * ppv 13880 lit lazy + ;
 : ppmx variable ;  : pprb variable ;
 : ppn ( -- n )     ppmx @ dup 0= if drop 100 lit then ;              \ peers=N
 : ppint ( -- ms )  pprb @ dup 0= if drop EA60 lit then ;             \ probe=S
+: ppip variable ;  : pseeding variable ;
+: pperip ( -- n )  ppip @ dup 0= if drop 4 lit then ;                \ perip=N
 
 \ Our own addresses, found out (as the Rust node does): a GET_HOSTS that
 \ arrives with one of our own requests' nonces is us asking ourselves -- the
@@ -130,6 +135,9 @@
 	0 lit  4 lit 0 lit do 2 lit pick i pself @ =  2 lit pick i pself 4 lit + @ = and or loop
 	nip nip
 ;
+
+\ pipn ( ip -- n )   hosts in the table with that IP address.
+: pipn ( ip -- n )   0 lit swap  ppn 0 lit do i pp 8 lit + @ if dup i pp @ = if swap 1 lit + swap then then loop drop ;
 
 \ pfind ( ip port -- k | -1 )
 : pfk variable ;
@@ -161,7 +169,9 @@
 \ padd ( ip port -- k | -1 )   a host (kept, if there's room -- see pevict).
 : padd ( ip port -- k | -1 )
 	2dup pfind dup 0< 0= if nip nip else drop
-		over 0= over 0= or  2 lit pick 2 lit pick pisself or if 2drop -1 lit else
+		over 0= over 0= or  2 lit pick 2 lit pick pisself or
+		pseeding @ 0=  3 lit pick pipn pperip u< 0= and or            \ its IP has perip hosts (not for a seed)
+		if 2drop -1 lit else
 		-1 lit pfk !
 		ppn 0 lit do i pp 8 lit + @ 0= pfk @ 0< and if i pfk ! then loop
 		pfk @ 0< if pevict pfk ! then                                 \ full: make room
@@ -173,7 +183,7 @@
 	then
 ;
 
-: pseed ( ip port -- )   padd dup 0< if drop else 1 lit swap pp 38 lit + ! then ;
+: pseed ( ip port -- )   -1 lit pseeding ! padd 0 lit pseeding !  dup 0< if drop else 1 lit swap pp 38 lit + ! then ;
 
 \ psendk ( k n -- )   send the packet built (n bytes) to peer k.
 : psendk ( k n -- )   swap pp dup @ swap 4 lit + @ rot nsend drop ;
@@ -269,13 +279,15 @@
 	then
 ;
 
-\ phosts ( -- )   HOSTS: the answer to our request, if it is one.
+\ phosts ( -- )   HOSTS: the answer to our latest request to that host, if it
+\        is one -- even after the request timed out (a host busy for a while,
+\        or slow): it's answering, then.
 : phosts ( -- )
 	pbn @ 12 lit u< 0= if
 		pfrom dup pk ! 0< 0= if
 			pbd @ 10 lit + nb16@ dup 6 lit * 12 lit + dup pbn @ =  swap 9 lit + pbn @ = or    \ (a trailer may follow)
-			pk @ pp 1C lit + @ and
-			pbd @ qbe@ pk @ pp 18 lit + @ = swap pk @ pp 14 lit + @ = and and if
+			pk @ pp 24 lit + @ and                                  \ we've asked it
+			pbd @ qbe@ pk @ pp 18 lit + @ = swap pk @ pp 14 lit + @ = and and if    \ our latest request's nonce (late too)
 				pbd @ 8 lit + qbe@ pk @ pp 10 lit + !  pk @ pp C lit + !
 				2 lit pk @ pp 8 lit + !  hnow pk @ pp 48 lit + ! pk @ pp 44 lit + !  0 lit pk @ pp 1C lit + !  0 lit pk @ pp 30 lit + !
 				?dup if 0 lit do
@@ -288,17 +300,41 @@
 	then
 ;
 
+\ psil ( k -- ms )   how long since peer k last answered (FFFFFFFF: longer
+\        than the low word holds; 0 if its time is ahead of ours).
+: psk variable ;
+: psil ( k -- ms )
+	pp psk !  hnow  psk @ 48 lit + @ -  over psk @ 44 lit + @ u< if 1 lit - then     ( nlo dhi )
+	dup 0< if 2drop 0 lit else if drop FFFFFFFF lit else psk @ 44 lit + @ - then then
+;
+
+\ pnever ( k -- f )   peer k has never answered.
+: pnever ( k -- f )   pp dup 44 lit + @ swap 48 lit + @ or 0= ;
+
+\ pint ( k -- ms )   how often peer k is asked: hourly if silent over a day
+\        (not a seed), else every probe interval.
+: pint ( k -- ms )
+	dup pp 38 lit + @ 0=  over pnever 0= and if
+		psil 5265C00 lit u> if 36EE80 lit else ppint then
+	else drop ppint then
+;
+
 \ pdisc ( -- )   time requests out (a host silent 5 s isn't answering: back
-\        to known, kept); ask every host due (a probe interval since).
+\        to known -- and gone, not a seed, if it never answered in 3 asks or
+\        not in a week); ask every host due (pint).
 : pdisc ( -- )
 	ppn 0 lit do
 		i pp 8 lit + @ if
 			i pp 1C lit + @ i pp 20 lit + @ pago 1388 lit u> and if          \ 5 s: a failure
 				0 lit i pp 1C lit + !  i pp 30 lit + @ 1 lit + i pp 30 lit + !
 				1 lit i pp 8 lit + !
+				i pp 38 lit + @ 0= if
+					i pnever if i pp 30 lit + @ 3 lit u< 0= else i psil 240C8400 lit u< 0= then
+					if 0 lit i pp 8 lit + ! then                               \ gone
+				then
 			then
 			i pp 8 lit + @ i pp 1C lit + @ 0= and if
-				i pp 24 lit + @ 0=  i pp 24 lit + @ pago ppint u> or if i pprobe then
+				i pp 24 lit + @ 0=  i pp 24 lit + @ pago i pint u> or if i pprobe then
 			then
 		then
 	loop

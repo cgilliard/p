@@ -77,12 +77,15 @@ Its `HOSTS` answers share the peers that have answered it (not 10.0.2.2,
 QEMU's view of this machine). A node that asks itself -- a seed list holding
 it, a NAT looping back -- knows by the nonce (a `GET_HOSTS` carrying one of
 its own), and drops that address for good, as the Rust node does. Hosts
-that stop answering aren't dropped -- by either node -- but kept and asked
-again every probe interval (a minute), however long they've been silent;
-they're not counted, shared or announced to until they answer. A full
-table (256 hosts; Forth `peers=N` / `PEERS`, Rust `--max-hosts`) makes room
-by evicting the host silent longest among those not answering, never a
-seed. The Forth node keeps its table on the disk (32 sectors at the end of
+that stop answering -- in both nodes -- are kept and asked again every
+probe interval (a minute; hourly once silent over a day), not counted,
+shared or announced to until they answer, and removed only when they've
+never answered in 3 asks, or not in a week: a node back after longer
+reaches out itself. Seeds are never removed. At most 4 hosts share an IP
+address (Forth `perip=N` / `PERIP`, Rust `--max-per-ip`), so no address can
+be made a target for the whole network's probes. A full table (256 hosts;
+Forth `peers=N` / `PEERS`, Rust `--max-hosts`) makes room by evicting the
+host silent longest among those not answering, never a seed. The Forth node keeps its table on the disk (32 sectors at the end of
 the boot image's 32 MiB), as the Rust node keeps its in LMDB, so after a
 restart both sides find each other again without their seeds. So Forth nodes alone can sync each other and
 fast-sync new ones. Blocks are kept from where a node started -- a

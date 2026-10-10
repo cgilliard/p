@@ -253,8 +253,8 @@ Done: `mnemonic.rs`.
       spends we signed ourselves were recognized.
 - [x] "Caught up": the network thread shares the highest tip any peer
       has reported (`net::Node::peer_height`, from `transfer`); the node
-      scans once its chain reaches it -- or at once, with no seeds and no
-      peer heights (a standalone node is its network).
+      scans once its chain reaches it -- or at once, with no peer heights
+      when started `--standalone` (a standalone node is its network).
 - [x] Startup: `--recover` reads the 24 words from stdin (asks again on
       a mistake), then runs as normal; `status` shows the recovery's
       progress, and the log reports what was found.

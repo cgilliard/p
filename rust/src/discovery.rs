@@ -6,11 +6,13 @@
 //! learned that way goes into the persistent `peers::PeerTable` as a
 //! candidate, and is itself sent `GET_HOSTS` in turn -- which both
 //! verifies it (an answer proves it's reachable) and learns its hosts.
-//! Every known host is re-probed every `probe_interval_ms`, however long
-//! it's been silent -- a host is only ever displaced by a new one, and
-//! never a seed (see `peers`) -- so a node finds its peers again when they
-//! come back (after a restart, say), not only when it restarts itself.
-//! That's the whole protocol: two message types.
+//! Every known host is re-probed every `probe_interval_ms` -- one silent
+//! for over a day (`SLOW_AFTER_MS`) only hourly (`SLOW_PROBE_MS`), a seed
+//! always every interval -- until it's removed (see `peers`: never
+//! answered after a few tries, or silent a week; never a seed), so a node
+//! finds its peers again when they come back (after a restart, say), not
+//! only when it restarts itself. That's the whole protocol: two message
+//! types.
 //!
 //! # Bare-metal shape
 //!
@@ -62,6 +64,12 @@ use crate::wire::{self, MAX_HOSTS_PER_PACKET, Message};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, SocketAddrV4};
 
+/// A host silent this long (it has answered, but not since) is asked only
+/// every `SLOW_PROBE_MS`: a day.
+pub const SLOW_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+/// How often such a host is asked: an hour.
+pub const SLOW_PROBE_MS: u64 = 60 * 60 * 1000;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Hosts to ask first, every time the node starts.
@@ -107,6 +115,10 @@ pub struct Discovery {
     /// Requests awaiting a reply, by the host they were sent to -- at
     /// most one outstanding per host.
     pending: HashMap<SocketAddrV4, Pending>,
+    /// A timed-out request's nonce, per host, until the next request to
+    /// it: an answer that comes late (a node busy for a while -- a Forth
+    /// node checking a block) still counts.
+    late: HashMap<SocketAddrV4, u64>,
     /// When each host was last sent a request -- in memory only, so a
     /// restart re-probes everything right away, which is what a freshly
     /// started node wants anyway.
@@ -130,6 +142,7 @@ impl Discovery {
             cookie_key: crate::poseidon2::hash_bytes_32(&[&nonce_key[..], b"discovery cookie key"].concat()),
             peer_cookies: HashMap::new(),
             pending: HashMap::new(),
+            late: HashMap::new(),
             last_probe_ms: HashMap::new(),
             self_addrs: HashSet::new(),
         }
@@ -169,6 +182,7 @@ impl Discovery {
     fn mark_self(&mut self, addr: SocketAddrV4) -> peers::Result<()> {
         self.self_addrs.insert(addr);
         self.pending.remove(&addr);
+        self.late.remove(&addr);
         self.last_probe_ms.remove(&addr);
         self.peer_cookies.remove(&addr);
         self.table.remove(addr)
@@ -209,6 +223,7 @@ impl Discovery {
     fn request(&mut self, to: SocketAddrV4, now_ms: u64) -> Outgoing {
         let nonce = self.next_nonce();
         self.pending.insert(to, Pending { nonce, sent_at_ms: now_ms });
+        self.late.remove(&to);
         self.last_probe_ms.insert(to, now_ms);
         let message = Message::GetHosts {
             nonce,
@@ -248,13 +263,23 @@ impl Discovery {
             .map(|(addr, _)| *addr)
             .collect();
         for addr in expired {
-            self.pending.remove(&addr);
-            self.table.record_failure(addr)?; // kept: asked again next interval
+            if let Some(p) = self.pending.remove(&addr) {
+                self.late.insert(addr, p.nonce); // a late answer still counts
+            }
+            if self.table.record_failure(addr, now_ms)? {
+                // Never answered, or silent a week: gone.
+                self.late.remove(&addr);
+                self.last_probe_ms.remove(&addr);
+                self.peer_cookies.remove(&addr);
+            }
         }
 
-        let interval = self.config.probe_interval_ms;
         let mut out = Vec::new();
-        for (addr, _) in self.table.all()? {
+        for (addr, record) in self.table.all()? {
+            let slow = record.is_verified()
+                && now_ms.saturating_sub(record.last_success_ms) > SLOW_AFTER_MS
+                && !self.config.seeds.contains(&addr);
+            let interval = if slow { SLOW_PROBE_MS.max(self.config.probe_interval_ms) } else { self.config.probe_interval_ms };
             let due = self.last_probe_ms.get(&addr).is_none_or(|&last| now_ms >= last + interval);
             if due && !self.pending.contains_key(&addr) {
                 out.push(self.request(addr, now_ms));
@@ -320,11 +345,13 @@ impl Discovery {
                 }])
             }
             Message::Hosts { nonce, cookie, ref hosts } => {
-                match self.pending.get(&from) {
-                    Some(p) if p.nonce == nonce => {}
-                    _ => return Ok(Vec::new()),
+                let ours = self.pending.get(&from).is_some_and(|p| p.nonce == nonce)
+                    || self.late.get(&from) == Some(&nonce);
+                if !ours {
+                    return Ok(Vec::new());
                 }
                 self.pending.remove(&from);
+                self.late.remove(&from);
                 self.peer_cookies.insert(from, cookie);
                 self.table.record_success(from, now_ms)?;
                 for &host in hosts.iter().take(self.share_limit()) {
@@ -378,7 +405,7 @@ mod tests {
     fn discovery(config: Config) -> (TempDir, Discovery) {
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let table = PeerTable::open(&storage, 100).unwrap();
+        let table = PeerTable::open(&storage, 100, 4).unwrap();
         (dir, Discovery::new(config, table, [7u8; 32]))
     }
 
@@ -465,9 +492,9 @@ mod tests {
         let (_dir, mut d) = discovery(cfg);
 
         let mut now = 0;
-        let out = d.start(now).unwrap();
-        let nonce = nonce_sent_to(&out, seed);
-        d.handle(SocketAddr::V4(seed), &hosts_reply(nonce, vec![learned]), 10).unwrap();
+        d.start(now).unwrap();
+        d.table().add_candidate(learned).unwrap();
+        d.table().record_success(learned, 1).unwrap(); // it answered once
         for _ in 0..10 {
             now += 100;
             d.tick(now).unwrap();
@@ -475,6 +502,37 @@ mod tests {
         assert!(d.table().get(learned).unwrap().is_some());
         now += 100;
         nonce_sent_to(&d.tick(now).unwrap(), learned);
+    }
+
+    #[test]
+    fn a_host_silent_over_a_day_is_asked_hourly() {
+        let host = addr(2, 9000);
+        let mut cfg = config(vec![]);
+        cfg.probe_interval_ms = 60_000;
+        let (_dir, mut d) = discovery(cfg);
+        d.table().add_candidate(host).unwrap();
+        d.table().record_success(host, 1).unwrap();
+        let mut now = 1 + SLOW_AFTER_MS + 1;
+        nonce_sent_to(&d.tick(now).unwrap(), host); // asked now
+        now += 2 * 60_000;
+        assert!(d.tick(now).unwrap().iter().all(|o| o.to != host)); // not each minute
+        now += SLOW_PROBE_MS;
+        nonce_sent_to(&d.tick(now).unwrap(), host); // but each hour
+    }
+
+    #[test]
+    fn an_answer_after_the_timeout_still_counts() {
+        let seed = addr(1, 9000);
+        let mut cfg = config(vec![seed]);
+        cfg.probe_interval_ms = 60_000;
+        let timeout = cfg.response_timeout_ms;
+        let (_dir, mut d) = discovery(cfg);
+        let out = d.start(0).unwrap();
+        let nonce = nonce_sent_to(&out, seed);
+        d.tick(timeout + 1).unwrap(); // timed out: a failure
+        assert!(!d.table().get(seed).unwrap().unwrap().is_answering());
+        d.handle(SocketAddr::V4(seed), &hosts_reply(nonce, vec![]), timeout + 2_000).unwrap();
+        assert!(d.table().get(seed).unwrap().unwrap().is_answering());
     }
 
     #[test]
@@ -699,7 +757,7 @@ mod tests {
 
         let dir = TempDir::new();
         let storage = Storage::open(&dir.0).unwrap();
-        let other = Discovery::new(config(vec![]), PeerTable::open(&storage, 100).unwrap(), [8u8; 32]);
+        let other = Discovery::new(config(vec![]), PeerTable::open(&storage, 100, 4).unwrap(), [8u8; 32]);
         assert!(!other.check_cookie(requester, cookie));
     }
 }
