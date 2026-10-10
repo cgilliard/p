@@ -416,8 +416,7 @@
 	"\nnode: a new wallet.  Its 24 backup words -- write them down, in order, and keep\nthem safe:\n\n" puts
 	pgop wlm 30 lit + mnshow
 	"\nThey" puts  wlflags 1 lit and if " and the passphrase" puts then
-	" are the only way to restore the wallet, and anyone holding\nthem can spend everything in it.  The wallet lives on this disk: deleting\ndata/disk.img deletes it.  Press Enter once they're written down.\n" puts
-	wlin FF lit wlline drop
+	" are the only way to restore the wallet, and anyone holding\nthem can spend everything in it.  The wallet lives on this disk: deleting\ndata/disk.img deletes it.\n\n" puts
 	mnb 9 lit zero
 ;
 
