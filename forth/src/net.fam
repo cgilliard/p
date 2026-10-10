@@ -243,7 +243,8 @@
 		40 lit over 8 lit + c!  11 lit over 9 lit + c!
 		nadr @ over C lit + be!  nsdi @ over 10 lit + be!
 		0 lit  A lit 0 lit do over i 1 lit lshift + nb16@ + loop
-		dup 10 lit rshift + dup 10 lit rshift + FFFF lit and FFFF lit xor
+		dup FFFF lit and swap 10 lit rshift +  dup FFFF lit and swap 10 lit rshift +    \ fold the carries
+		FFFF lit xor
 		over A lit + nb16!
 		14 lit +
 		nsfrom @ ?dup 0= if nport @ then over nb16!  nsdp @ over 2 lit + nb16!  nsdn @ 8 lit + over 4 lit + nb16!  0 lit swap 6 lit + nb16!

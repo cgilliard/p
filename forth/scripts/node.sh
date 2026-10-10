@@ -51,6 +51,15 @@ for arg in "$@"; do
 done
 mkdir -p data
 [ -e data/disk.img ] || truncate -s 4G data/disk.img
+# QEMU can't forward a port something else holds, and quits without a word.
+if command -v ss >/dev/null; then
+	for p in "$PORT" "$API"; do
+		if ss -Huln "sport = :$p" | grep -q .; then
+			echo "node.sh: UDP port $p is in use (another node? set PORT, or API)" >&2
+			exit 1
+		fi
+	done
+fi
 # The console: the settings, then the keyboard (for the wallet), through a
 # fifo so the node runs in the foreground (Ctrl-C stops it).  What's typed
 # isn't echoed (words, passphrases); the terminal is put back however the
