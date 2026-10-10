@@ -88,7 +88,7 @@
 \ acparent ( hash -- h )   replace a hash (32 bytes, in place) by its
 \        parent's; the block's height (from its tip).
 : acparent ( hash -- h )
-	dup dbfind dup 0< if "missing tip" puts A lit putc bye then
+	dup dbfind dup 0< if "missing tip" lputs A lit lputc bye then
 	dbrd drop
 	dbbuf C4 lit + 20 lit + @                               ( hash h )
 	dbbuf 8 lit + 4 lit + rot 20 lit ncpy
@@ -100,14 +100,14 @@
 
 \ acpush ( -- )   the best's side's hash, onto the list.
 : acpush ( -- )
-	acln @ 1000 lit u< 0= if "the state is too far behind: resync" puts A lit putc bye then
+	acln @ 1000 lit u< 0= if "the state is too far behind: resync" lputs A lit lputc bye then
 	acA acl acln @ 5 lit lshift + 20 lit ncpy
 	acln @ 1 lit + acln !
 ;
 
 \ acundo ( -- )   undo the state's block (acB): it's at the parent now.
 : acundo ( -- )
-	acB stunapl 0= if "state undo failed" puts A lit putc bye then
+	acB stunapl 0= if "state undo failed" lputs A lit lputc bye then
 	achb @ bldel                                          \ off the active chain
 	acB acparent drop
 	acB achb @ 1 lit - 0 lit stmeta
@@ -129,9 +129,9 @@
 \ acapply ( k -- )   apply list entry k to the state, and commit.
 : acapply ( k -- )
 	5 lit lshift acl + acA 20 lit ncpy
-	acA acdget  2dup or 0= if "missing delta" puts A lit putc bye then
+	acA acdget  2dup or 0= if "missing delta" lputs A lit lputc bye then
 	bparse drop
-	acA stapply if acA bheight drop blat! pgcommit drop else pgabort "the state rejected a valid block" puts A lit putc bye then
+	acA stapply if acA bheight drop blat! pgcommit drop else pgabort "the state rejected a valid block" lputs A lit lputc bye then
 	bheight drop acha !
 	acprune
 ;

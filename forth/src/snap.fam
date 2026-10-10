@@ -72,7 +72,7 @@
 \ snwant ( l i hash -- )   fetch (l, i) unless its hash says it's empty.
 : snwant ( l i hash -- )
 	dup 3 lit pick stemp 8 lit ceq  over 4 lit pick stspt 8 lit ceq or if drop 2drop else
-		snpn @ 400 lit u< 0= if "too many pieces" puts A lit putc bye then
+		snpn @ 400 lit u< 0= if "too many pieces" lputs A lit lputc bye then
 		snpn @ 28 lit * snpend +                         ( l i hash e )
 		tuck 8 lit + 8 lit cpy  tuck 4 lit + !  !
 		snpn @ 1 lit + snpn !

@@ -1,0 +1,50 @@
+\ tests/peer.fam — the host table (src/peer.fam): how many hosts an IP keeps.
+
+: tpip ( -- ip )   A000005 lit ;
+: tpst variable ;  : tplo variable ;
+
+\ tpset ( port state lo -- )   host tpip:port's state, and when it last
+\        answered (low word; the high word 1).
+: tpset ( port state lo -- )
+	tplo ! tpst !  tpip swap pfind dup 0< 0= assert  pp
+	tpst @ over 8 lit + !  tplo @ over 44 lit + !  1 lit swap 48 lit + !
+;
+
+\ tpclear ( -- )   an empty table.
+: tpclear ( -- )   0 lit pp ppn 50 lit * nzero ;
+
+Test {
+	peer_ip_keeps_answering_hosts {
+		tpclear
+		5 lit 1 lit do tpip i padd 0< 0= assert  i 2 lit i 3E8 lit * tpset loop
+		tpip pipn 4 lit asrt_eq
+		tpip 5 lit padd 0< assert                        \ all four answering: refused
+		tpip 5 lit pfind 0< assert
+		tpclear
+	}
+	peer_new_port_replaces_a_silent_one {
+		\ A node behind a NAT, back on another port: it takes the place of the
+		\ old port silent longest among those not answering.
+		tpclear
+		5 lit 1 lit do tpip i padd 0< 0= assert  i 2 lit i 3E8 lit * tpset loop
+		3 lit 1 lit BB8 lit tpset                        \ silent since 3,000
+		2 lit 1 lit 7D0 lit tpset                        \ silent since 2,000: longest
+		tpip 5 lit padd 0< 0= assert
+		tpip 2 lit pfind 0< assert
+		tpip 3 lit pfind 0< 0= assert
+		tpip pipn 4 lit asrt_eq
+		tpclear
+	}
+	peer_inv_adds_its_sender {
+		\ An announcement from a host not in the table: it's added, at the
+		\ height announced (the tip's, the higher), to be probed.
+		tpclear  -1 lit pqk !
+		pbody 34 lit nzero  pbody pbd !  34 lit pbn !
+		5 lit 0 lit pbody 20 lit + qbe!  9 lit 0 lit pbody 2C lit + qbe!
+		tpip nsrc !  7 lit nsport !
+		pinv
+		tpip 7 lit pfind dup 0< 0= assert
+		pp dup 8 lit + @ 1 lit asrt_eq  dup 28 lit + @ 9 lit asrt_eq  2C lit + @ 0= 0= assert
+		tpclear
+	}
+}

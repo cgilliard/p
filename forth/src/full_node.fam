@@ -56,7 +56,7 @@
 	fn+ fnnum
 ;
 
-: fnbad ( -- )   "node: a setting it doesn't know: " puts  fncfg fnp @ + puts  A lit putc bye ;
+: fnbad ( -- )   "node: a setting it doesn't know: " lputs  fncfg fnp @ + lputs  A lit lputc bye ;
 
 \ fnparse ( -- )
 : fnparse ( -- )
@@ -83,7 +83,7 @@
 
 \ ── Saying what it's doing ──
 
-: fnnib ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then putc ;
+: fnnib ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then lputc ;
 : fnhex ( a n -- )   0 lit do dup i + c@ dup 4 lit rshift fnnib fnnib loop drop ;
 
 : fnth variable ;  : fnhv variable ;  : fnhash ( -- a )  fnhv 20 lit lazy ;
@@ -98,21 +98,21 @@
 	dbtip ?dup if
 		dup fnhash 8 lit ceq 0= if
 			dup fnhash 8 lit cpy
-			"tip: height " puts dup 20 lit + @ fndec  "  " puts  dup 6 lit fnhex
-			"  outputs " puts dup 70 lit + @ fndec  A lit putc
+			"tip: height " lputs dup 20 lit + @ fndec  "  " lputs  dup 6 lit fnhex
+			"  outputs " lputs dup 70 lit + @ fndec  A lit lputc
 		then drop
 	then
 	pfsv @ fnfs @ = 0= if
 		pfsv @ dup fnfs !
-		dup 1 lit = if "fast sync: waiting to hear a peer's height\n" puts then
-		dup 2 lit = if "fast sync: fetching blocks " puts pq @ fndec " and " puts pq @ 1 lit + fndec A lit putc then
-		dup 3 lit = if "fast sync: checking the sync point's chain proof\n" puts then
-		dup 4 lit = if "fast sync: downloading the state, piece by piece\n" puts then
-		0= if "syncing block by block\n" puts then
+		dup 1 lit = if "fast sync: waiting to hear a peer's height\n" lputs then
+		dup 2 lit = if "fast sync: fetching blocks " lputs pq @ fndec " and " lputs pq @ 1 lit + fndec A lit lputc then
+		dup 3 lit = if "fast sync: checking the sync point's chain proof\n" lputs then
+		dup 4 lit = if "fast sync: downloading the state, piece by piece\n" lputs then
+		0= if "syncing block by block\n" lputs then
 	then
-	fnpeers dup fnpc @ = 0= if dup fnpc ! "peers: " puts fndec A lit putc else drop then
+	fnpeers dup fnpc @ = 0= if dup fnpc ! "peers: " lputs fndec A lit lputc else drop then
 	0 lit pbest dup 0< if drop else
-		pp 28 lit + @ dup fnph @ = if drop else dup fnph ! "best peer: height " puts fndec A lit putc then
+		pp 28 lit + @ dup fnph @ = if drop else dup fnph ! "best peer: height " lputs fndec A lit lputc then
 	then
 ;
 
@@ -133,6 +133,12 @@
 \ dropped, and asked again -- and the timers that ask peers, before going
 \ back.  The datagram (and its body) the interrupted code may be in the
 \ middle of is put back as it was.
+\ The rule for anything a yield runs: touch nothing the interrupted work may
+\ be using -- above all a hash's variables (p2hash, p2hashb, hbytes, os+:
+\ the work is inside one of those whenever it yields).  A keyed hash in a
+\ yield is phk's own permutation, never the sponge.  tests/net.fam's
+\ net_yield_keeps_a_hash runs a long hash with the yield on and probing, and
+\ checks it comes out the same.
 
 : fnlive variable ;                                   \ the node is running (not the tests)
 : pybsy variable ;  : pyt variable ;
@@ -254,10 +260,10 @@ B7021000 ,   \ lui t0,0x100
 	dbdev if
 		pgbase fnkb 8 lit 0 lit dbion  fnkb 200 lit + @ 544C4157 lit = and if
 			0 lit  20 lit 0 lit do fnkb 250 lit + i + c@ or loop if
-				"node: the wallet's API key: " puts  fnkb 250 lit + 20 lit wlhex A lit putc
-			else "node: the wallet has no API key yet (the node makes one when it starts)\n" puts then
-		else "node: no wallet on the disk yet (the node makes one when it starts)\n" puts then
-	else "node: no disk\n" puts then
+				"node: the wallet's API key: " lputs  fnkb 250 lit + 20 lit wlhex A lit lputc
+			else "node: the wallet has no API key yet (the node makes one when it starts)\n" lputs then
+		else "node: no wallet on the disk yet (the node makes one when it starts)\n" lputs then
+	else "node: no disk\n" lputs then
 	bye
 ;
 
@@ -268,20 +274,21 @@ B7021000 ,   \ lui t0,0x100
 	19 lit pfdep !  0 lit bnet !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
 	fnread fnparse
 	wlshowk @ if fnkey then
+	-1 lit lgon !                                     \ the log: each line timed (src/log.fam)
 	naport @ 0= if nport @ 1 lit + naport ! then
-	"node: " puts  bnet @ if "dev" else "main" then puts  " network, UDP port " puts nport @ fndec
-	", fast sync depth " puts pfdep @ fndec  ", wallet API port " puts naport @ fndec A lit putc
+	"node: " lputs  bnet @ if "dev" else "main" then lputs  " network, UDP port " lputs nport @ fndec
+	", fast sync depth " lputs pfdep @ fndec  ", wallet API port " lputs naport @ fndec A lit lputc
 	acopen 0= if
 		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"
-		else "node: no disk" then puts A lit putc bye
+		else "node: no disk" then lputs A lit lputc bye
 	then
 	imopen imsave
 	wlboot txstart
-	dbtip ?dup if "node: resuming at height " puts 20 lit + @ fndec A lit putc else "node: a new chain\n" puts then
-	pstart 0= if "node: no network device" puts A lit putc bye then
-	ppn 0 lit do i pp 38 lit + @ if "node: seed " puts i pp @ fnip. 3A lit putc i pp 4 lit + @ fndec A lit putc then loop
+	dbtip ?dup if "node: resuming at height " lputs 20 lit + @ fndec A lit lputc else "node: a new chain\n" lputs then
+	pstart 0= if "node: no network device" lputs A lit lputc bye then
+	ppn 0 lit do i pp 38 lit + @ if "node: seed " lputs i pp @ fnip. 3A lit lputc i pp 4 lit + @ fndec A lit lputc then loop
 	0 lit ppn 0 lit do i pp 8 lit + @ i pp 38 lit + @ 0= and if 1 lit + then loop
-	?dup if "node: hosts known from before: " puts fndec A lit putc then
+	?dup if "node: hosts known from before: " lputs fndec A lit lputc then
 	-1 lit fnlive !                                   \ yields may answer the network now
 	begin fnstep fnsay wltick 0 lit until
 ;

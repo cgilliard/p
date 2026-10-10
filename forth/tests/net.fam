@@ -11,6 +11,15 @@
 	begin nrecv dup 0= hnow drop tnw @ - 7D0 lit u< and while drop repeat
 ;
 
+\ A long hash, with the yield on (src/full_node.fam's pyield, as the node
+\ runs) and owing probes -- each a keyed hash (phk) -- must come out as it
+\ does without: whatever a yield does mustn't touch what the work it
+\ interrupted is using.
+: tnyv variable ;  : tnyst ( -- a )  tnyv 60 lit lazy ;
+: tndv variable ;  : tnyd ( -- a )   tndv 20 lit lazy ;
+: tnhash ( -- )   p2cnt @ FF lit or p2cnt !  tnyst wtx 10000 lit p2hashb ;   \ a yield after the first permutation
+: tnclear ( -- )  0 lit pp ppn 50 lit * nzero ;
+
 Test {
 	net_opens {
 		nopen assert
@@ -24,5 +33,18 @@ Test {
 		A000202 lit BA25 lit 5 lit nsend assert
 		tnwait assert
 		npn @ 5 lit asrt_eq  npay @ c@ 68 lit asrt_eq  npay @ 4 lit + c@ 6F lit asrt_eq
+	}
+	net_yield_keeps_a_hash {
+		10000 lit 0 lit do i 7 lit * wtx i + c! loop
+		tnhash  tnyst tnyd 8 lit cpy                              \ without yields
+		tnclear  ppip @ pprb @
+		A lit ppip !  1 lit pprb !                                  \ probe every host, every time
+		8 lit 0 lit do A000202 lit 9 lit i + padd 0< 0= assert loop
+		0 lit pyt !  -1 lit fnlive !
+		tnhash
+		0 lit fnlive !  pprb ! ppip !
+		0 lit  8 lit 0 lit do i pp 1C lit + @ + loop  8 lit asrt_eq    \ the yield probed all 8
+		tnyst tnyd 8 lit ceq assert
+		tnclear
 	}
 }

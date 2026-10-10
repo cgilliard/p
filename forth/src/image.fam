@@ -107,7 +107,7 @@ B3828140 ,   \ sub  t0,gp,s0          ( the offset )
 			if ims @ 9 lit rshift imbuf imk @ -1 lit dbion drop  -1 lit imw ! then
 			ims @ 8000 lit + ims !
 		repeat
-		imw @ if "node: wrote its boot image to the disk" puts A lit putc then
+		imw @ if "node: wrote its boot image to the disk" lputs A lit lputc then
 	then
 ;
 
@@ -122,7 +122,7 @@ B3828140 ,   \ sub  t0,gp,s0          ( the offset )
 ;
 
 \ imsay ( s -- )   "node: <s> its boot image to <the asker>".
-: imsay ( s -- )   "node: " puts puts " its boot image to " puts  nsrc @ fnip. 3A lit putc nsport @ fndec A lit putc ;
+: imsay ( s -- )   "node: " lputs lputs " its boot image to " lputs  nsrc @ fnip. 3A lit lputc nsport @ fndec A lit lputc ;
 
 \ imget ( -- )   GET_BIN, with our cookie and our image's hash: the chunks
 \        asked for, at most 32 -- said when it starts (chunk 0) and when the

@@ -82,14 +82,23 @@
 	pst pkey 20 lit p2hashb  pst pkey 8 lit cpy
 ;
 
-\ phk ( tag a n -- lo hi )   a keyed hash of n bytes (n <= 15), tagged: the
-\        first two words of hash(secret, tag, bytes).
-\        Never interrupted by a yield (p2off): pkey and pst are its own.
+\ phk ( tag a n -- lo hi )   a keyed hash of n bytes (n <= 15), tagged: one
+\        permutation of the secret (8 elements), the tag and bytes (16 bits
+\        to an element), 7 in the capacity; its first two words.
+\        It runs inside yields (cookies, probes' nonces), so it touches only
+\        what's its own -- pkey, pst -- never a sponge's variables (p2hashb's:
+\        a hash the yield interrupted would go on with them changed), and is
+\        never itself interrupted (p2off).
 : phkn variable ;
 : phk ( tag a n -- lo hi )
 	p2off @ 1 lit + p2off !
 	phkn !  pkey 20 lit + 10 lit nzero  pkey 21 lit + phkn @ ncpy  pkey 20 lit + c!
-	pst pkey 30 lit p2hashb  pst @ pst 4 lit + @
+	pst 18 lit zero  pkey pst 8 lit cpy
+	8 lit 0 lit do
+		pkey 20 lit + i 1 lit lshift + dup c@ swap 1 lit + c@ 8 lit lshift or  pst 20 lit + i 2 lit lshift + !
+	loop
+	7 lit pst 40 lit + !
+	pst p2perm  pst @ pst 4 lit + @
 	p2off @ 1 lit - p2off !
 ;
 
@@ -120,7 +129,8 @@
 \ silent over a day, hourly -- until it's removed: one that never answered,
 \ after 3 unanswered asks; one that did, after a week's silence.  A seed is
 \ never removed, and always asked every interval.  At most perip=N (4) hosts
-\ share an IP address.  A full table makes room for a new host by evicting
+\ share an IP address (a new one at a full IP replaces the one there silent
+\ longest among those not answering).  A full table makes room for a new host by evicting
 \ the one silent longest among those not answering (never answered, first),
 \ and never a seed.  The table is kept on the disk (`psave`, `pload`).
 
@@ -158,14 +168,15 @@
 	loop 2drop pfk @
 ;
 
-\ pevict ( -- k | -1 )   the host to make room by evicting: the one silent
-\        longest (oldest last answer; never, first) among those not answering
-\        now and not seeds -- if there's one.
-: pvh variable ;  : pvl variable ;
-: pevict ( -- k | -1 )
-	-1 lit pfk !
+\ pevict ( ip -- k | -1 )   the host to make room by evicting: the one
+\        silent longest (oldest last answer; never, first) among those not
+\        answering now and not seeds -- at that IP address (0: any) -- if
+\        there's one.
+: pvh variable ;  : pvl variable ;  : pvip variable ;
+: pevict ( ip -- k | -1 )
+	pvip !  -1 lit pfk !
 	ppn 0 lit do
-		i pp 8 lit + @ 1 lit =  i pp 38 lit + @ 0= and if
+		i pp 8 lit + @ 1 lit =  i pp 38 lit + @ 0= and  pvip @ 0=  i pp @ pvip @ = or and if
 			pfk @ 0< if -1 lit else
 				i pp 48 lit + @ pvh @ u<  i pp 48 lit + @ pvh @ =  i pp 44 lit + @ pvl @ u< and or
 			then
@@ -175,14 +186,23 @@
 ;
 
 \ padd ( ip port -- k | -1 )   a host (kept, if there's room -- see pevict).
+\        Its IP holding perip hosts already (and it's not a seed), it takes
+\        the place of one of them not answering: a node behind a NAT, back
+\        from a laptop's sleep on another port, replaces its dead old ports
+\        -- refused, it couldn't be heard until they were dropped (a week).
 : padd ( ip port -- k | -1 )
 	2dup pfind dup 0< 0= if nip nip else drop
 		over 0= over 0= or  2 lit pick 2 lit pick pisself or
-		pseeding @ 0=  3 lit pick pipn pperip u< 0= and or            \ its IP has perip hosts (not for a seed)
+		pseeding @ 0=  3 lit pick pipn pperip u< 0= and if            \ its IP has perip hosts
+			2 lit pick pevict dup 0< if
+				drop -1 lit
+				"peers: " lputs 3 lit pick fnip. 3A lit lputc 2 lit pick fndec " not kept: its IP has " lputs pperip fndec " hosts answering" lputs A lit lputc
+			else pp 8 lit + 0 lit swap ! 0 lit then or
+		then
 		if 2drop -1 lit else
 		-1 lit pfk !
 		ppn 0 lit do i pp 8 lit + @ 0= pfk @ 0< and if i pfk ! then loop
-		pfk @ 0< if pevict pfk ! then                                 \ full: make room
+		pfk @ 0< if 0 lit pevict pfk ! then                           \ full: make room
 		pfk @ 0< if 2drop -1 lit else
 			pfk @ pp 50 lit nzero
 			pfk @ pp 4 lit + !  pfk @ pp !  1 lit pfk @ pp 8 lit + !
@@ -243,7 +263,7 @@
 : pselfk ( k -- )
 	dup pp @ pmen @ 3 lit and pself !  dup pp 4 lit + @ pmen @ 3 lit and pself 4 lit + !
 	pmen @ 1 lit + pmen !
-	"node: " puts dup pp @ fnip. 3A lit putc dup pp 4 lit + @ fndec " is this node: dropped" puts A lit putc
+	"node: " lputs dup pp @ fnip. 3A lit lputc dup pp 4 lit + @ fndec " is this node: dropped" lputs A lit lputc
 	pp 8 lit + 0 lit swap !
 ;
 
@@ -437,10 +457,19 @@
 : pscbv variable ;  : pscb ( -- a )  pscbv 200000 lit lazy ;
 
 \ Blocks found invalid (the last 8): never fetched again.
+\ Blocks that failed their checks (the last 8), not fetched again for 10
+\ minutes: a failure may not be the block's (its time too far ahead of our
+\ clock, say), and a node that kept refusing a good block would never get
+\ past it until restarted.  A bad block costs a download every 10 minutes.
 : pbdv variable ;  : pbads ( -- a )  pbdv 100 lit lazy ;  : pbdn variable ;
-: pbadd ( hash -- )   pbads pbdn @ 7 lit and 5 lit lshift + 20 lit ncpy  pbdn @ 1 lit + pbdn ! ;
+: pbtv variable ;  : pbat ( k -- a )  2 lit lshift pbtv 20 lit lazy + ;    \ when
+: pbadd ( hash -- )
+	pbads pbdn @ 7 lit and 5 lit lshift + 20 lit ncpy  pms pbdn @ 7 lit and pbat !  pbdn @ 1 lit + pbdn !
+;
 : pbad? ( hash -- f )
-	0 lit  8 lit 0 lit do over pbads i 5 lit lshift + 20 lit mcmp 0= or loop  nip
+	0 lit  8 lit 0 lit do
+		over pbads i 5 lit lshift + 20 lit mcmp 0=  i pbat @ pago 927C0 lit u< and  i pbdn @ u< and or
+	loop  nip
 ;
 
 \ ── Block downloads (one at a time) ──
@@ -523,7 +552,7 @@
 						over pscb 2 lit pick ncpy  dup pscn !  pid pscid 20 lit ncpy
 						pid  bheight drop  2 lit pick  dlk @ pann
 						-1 lit prl !
-						"relayed block " puts bheight drop fndec " (its proof of work checks out; checking the rest)" puts A lit putc
+						"relayed block " lputs bheight drop fndec " (its proof of work checks out; checking the rest)" lputs A lit lputc
 					then
 				then
 			then
@@ -542,8 +571,10 @@
 					dup pid 20 lit mcmp 0= if 20 lit + @ pid swap dlsize @ dlk @ pann else drop then
 				then then
 			else
-				prl @ if pid pscid 20 lit mcmp 0= if 0 lit pscn ! then  "a block relayed failed its checks: no longer served" puts A lit putc then
-				pid pbadd                                               \ never again
+				prl @ if pid pscid 20 lit mcmp 0= if 0 lit pscn ! then then
+				"block " lputs bheight drop fndec " from " lputs dlk @ pp @ fnip. 3A lit lputc dlk @ pp 4 lit + @ fndec
+				" failed its checks: not fetched again for 10 minutes" lputs  prl @ if " (no longer served)" lputs then  A lit lputc
+				pid pbadd                                               \ not again soon
 				0 lit dlk @ pp 2C lit + !                               \ invalid: forget its height
 			then
 		then
@@ -582,10 +613,14 @@
 	then
 ;
 
-\ pinv ( -- )   INV: the peer's height; and the block we asked it for.
+\ pinv ( -- )   INV: the peer's height; and the block we asked it for.  A
+\        sender not in the table is added (as GET_HOSTS adds the asker) and
+\        its height kept: probed at once, it's synced from as soon as it
+\        answers -- a higher tip is never ignored for its sender being new
+\        to us (a node back from a sleep on another port, say).
 : pinv ( -- )
 	pbn @ 34 lit = if
-		pfrom dup pk ! 0< 0= if
+		nsrc @ nsport @ padd dup pk ! 0< 0= if
 			pbd @ 20 lit + qbe@ drop  pbd @ 2C lit + qbe@ drop  2dup u< if nip else drop then
 			pk @ pp 28 lit + !  -1 lit pk @ pp 2C lit + !  pms pk @ pp 34 lit + !
 			dlon @ 0= pk @ pqk @ = and  pbd @ 20 lit + qbe@ drop pqh @ = and  pyl @ 0= and if

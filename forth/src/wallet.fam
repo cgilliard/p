@@ -354,10 +354,10 @@
 \ wltick ( -- )   a restored wallet: once caught up, find its outputs.
 : wltick ( -- )
 	wl? if wlflags 2 lit and if wlup? if
-		"wallet: restoring: looking for its outputs in the state\n" puts
+		"wallet: restoring: looking for its outputs in the state\n" lputs
 		wlscan
-		"wallet: restored: " puts wlnfound @ wldec " output(s) found; new keys from index " puts
-		pgop wlm 8 lit + @ wldec A lit putc
+		"wallet: restored: " lputs wlnfound @ wldec " output(s) found; new keys from index " lputs
+		pgop wlm 8 lit + @ wldec A lit lputc
 	then then then
 ;
 
@@ -427,11 +427,11 @@
 : wlnew ( -- ok )
 	wlpass @ if wlnewpw else 0 lit wlpwn ! then
 	mnb wlent if
-		wlpwn @ if "node: stretching the passphrase (about two minutes)\n" puts then
+		wlpwn @ if "node: stretching the passphrase (about two minutes)\n" lputs then
 		mnb wlseed wlstr
 		mnb wlseed  wlpwn @ 0= 0= 1 lit and  wlmake
 		dup if wlshow then
-	else "node: no source of randomness for a new wallet's seed\n" puts 0 lit then
+	else "node: no source of randomness for a new wallet's seed\n" lputs 0 lit then
 ;
 
 \ wlback ( -- ok )   a wallet from its words, to be recovered once the
@@ -441,11 +441,11 @@
 	wlpass @ if
 		"The wallet's passphrase (not shown):\n" puts  wlpw FF lit wlline wlpwn !
 	else 0 lit wlpwn ! then
-	wlpwn @ if "node: stretching the passphrase (about two minutes)\n" puts then
+	wlpwn @ if "node: stretching the passphrase (about two minutes)\n" lputs then
 	mnb wlseed wlstr
 	mnb wlseed  wlpwn @ 0= 0= 1 lit and 2 lit or  wlmake
 	mnb 9 lit zero
-	dup if "node: restoring the wallet: it finds its coins once the node has caught up\n" puts then
+	dup if "node: restoring the wallet: it finds its coins once the node has caught up\n" lputs then
 ;
 
 \ wlmigr ( -- )   a wallet whose records are older: its outputs (all
@@ -463,21 +463,21 @@
 	wlhb 8 lit zero  pgop wlm 50 lit + wlhb 8 lit ceq if
 		wlhb wlent if
 			pgop wlhb wlm 50 lit + 8 lit cpy  pgmd  pgcommit drop
-			"node: a new API key for the wallet (tools/wallet asks for it once)\n" puts  -1 lit wlshowk !
+			"node: a new API key for the wallet (tools/wallet asks for it once)\n" lputs  -1 lit wlshowk !
 		then
 	then
 ;
 
 : wlboot ( -- )
 	wl? if
-		wlrec @ if "node: this disk already holds a wallet; to restore one, start on a new disk\n(rm data/disk.img, which deletes this wallet)\n" puts bye then
-		wlpass @ if "node: passphrase: this disk already holds a wallet (a passphrase is set when\nit's made, or with recover)\n" puts bye then
-		"node: wallet open" puts  wlflags 2 lit and if ", to be restored once the node has caught up" puts then  A lit putc
+		wlrec @ if "node: this disk already holds a wallet; to restore one, start on a new disk\n(rm data/disk.img, which deletes this wallet)\n" lputs bye then
+		wlpass @ if "node: passphrase: this disk already holds a wallet (a passphrase is set when\nit's made, or with recover)\n" lputs bye then
+		"node: wallet open" lputs  wlflags 2 lit and if ", to be restored once the node has caught up" lputs then  A lit lputc
 	else
 		wlrec @ if wlback else wlnew then
-		0= if "node: couldn't keep the wallet on the disk\n" puts bye then
+		0= if "node: couldn't keep the wallet on the disk\n" lputs bye then
 	then
 	wlmigr wlapik
 	wlload  wlpw 40 lit zero  0 lit wlpwn !
-	wlshowk @ if "node: the wallet's API key: " puts pgop wlm 50 lit + 20 lit wlhex A lit putc then
+	wlshowk @ if "node: the wallet's API key: " lputs pgop wlm 50 lit + 20 lit wlhex A lit lputc then
 ;

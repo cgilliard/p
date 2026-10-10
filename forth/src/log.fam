@@ -1,0 +1,43 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/log.fam — the node's log.  lputc / lputs write as putc / puts do and,
+\ once lgon is set, begin every line with the time, as the Rust node's log
+\ does (UTC, to the millisecond):  [2026-10-10 12:00:05:538] ...
+\ The clock is hnow (src/header.fam).  What isn't the log -- the backup
+\ words, the passphrase prompts -- is written with putc / puts.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: lgon variable ;  : lgmid variable ;                  \ on; in the middle of a line
+: lgbv variable ;  : lgb ( -- a )  lgbv 10 lit lazy ;
+: lgdv variable ;  : lgyv variable ;  : lgmv variable ;  : lgev variable ;
+
+: lg2 ( n -- )   dup A lit / 30 lit + putc  A lit % 30 lit + putc ;
+: lg3 ( n -- )   dup 64 lit / 30 lit + putc  64 lit % lg2 ;
+: lg4 ( n -- )   dup 3E8 lit / 30 lit + putc  3E8 lit % lg3 ;
+
+\ lgdate ( days -- )   the civil date of days since 1970-01-01, written
+\        YYYY-MM-DD (Howard Hinnant's days_from_civil, inverted).
+: lgdate ( days -- )
+	AFA6C lit +  dup 23AB1 lit / lgev !  lgev @ 23AB1 lit * -          ( doe )
+	dup dup 5B4 lit / -  over 8EAC lit / +  over 23AB0 lit / -  16D lit /   ( doe yoe )
+	dup lgev @ 190 lit * + lgyv !
+	dup 16D lit *  over 2 lit rshift +  swap 64 lit / -  -              ( doy )
+	dup 5 lit * 2 lit + 99 lit /                                        ( doy mp )
+	dup 99 lit * 2 lit + 5 lit / rot swap - 1 lit + lgdv !              ( mp )
+	dup A lit u< if 3 lit + else 9 lit - then lgmv !
+	lgmv @ 3 lit u< if lgyv @ 1 lit + lgyv ! then
+	lgyv @ lg4 2D lit putc lgmv @ lg2 2D lit putc lgdv @ lg2
+;
+
+\ lgstamp ( -- )   "[YYYY-MM-DD HH:MM:SS:mmm] ".
+: lgstamp ( -- )
+	lgb 10 lit nzero  hnow lgb 4 lit + ! lgb !
+	lgb 8 lit 3E8 lit ndivw                                             ( ms )
+	5B lit putc
+	lgb @ dup 15180 lit / lgdate  20 lit putc
+	15180 lit %  dup E10 lit / lg2 3A lit putc  E10 lit % dup 3C lit / lg2 3A lit putc  3C lit % lg2
+	3A lit putc lg3  5D lit putc 20 lit putc
+;
+
+\ lputc ( c -- )   lputs ( a -- )   to the log.
+: lputc ( c -- )   lgon @ lgmid @ 0= and if lgstamp then  dup A lit = 0= lgmid !  putc ;
+: lputs ( a -- )   begin dup c@ ?dup while lputc 1 lit + repeat drop ;

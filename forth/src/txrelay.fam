@@ -527,7 +527,7 @@
 	0 lit tdon !
 	tkst tdbuf tdsize @ p2hashb  tkst tdid 8 lit ceq if
 		tdbuf tdsize @ txadmit dup 0< if drop else
-			"tx: accepted a transaction (" puts tdsize @ fndec " bytes), relaying it" puts A lit putc
+			"tx: accepted a transaction (" lputs tdsize @ fndec " bytes), relaying it" lputs A lit lputc
 			tdk @ txskip !  txann
 		then
 	then

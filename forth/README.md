@@ -41,8 +41,20 @@ the network (`p2hook` in `src/poseidon2.fam`, pointed at the yield in
 it owes. Syncing blocks, a node answered every one of 600 pings, the slowest
 in 0.54 s. And it relays a block on its cheap checks -- the header rules and
 the proof of work, which is what makes a bad block too dear to spread -- then
-checks the rest; a block that fails is no longer served and never fetched
-again.
+checks the rest; a block that fails is no longer served, and not fetched
+again for 10 minutes (a failure needn't be the block's -- its time too far
+ahead of this node's clock, say -- and a node that refused a good block for
+good would never get past it until restarted). A yield touches nothing the
+work it interrupted may be using: its keyed hash (cookies, probes' nonces)
+is one permutation on state of its own, never a sponge's shared variables
+-- through those, a probe sent in a yield could make a block being checked
+fail. A test (`net_yield_keeps_a_hash`) runs a long hash with the yield on and
+probing peers, and checks the digest is unchanged; it fails on the old keyed
+hash.
+
+The node's log lines begin with the time, as the Rust node's do (UTC, to
+the millisecond: `[2026-10-10 12:00:05:538] tip: height 18 ...`;
+`src/log.fam`); the backup words and passphrase prompts are left bare.
 
 Timings vary by about a quarter between runs with the laptop's load (QEMU
 emulates on one host thread).
@@ -108,7 +120,15 @@ shared or announced to until they answer, and removed only when they've
 never answered in 3 asks, or not in a week: a node back after longer
 reaches out itself. Seeds are never removed. At most 4 hosts share an IP
 address (Forth `perip=N` / `PERIP`, Rust `--max-per-ip`), so no address can
-be made a target for the whole network's probes. A full table (256 hosts;
+be made a target for the whole network's probes; a new host at a full IP
+takes the place of the one there silent longest among those not answering.
+So a node behind a NAT that comes back on another public port -- a laptop
+after sleeping -- replaces its own dead old ports instead of being refused
+(and unheard) until they're dropped a week later. And an announcement from
+an address not in the table adds it (as a `GET_HOSTS` does) with the height
+announced: probed at once, it's synced from as soon as it answers -- a higher
+tip is never ignored because its sender is new. (The Rust node keeps the
+height of any sender already.) A full table (256 hosts;
 Forth `peers=N` / `PEERS`, Rust `--max-hosts`) makes room by evicting the
 host silent longest among those not answering, never a seed. The Forth node keeps its table on the disk (32 sectors at the end of
 the boot image's 32 MiB), as the Rust node keeps its in LMDB, so after a

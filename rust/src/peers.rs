@@ -25,7 +25,9 @@
 //! A `protect`ed host (a seed) is never removed, nor evicted: a node can
 //! always find its way back to the network. At most `max_per_ip` hosts
 //! share an IP address (so one address can't fill the table, or be sprayed
-//! with probes on many ports). The table is bounded by `max_hosts`; once
+//! with probes on many ports); a new one at a full IP takes the place of
+//! the one there silent longest among those not answering -- a node behind
+//! a NAT that comes back on another port replaces its dead old ports. The table is bounded by `max_hosts`; once
 //! full, a new host takes the place of the one silent longest among those
 //! not answering now (never answered at all, first) -- never one that is
 //! answering, and never a seed. So a flood of made-up addresses can only
@@ -177,20 +179,28 @@ impl PeerTable {
         })
     }
 
-    /// Whether `addr`'s IP already has `max_per_ip` hosts (a seed always
-    /// has room).
-    fn ip_full(&self, wtxn: &heed::RwTxn, addr: SocketAddrV4) -> Result<bool> {
+    /// Room for `addr` among its IP's hosts (a seed always has room): if
+    /// the IP already has `max_per_ip`, made by evicting the one of them
+    /// silent longest among those not answering now (see `evict`). A host
+    /// behind a NAT that comes back on a new port -- after a laptop's
+    /// sleep, say -- takes the place of its dead old ports, rather than
+    /// being refused until they're dropped (a week). Whether there's room.
+    fn room_at_ip(&self, wtxn: &mut heed::RwTxn, addr: SocketAddrV4) -> Result<bool> {
         if self.protected.contains(&addr) {
-            return Ok(false);
+            return Ok(true);
         }
+        let ip = addr.ip().octets();
         let mut same = 0;
         for entry in self.hosts.iter(wtxn)? {
             let (key, _) = entry?;
-            if key[..4] == addr.ip().octets() {
+            if key[..4] == ip {
                 same += 1;
             }
         }
-        Ok(same >= self.max_per_ip)
+        if same < self.max_per_ip {
+            return Ok(true);
+        }
+        self.evict(wtxn, Some(ip))
     }
 
     /// Hosts never evicted to make room (the seeds).
@@ -206,6 +216,13 @@ impl PeerTable {
         if (self.hosts.len(wtxn)? as usize) < self.max_hosts {
             return Ok(true);
         }
+        self.evict(wtxn, None)
+    }
+
+    /// Evict the host silent longest among those not answering now --
+    /// never answered first, then the oldest last success -- and not
+    /// protected; only among `ip`'s hosts, if given. Whether one was.
+    fn evict(&self, wtxn: &mut heed::RwTxn, ip: Option<[u8; 4]>) -> Result<bool> {
         let mut victim: Option<([u8; ADDR_LEN], HostRecord)> = None;
         for entry in self.hosts.iter(wtxn)? {
             let (key, value) = entry?;
@@ -213,6 +230,9 @@ impl PeerTable {
             let record = HostRecord::from_bytes(value)?;
             if (record.is_verified() && record.failures == 0) || self.protected.contains(&decode_addr(key)) {
                 continue; // answering, or a seed: kept
+            }
+            if ip.is_some_and(|ip| key[..4] != ip) {
+                continue;
             }
             let older = match victim {
                 None => true,
@@ -254,7 +274,7 @@ impl PeerTable {
         }
         let key = encode_addr(addr);
         let mut wtxn = self.storage.write_txn()?;
-        if self.hosts.get(&wtxn, &key)?.is_some() || self.ip_full(&wtxn, addr)? || !self.make_room(&mut wtxn)? {
+        if self.hosts.get(&wtxn, &key)?.is_some() || !self.room_at_ip(&mut wtxn, addr)? || !self.make_room(&mut wtxn)? {
             return Ok(false);
         }
         let record = HostRecord {
@@ -273,7 +293,7 @@ impl PeerTable {
         let key = encode_addr(addr);
         let mut wtxn = self.storage.write_txn()?;
         let known = self.hosts.get(&wtxn, &key)?.is_some();
-        if !known && (self.ip_full(&wtxn, addr)? || !self.make_room(&mut wtxn)?) {
+        if !known && (!self.room_at_ip(&mut wtxn, addr)? || !self.make_room(&mut wtxn)?) {
             return Ok(());
         }
         let record = HostRecord {
@@ -465,11 +485,36 @@ mod tests {
         let (_dir, _storage, table) = open(100);
         for port in 1..=4 {
             assert!(table.add_candidate(addr(1, port)).unwrap());
+            table.record_success(addr(1, port), 1_000 * port as u64).unwrap();
         }
-        assert!(!table.add_candidate(addr(1, 5)).unwrap());
+        assert!(!table.add_candidate(addr(1, 5)).unwrap()); // all four answering
         assert!(table.add_candidate(addr(2, 5)).unwrap());
-        table.record_success(addr(1, 6), 1_000).unwrap(); // nor by answering
+        table.record_success(addr(1, 6), 9_000).unwrap(); // nor by answering
         assert_eq!(table.get(addr(1, 6)).unwrap(), None);
+        assert_eq!(table.len().unwrap(), 5);
+    }
+
+    #[test]
+    fn a_new_port_replaces_a_silent_one_at_a_full_ip() {
+        // A node behind a NAT, back from a sleep on another port: it takes
+        // the place of the old port silent longest, not of one answering.
+        let (_dir, _storage, table) = open(100);
+        for port in 1..=4 {
+            assert!(table.add_candidate(addr(1, port)).unwrap());
+            table.record_success(addr(1, port), 1_000 * port as u64).unwrap();
+        }
+        table.record_failure(addr(1, 3), 10_000).unwrap(); // silent since 3,000
+        table.record_failure(addr(1, 2), 10_000).unwrap(); // silent since 2,000: longest
+        assert!(table.add_candidate(addr(1, 5)).unwrap());
+        assert_eq!(table.get(addr(1, 2)).unwrap(), None);
+        assert!(table.get(addr(1, 3)).unwrap().is_some());
+        // Port 6 answering: it's added in place of port 5, which hasn't yet
+        // (never answered goes first), then port 3.
+        table.record_success(addr(1, 6), 20_000).unwrap();
+        assert_eq!(table.get(addr(1, 5)).unwrap(), None);
+        table.record_success(addr(1, 7), 21_000).unwrap();
+        assert_eq!(table.get(addr(1, 3)).unwrap(), None);
+        assert_eq!(table.len().unwrap(), 4);
     }
 
     #[test]

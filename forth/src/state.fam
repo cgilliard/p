@@ -239,7 +239,7 @@
 		else
 			dup 4 lit stf @ over 5 lit stf @ 2 lit pick 6 lit stf @ 3 lit pick 7 lit stf @
 			4 lit pick stfrom u< 0= if 2 lit else 10 lit then stun          ( l n )
-			over stfrom u< 0= over 1 lit > and if "corrupt state tree" puts A lit putc bye then
+			over stfrom u< 0= over 1 lit > and if "corrupt state tree" lputs A lit lputc bye then
 			over 3 lit stf !  stent over 2 lit stf !
 			dup sthash  dup stres stgo @ 8 lit cpy
 		then

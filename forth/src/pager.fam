@@ -74,7 +74,7 @@
 
 \ pgjnew ( p -- slot )   a new slot for page p.  Halts if the journal is full.
 : pgjnew ( p -- slot )
-	pgjn @ pgjcap u< 0= if "transaction too large for the journal" puts A lit putc bye then
+	pgjn @ pgjcap u< 0= if "transaction too large for the journal" lputs A lit lputc bye then
 	dup pgjh#
 	begin dup pgjt@ while 1 lit + pgjtn 1 lit - and repeat      ( p i )
 	over 1 lit + over 3 lit lshift pgjt + !
@@ -175,7 +175,7 @@
 			then
 		loop
 	then
-	pgvs @ 0< if "page cache full" puts A lit putc bye then
+	pgvs @ 0< if "page cache full" lputs A lit lputc bye then
 	pgvs @
 ;
 
