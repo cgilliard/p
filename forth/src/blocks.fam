@@ -1,0 +1,67 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/blocks.fam — the blocks themselves, kept so the node can serve them as
+\ the Rust node does (src/peer.fam: GET_INV, GET_CHUNKS): every block the
+\ node validates (src/accept.fam), whole, in a chain of pages (0 the next, 4
+\ bytes in this one, data from 8), and the active chain by height.  Nothing
+\ is pruned: like the Rust node's, the disk is reclaimed by syncing anew.
+\
+\ Tree 7: keys 0x21 bytes, values 0x20.
+\   [0][hash]                   -> first page, length, height
+\   [1][height (4, BE)][zeros]  -> the active chain's block at that height
+\ The active chain is the state's (src/accept.fam keeps it as the state
+\ moves), from where the node started (a fast-synced node: its sync point).
+\
+\   blput ( hash a n h -- )   keep a block
+\   blfind ( hash -- f )      a kept block: its page, length and height in blv
+\   blat ( h -- f )           the active chain's hash at h, in blv
+\   blat! ( hash h -- )       set it
+\   bldel ( h -- )            no block at h now
+\   blread ( hash buf -- n )  a kept block's bytes (0: not kept)
+\ Changes are in the page cache until `pgcommit`.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: bltree ( -- )   7 lit 21 lit 20 lit btuse ;
+
+: blkv variable ;  : blk ( -- a )  blkv 24 lit lazy ;      \ a key
+: blvv variable ;  : blv ( -- a )  blvv 20 lit lazy ;      \ a value
+
+: blkh ( hash -- )   blk 21 lit nzero  blk 1 lit + 20 lit ncpy ;
+: blkn ( h -- )      blk 21 lit nzero  1 lit blk c!  blk 1 lit + be! ;
+
+: blf variable ;  : bll variable ;  : blo variable ;  : bln variable ;
+: bla variable ;  : blp variable ;  : blq variable ;
+
+\ blput ( hash a n h -- )
+: blput ( hash a n h -- )
+	blv 8 lit + !  bln ! bla !  0 lit blf !  0 lit bll !  0 lit blo !
+	begin blo @ bln @ u< while
+		pgop  pgnew blp !
+		bll @ if blp @ bll @ pgget !  bll @ pgdirty else blp @ blf ! then
+		blp @ bll !
+		bln @ blo @ - dup FF8 lit u> if drop FF8 lit then blq !
+		blq @ blp @ pgget 4 lit + !
+		bla @ blo @ +  blp @ pgget 8 lit +  blq @ ncpy
+		blp @ pgdirty
+		blo @ blq @ + blo !
+	repeat
+	blf @ blv !  bln @ blv 4 lit + !
+	blkh  bltree blk blv btput
+;
+
+: blfind ( hash -- f )   blkh  bltree blk blv btget ;
+
+: blat ( h -- f )        blkn  bltree blk blv btget ;
+: blat! ( hash h -- )    blkn  blv 20 lit ncpy  bltree blk blv btput ;
+: bldel ( h -- )         blkn  bltree blk btdel drop ;
+
+\ blread ( hash buf -- n )
+: blread ( hash buf -- n )
+	bla !  blfind if
+		blv @ blp !  0 lit blo !
+		begin blp @ while
+			pgop  blp @ pgget dup 4 lit + @ blq !  8 lit + bla @ blo @ + blq @ ncpy
+			blo @ blq @ + blo !  blp @ pgget @ blp !
+		repeat
+		blo @
+	else 0 lit then
+;

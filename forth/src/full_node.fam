@@ -8,7 +8,7 @@
 \ booted by it), ended by EOT (0x04), separated by spaces:
 \   seed=A.B.C.D:PORT   a host to start from (any number; 127.x.x.x is the
 \                       host machine, reached through QEMU's gateway)
-\   port=N              our UDP port (47653)
+\   port=N              our UDP port (3737)
 \   depth=N             fast sync: start N blocks behind the best peer, on a
 \                       node with nothing past genesis (25; 0: never)
 \   net=main | net=dev  the network (main)
@@ -130,7 +130,7 @@
 \ fnmain ( -- )
 : fnmain ( -- )
 	fnclean
-	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  BA25 lit nport !
+	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  E99 lit nport !
 	19 lit pfdep !  0 lit bnet !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
 	fnread fnparse
 	naport @ 0= if nport @ 1 lit + naport ! then

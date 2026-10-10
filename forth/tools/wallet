@@ -26,7 +26,7 @@ The node answers only requests carrying an HMAC under the wallet's API key.
 It shows the key on its console when the wallet is made (or run
 `scripts/node.sh --api-key`); this tool asks for it once and keeps it in
 data/wallet.key (readable by you alone). The API port is the node's UDP
-port + 1 (47654), forwarded from 127.0.0.1 only.
+port + 1 (3738), forwarded from 127.0.0.1 only.
 """
 
 import argparse
@@ -360,7 +360,7 @@ def do_slates(node, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Talk to the Forth node's wallet.")
-    parser.add_argument("--node", default="127.0.0.1:47654", help="the wallet API's address (127.0.0.1:47654)")
+    parser.add_argument("--node", default="127.0.0.1:3738", help="the wallet API's address (127.0.0.1:3738)")
     parser.add_argument("--key-file", default=DEFAULT_KEY_FILE, help="where the API key is kept (data/wallet.key)")
     parser.add_argument("command", choices=["status", "balance", "outputs", "send", "receive", "finalize", "cancel", "slates", "key"])
     parser.add_argument("args", nargs="*")

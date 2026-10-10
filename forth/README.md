@@ -68,6 +68,19 @@ a real Rust node on the host: the Forth node syncs block by block,
 reorganizes onto the Rust node's branch, and fast-syncs from it. Accepting main block 3b -- validating
 it and reorganizing from block 2 to the 2b/3b branch -- took 21.5 s.
 
+It propagates blocks as the Rust node does, short of mining them: every
+block it validates is kept whole (`src/blocks.fam`, on the pager, with the
+active chain by height), served (`GET_INV` by hash or height, `GET_CHUNKS`
+with the asker's cookie), and a new best block is announced (`INV`) to every
+peer but the one it came from; an announced next block is fetched at once.
+Its `HOSTS` answers share the peers that have answered it (not 10.0.2.2,
+QEMU's view of this machine). So Forth nodes alone can sync each other and
+fast-sync new ones. Blocks are kept from where a node started -- a
+fast-synced node's sync point, or, on a disk from before this, its next
+block -- and nothing is pruned. Run against a mining Rust dev node: a Forth
+node synced from it, a second Forth node, knowing only the first, synced
+blocks 0--3 from it alone, and blocks mined after reached both.
+
 `src/wallet.fam` is the wallet's seed and keys, as the Rust node makes them
 (`../rust/src/wallet.rs`, `mnemonic.rs`, `keychain.rs`): the same 24 BIP39
 backup words (`src/bip39.fam`), and passphrase (PBKDF2-HMAC-SHA256,
@@ -82,7 +95,7 @@ A restored wallet finds its outputs once the node has caught up, by their
 recovery nonces in the state, as the Rust node's restore does.
 
 `src/wapi.fam` is the wallet's API: UDP on its own port (the node's + 1,
-47654), forwarded from 127.0.0.1 only, every datagram both ways carrying an
+3738), forwarded from 127.0.0.1 only, every datagram both ways carrying an
 HMAC-SHA256 under the wallet's API key, with sessions and counters so
 nothing can be replayed. `tools/wallet` (Python, no dependencies) is its
 client: `tools/wallet status | balance | outputs`. It asks for the API key

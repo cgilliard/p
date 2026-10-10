@@ -133,7 +133,7 @@ fn half_life_ms() -> u64 {
 const MAX_REORG_DEPTH: u64 = 1000;
 
 /// UDP port discovery listens on when `--port` isn't given.
-const DEFAULT_PORT: u16 = 7701;
+const DEFAULT_PORT: u16 = 3739;
 
 /// Peer discovery knobs for this driver's actual run (see `discovery`
 /// and `peers` for what each one does). Starting points, not

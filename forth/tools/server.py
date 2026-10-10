@@ -4,7 +4,7 @@ does (src/image.fam), for running on a seed without a node.
 
 Usage: server.py [binary_path] [port] [--net main|dev]
   Default binary: bin/full_node.bin
-  Default port:   47653
+  Default port:   3737
   Default net:    dev
 
 The file is re-read (and re-hashed) whenever its mtime changes, so you can
@@ -32,7 +32,7 @@ CHUNK = 1024
 WINDOW = 32
 VERSION = 12
 BINARY = 'bin/full_node.bin'
-PORT = 47653
+PORT = 3737
 NET = 'dev'
 VERBOSE = os.environ.get('VERBOSE', '') != ''
 

@@ -3,6 +3,9 @@
 \ tip (src/header.fam), keep its tip (src/store.fam) and its state delta, and
 \ keep the state (src/state.fam) at the best tip -- through reorganizations.
 \
+\ The block itself is kept too (src/blocks.fam), and the active chain's
+\ blocks by height, for serving them.
+\
 \ A block's delta is what the state needs to apply it: its header and its
 \ body without the proofs (the input commitments, the outputs and their
 \ nonces) -- in the shape of a block whose proofs are empty, so `bparse`
@@ -105,6 +108,7 @@
 \ acundo ( -- )   undo the state's block (acB): it's at the parent now.
 : acundo ( -- )
 	acB stunapl 0= if "state undo failed" puts A lit putc bye then
+	achb @ bldel                                          \ off the active chain
 	acB acparent drop
 	acB achb @ 1 lit - 0 lit stmeta
 	pgcommit drop
@@ -127,7 +131,7 @@
 	5 lit lshift acl + acA 20 lit ncpy
 	acA acdget  2dup or 0= if "missing delta" puts A lit putc bye then
 	bparse drop
-	acA stapply if pgcommit drop else pgabort "the state rejected a valid block" puts A lit putc bye then
+	acA stapply if acA bheight drop blat! pgcommit drop else pgabort "the state rejected a valid block" puts A lit putc bye then
 	bheight drop acha !
 	acprune
 ;
@@ -153,13 +157,13 @@
 
 \ ── Blocks ──
 
-: acok variable ;   : acdz variable ;
+: acok variable ;   : acdz variable ;  : acba variable ;  : acbn variable ;
 
 \ acblock ( a n -- ok )   take a block: if it's new, valid on its parent's tip
-\        (kept), and less than 1,000 below the best, keep its delta and tip
-\        and move the state to the best tip.
+\        (kept), and less than 1,000 below the best, keep it, its delta and
+\        its tip, and move the state to the best tip.
 : acblock ( a n -- ok )
-	0 lit acok !
+	0 lit acok !  2dup acbn ! acba !
 	2dup bparse if
 		bhdr @ dbid hdrid
 		dbid dbfind 0< 0= if 2drop -1 lit acok ! else
@@ -179,6 +183,7 @@
 			bhdr @ acbuf  bnon @ bnnon @ 4 lit lshift + bhdr @ -  dup acdz !  ncpy
 			acbuf acdz @ + 8 lit nzero
 			dbid acbuf acdz @ 8 lit + acdput
+			dbid acba @ acbn @ bheight drop blput            \ the block, to serve (src/blocks.fam)
 			pgcommit drop
 			bhdr @ dbnt dbput drop
 			acmove

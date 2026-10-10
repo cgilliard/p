@@ -2,7 +2,7 @@
 //! output, from any thread.
 //!
 //! ```text
-//! [2026-10-05 16:00:01:012] received block #12 from 10.0.0.7:7701
+//! [2026-10-05 16:00:01:012] received block #12 from 10.0.0.7:3739
 //! ```
 //!
 //! Timestamps are UTC, to the millisecond. The level (`(INFO)`) and the

@@ -15,11 +15,12 @@
 # passphrases go straight to the node over the console, never in settings or
 # the environment; what you type isn't shown.
 #
-#   SEED   host:port to start from (127.0.0.1: this machine; default
-#          127.0.0.1:7701, a Rust node's default port)
+#   SEED   the hosts to start from, host:port, space-separated (default the
+#          two public seeds; 127.0.0.1 is this machine -- a Rust node here
+#          is 127.0.0.1:3739)
 #   DEPTH  fast sync: start this many blocks behind the seed on a new chain
 #          (default 25: a few minutes of replay under QEMU; 0 syncs every block)
-#   PORT   our UDP port, forwarded from this machine (default 47653)
+#   PORT   our UDP port, forwarded from this machine (default 3737)
 #   API    the wallet API's UDP port, forwarded from 127.0.0.1 only (default
 #          PORT + 1); tools/wallet talks to it
 #   NET    main or dev (default dev, for now); a disk holds one network's
@@ -27,15 +28,15 @@
 #   BOOT   the seeds tabernacle starts from when the disk's copy isn't the
 #          build it expects: it finds peers through them and fetches the node
 #          from the peers holding it, the seeds only if no one else does
-#          (default SEED; 127.0.0.1 is this machine)
+#          (default SEED)
 #
 # To boot a new build from the disk without fetching it, run
 # scripts/makenode.sh after scripts/build.sh.  To start over: rm
 # data/disk.img -- which deletes the wallet too (restore it with --recover).
 set -e
-SEED=${SEED:-127.0.0.1:7701}
+SEED=${SEED:-159.54.172.190:3737 146.235.230.124:3737}
 DEPTH=${DEPTH:-25}
-PORT=${PORT:-47653}
+PORT=${PORT:-3737}
 NET=${NET:-dev}
 API=${API:-$((PORT + 1))}
 BOOT=${BOOT:-$SEED}
@@ -75,8 +76,8 @@ fi
 # (src/full_node.fam).
 exec 3<&0
 {
-	printf '%s 0 10000 %s %s\004seed=%s depth=%s port=%s api=%s net=%s%s\004' \
-		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$SEED" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET"
+	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s\004' \
+		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET"
 	exec cat <&3
 } > "$FIFO" &
 CAT=$!

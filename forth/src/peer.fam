@@ -6,15 +6,17 @@
 \
 \ Every packet: magic "TBRN" ("TBRD" on dev), version 12, type, body; numbers
 \ big-endian; at most 1,200 bytes.  This node takes:
-\   GET_HOSTS -> HOSTS (with the cookie we issue the asker; no hosts shared)
+\   GET_HOSTS -> HOSTS (with the cookie we issue the asker, and our peers)
 \   HOSTS     the answer to ours: the peer's cookie for us, and more hosts
 \   INV       a peer's block (and its tip's height): where it is
 \   CHUNK     a block downloading
 \   GET_SYNC_POINT -> SYNC_POINT, GET_PIECE -> PIECE_CHUNKs (cookie checked):
 \             fast sync's state, served as of a recent block (src/snap.fam)
 \   SYNC_POINT, PIECE_CHUNK   fast sync's, fetching
-\ Not served: blocks (GET_INV, GET_CHUNKS) -- this node keeps blocks' deltas,
-\ not the blocks -- and transactions.
+\   GET_INV -> INV, GET_CHUNKS -> CHUNKs (cookie checked): the blocks it
+\             keeps (src/blocks.fam); and a new best block is announced (INV)
+\             to every peer but the one it came from, as the Rust node does
+\ Not served: other nodes' transactions (only the wallet's own, src/txrelay.fam).
 \
 \ Discovery: each known host is asked GET_HOSTS (a nonce from a keyed hash)
 \ every minute; an answer within 5 s with that nonce makes it a peer and
@@ -167,16 +169,32 @@
 	pk @ 18 lit psendk
 ;
 
-\ pghosts ( -- )   GET_HOSTS: HOSTS, with the asker's cookie (no hosts).
+\ pghosts ( -- )   GET_HOSTS: HOSTS, with the asker's cookie, and the hosts
+\        that have answered us -- not the asker, not QEMU's gateway (this
+\        machine, 10.0.2.2) -- as many as asked for and the request's size
+\        allows (the answer at most three times it, as the Rust node bounds
+\        it).
+: phm variable ;  : phc variable ;
 : pghosts ( -- )
 	pbn @ A lit u< 0= if
 		0 lit  pbn @ A lit u> if pbn @ A lit do pbd @ i + c@ or loop then
 		0= if                                                           \ zero padding
 			nsrc @ nsport @ padd drop
+			pbd @ 8 lit + nb16@  pbn @ 6 lit + 3 lit * 18 lit - 6 lit /  pumin  phm !
 			2 lit phdr  pbd @ swap 8 lit ncpy
 			nsrc @ nsport @ pcookie npkt E lit + qbe!
-			0 lit npkt 16 lit + nb16!
-			18 lit preply
+			0 lit phc !
+			ppn 0 lit do
+				phc @ phm @ u<  i pp 8 lit + @ 2 lit = and
+				i pp @ nsrc @ =  i pp 4 lit + @ nsport @ = and 0= and
+				i pp @ A000202 lit = 0= and if
+					i pp @ npkt 18 lit + phc @ 6 lit * + be!
+					i pp 4 lit + @ npkt 1C lit + phc @ 6 lit * + nb16!
+					phc @ 1 lit + phc !
+				then
+			loop
+			phc @ npkt 16 lit + nb16!
+			phc @ 6 lit * 18 lit + preply
 		then
 	then
 ;
@@ -230,6 +248,20 @@
 			pms i pp 40 lit + !  i dbtip ?dup if 20 lit + @ 1 lit + else 0 lit then pgetinv
 		then
 	loop
+;
+
+\ ── Announcing ──
+
+\ pann ( hash h size skip -- )   INV: a new best block of ours, to every
+\        answered peer but skip (-1: none) -- as the Rust node announces.
+: pah variable ;  : pasz variable ;  : pas variable ;
+: pann ( hash h size skip -- )
+	pas ! pasz ! pah !
+	3 lit phdr 20 lit ncpy
+	pah @ 0 lit npkt 26 lit + qbe!
+	pasz @ npkt 2E lit + be!
+	pah @ 0 lit npkt 32 lit + qbe!                               \ our tip's height: its
+	ppn 0 lit do i pp 8 lit + @ 2 lit =  i pas @ = 0= and if i 3A lit psendk then loop
 ;
 
 \ ── Block downloads (one at a time) ──
@@ -299,7 +331,12 @@
 		bheight drop  bhdr @ 4 lit + dbfind 0<  over 0= 0= and if          \ an unknown parent
 			nip nip 1 lit -  dup pgm 7C lit + @ u< if drop pnext then  pq !
 		else
-			drop acblock if pnext pq ! else
+			drop acblock if
+				pnext pq !
+				dbtip ?dup if                                           \ our new best: announce it
+					dup pid 20 lit mcmp 0= if 20 lit + @ pid swap dlsize @ dlk @ pann else drop then
+				then
+			else
 				0 lit dlk @ pp 2C lit + !                               \ invalid: forget its height
 			then
 		then
@@ -352,6 +389,10 @@
 						pk @ pbd @ pqh @ pbd @ 28 lit + be32 0 lit dlstart
 					else pq @ 1 lit + pq !  0 lit pqat ! then                   \ have it: the next one up
 				then then
+			then
+			\ An announcement of the block after our tip: fetch it now.
+			dlon @ 0= pfsv @ 0= and  pbd @ 20 lit + qbe@ drop pnext = and if
+				pbd @ dbfind 0< if pk @ pbd @ pnext pbd @ 28 lit + be32 0 lit dlstart then
 			then
 		then
 	then
@@ -566,11 +607,77 @@
 : pbv variable ;  : pbody ( -- a )  pbv 4B0 lit lazy ;
 
 \ pin ( -- )   a datagram arrived: a packet of ours, by type.
+\ ── Serving blocks (src/blocks.fam) ──
+
+: pgif variable ;  : pgiv variable ;  : pgi ( -- a )  pgiv 20 lit lazy ;
+
+\ pginv ( -- )   GET_INV: by hash, any block kept; by height, the active
+\        chain's -- or, past our tip, our tip (telling the asker our height).
+\        Answered with an INV of a block we hold, or not at all.
+: pginv ( -- )
+	pbn @ 21 lit = if
+		0 lit pgif !
+		pbd @ c@ 0= if
+			pbd @ 19 lit + qbe@ 0= if
+				dup blat if drop blv pgi 20 lit ncpy -1 lit pgif ! else
+					dbtip ?dup if
+						dup 20 lit + @ rot u< if pgi 20 lit ncpy -1 lit pgif ! else drop then
+					else drop then
+				then
+			else drop then
+		else
+			pbd @ c@ 1 lit = if pbd @ 1 lit + pgi 20 lit ncpy -1 lit pgif ! then
+		then
+		pgif @ if pgi blfind if
+			3 lit phdr pgi swap 20 lit ncpy
+			blv 8 lit + @ 0 lit npkt 26 lit + qbe!
+			blv 4 lit + @ npkt 2E lit + be!
+			dbtip ?dup if 20 lit + @ else 0 lit then 0 lit npkt 32 lit + qbe!
+			3A lit preply
+		then then
+	then
+;
+
+\ The block last served stays loaded: its peers ask for it a window at a time.
+: pscv variable ;  : pscid ( -- a )  pscv 20 lit lazy ;  : pscn variable ;
+: pscbv variable ;  : pscb ( -- a )  pscbv 200000 lit lazy ;
+
+\ pscache ( hash -- n )   a kept block, loaded: its length (0: not kept).
+: pscache ( hash -- n )
+	dup pscid 20 lit mcmp 0= pscn @ and if drop pscn @ else
+		dup pscb blread dup pscn !  swap pscid 20 lit ncpy
+	then
+;
+
+\ pbchunk ( c -- )   CHUNK c of the block loaded.
+: pbchunk ( c -- )
+	6 lit phdr  pscid over 20 lit ncpy  over over 20 lit + be!
+	pscn @ 2 lit pick A lit lshift - dup 400 lit u> if drop 400 lit then     ( c body len )
+	rot A lit lshift pscb + 2 lit pick 24 lit + 2 lit pick ncpy
+	nip 2A lit + preply
+;
+
+\ pgchunks ( -- )   GET_CHUNKS, with our cookie: the chunks asked for, at
+\        most 64 (the Rust node's MAX_SERVE_WINDOW).
+: pgchunks ( -- )
+	pbn @ 2E lit = if
+		pbd @ qbe@ nsrc @ nsport @ pcookie rot = -rot = and if
+			pbd @ 8 lit + pscache ?dup if
+				3FF lit + A lit rshift                                       ( chunks )
+				pbd @ 28 lit + be32  pbd @ 2C lit + nb16@ 40 lit pumin over +   ( chunks first end )
+				rot over over u> if nip else drop then                       ( first end' )
+				2dup u< if swap do i pbchunk loop else 2drop then
+			then
+		then
+	then
+;
+
 : pin ( -- )
 	pok? if
 		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
 		npay @ 5 lit + c@
 		dup 1 lit = if pghosts then  dup 2 lit = if phosts then  dup 3 lit = if pinv then
+		dup 4 lit = if pginv then  dup 5 lit = if pgchunks then
 		dup 6 lit = if pchunk then  dup B lit = if pgsp then  dup C lit = if psp then
 		dup D lit = if pgpiece then  dup E lit = if ppchunk then
 		drop

@@ -6,7 +6,7 @@
 # reorganizes onto its branch, and fast-syncs from it (tests/net_sync.fam).
 # A few minutes; the Rust node's log is tmp/peer.log.
 set -e
-SRC="src/fence.fam src/text.fam src/disk.fam src/poseidon2.fam src/wots.fam src/ext.fam src/transcript.fam src/merkle.fam src/fri.fam src/stark.fam src/circuit.fam src/block.fam src/chain.fam src/pow.fam src/diff.fam src/header.fam src/store.fam src/pager.fam src/btree.fam src/state.fam src/accept.fam src/snap.fam src/net.fam src/peer.fam"
+SRC="src/fence.fam src/text.fam src/disk.fam src/poseidon2.fam src/wots.fam src/ext.fam src/transcript.fam src/merkle.fam src/fri.fam src/stark.fam src/circuit.fam src/block.fam src/chain.fam src/pow.fam src/diff.fam src/header.fam src/store.fam src/pager.fam src/btree.fam src/state.fam src/blocks.fam src/accept.fam src/snap.fam src/net.fam src/peer.fam"
 D=tests/fixtures/main
 (cd ../rust && cargo build --release -q && cargo test --release -q -- --ignored forth_peer_data >/dev/null)
 # Its console's stdin: a pipe held open (an ended stdin would stop it).
