@@ -47,10 +47,23 @@ impl Transport for std::net::UdpSocket {
         std::net::UdpSocket::send_to(self, bytes, to).map(|_| ())
     }
 
+    /// Nothing to read is `None` -- and so is a receive that fails for a
+    /// passing reason: interrupted (a laptop's suspend freezes every
+    /// process, and a socket wait comes back `EINTR` when it thaws), or an
+    /// ICMP error an earlier datagram drew (refused, reset, unreachable --
+    /// a network going down or changing).  UDP loses datagrams anyway.
     fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<Option<(usize, SocketAddr)>> {
+        use std::io::ErrorKind::*;
         match std::net::UdpSocket::recv_from(self, buf) {
             Ok((len, from)) => Ok(Some((len, from))),
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    WouldBlock | TimedOut | Interrupted | ConnectionRefused | ConnectionReset | NetworkUnreachable | HostUnreachable | NetworkDown
+                ) =>
+            {
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
@@ -337,12 +350,30 @@ impl<T: Transport> Node<T> {
         mut deliver_sync: impl FnMut(crate::statesync::Event),
         commands: &std::sync::mpsc::Receiver<Command>,
     ) -> Result<(), NodeError<T::Error>> {
+        // An error never stops the network for good: the node would go on
+        // (mining, say) cut off, and say nothing -- it's logged, and after
+        // a pause the loop carries on.
+        let mut last_error_ms = 0;
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             while let Ok(command) = commands.try_recv() {
-                self.command(command)?;
+                if let Err(e) = self.command(command) {
+                    error!("network: {e:?} (carrying on)");
+                }
             }
-            for (block, from) in self.poll(clock())? {
-                deliver(block, from);
+            let now = clock();
+            match self.poll(now) {
+                Ok(blocks) => {
+                    for (block, from) in blocks {
+                        deliver(block, from);
+                    }
+                }
+                Err(e) => {
+                    if now.saturating_sub(last_error_ms) >= 60_000 {
+                        error!("network: {e:?} (carrying on; the same again within a minute isn't logged)");
+                        last_error_ms = now;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
             }
             for (bytes, from) in self.take_transactions() {
                 deliver_tx(bytes, from);
@@ -455,6 +486,74 @@ mod tests {
             chain,
             node,
         }
+    }
+
+    /// A socket whose first receives fail (an error `recv_from` doesn't
+    /// pass over), counting every receive.
+    struct Flaky {
+        socket: UdpSocket,
+        failures: usize,
+        receives: std::sync::Arc<AtomicU64>,
+    }
+
+    impl Transport for Flaky {
+        type Error = std::io::Error;
+        fn send_to(&mut self, bytes: &[u8], to: SocketAddrV4) -> std::io::Result<()> {
+            Transport::send_to(&mut self.socket, bytes, to)
+        }
+        fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<Option<(usize, SocketAddr)>> {
+            self.receives.fetch_add(1, Ordering::Relaxed);
+            if self.failures > 0 {
+                self.failures -= 1;
+                return Err(std::io::Error::other("a socket error"));
+            }
+            Transport::recv_from(&mut self.socket, buf)
+        }
+    }
+
+    /// A socket error doesn't stop the network: the loop logs it, and goes
+    /// on receiving -- it stops only when asked.  (It once quit on the
+    /// `EINTR` a laptop's suspend leaves, and the node mined on, cut off.)
+    #[test]
+    fn the_network_survives_socket_errors() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let table = PeerTable::open(&storage, 100, 4).unwrap();
+        let discovery = Discovery::new(
+            discovery::Config { seeds: vec![], share_limit: 10, probe_interval_ms: 50, response_timeout_ms: 500 },
+            table,
+            [9; 32],
+        );
+        let transfer = Transfer::new(transfer::Config {
+            max_block_bytes: crate::block::MAX_BLOCK_BYTES,
+            window: 8,
+            chunk_timeout_ms: 200,
+            max_retries: 5,
+            max_downloads: 4,
+            peer_height_refresh_ms: 60_000,
+        });
+        let reader = BlockReader::open(&storage).unwrap();
+        let state_reader = crate::chain::StateReader::open(&storage).unwrap();
+        let statesync = crate::statesync::StateSync::new(test_statesync_config());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+        let receives = std::sync::Arc::new(AtomicU64::new(0));
+        let flaky = Flaky { socket, failures: 3, receives: receives.clone() };
+        let mut node = Node::new(discovery, transfer, TxRelay::new(test_txrelay_config()), statesync, reader, state_reader, flaky, 10);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let running = {
+            let stop = stop.clone();
+            std::thread::spawn(move || node.run(crate::block::now_millis, &stop, |_, _| {}, |_, _| {}, |_| {}, &rx).is_ok())
+        };
+        let started = Instant::now();
+        while receives.load(Ordering::Relaxed) < 20 && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(receives.load(Ordering::Relaxed) >= 20, "still receiving after the errors");
+        assert!(!running.is_finished(), "the loop didn't quit");
+        stop.store(true, Ordering::Relaxed);
+        assert!(running.join().unwrap());
     }
 
     impl TestNode {
