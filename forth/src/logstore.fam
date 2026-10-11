@@ -1,0 +1,62 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/logstore.fam — the log, kept on the disk for the web wallet's Log tab:
+\ the lines src/log.fam queues, taken from the main loop (never a yield) and
+\ committed, at most once a second, into B+tree 8 -- keys their numbers
+\ (4 bytes, big-endian), values their text (0xFC bytes, zero-padded).  The
+\ oldest go as new ones come, past the most kept (lgmax, the `logmax=`
+\ setting: 10,000).  Meta page: 114 the oldest line's number, 118 the next's.
+\
+\   lgopen ( -- )          the disk is open: keep lines from now on
+\   lgsave ( -- )          keep what's queued, if it's time
+\   lgget ( n out -- ok )  line n's text (0xFC bytes) at out, if it's kept
+\   lgfirst / lgnext ( -- n )   the oldest line kept; the next line's number
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: lgmax variable ;  : lgrdy variable ;  : lgat variable ;
+: lgnx variable ;  : lgfs variable ;                  \ next, oldest: as on the disk
+: lgkv variable ;  : lgkey ( -- a )  lgkv 4 lit lazy ;
+
+: lgtree ( -- )   8 lit 4 lit FC lit btuse ;
+: lgfirst ( -- n )   lgfs @ ;
+: lgnext ( -- n )    lgnx @ ;
+
+: lgopen ( -- )
+	pgop pgm 114 lit + @ lgfs !  pgm 118 lit + @ lgnx !
+	lgmax @ 0= if 2710 lit lgmax ! then
+	-1 lit lgrdy !
+;
+
+\ lgtrim ( -- )   the oldest lines, past the most kept.
+: lgtrim ( -- )
+	begin lgnx @ lgfs @ - lgmax @ u> while
+		lgfs @ lgkey be!  lgtree lgkey btdel drop
+		lgfs @ 1 lit + lgfs !
+	repeat
+;
+
+\ lgsave ( -- )   the queued lines, onto the disk: once a second, or sooner if
+\        the ring is half full.
+: lgsave ( -- )
+	lgrdy @ if
+		lgqh @ lgqt @ - ?dup if
+			dup FF lit u>  hnow drop lgat @ - 3E7 lit u> or if
+				hnow drop lgat !
+				dup 0 lit do
+					lgnx @ lgkey be!  lgtree lgkey lgqt @ i + lgslot btput
+					lgnx @ 1 lit + lgnx !
+				loop
+				lgtrim
+				pgop lgfs @ pgm 114 lit + !  lgnx @ pgm 118 lit + !  pgmd
+				pgcommit drop
+				lgqt @ + lgqt !
+			else drop then
+		then
+	then
+;
+
+\ lgget ( n out -- ok )
+: lgget ( n out -- ok )
+	over lgfs @ - lgnx @ lgfs @ - u< if
+		swap lgkey be!  lgtree lgkey swap btget
+	else 2drop 0 lit then
+;

@@ -470,12 +470,12 @@
 
 : wlboot ( -- )
 	wl? if
-		wlrec @ if "node: this disk already holds a wallet; to restore one, start on a new disk\n(rm data/disk.img, which deletes this wallet)\n" lputs bye then
-		wlpass @ if "node: passphrase: this disk already holds a wallet (a passphrase is set when\nit's made, or with recover)\n" lputs bye then
+		wlrec @ if "node: this disk already holds a wallet; to restore one, start on a new disk\n(rm data/disk.img, which deletes this wallet)\n" lputs lfail then
+		wlpass @ if "node: passphrase: this disk already holds a wallet (a passphrase is set when\nit's made, or with recover)\n" lputs lfail then
 		"node: wallet open" lputs  wlflags 2 lit and if ", to be restored once the node has caught up" lputs then  A lit lputc
 	else
 		wlrec @ if wlback else wlnew then
-		0= if "node: couldn't keep the wallet on the disk\n" lputs bye then
+		0= if "node: couldn't keep the wallet on the disk\n" lputs lfail then
 	then
 	wlmigr wlapik
 	wlload  wlpw 40 lit zero  0 lit wlpwn !

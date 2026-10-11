@@ -83,6 +83,15 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
   padding: 9px 4px; color: var(--ink); font: 15px/1.55 Georgia, "Times New Roman", serif; cursor: pointer; }
 .hit:hover { background: var(--chip); }
 .hit b { font-family: system-ui, sans-serif; font-size: 12.5px; color: var(--accent); margin-right: 6px; }
+.logbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.logbar input[type=text] { flex: 1 1 220px; }
+.logbar .check { margin-top: 0; }
+.logbar button.secondary { margin-top: 0; padding: 8px 12px; }
+#logview { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; margin-top: 10px; height: 60vh; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+#logview div { white-space: pre-wrap; overflow-wrap: anywhere; }
+#logview .t { color: var(--muted); }
+#logview .warn { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -112,6 +121,7 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
     <button role="tab" data-tab="activity">Activity</button>
     <button role="tab" data-tab="coins">Coins</button>
     <button role="tab" data-tab="bible">Bible</button>
+    <button role="tab" data-tab="log">Log</button>
   </nav>
 
   <section id="tab-send" class="card">
@@ -165,6 +175,16 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
     </div>
     <div id="bstatus" class="hint"></div>
     <div id="bview" class="scripture"></div>
+  </section>
+
+  <section id="tab-log" class="card" hidden>
+    <div class="logbar">
+      <button class="secondary" id="logolder">Older</button>
+      <input id="logfilter" type="text" placeholder="Show only lines containing…" autocomplete="off" spellcheck="false">
+      <label class="check"><input id="logfollow" type="checkbox" checked> Follow</label>
+    </div>
+    <div id="logstatus" class="hint"></div>
+    <div id="logview" role="log" aria-live="off"></div>
   </section>
 
   <section id="tab-coins" class="card" hidden>
@@ -229,6 +249,7 @@ function connect() {
   ws.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
     if (m.event === "tip") { refresh(); return; }
+    if (m.event === "log") { logNext = m.next; if (logShown()) logPull(); return; }
     const w = waiting.get(m.id);
     if (w) { waiting.delete(m.id); m.ok ? w.resolve(m.result) : w.reject(new Error(m.error)); }
   };
@@ -253,7 +274,7 @@ async function auth() {
   if (!k) { askKey(); return; }
   try {
     await call("auth", { key: k });
-    authed = true; pageKey = k; refresh();
+    authed = true; pageKey = k; refresh(); if (logShown()) logPull();
   } catch (e) {
     if (/wrong key/.test(e.message)) { forgetKey(); pageKey = null; askKey("The node didn't accept that key."); }
   }
@@ -534,12 +555,69 @@ async function openBible() {
   try { await loadBible(); if (!$("bview").childNodes.length) showChapter(Math.min(bpos.b, bible.length - 1), bpos.c, bpos.v); } catch (e) {}
 }
 
+// ── The node's log ──
+// Lines come numbered (seq) from the node's disk: the last 200 when the tab
+// opens, then each new batch as the node says it has kept one; "Older"
+// fetches the 200 before the oldest shown.  At most LOGMAX lines stay here.
+const LOGMAX = 5000;
+let logLines = [], logNext = 0, logFirst = 0, logBusy = false, logStarted = false;
+const logShown = () => !$("tab-log").hidden;
+const WARN = /fail|refus|reject|error|invalid|bad |not kept|couldn't|wrong/i;
+function logRow(l) {
+  const m = /^(\[[^\]]*\] )?(.*)$/s.exec(l.text);
+  return el("div", { class: WARN.test(m[2]) ? "warn" : "" }, el("span", { class: "t" }, m[1] || ""), m[2]);
+}
+function logRender() {
+  const v = $("logview"), f = $("logfilter").value.toLowerCase();
+  const atEnd = v.scrollHeight - v.scrollTop - v.clientHeight < 40;
+  const keep = $("logfollow").checked && atEnd, top = v.scrollTop;
+  v.replaceChildren(...logLines.filter((l) => !f || l.text.toLowerCase().includes(f)).map(logRow));
+  v.scrollTop = keep || !logStarted ? v.scrollHeight : top;
+  logStarted = true;
+  const first = logLines.length ? logLines[0].seq : logNext;
+  $("logolder").hidden = first <= logFirst;
+  $("logstatus").textContent = logLines.length
+    ? `lines ${first.toLocaleString("en-US")}–${logLines[logLines.length - 1].seq.toLocaleString("en-US")} of those the node keeps (from ${logFirst.toLocaleString("en-US")})`
+    : "No log lines yet.";
+}
+async function logPull() {
+  if (logBusy || !authed) return;
+  logBusy = true;
+  try {
+    for (;;) {
+      const last = logLines.length ? logLines[logLines.length - 1].seq : null;
+      const r = await call("log", last === null ? { limit: 200 } : { from: last + 1, limit: 200 });
+      logFirst = r.first; logNext = r.next;
+      if (last !== null && r.next <= last) { logLines = []; continue; }   // a new disk: start over
+      logLines.push(...r.lines);
+      if (logLines.length > LOGMAX) logLines.splice(0, logLines.length - LOGMAX);
+      if (!r.lines.length || r.lines[r.lines.length - 1].seq + 1 >= r.next) break;
+    }
+    logRender();
+  } catch (e) { $("logstatus").textContent = e.message; }
+  logBusy = false;
+}
+$("logolder").addEventListener("click", () => busy($("logolder"), async () => {
+  if (!logLines.length) return;
+  const first = logLines[0].seq, from = Math.max(logFirst, first - 200);
+  const r = await call("log", { from, limit: first - from });
+  const older = r.lines.filter((l) => l.seq < first);
+  const v = $("logview"), h = v.scrollHeight;
+  logLines.unshift(...older);
+  logRender();
+  v.scrollTop += v.scrollHeight - h;
+}));
+let logFilterTimer = null;
+$("logfilter").addEventListener("input", () => { clearTimeout(logFilterTimer); logFilterTimer = setTimeout(logRender, 150); });
+$("logfollow").addEventListener("change", () => { if ($("logfollow").checked) $("logview").scrollTop = $("logview").scrollHeight; });
+
 // ── Tabs ──
 for (const b of document.querySelectorAll("nav button")) {
   b.addEventListener("click", () => {
     for (const o of document.querySelectorAll("nav button")) o.setAttribute("aria-selected", o === b ? "true" : "false");
     for (const s of document.querySelectorAll("main > section")) s.hidden = s.id !== "tab-" + b.dataset.tab;
     if (b.dataset.tab === "bible") openBible();
+    if (b.dataset.tab === "log") logPull();
   });
 }
 

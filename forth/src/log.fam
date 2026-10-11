@@ -4,15 +4,50 @@
 \ does (UTC, to the millisecond):  [2026-10-10 12:00:05:538] ...
 \ The clock is hnow (src/header.fam).  What isn't the log -- the backup
 \ words, the passphrase prompts -- is written with putc / puts.
+\
+\ Where it goes (lgdst, the `log=` setting): the console (1), the web
+\ wallet's Log tab (2: the default), or both (3).  For the web, each line
+\ (its time, then at most 0xFB characters) waits in memory -- a ring of 512
+\ -- for src/logstore.fam to keep it on the disk, from the main loop: a line
+\ may be logged anywhere, a yield included, and none touches the disk.  With
+\ the ring full, a new line is dropped (lglost counts them).
+\   lfail ( -- )   stop the node: the lines the disk hasn't kept, and that
+\                  the console hasn't had, go to the console first.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : lgon variable ;  : lgmid variable ;                  \ on; in the middle of a line
 : lgbv variable ;  : lgb ( -- a )  lgbv 10 lit lazy ;
 : lgdv variable ;  : lgyv variable ;  : lgmv variable ;  : lgev variable ;
 
-: lg2 ( n -- )   dup A lit / 30 lit + putc  A lit % 30 lit + putc ;
-: lg3 ( n -- )   dup 64 lit / 30 lit + putc  64 lit % lg2 ;
-: lg4 ( n -- )   dup 3E8 lit / 30 lit + putc  3E8 lit % lg3 ;
+: lgdst variable ;                                    \ 1 the console, 2 the web
+: lgln variable ;  : lglv variable ;  : lgline ( -- a )  lglv 100 lit lazy ;   \ the line, for the web
+: lgqv variable ;  : lgring ( -- a )  lgqv 20000 lit lazy ;   \ 512 lines, 0x100 bytes each
+: lgqh variable ;  : lgqt variable ;  : lglost variable ;     \ lines queued, taken; dropped
+
+\ lgemit ( c -- )   a character of the line, wherever it goes.
+: lgemit ( c -- )
+	lgdst @ 1 lit and if dup putc then
+	lgdst @ 2 lit and if lgln @ FB lit u< if dup lgline lgln @ + c!  lgln @ 1 lit + lgln ! then then
+	drop
+;
+
+\ lgslot ( k -- a )   line k's place in the ring.
+: lgslot ( k -- a )   1FF lit and 8 lit lshift lgring + ;
+
+\ lgend ( -- )   the line is done.
+: lgend ( -- )
+	lgdst @ 1 lit and if A lit putc then
+	lgdst @ 2 lit and if
+		lgqh @ lgqt @ - 200 lit u< if
+			lgqh @ lgslot dup 100 lit nzero  lgline swap lgln @ ncpy  lgqh @ 1 lit + lgqh !
+		else lglost @ 1 lit + lglost ! then
+	then
+	0 lit lgln !
+;
+
+: lg2 ( n -- )   dup A lit / 30 lit + lgemit  A lit % 30 lit + lgemit ;
+: lg3 ( n -- )   dup 64 lit / 30 lit + lgemit  64 lit % lg2 ;
+: lg4 ( n -- )   dup 3E8 lit / 30 lit + lgemit  3E8 lit % lg3 ;
 
 \ lgdate ( days -- )   the civil date of days since 1970-01-01, written
 \        YYYY-MM-DD (Howard Hinnant's days_from_civil, inverted).
@@ -25,19 +60,33 @@
 	dup 99 lit * 2 lit + 5 lit / rot swap - 1 lit + lgdv !              ( mp )
 	dup A lit u< if 3 lit + else 9 lit - then lgmv !
 	lgmv @ 3 lit u< if lgyv @ 1 lit + lgyv ! then
-	lgyv @ lg4 2D lit putc lgmv @ lg2 2D lit putc lgdv @ lg2
+	lgyv @ lg4 2D lit lgemit lgmv @ lg2 2D lit lgemit lgdv @ lg2
 ;
 
 \ lgstamp ( -- )   "[YYYY-MM-DD HH:MM:SS:mmm] ".
 : lgstamp ( -- )
 	lgb 10 lit nzero  hnow lgb 4 lit + ! lgb !
 	lgb 8 lit 3E8 lit ndivw                                             ( ms )
-	5B lit putc
-	lgb @ dup 15180 lit / lgdate  20 lit putc
-	15180 lit %  dup E10 lit / lg2 3A lit putc  E10 lit % dup 3C lit / lg2 3A lit putc  3C lit % lg2
-	3A lit putc lg3  5D lit putc 20 lit putc
+	5B lit lgemit
+	lgb @ dup 15180 lit / lgdate  20 lit lgemit
+	15180 lit %  dup E10 lit / lg2 3A lit lgemit  E10 lit % dup 3C lit / lg2 3A lit lgemit  3C lit % lg2
+	3A lit lgemit lg3  5D lit lgemit 20 lit lgemit
 ;
 
 \ lputc ( c -- )   lputs ( a -- )   to the log.
-: lputc ( c -- )   lgon @ lgmid @ 0= and if lgstamp then  dup A lit = 0= lgmid !  putc ;
+: lputc ( c -- )
+	lgon @ 0= if putc else
+		lgmid @ 0= if lgstamp then
+		dup A lit = 0= lgmid !
+		dup A lit = if drop lgend else lgemit then
+	then
+;
 : lputs ( a -- )   begin dup c@ ?dup while lputc 1 lit + repeat drop ;
+
+: lfail ( -- )
+	lgon @ lgdst @ 1 lit and 0= and if
+		lgqh @ lgqt @ - ?dup if 0 lit do lgqt @ i + lgslot puts A lit putc loop then
+		lgmid @ if lgline lgln @ + 0 lit swap c!  lgline puts A lit putc then
+	then
+	bye
+;

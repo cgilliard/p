@@ -23,8 +23,9 @@
 \
 \ Meta page (cells): 0 "STAT"  4 version (2)  8 commits  C hwm  10 free list
 \ head  14 .. 24 four roots (src/btree.fam)  24 .. 100 the state (src/state.fam,
-\ src/accept.fam, src/snap.fam)  100 .. 110 four more roots  200 .. 270 the
-\ wallet (src/wallet.fam).
+\ src/accept.fam, src/snap.fam)  100 .. 114 five more roots  114 .. 11C the
+\ log's line numbers (src/logstore.fam)  200 .. 270 the wallet
+\ (src/wallet.fam).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : pgbase ( -- sector )   110008 lit ;                 \ after the tip log (src/store.fam)
@@ -74,7 +75,7 @@
 
 \ pgjnew ( p -- slot )   a new slot for page p.  Halts if the journal is full.
 : pgjnew ( p -- slot )
-	pgjn @ pgjcap u< 0= if "transaction too large for the journal" lputs A lit lputc bye then
+	pgjn @ pgjcap u< 0= if "transaction too large for the journal" lputs A lit lputc lfail then
 	dup pgjh#
 	begin dup pgjt@ while 1 lit + pgjtn 1 lit - and repeat      ( p i )
 	over 1 lit + over 3 lit lshift pgjt + !
@@ -175,7 +176,7 @@
 			then
 		loop
 	then
-	pgvs @ 0< if "page cache full" lputs A lit lputc bye then
+	pgvs @ 0< if "page cache full" lputs A lit lputc lfail then
 	pgvs @
 ;
 

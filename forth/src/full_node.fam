@@ -22,6 +22,12 @@
 \   probe=S             every host asked for hosts every S seconds (60)
 \   perip=N             the most hosts kept with one IP address (4)
 \   apikey              show the wallet's API key (tools/wallet asks for it)
+\   log=webui | log=console | log=both
+\                       where the log goes: the web wallet's Log tab (kept on
+\                       the disk: src/logstore.fam), the console, or both
+\                       (webui)
+\   logmax=N            the most log lines kept for the Log tab (10,000; at
+\                       most 1,000,000)
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : fncv variable ;  : fncfg ( -- a )  fncv 400 lit lazy ;
@@ -78,7 +84,11 @@
 		else "probe=" fnpre? if fnnum 3E8 lit * dup 0= if drop 3E8 lit then pprb !
 		else "perip=" fnpre? if fnnum dup 0= if drop 1 lit then ppip !
 		else "apikey" fnpre? if -1 lit wlshowk !
-		else fnbad then then then then then then then then then then then then
+		else "log=webui" fnpre? if 2 lit lgdst !
+		else "log=console" fnpre? if 1 lit lgdst !
+		else "log=both" fnpre? if 3 lit lgdst !
+		else "logmax=" fnpre? if fnnum F4240 lit pumin dup 0= if drop 1 lit then lgmax !
+		else fnbad then then then then then then then then then then then then then then then then
 	repeat
 ;
 
@@ -220,27 +230,33 @@
 : fnmain ( -- )
 	fnclean
 	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  E99 lit nport !
-	19 lit pfdep !  0 lit bnet !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
+	19 lit pfdep !  0 lit bnet !  2 lit lgdst !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
 	fnread fnparse
 	wlshowk @ if fnkey then
-	-1 lit lgon !                                     \ the log: each line timed (src/log.fam)
 	naport @ 0= if nport @ 1 lit + naport ! then
+	-1 lit lgon !                                     \ the log: each line timed (src/log.fam)
 	naport @ ntport !                                 \ the wallet's port: TCP (src/web.fam)
+	lgdst @ 1 lit and 0= if
+		lgon @  0 lit lgon !
+		"node: the log is in the web wallet's Log tab: http://127.0.0.1:" lputs naport @ fndec "/ (log=console or log=both: here too)\n" lputs
+		lgon !
+	then
 	"node: " lputs  bnet @ if "dev" else "main" then lputs  " network, UDP port " lputs nport @ fndec
 	", fast sync depth " lputs pfdep @ fndec  ", wallet API port " lputs naport @ fndec A lit lputc
 	acopen 0= if
 		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"
-		else "node: no disk" then lputs A lit lputc bye
+		else "node: no disk" then lputs A lit lputc lfail
 	then
+	lgopen                                            \ the log, onto the disk from now on
 	imopen imsave
 	wlboot txstart
 	dbtip ?dup if "node: resuming at height " lputs 20 lit + @ fndec A lit lputc else "node: a new chain\n" lputs then
-	pstart 0= if "node: no network device" lputs A lit lputc bye then
+	pstart 0= if "node: no network device" lputs A lit lputc lfail then
 	ppn 0 lit do i pp 38 lit + @ if "node: seed " lputs i pp @ fnip. 3A lit lputc i pp 4 lit + @ fndec A lit lputc then loop
 	0 lit ppn 0 lit do i pp 8 lit + @ i pp 38 lit + @ 0= and if 1 lit + then loop
 	?dup if "node: hosts known from before: " lputs fndec A lit lputc then
 	-1 lit fnlive !                                   \ yields may answer the network now
-	begin fnstep fnsay wltick 0 lit until
+	begin fnstep fnsay wltick lgsave 0 lit until
 ;
 
 ntext                 \ first: find the Bible text, keep the heap off it (src/text.fam)

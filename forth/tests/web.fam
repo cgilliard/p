@@ -61,4 +61,25 @@ Test {
 		"{\"id\":\"a\\\"b\",\"cmd\":\"auth\",\"key\":\"00\"}" dup strlen 0 lit apirun 0= assert
 		jout "{\"id\":\"a\\\"b\",\"ok\":false,\"error\":\"wrong key\"}" dup strlen mcmp 0= assert
 	}
+	log_kept_on_disk {
+		\ four lines for the web wallet, at most three kept (a fresh disk:
+		\ lines 0 .. 3, line 0 dropped)
+		2 lit lgdst !  -1 lit lgon !  3 lit lgmax !  lgopen
+		"one\n" lputs "two\n" lputs "three\n" lputs "four" lputs
+		lgqh @ lgqt @ - 3 lit asrt_eq                                     \ "four": not ended yet
+		A lit lputc  lgqh @ lgqt @ - 4 lit asrt_eq
+		hnow drop 7D0 lit - lgat !  lgsave  0 lit lgon !  0 lit lgdst !
+		lgqh @ lgqt @ - 0 lit asrt_eq
+		lgfirst 1 lit asrt_eq  lgnext 4 lit asrt_eq
+		0 lit tw1o lgget 0= assert
+		1 lit tw1o lgget assert  tw1o c@ 5B lit asrt_eq  tw1o 1A lit + "two" 4 lit mcmp 0= assert
+		3 lit tw1o lgget assert  tw1o 1A lit + "four" 5 lit mcmp 0= assert
+		\ the API: from line 3, and the last two
+		"{\"id\":1,\"cmd\":\"log\",\"from\":3}" dup strlen -1 lit apirun drop
+		jout "{\"id\":1,\"ok\":true,\"result\":{\"first\":1,\"next\":4,\"lines\":[{\"seq\":3,\"text\":\"[" dup strlen mcmp 0= assert
+		jout jon @ + 9 lit - "four\"}]}}" 9 lit mcmp 0= assert
+		"{\"id\":2,\"cmd\":\"log\",\"limit\":2}" dup strlen -1 lit apirun drop
+		jout "{\"id\":2,\"ok\":true,\"result\":{\"first\":1,\"next\":4,\"lines\":[{\"seq\":2,\"text\":\"[" dup strlen mcmp 0= assert
+		jout jon @ + 9 lit - "four\"}]}}" 9 lit mcmp 0= assert
+	}
 }

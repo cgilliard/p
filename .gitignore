@@ -1,5 +1,6 @@
 **/*.swp
 /rust/target
+/forth/tools/__pycache__/
 /forth/bin
 /forth/data
 /forth/tmp

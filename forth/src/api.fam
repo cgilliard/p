@@ -28,6 +28,13 @@
 \   cancel slate_id         {}  (not "id": that's the request's)
 \   slates                  [ {id, role, state, unconfirmed, amount, fee,
 \                           txid} ]
+\   log [from] [limit]      {first, next, lines: [ {seq, text} ]}: the log
+\                           lines numbered from `from` on (without it, the
+\                           last ones), at most `limit` (200) and about 96 KB;
+\                           first: the oldest kept, next: the next line's
+\                           number.  Works with no wallet.
+\ And, once authenticated, events: {"event":"tip","height":N} when the best
+\ tip moves, {"event":"log","next":N} when log lines are kept.
 \
 \   apirun ( a n auth -- auth' )   a request: its answer at jout (jon
 \                                  bytes); auth: whether the connection has
@@ -465,6 +472,42 @@
 	else 2drop "slate_id: a slate's id, 32 hex digits" jerr then
 ;
 
+\ jnum ( key dflt -- n )   a number argument (decimal digits); else dflt.
+: jnv variable ;  : jnok variable ;
+: jnum ( key dflt -- n )
+	swap jget 2 lit = if
+		0 lit jnv !  -1 lit jnok !
+		?dup if 0 lit do
+			dup i + c@ dup jdig? if F lit and jnv @ A lit * + jnv ! else drop 0 lit jnok ! then
+		loop then drop
+		jnok @ if drop jnv @ then
+	else 2drop then
+;
+
+\ jlog ( -- )   log lines (src/logstore.fam), as text: a byte that isn't
+\        ASCII goes as "?", so the answer is always UTF-8.
+: jlbv variable ;  : jlbuf ( -- a )  jlbv 100 lit lazy ;
+: jlk variable ;  : jll variable ;
+: jlog ( -- )
+	"limit" C8 lit jnum  dup 0= if drop 1 lit then  C8 lit pumin jll !
+	"from" -1 lit jnum
+	dup -1 lit = if drop lgnext jll @ u< if lgfirst else lgnext jll @ - then then
+	dup lgfirst u< if drop lgfirst then jlk !
+	-1 lit jhead jobj
+	"first" jkey lgfirst jdec  "next" jkey lgnext jdec  "lines" jkey 5B lit jc
+	0 lit
+	begin jlk @ lgnext u< over jll @ u< and jon @ 18000 lit u< and while
+		jlk @ jlbuf lgget if
+			jlbuf FC lit 0 lit do dup i + c@ 7F lit u> if 3F lit over i + c! then loop drop
+			dup if 2C lit jc then
+			jobj "seq" jkey jlk @ jdec  "text" jkey jlbuf dup strlen jstr  7D lit jc
+			1 lit +
+		then
+		jlk @ 1 lit + jlk !
+	repeat drop
+	5D lit jc jdone jdone
+;
+
 \ jauth ( -- ok )   {"cmd":"auth","key":..}: the API key, compared in full.
 : jauth ( -- ok )
 	"key" jget 1 lit = over 40 lit = and wl? and if
@@ -484,6 +527,7 @@
 			jauth if -1 lit jau !  -1 lit jhead "{}" js jdone else 0 lit jau !  "wrong key" jerr then
 		else jau @ 0= if 2drop "authenticate first: {\"cmd\":\"auth\",\"key\":\"...\"}" jerr else
 		2dup "status" jis if 2drop jstatus else
+		2dup "log" jis if 2drop jlog else
 		wl? 0= if 2drop "no wallet" jerr else
 		wlflags 2 lit and if 2drop "the wallet is being restored (once the node has caught up)" jerr else
 		2dup "balance" jis if 2drop jbalance else
@@ -494,7 +538,7 @@
 		2dup "cancel" jis if 2drop jcancel else
 		2dup "slates" jis if 2drop jslates else
 		2drop "unknown command" jerr
-		then then then then then then then then then then then then
+		then then then then then then then then then then then then then
 	else 2drop "not a request: {\"id\":..,\"cmd\":\"...\"}" jerr then
 	jau @
 ;

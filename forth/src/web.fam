@@ -25,7 +25,8 @@
 \ connection (1002).  A text message is a request to the API (src/api.fam),
 \ answered in a text message; a binary one, refused.  When the best tip
 \ changes, every connection that has authenticated is told:
-\ {"event":"tip","height":N}.
+\ {"event":"tip","height":N}; when log lines are kept (src/logstore.fam),
+\ {"event":"log","next":N}.
 \
 \   wtick ( -- )   serve the connections
 \ ──────────────────────────────────────────────────────────────────────────────
@@ -225,16 +226,27 @@
 	drop
 ;
 
-\ wevents ( -- )   the best tip moved: tell every authenticated connection.
-: wtiph variable ;
+\ wcast ( -- )   the message at jout, to every authenticated connection.
+: wcast ( -- )
+		tcmax 0 lit do
+			i tstate 2 lit =  i C lit wc@ 1 lit = and  i 34 lit wc@ and if i 1 lit jout jon @ wframe then
+		loop
+;
+
+\ wevents ( -- )   the best tip moved, log lines were kept: tell every
+\        authenticated connection.
+: wtiph variable ;  : wlogn variable ;
 : wevents ( -- )
 	dbtip ?dup if 20 lit + @ else 0 lit then
 	dup wtiph @ = if drop else
 		dup wtiph !
 		jout jon jto  "{\"event\":\"tip\",\"height\":" js jdec 7D lit jc
-		tcmax 0 lit do
-			i tstate 2 lit =  i C lit wc@ 1 lit = and  i 34 lit wc@ and if i 1 lit jout jon @ wframe then
-		loop
+		wcast
+	then
+	lgnext dup wlogn @ = if drop else
+		dup wlogn !
+		jout jon jto  "{\"event\":\"log\",\"next\":" js jdec 7D lit jc
+		wcast
 	then
 ;
 

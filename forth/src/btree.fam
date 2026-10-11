@@ -1,8 +1,8 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 \ src/btree.fam — B+trees on the pager's pages (src/pager.fam): fixed-size
 \ keys (compared as bytes, so big-endian numbers sort) and values.  Up to
-\ eight trees, each rooted in a cell of the meta page (0..3 at 0x14, 4..7 at
-\ 0x100).
+\ nine trees, each rooted in a cell of the meta page (0..3 at 0x14, 4..8 at
+\ 0x100; 8 is the log's: src/logstore.fam).
 \
 \ Page: 0 type (1 leaf, 2 inner), 4 n, then
 \   leaf:  n entries, key then value, from 8
@@ -13,7 +13,7 @@
 \ on up); a root inner node left with one child is replaced by it.  Nodes
 \ aren't merged, so a tree can be sparser than it need be, never wrong.
 \
-\   btuse ( id ks vs -- )     work on tree id (0..7), keys ks bytes, values vs
+\   btuse ( id ks vs -- )     work on tree id (0..8), keys ks bytes, values vs
 \   btget ( key out -- found )
 \   btput ( key val -- )      insert, or replace the value
 \   btdel ( key -- found )

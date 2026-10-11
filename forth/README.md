@@ -55,6 +55,14 @@ hash.
 The node's log lines begin with the time, as the Rust node's do (UTC, to
 the millisecond: `[2026-10-10 12:00:05:538] tip: height 18 ...`;
 `src/log.fam`); the backup words and passphrase prompts are left bare.
+By default the log goes to the web wallet's Log tab, not the console:
+`scripts/node.sh --log-dest webui | console | both` chooses. For the tab,
+each line (at most 251 characters) is queued in memory -- a line may be
+logged anywhere, a yield included -- and the main loop commits what's queued
+to the disk at most once a second, into a B+tree of its own on the pager
+(`src/logstore.fam`), dropping the oldest past `--log-max-entries` (10,000
+by default). A fatal error still reaches the console: the lines not yet on
+the disk are printed there before the node stops.
 
 Timings vary by about a quarter between runs with the laptop's load (QEMU
 emulates on one host thread).
@@ -181,10 +189,12 @@ host -- so no other site can reach the wallet from a browser.
 `{"id":1,"cmd":"send","amount":"1.5","fee":"0.0001"}` answered
 `{"id":1,"ok":true,"result":{...}}` -- after
 `{"cmd":"auth","key":"<API key>"}`; `status`, `balance`, `outputs`, `send`,
-`receive`, `finalize`, `cancel`, `slates`; amounts as decimal strings of
+`receive`, `finalize`, `cancel`, `slates`, `log` (lines by number:
+`from`, `limit`; works without a wallet); amounts as decimal strings of
 coins, exact; slates as their files' text (the armor `../rust/src/slate.rs`
 writes and reads -- now made and checked in Forth). And a pushed
-`{"event":"tip","height":N}` when the chain moves. Tested end to end against
+`{"event":"tip","height":N}` when the chain moves, `{"event":"log","next":N}`
+when log lines are kept. Tested end to end against
 a Rust dev miner: it paid this wallet, and this wallet paid it, the slate
 files crossing between the Rust CLI and the WebSocket both ways.
 
@@ -202,7 +212,9 @@ is (`data/akjv.txt.gz`) with `Content-Encoding: gzip`, so the browser
 inflates it and the node never needs to (cached for good once fetched,
 about 4 s over the node's TCP) -- by book and chapter, going to a reference
 as typed (`John 3:16`, `1 cor 13:4`, `ps 23`), and searching every verse as
-you type (the exact phrase first, then all the words apart). It's served with headers that keep it to itself (its own
+you type (the exact phrase first, then all the words apart). Log shows the
+node's log, following it live (the last 200 lines, then each new batch as
+the node keeps it; Older for the 200 before), with a filter. It's served with headers that keep it to itself (its own
 inline code only, connecting only back to the node, never framed, never
 cached). Its script was run under Node against a live node and a Rust dev
 miner -- unlocking (a wrong key refused), receiving a Rust S1 and the Rust
