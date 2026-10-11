@@ -152,20 +152,57 @@ the console (`--passphrase` for a passphrase) -- never passed as settings.
 A restored wallet finds its outputs once the node has caught up, by their
 recovery nonces in the state, as the Rust node's restore does.
 
-`src/wapi.fam` is the wallet's API: UDP on its own port (the node's + 1,
-3738), forwarded from 127.0.0.1 only, every datagram both ways carrying an
-HMAC-SHA256 under the wallet's API key, with sessions and counters so
-nothing can be replayed. `tools/wallet` (Python, no dependencies) is its
-client: `tools/wallet status | balance | outputs`. It asks for the API key
-once -- the node shows it when the wallet is made, and
-`scripts/node.sh --api-key` reads it from `data/disk.img` (the node may be
-running) -- and keeps it in `data/wallet.key`.
+The wallet's API is a WebSocket on its own port (the node's + 1, 3738/tcp),
+forwarded from 127.0.0.1 only (below). `tools/wallet` (Python, no
+dependencies) is a client of it: `tools/wallet status | balance | outputs`.
+It asks for the API key once -- the node shows it when the wallet is made,
+and `scripts/node.sh --api-key` reads it from `data/disk.img` (the node may
+be running) -- and keeps it in `data/wallet.key`.
 
 Payments are slates, as in the Rust wallet and in the same armored files, so
 either can pay the other: `tools/wallet send AMOUNT [FEE]` writes S1,
 `receive FILE` answers one with S2, `finalize FILE` signs and submits,
 `cancel ID` undoes an unsigned one, `slates` lists them (`src/slate.fam`).
 A signed transaction is kept before its signature leaves the node.
+
+The wallet's port speaks TCP (forwarded from 127.0.0.1 only, as 3738/tcp):
+HTTP, and at `/ws` a WebSocket -- the API the web wallet and `tools/wallet`
+use (it replaced an earlier UDP API).
+`src/tcp.fam` is TCP's server side, as much of it as a peer that is QEMU's
+user network needs (it neither loses nor reorders, and resends what we
+drop): the handshake, sequence numbers and acknowledgements, windows, MSS,
+sending again what isn't acknowledged, closing from either side, resets; 8
+connections. `src/ws.fam` is SHA-1 and base64, for the handshake;
+`src/web.fam` the HTTP and WebSocket server (frames unmasked as they arrive,
+fragments joined, up to 64 KiB a message; ping, close). A request's Host
+must be 127.0.0.1 or localhost, and a WebSocket's Origin, if any, that same
+host -- so no other site can reach the wallet from a browser.
+`src/api.fam` is the API: JSON both ways --
+`{"id":1,"cmd":"send","amount":"1.5","fee":"0.0001"}` answered
+`{"id":1,"ok":true,"result":{...}}` -- after
+`{"cmd":"auth","key":"<API key>"}`; `status`, `balance`, `outputs`, `send`,
+`receive`, `finalize`, `cancel`, `slates`; amounts as decimal strings of
+coins, exact; slates as their files' text (the armor `../rust/src/slate.rs`
+writes and reads -- now made and checked in Forth). And a pushed
+`{"event":"tip","height":N}` when the chain moves. Tested end to end against
+a Rust dev miner: it paid this wallet, and this wallet paid it, the slate
+files crossing between the Rust CLI and the WebSocket both ways.
+
+The web wallet is served at `/`: open `http://127.0.0.1:3738/` while the
+node runs (`scripts/node.sh` prints it). One page, `web/wallet.html` -- no
+build step, nothing fetched from elsewhere -- built into the node as
+`src/page.fam` (`tools/html2fam.py web/wallet.html wpage > src/page.fam`
+after changing it). It asks for the API key once (kept in the browser, or
+for the session), shows the balance and the chain (live: the tip event),
+and pays and is paid with slate files: Send makes the file to give (a
+download, or its text to copy), Receive answers one, Finalize signs and
+sends; Activity lists payments (an unanswered one can be cancelled), Coins
+the outputs. It's served with headers that keep it to itself (its own
+inline code only, connecting only back to the node, never framed, never
+cached). Its script was run under Node against a live node and a Rust dev
+miner -- unlocking (a wrong key refused), receiving a Rust S1 and the Rust
+CLI finalizing the S2 downloaded, sending (the Rust CLI answering the S1)
+and finalizing the answer -- both payments mined.
 
 `src/txrelay.fam` is the mempool, and relays everyone's transactions as the
 Rust node does (`TX_INV`, `GET_TX`, `TX_CHUNK`, `GET_TX_INV`): an announced

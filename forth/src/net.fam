@@ -11,7 +11,7 @@
 \ Region (page-aligned): 0 the receive queue (descriptors, available ring
 \ at 0x100, used ring at 0x1000), 0x2000 the transmit queue (likewise), 0x4000
 \ 16 receive buffers of 0x600, 0xA000 the transmit buffer, 0xA800 ARP's (so
-\ resolving an address never touches a datagram being built).  Each buffer
+\ resolving an address never touches a datagram being built), 0xB000 TCP's.  Each buffer
 \ starts with the virtio-net header (`nhl`: 12 bytes, or 10 without
 \ mergeable buffers).
 \
@@ -22,8 +22,14 @@
 \   npkt ( -- a )              where to build a datagram's bytes
 \   nsend ( ip port n -- ok )  send the n bytes built at npkt
 \
-\ A second port may be opened (`naport`, the wallet's API: src/wapi.fam): a
-\ datagram's port is then in ndport, and a reply goes from nsfrom (0: nport).
+\ TCP: with ntport set (the wallet's port: src/tcp.fam, src/web.fam), nrecv also takes a TCP segment to that port: then
+\ nproto is 6 (UDP: 17), npay / npn the segment (header and bytes), nsrc /
+\ nsport / ndport as for a datagram -- for src/tcp.fam (callers check
+\ nproto).  TCP builds its frames in a buffer of its own (0xB000), so a
+\ segment can go out while a datagram is being built.
+\   nipout ( ip proto n -- a | 0 )   Ethernet and IPv4 headers for n bytes of
+\                                    payload to ip, in the buffer in use (nfb):
+\                                    where the payload goes (0: no route)
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : ndev variable ;  : nq variable ;  : nhl variable ;
@@ -31,7 +37,8 @@
 : nmacv variable ;  : nmac ( -- a )  nmacv 8 lit lazy ;
 : nadr variable ;  : ngw variable ;  : nmask variable ;  : nport variable ;  : nipid variable ;
 : nsrc variable ;  : nsport variable ;  : npay variable ;  : npn variable ;
-: naport variable ;  : ndport variable ;  : nsfrom variable ;
+: naport variable ;  : ndport variable ;
+: nproto variable ;  : ntport variable ;
 
 : nrxb ( id -- a )   600 lit * 4000 lit + nq @ + ;
 : nfb variable ;                                     \ the transmit buffer in use
@@ -76,7 +83,7 @@
 \        receive queue.
 : nopen ( -- ok )
 	nfind dup ndev ! if
-		C000 lit alloc FFF lit + FFFFF000 lit and nq !       \ (0xB000, page-aligned)
+		D000 lit alloc FFF lit + FFFFF000 lit and nq !       \ (0xC000, page-aligned)
 		nq @ 2980 lit zero
 		0 lit nrxc !  0 lit nrxa !  0 lit ntxc !  0 lit nheld !  A000 lit nfb !
 		nadr @ 0= if A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  BA25 lit nport ! then
@@ -171,8 +178,8 @@
 : nfree ( -- )   nrid @ npost  fence_io  0 lit ndev @ 50 lit + ! ;
 
 \ nin ( a n -- f )   handle a frame: answer ARP for us and learn from ARP;
-\        an IPv4 UDP datagram to our port (or naport) -> true (nsrc .. npn,
-\        ndport set).
+\        an IPv4 UDP datagram to our port, or a TCP segment to
+\        ntport -> true (nproto, nsrc .. npn, ndport set).
 : nin ( a n -- f )
 	dup 2A lit u< if 2drop 0 lit else
 	over C lit + nb16@ dup 806 lit = if
@@ -187,19 +194,24 @@
 	else 800 lit = if
 		swap E lit + swap E lit -                               ( ip n )
 		over c@ 45 lit =  over 1C lit u< 0= and
-		2 lit pick 9 lit + c@ 11 lit = and
 		2 lit pick 10 lit + be32 nadr @ = and
 		2 lit pick 6 lit + nb16@ 3FFF lit and 0= and            \ not a fragment
 		2 lit pick 2 lit + nb16@ 2 lit pick u> 0= and            \ its length fits
-		if
-			drop  dup C lit + be32 nsrc !
+		0= if 2drop 0 lit else
+		over 9 lit + c@ 6 lit =  ntport @ 0= 0= and if          \ TCP
+			drop  dup 2 lit + nb16@ 14 lit -  dup 14 lit u< if 2drop 0 lit else
+				npn !  dup C lit + be32 nsrc !  14 lit + dup npay !
+				dup nb16@ nsport !  2 lit + nb16@ dup ndport !  ntport @ =  6 lit nproto !
+			then
+		else over 9 lit + c@ 11 lit = if                          \ UDP
+			drop  11 lit nproto !  dup C lit + be32 nsrc !
 			dup 14 lit + dup nb16@ nsport !
 			dup 2 lit + nb16@ dup ndport !
-			dup nport @ =  swap naport @ = naport @ 0= 0= and  or
+			nport @ =
 			over 4 lit + nb16@ 8 lit -  dup npn !
 			3 lit pick 2 lit + nb16@ 1C lit - u> 0= and          \ the UDP length fits
 			swap 8 lit + npay !  nip
-		else 2drop 0 lit then
+		else 2drop 0 lit then then then
 	else 2drop 0 lit then then then
 ;
 
@@ -234,25 +246,42 @@
 	then
 ;
 
-\ nsend ( ip port n -- ok )   the n bytes at npkt, as a UDP datagram.
-: nsdi variable ;  : nsdp variable ;  : nsdn variable ;  : nsdm variable ;
-: nsend ( ip port n -- ok )
-	nsdn ! nsdp ! nsdi !
-	nheld @ if nfree 0 lit nheld ! then                        \ (its buffer may be reused)
-	nsdi @ nhop dup nsdm ! if
-		nsdm @ 800 lit neth                                     ( ip header )
+\ nipout ( ip proto n -- a | 0 )   Ethernet and IPv4 headers, for n bytes of
+\        payload to ip, in the frame being built (nfb's buffer).
+: nipi variable ;  : nipp variable ;  : nipn variable ;  : nipm variable ;
+: nipout ( ip proto n -- a | 0 )
+	nipn ! nipp ! nipi !
+	nipi @ nhop dup nipm ! if
+		nipm @ 800 lit neth                                     ( ip header )
 		dup 14 lit nzero
-		45 lit over c!  nsdn @ 1C lit + over 2 lit + nb16!
+		45 lit over c!  nipn @ 14 lit + over 2 lit + nb16!
 		nipid @ 1 lit + dup nipid ! over 4 lit + nb16!  4000 lit over 6 lit + nb16!
-		40 lit over 8 lit + c!  11 lit over 9 lit + c!
-		nadr @ over C lit + be!  nsdi @ over 10 lit + be!
+		40 lit over 8 lit + c!  nipp @ over 9 lit + c!
+		nadr @ over C lit + be!  nipi @ over 10 lit + be!
 		0 lit  A lit 0 lit do over i 1 lit lshift + nb16@ + loop
 		dup FFFF lit and swap 10 lit rshift +  dup FFFF lit and swap 10 lit rshift +    \ fold the carries
 		FFFF lit xor
 		over A lit + nb16!
 		14 lit +
-		nsfrom @ ?dup 0= if nport @ then over nb16!  nsdp @ over 2 lit + nb16!  nsdn @ 8 lit + over 4 lit + nb16!  0 lit swap 6 lit + nb16!
+	else 0 lit then
+;
+
+\ nsend ( ip port n -- ok )   the n bytes at npkt, as a UDP datagram.
+: nsdi variable ;  : nsdp variable ;  : nsdn variable ;
+: nsend ( ip port n -- ok )
+	nsdn ! nsdp ! nsdi !
+	nheld @ if nfree 0 lit nheld ! then                        \ (its buffer may be reused)
+	nsdi @ 11 lit nsdn @ 8 lit + nipout ?dup if
+		nport @ over nb16!  nsdp @ over 2 lit + nb16!  nsdn @ 8 lit + over 4 lit + nb16!  0 lit swap 6 lit + nb16!
 		nsdn @ 2A lit + dup 3C lit u< if drop 3C lit then ntx
 		-1 lit
 	else 0 lit then
+;
+
+\ p2rly -- the yield's relay (src/poseidon2.fam's p2hook jumps here, and
+\ from here to the yield, src/full_node.fam's p2yhk): half way, so each jump
+\ is within a jal's 1 MiB.  "p2ho" "ok": p2hook's name.
+: p2rly ( -- )
+	6F683270 6B6F hookto
+6F004000 ,   \ jal x0,+4: rewritten by p2yhk's hookto
 ;

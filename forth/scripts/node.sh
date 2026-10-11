@@ -69,13 +69,16 @@ mkdir -p data
 [ -e data/disk.img ] || truncate -s 4G data/disk.img
 # QEMU can't forward a port something else holds, and quits without a word.
 if command -v ss >/dev/null; then
-	for p in "$PORT" "$API"; do
-		if ss -Huln "sport = :$p" | grep -q .; then
-			echo "node.sh: UDP port $p is in use (another node? set PORT, or API)" >&2
-			exit 1
-		fi
-	done
+	if ss -Huln "sport = :$PORT" | grep -q .; then
+		echo "node.sh: UDP port $PORT is in use (another node? set PORT)" >&2
+		exit 1
+	fi
+	if ss -Htln "sport = :$API" | grep -q .; then
+		echo "node.sh: TCP port $API is in use (the web wallet's: set API)" >&2
+		exit 1
+	fi
 fi
+echo "node.sh: the web wallet: http://127.0.0.1:$API/ (once the node is up)" >&2
 # The console: two lines of settings first -- tabernacle's (its port, debug,
 # timeout, network, and the seeds it would fetch the node from if the disk's
 # copy were bad), then the node's own (src/full_node.fam).
@@ -90,7 +93,7 @@ run() {
 	./tools/q32 bin/tabernacle \
 		--disk=./data/disk.img \
 		--net \
-		--hostfwd=udp::$PORT-:$PORT,hostfwd=udp:127.0.0.1:$API-:$API | cat
+		--hostfwd=udp::$PORT-:$PORT,hostfwd=tcp:127.0.0.1:$API-:$API | cat
 }
 if [ -z "$WALLET" ]; then
 	# Nothing to type: the terminal is left alone (Ctrl-C stops the node).

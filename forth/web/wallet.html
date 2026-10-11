@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tabernacle Wallet</title>
+<style>
+:root {
+  --bg: #f6f4ef; --panel: #ffffff; --ink: #1d1b16; --muted: #6b665a; --line: #e2ddd1;
+  --accent: #7a5a1e; --accent-ink: #ffffff; --good: #2f6b3a; --bad: #9b2c2c; --chip: #efe9da;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15140f; --panel: #1f1d17; --ink: #ece7da; --muted: #a39c8a; --line: #34312a;
+    --accent: #d2a75a; --accent-ink: #1b1a14; --good: #7cc48a; --bad: #e08b8b; --chip: #2b2820;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.chip { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--chip); color: var(--muted); }
+.chip.dev { color: var(--accent); }
+#chain { margin-left: auto; font-size: 13px; color: var(--muted); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+  background: var(--muted); vertical-align: middle; }
+.dot.on { background: var(--good); } .dot.off { background: var(--bad); }
+main { max-width: 860px; margin: 0 auto; padding: 20px 16px 60px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+.balance .big { font-size: 34px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.balance .label { color: var(--muted); font-size: 13px; }
+.subs { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 8px; font-size: 13px; color: var(--muted); }
+.subs b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; }
+nav button { background: none; border: 0; padding: 8px 12px; border-radius: 8px; color: var(--muted);
+  font: inherit; cursor: pointer; }
+nav button[aria-selected="true"] { background: var(--panel); color: var(--ink); border: 1px solid var(--line); }
+section[hidden] { display: none; }
+label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+input[type=text], textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg); color: var(--ink); font: inherit; }
+textarea { font-family: var(--mono); font-size: 12px; min-height: 110px; resize: vertical; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; } .row > div { flex: 1 1 180px; }
+button.primary, button.secondary { font: inherit; border-radius: 8px; padding: 9px 16px; cursor: pointer; margin-top: 14px; }
+button.primary { background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent); font-weight: 600; }
+button.secondary { background: none; color: var(--ink); border: 1px solid var(--line); }
+button:disabled { opacity: .5; cursor: default; }
+.hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+.result { margin-top: 16px; padding: 14px 16px; border: 1px dashed var(--line); border-radius: 10px; }
+.result h3 { margin: 0 0 6px; font-size: 15px; }
+.result .mono, .mono { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+.error { color: var(--bad); margin-top: 10px; font-size: 14px; }
+.ok { color: var(--good); }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.empty { color: var(--muted); padding: 14px 8px; }
+.tablewrap { overflow-x: auto; }
+ol.steps { margin: 6px 0 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+#keydlg { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; padding: 16px; }
+#keydlg[hidden] { display: none; }
+#keydlg .card { max-width: 520px; width: 100%; margin: 0; }
+#keydlg h2 { margin: 0 0 6px; font-size: 18px; }
+code { font-family: var(--mono); font-size: 12.5px; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+.check { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.check input { margin: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tabernacle Wallet</h1>
+  <span id="net" class="chip">…</span>
+  <span id="chain"><span id="conn" class="dot"></span><span id="chaintext">connecting…</span></span>
+</header>
+
+<main>
+  <div class="card balance">
+    <div class="label">Spendable</div>
+    <div class="big" id="spendable">–</div>
+    <div class="subs">
+      <span>Immature <b id="immature">–</b></span>
+      <span>Pending <b id="pending">–</b></span>
+      <span>Locked <b id="locked">–</b></span>
+      <span id="heldwrap" hidden>Held <b id="held">–</b></span>
+    </div>
+    <div id="walletnote" class="hint" hidden></div>
+  </div>
+
+  <nav role="tablist">
+    <button role="tab" data-tab="send" aria-selected="true">Send</button>
+    <button role="tab" data-tab="receive">Receive</button>
+    <button role="tab" data-tab="finalize">Finalize</button>
+    <button role="tab" data-tab="activity">Activity</button>
+    <button role="tab" data-tab="coins">Coins</button>
+  </nav>
+
+  <section id="tab-send" class="card">
+    <div class="row">
+      <div><label for="amount">Amount</label><input id="amount" type="text" inputmode="decimal" placeholder="1.5" autocomplete="off"></div>
+      <div><label for="fee">Fee</label><input id="fee" type="text" inputmode="decimal" value="0.0001" autocomplete="off"></div>
+    </div>
+    <button class="primary" id="sendbtn">Create payment file</button>
+    <ol class="steps">
+      <li>Give the payment file to the person you're paying.</li>
+      <li>They answer it and send a file back.</li>
+      <li>Finalize that file here: the payment is signed and sent.</li>
+    </ol>
+    <div id="sendout"></div>
+  </section>
+
+  <section id="tab-receive" class="card" hidden>
+    <p class="hint" style="margin-top:0">Answer a payment file someone gave you. Then give your answer back to them; they finalize it.</p>
+    <label for="recvfile">Payment file (<code>.s1.slate</code>)</label>
+    <input id="recvfile" type="file" accept=".slate,text/plain">
+    <label for="recvtext">…or paste its text</label>
+    <textarea id="recvtext" placeholder="-----BEGIN TABERNACLE SLATE-----"></textarea>
+    <button class="primary" id="recvbtn">Answer it</button>
+    <div id="recvout"></div>
+  </section>
+
+  <section id="tab-finalize" class="card" hidden>
+    <p class="hint" style="margin-top:0">Finalize the answer to a payment you started: it's signed and sent to the network.</p>
+    <label for="finfile">Answer file (<code>.s2.slate</code>)</label>
+    <input id="finfile" type="file" accept=".slate,text/plain">
+    <label for="fintext">…or paste its text</label>
+    <textarea id="fintext" placeholder="-----BEGIN TABERNACLE SLATE-----"></textarea>
+    <button class="primary" id="finbtn">Sign and send</button>
+    <div id="finout"></div>
+  </section>
+
+  <section id="tab-activity" class="card" hidden>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Payment</th><th class="num">Amount</th><th class="num">Fee</th><th>State</th><th>Slate</th><th></th></tr></thead>
+      <tbody id="slates"></tbody>
+    </table></div>
+  </section>
+
+  <section id="tab-coins" class="card" hidden>
+    <div class="tablewrap"><table>
+      <thead><tr><th class="num">Amount</th><th>Status</th><th class="num">Confirmations</th><th class="num">Key</th><th>Commitment</th></tr></thead>
+      <tbody id="coins"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<div id="keydlg" hidden>
+  <form class="card" id="keyform">
+    <h2>Unlock the wallet</h2>
+    <p class="hint">Enter the wallet's API key. The node shows it when the wallet is made; to see it again, run <code>./scripts/node.sh --api-key</code>.</p>
+    <label for="keyin">API key</label>
+    <input id="keyin" type="text" autocomplete="off" spellcheck="false" placeholder="64 hex digits">
+    <label class="check"><input id="keyremember" type="checkbox" checked> Remember it in this browser</label>
+    <div id="keyerr" class="error" hidden></div>
+    <button class="primary" type="submit">Unlock</button>
+  </form>
+</div>
+
+<script>
+"use strict";
+const KEY = "tabernacle.apikey";
+const $ = (id) => document.getElementById(id);
+let ws = null, nextId = 1, waiting = new Map(), authed = false, retry = 500;
+
+// ── The key ──
+function storedKey() {
+  try { return localStorage.getItem(KEY) || sessionStorage.getItem(KEY); } catch (e) { return null; }
+}
+function storeKey(k, remember) {
+  try {
+    localStorage.removeItem(KEY); sessionStorage.removeItem(KEY);
+    (remember ? localStorage : sessionStorage).setItem(KEY, k);
+  } catch (e) { /* storage unavailable: kept for this page only */ }
+}
+function forgetKey() { try { localStorage.removeItem(KEY); sessionStorage.removeItem(KEY); } catch (e) {} }
+let pageKey = null;
+function askKey(why) {
+  $("keyerr").hidden = !why; $("keyerr").textContent = why || "";
+  $("keydlg").hidden = false; $("keyin").focus();
+}
+$("keyform").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const k = $("keyin").value.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(k)) { askKey("That isn't an API key: it's 64 hex digits."); return; }
+  pageKey = k; storeKey(k, $("keyremember").checked);
+  $("keydlg").hidden = true; auth();
+});
+
+// ── The connection ──
+function setConn(state, text) {
+  $("conn").className = "dot " + (state === "on" ? "on" : state === "off" ? "off" : "");
+  if (text) $("chaintext").textContent = text;
+}
+function connect() {
+  setConn("", "connecting…");
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { retry = 500; auth(); };
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.event === "tip") { refresh(); return; }
+    const w = waiting.get(m.id);
+    if (w) { waiting.delete(m.id); m.ok ? w.resolve(m.result) : w.reject(new Error(m.error)); }
+  };
+  ws.onclose = () => {
+    authed = false;
+    for (const w of waiting.values()) w.reject(new Error("the connection to the node closed"));
+    waiting.clear();
+    setConn("off", "node unreachable — retrying");
+    setTimeout(connect, retry); retry = Math.min(retry * 2, 10000);
+  };
+}
+function call(cmd, args) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== 1) { reject(new Error("not connected to the node")); return; }
+    const id = nextId++;
+    waiting.set(id, { resolve, reject });
+    ws.send(JSON.stringify(Object.assign({}, args || {}, { id, cmd })));   // the request's own id wins
+  });
+}
+async function auth() {
+  const k = pageKey || storedKey();
+  if (!k) { askKey(); return; }
+  try {
+    await call("auth", { key: k });
+    authed = true; pageKey = k; refresh();
+  } catch (e) {
+    if (/wrong key/.test(e.message)) { forgetKey(); pageKey = null; askKey("The node didn't accept that key."); }
+  }
+}
+
+// ── What the node knows ──
+async function refresh() {
+  if (!authed) return;
+  try {
+    const s = await call("status");
+    $("net").textContent = s.network === "dev" ? "dev network" : "main network";
+    $("net").className = "chip" + (s.network === "dev" ? " dev" : "");
+    let sync = s.fast_sync ? "fast sync" : (s.best_peer > s.height ? `catching up to ${s.best_peer}` : "in sync");
+    if (s.peers === 0) sync = "no peers";
+    setConn(s.peers ? "on" : "", `height ${s.height} · ${s.peers} peer${s.peers === 1 ? "" : "s"} · ${sync}`);
+    const note = $("walletnote");
+    if (s.wallet !== "open") {
+      note.hidden = false;
+      note.textContent = s.wallet === "restoring" ? "The wallet is being restored: it finds its coins once the node has caught up." : "There's no wallet on this node yet.";
+      return;
+    }
+    note.hidden = true;
+    const b = await call("balance");
+    $("spendable").textContent = coins(b.spendable);
+    $("immature").textContent = coins(b.immature);
+    $("pending").textContent = coins(b.pending);
+    $("locked").textContent = coins(b.locked);
+    $("heldwrap").hidden = b.held === "0.000000000";
+    $("held").textContent = coins(b.held) + (b.held_until ? ` (until ${b.held_until})` : "");
+    await Promise.all([loadSlates(), loadCoins()]);
+  } catch (e) { /* shown on the next action */ }
+}
+setInterval(refresh, 15000);
+
+// Coins as written for people: trailing zeros trimmed (at least 2 decimals).
+function coins(a) {
+  const [w, f = ""] = a.split(".");
+  let t = f.replace(/0+$/, ""); if (t.length < 2) t = (t + "00").slice(0, 2);
+  return `${Number(w).toLocaleString("en-US")}.${t}`;
+}
+const short = (h) => h.slice(0, 8) + "…" + h.slice(-4);
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+  }
+  for (const c of kids) if (c != null) e.append(c);
+  return e;
+}
+
+async function loadSlates() {
+  const list = await call("slates"), body = $("slates");
+  body.replaceChildren();
+  if (!list.length) { body.append(el("tr", {}, el("td", { colspan: 6, class: "empty" }, "No payments yet."))); return; }
+  for (const s of list.slice().reverse()) {
+    const sent = s.role === "sender";
+    let state = { sent: "waiting for the answer", received: "answered", finalized: "sent", cancelled: "cancelled" }[s.state] || s.state;
+    if (s.state === "finalized") state = s.unconfirmed ? "sent, unconfirmed" : "confirmed";
+    if (!sent && s.state === "received") state = "answered";
+    const cancel = sent && s.state === "sent"
+      ? el("button", { class: "secondary", onclick: () => cancelSlate(s.id) }, "Cancel") : null;
+    body.append(el("tr", {},
+      el("td", {}, sent ? "Paid out" : "Received"),
+      el("td", { class: "num" }, (sent ? "−" : "+") + coins(s.amount)),
+      el("td", { class: "num" }, sent ? coins(s.fee) : "–"),
+      el("td", {}, state),
+      el("td", { class: "mono", title: s.id + (s.txid && !/^0+$/.test(s.txid) ? "\ntransaction " + s.txid : "") }, short(s.id)),
+      el("td", {}, cancel)));
+  }
+}
+async function cancelSlate(id) {
+  if (!confirm("Cancel this payment? Its coins become spendable again.")) return;
+  try { await call("cancel", { slate_id: id }); refresh(); } catch (e) { alert(e.message); }
+}
+
+async function loadCoins() {
+  const list = await call("outputs"), body = $("coins");
+  body.replaceChildren();
+  const shown = list.filter((o) => o.status !== "spent");
+  if (!shown.length) { body.append(el("tr", {}, el("td", { colspan: 5, class: "empty" }, "No coins yet."))); return; }
+  for (const o of shown) {
+    body.append(el("tr", {},
+      el("td", { class: "num" }, coins(o.amount)),
+      el("td", {}, o.status),
+      el("td", { class: "num" }, String(o.confirmations)),
+      el("td", { class: "num" }, String(o.key)),
+      el("td", { class: "mono", title: o.commitment }, short(o.commitment))));
+  }
+}
+
+// ── Payments ──
+function slateResult(box, title, r, steps) {
+  const dl = el("button", { class: "primary", onclick: () => download(r.file, r.slate) }, "Download " + r.file);
+  const cp = el("button", { class: "secondary", onclick: async (ev) => {
+    try { await navigator.clipboard.writeText(r.slate); ev.target.textContent = "Copied"; }
+    catch (e) { ev.target.textContent = "Copy failed — select the text below"; }
+  } }, "Copy text");
+  const ta = el("textarea", { readonly: "" }); ta.value = r.slate;
+  box.replaceChildren(el("div", { class: "result" },
+    el("h3", { class: "ok" }, title), el("p", { class: "hint" }, steps),
+    dl, " ", cp, el("label", {}, "The file's text"), ta));
+}
+function showError(box, e) { box.replaceChildren(el("div", { class: "error" }, e.message)); }
+function download(name, text) {
+  const a = el("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain" })), download: name });
+  document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+async function slateText(fileInput, textArea) {
+  const f = fileInput.files[0];
+  if (f) return await f.text();
+  return textArea.value;
+}
+async function busy(btn, fn) {
+  btn.disabled = true;
+  try { await fn(); } finally { btn.disabled = false; }
+}
+const AMOUNT = /^\d+(\.\d{1,9})?$/;
+
+$("sendbtn").addEventListener("click", () => busy($("sendbtn"), async () => {
+  const amount = $("amount").value.trim(), fee = $("fee").value.trim() || "0.0001", box = $("sendout");
+  if (!AMOUNT.test(amount) || !AMOUNT.test(fee)) { showError(box, new Error("Amounts are coins, like 1.5 (at most 9 decimals).")); return; }
+  try {
+    const r = await call("send", { amount, fee });
+    slateResult(box, `Payment file for ${coins(amount)}`, r, "Give this file to the person you're paying. When they send their answer back, finalize it.");
+    refresh();
+  } catch (e) { showError(box, e); }
+}));
+$("recvbtn").addEventListener("click", () => busy($("recvbtn"), async () => {
+  const box = $("recvout");
+  try {
+    const text = await slateText($("recvfile"), $("recvtext"));
+    if (!text.trim()) throw new Error("Choose the payment file, or paste its text.");
+    const r = await call("receive", { slate: text });
+    slateResult(box, "Your answer", r, "Give this file back to the sender: they finalize it, and the coins arrive once it's mined.");
+    $("recvfile").value = ""; $("recvtext").value = ""; refresh();
+  } catch (e) { showError(box, e); }
+}));
+$("finbtn").addEventListener("click", () => busy($("finbtn"), async () => {
+  const box = $("finout");
+  try {
+    const text = await slateText($("finfile"), $("fintext"));
+    if (!text.trim()) throw new Error("Choose the answer file, or paste its text.");
+    const r = await call("finalize", { slate: text });
+    box.replaceChildren(el("div", { class: "result" }, el("h3", { class: "ok" }, "Signed and sent"),
+      el("p", { class: "hint" }, "The transaction is on its way to the network; it counts once it's mined."),
+      el("div", { class: "mono" }, "transaction " + r.txid)));
+    $("finfile").value = ""; $("fintext").value = ""; refresh();
+  } catch (e) { showError(box, e); }
+}));
+
+// ── Tabs ──
+for (const b of document.querySelectorAll("nav button")) {
+  b.addEventListener("click", () => {
+    for (const o of document.querySelectorAll("nav button")) o.setAttribute("aria-selected", o === b ? "true" : "false");
+    for (const s of document.querySelectorAll("main > section")) s.hidden = s.id !== "tab-" + b.dataset.tab;
+  });
+}
+
+connect();
+</script>
+</body>
+</html>

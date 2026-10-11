@@ -1,0 +1,321 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/web.fam — the wallet's web server, on its TCP port (src/tcp.fam): HTTP
+\ for the page, and the WebSocket API (RFC 6455) at /ws.
+\
+\ Only from this machine, for this machine's browser: the port is forwarded
+\ from the host's 127.0.0.1 only (scripts/node.sh); a request's Host must be
+\ 127.0.0.1 or localhost (so no other site's name, rebound to this machine,
+\ gets in); and a WebSocket's Origin, if it has one, must be http:// and
+\ that same host (so no other site's page can open one).
+\
+\ HTTP: one request a connection, answered and closed.  "/" is the web
+\ wallet (web/wallet.html, as src/page.fam), with headers that keep it to
+\ itself: its own inline code, connecting only back here, never framed by
+\ another page, never cached; anything else is 404.  A body larger than the
+\ room to queue it is fed as room frees up (each connection's pending
+\ bytes), then the close.
+\
+\ WebSocket: a client's frames (masked, as they must be) are unmasked into
+\ the connection's message buffer as they arrive -- a message needn't fit
+\ the receive buffer at once -- and fragments joined, up to 64 KiB a
+\ message.  A ping is answered, a close returned; a broken rule closes the
+\ connection (1002).  A text message is a request to the API (src/api.fam),
+\ answered in a text message; a binary one, refused.  When the best tip
+\ changes, every connection that has authenticated is told:
+\ {"event":"tip","height":N}.
+\
+\   wtick ( -- )   serve the connections
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: wmcap ( -- n )   10000 lit ;                       \ a message: 64 KiB
+
+\ Per connection (0x40): 0 pending bytes' address  4 how many  8 close when
+\ sent  C mode (0 HTTP, 1 WebSocket, 2 closing)  10 the frame's header read
+\ 14 its opcode (FIN: 0x80)  18 payload bytes left  1C its mask (4 bytes)
+\ 20 payload bytes read  24 the message's length  28 its opcode (0: none
+\ yet)  2C the control frame's length  30 the connection it's for (its iss:
+\ a new connection in the slot starts a fresh record)  34 authenticated.
+: wcv variable ;  : wc ( k -- a )  6 lit lshift wcv 200 lit lazy + ;
+: wmv variable ;  : wmsg ( k -- a )  10 lit lshift wmv 80000 lit lazy + ;
+: wkv variable ;  : wctl ( k -- a )  7 lit lshift wkv 400 lit lazy + ;   \ a control frame's payload
+: wc@ ( k off -- v )   swap wc + @ ;
+: wc! ( v k off -- )   swap wc + ! ;
+
+\ ── Text ──
+
+\ wlow ( c -- c' )   ASCII lower case.
+: wlow ( c -- c' )   dup 41 lit u< 0= over 5B lit u< and if 20 lit or then ;
+
+\ wieq ( a b n -- f )   n bytes equal, ignoring case.
+: wieq ( a b n -- f )
+	-1 lit swap ?dup if 0 lit do 2 lit pick i + c@ wlow  2 lit pick i + c@ wlow = and loop then
+	nip nip
+;
+
+\ whas ( a n s -- f )   the string s appears in the n bytes, ignoring case.
+: wcs variable ;  : wcl variable ;
+: whas ( a n s -- f )
+	dup wcs ! strlen wcl !
+	0 lit  over wcl @ u< 0= if
+		over wcl @ - 1 lit + 0 lit do  2 lit pick i + wcs @ wcl @ wieq or  loop
+	then nip nip
+;
+
+\ ── HTTP ──
+
+\ wcrlf2 ( a n -- f )   the bytes hold an empty line (the headers' end).
+: wcrlf2 ( a n -- f )
+	0 lit  over 3 lit u> if
+		over 3 lit - 0 lit do
+			2 lit pick i + be32 0D0A0D0A lit = or
+		loop
+	then nip nip
+;
+
+\ whdr ( k name -- a n | 0 0 )   a request header's value (name: lower case,
+\        ending in ':'; matched ignoring case), trimmed of spaces.
+: whn variable ;  : whl variable ;  : wha variable ;  : whe variable ;
+: whdr ( k name -- a n )
+	dup strlen whl ! whn !
+	tread over + whe !                                         ( a )
+	0 lit wha !
+	1 lit +  whe @ whl @ - over u> if                           \ a line starts after a newline
+		whe @ whl @ - over - 0 lit do
+			wha @ 0= if
+				dup i + 1 lit - c@ A lit = if dup i + whn @ whl @ wieq if dup i + wha ! then then
+			then
+		loop
+	then drop
+	wha @ if
+		wha @ whl @ +  begin dup c@ 20 lit = over whe @ u< and while 1 lit + repeat                 ( v )
+		dup begin dup whe @ u< if dup c@ D lit = over c@ A lit = or 0= else 0 lit then while 1 lit + repeat
+		over -                                                                                       ( v n )
+		begin dup if 2dup + 1 lit - c@ 20 lit = else 0 lit then while 1 lit - repeat
+	else 0 lit 0 lit then
+;
+
+\ wlocal ( a n -- f )   a Host value naming this machine: 127.0.0.1 or
+\        localhost, with or without a port.
+: wla variable ;  : wln variable ;  : wll variable ;
+: wlhost ( s l -- f )
+	wln @ over u< if 2drop 0 lit else
+		dup wll !  wla @ rot rot wieq
+		wln @ wll @ = 0= if wla @ wll @ + c@ 3A lit = and then
+	then
+;
+: wlocal ( a n -- f )   wln ! wla !  "127.0.0.1" 9 lit wlhost  "localhost" 9 lit wlhost or ;
+
+\ worigin ( k ha hn -- f )   no Origin, or http:// and the Host given.
+: woa variable ;  : won variable ;
+: worigin ( k ha hn -- f )
+	rot "origin:" whdr won ! woa !                              ( ha hn )
+	won @ 0= if 2drop -1 lit else
+		won @ over 7 lit + =  woa @ "http://" 7 lit wieq and
+		rot rot woa @ 7 lit + swap wieq and
+	then
+;
+
+\ wsend ( k s -- )   queue a string (it fits: a response's head).
+: wsend ( k s -- )   dup strlen twrite drop ;
+
+\ wbody ( k a n -- )   send n bytes from a, then close.
+: wbody ( k a n -- )   2 lit pick 4 lit wc!  over 0 lit wc!  -1 lit swap 8 lit wc! ;
+
+\ wstatus ( k s -- )   a whole response (no body), then close.
+: wstatus ( k s -- )   over swap wsend  0 lit 0 lit wbody ;
+
+\ wfeed ( k -- )   queue what's pending, as room allows; close once it's out.
+: wfeed ( k -- )
+	dup 4 lit wc@ if
+		dup dup 0 lit wc@ over 4 lit wc@ twrite                 ( k n )
+		over 0 lit wc@ over + 2 lit pick 0 lit wc!  over 4 lit wc@ swap - over 4 lit wc!
+	then
+	dup 4 lit wc@ 0=  over 8 lit wc@ and if 0 lit over 8 lit wc! tclose else drop then
+;
+
+\ ── The WebSocket handshake ──
+
+: wsabv variable ;  : wsab ( -- a )  wsabv 80 lit lazy ;
+
+\ wupgrade ( k -- )   GET /ws: checked, then 101 and the accept.
+: wwk variable ;
+: wupgrade ( k -- )
+	dup wwk !
+	dup "upgrade:" whdr "websocket" whas
+	over "sec-websocket-version:" whdr "13" whas and
+	over "sec-websocket-key:" whdr nip 18 lit = and
+	if
+		dup dup "host:" whdr worigin if
+			wwk @ "sec-websocket-key:" whdr drop wsab 18 lit ncpy
+			"258EAFA5-E914-47DA-95CA-C5AB0DC85B11" wsab 18 lit + 24 lit ncpy
+			wsab 3C lit wsab 40 lit + sha1
+			wsab 40 lit + 14 lit wsab 60 lit + b64 drop
+			dup "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " wsend
+			dup wsab 60 lit + 1C lit twrite drop  dup "\r\n\r\n" wsend
+			1 lit swap C lit wc!
+		else "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" wstatus then
+	else "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" wstatus then
+;
+
+\ wphead ( k n -- )   the page's response head, for n bytes.
+: wphead ( k n -- )
+	jout jon jto
+	"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " js  jdec
+	"\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n" js
+	"Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:* ws://localhost:*; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n" js
+	"Connection: close\r\n\r\n" js
+	jout jon @ twrite drop
+;
+
+\ wserve ( k -- )   the request's headers are in.
+: wserve ( k -- )
+	dup "host:" whdr wlocal 0= if
+		dup "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" wstatus
+	else dup tread drop "GET /ws " 8 lit mcmp 0= if dup wupgrade
+	else dup tread drop "GET / " 6 lit mcmp 0=  over tread drop "GET /index.html " 10 lit mcmp 0= or if
+		dup wpage nip wphead  dup wpage wbody
+	else
+		dup "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" wstatus
+	then then then
+	dup tread nip ttake
+;
+
+\ ── WebSocket frames ──
+
+: wfhv variable ;  : wfh ( -- a )  wfhv 10 lit lazy ;
+
+\ wframe ( k op a n -- )   a frame (FIN, unmasked) -- if there's room for it
+\        whole; if not, the client isn't reading: closed.
+: wfk variable ;  : wfn variable ;  : wfa variable ;
+: wframe ( k op a n -- )
+	wfn ! wfa !  80 lit or wfh c!  wfk !
+	wfn @ 7E lit u< if wfn @ wfh 1 lit + c!  2 lit
+	else wfn @ 10000 lit u< if 7E lit wfh 1 lit + c!  wfn @ wfh 2 lit + nb16!  4 lit
+	else 7F lit wfh 1 lit + c!  0 lit wfh 2 lit + be!  wfn @ wfh 6 lit + be!  A lit then then
+	wfk @ troom over wfn @ + u< if drop wfk @ tabort else
+		wfk @ wfh rot twrite drop  wfk @ wfa @ wfn @ twrite drop
+	then
+;
+
+\ wfail ( k -- )   a broken rule: close (1002), and read no more.
+: wfail ( k -- )
+	3EA lit wfh 8 lit + nb16!  dup 8 lit wfh 8 lit + 2 lit wframe
+	dup tclose  2 lit swap C lit wc!
+;
+
+\ wonmsg ( k -- )   a whole message (opcode at 28, length at 24).
+: wonmsg ( k -- )
+	dup 28 lit wc@ 1 lit = if
+		dup wmsg over 24 lit wc@  2 lit pick 34 lit wc@ apirun  over 34 lit wc!
+		dup 1 lit jout jon @ wframe
+	else dup 1 lit "{\"id\":null,\"ok\":false,\"error\":\"requests are text messages\"}" dup strlen wframe then
+	drop
+;
+
+\ wevents ( -- )   the best tip moved: tell every authenticated connection.
+: wtiph variable ;
+: wevents ( -- )
+	dbtip ?dup if 20 lit + @ else 0 lit then
+	dup wtiph @ = if drop else
+		dup wtiph !
+		jout jon jto  "{\"event\":\"tip\",\"height\":" js jdec 7D lit jc
+		tcmax 0 lit do
+			i tstate 2 lit =  i C lit wc@ 1 lit = and  i 34 lit wc@ and if i 1 lit jout jon @ wframe then
+		loop
+	then
+;
+
+\ wcontrol ( k -- )   a whole control frame.
+: wcontrol ( k -- )
+	dup 14 lit wc@ F lit and
+	dup 8 lit = if drop dup 8 lit 2 lit pick wctl 3 lit pick 2C lit wc@ wframe  dup tclose  2 lit swap C lit wc! else
+	9 lit = if dup A lit 2 lit pick wctl 3 lit pick 2C lit wc@ wframe then drop then        \ a ping: pong
+;
+
+\ wfhead ( k a n -- k f )   a frame's header, if all in: read, checked; whether
+\        it was.
+: wfb0 variable ;  : wfl variable ;  : wfhl variable ;
+: wfhead ( k a n -- k f )
+	dup 2 lit u< if 2drop 0 lit else
+		over c@ wfb0 !  over 1 lit + c@                                     ( k a n b1 )
+		dup 7F lit and wfl !
+		80 lit and 0= if 2drop dup wfail 0 lit else                         \ a client's frames are masked
+			6 lit  wfl @ 7E lit = if 2 lit + then  wfl @ 7F lit = if 8 lit + then  wfhl !
+			wfhl @ u< if drop 0 lit else                                     ( k a )
+				wfl @ 7E lit = if dup 2 lit + nb16@ wfl ! then
+				wfl @ 7F lit = if dup 2 lit + be32 if FFFFFFFF lit else dup 6 lit + be32 then wfl ! then
+				wfhl @ + 4 lit - over wc 1C lit + 4 lit ncpy                   ( k )
+				wfb0 @ F lit and                                                 ( k op )
+				dup 7 lit u> if
+					wfl @ 7E lit u<  wfb0 @ 80 lit and and                       \ control: short, whole
+				else
+					dup 0= if over 28 lit wc@ 0= 0= else over 28 lit wc@ 0= over 3 lit u< and over 0= 0= and then
+					over 24 lit wc@ wfl @ + wmcap u> 0= and
+				then                                                              ( k op ok )
+				if
+					drop  wfb0 @ over 14 lit wc!
+					dup wfhl @ ttake
+					-1 lit over 10 lit wc!  wfl @ over 18 lit wc!  0 lit over 20 lit wc!
+					dup 14 lit wc@ F lit and dup 7 lit u> if drop 0 lit over 2C lit wc! else
+						?dup if over 28 lit wc! then then
+					-1 lit
+				else drop dup wfail 0 lit then
+			then
+		then
+	then
+;
+
+\ wfbody ( k a n -- k f )   payload bytes in hand: unmasked into the message
+\        (or the control frame); the frame done, it's acted on.  Whether
+\        anything was.
+: wfd variable ;  : wfm variable ;
+: wfbody ( k a n -- k f )
+	2 lit pick 18 lit wc@ tmin  wfm !                                         ( k a )
+	over 14 lit wc@ F lit and 7 lit u> if
+		over wctl 2 lit pick 2C lit wc@ +
+	else over wmsg 2 lit pick 24 lit wc@ + then wfd !
+	wfm @ ?dup if 0 lit do
+		dup i + c@  2 lit pick wc 1C lit + 3 lit pick 20 lit wc@ i + 3 lit and + c@ xor  wfd @ i + c!
+	loop then drop                                                           ( k )
+	dup wfm @ ttake
+	dup 18 lit wc@ wfm @ - over 18 lit wc!  dup 20 lit wc@ wfm @ + over 20 lit wc!
+	dup 14 lit wc@ F lit and 7 lit u> if dup 2C lit wc@ wfm @ + over 2C lit wc! else
+		dup 24 lit wc@ wfm @ + over 24 lit wc! then
+	dup 18 lit wc@ 0= if                                                     \ the frame's done
+		0 lit over 10 lit wc!
+		dup 14 lit wc@ F lit and 7 lit u> if dup wcontrol else
+			dup 14 lit wc@ 80 lit and if dup wonmsg  0 lit over 24 lit wc!  0 lit over 28 lit wc! then
+		then
+		-1 lit
+	else wfm @ 0= 0= then
+;
+
+\ wsread ( k -- )   the frames in hand.
+: wsread ( k -- )
+	begin
+		dup C lit wc@ 1 lit = if
+			dup tread  2 lit pick 10 lit wc@ if wfbody else wfhead then
+		else 0 lit then
+	0= until drop
+;
+
+\ ── Serving ──
+
+: wtick ( -- )
+	wevents
+	tcmax 0 lit do
+		i tstate if i 3C lit tf@ i 30 lit wc@ = 0= if              \ a new connection here: start afresh
+			i wc 40 lit nzero  i 3C lit tf@ i 30 lit wc!
+		then then
+		i tstate 2 lit = if
+			i C lit wc@ 1 lit = if i wsread  i teof? if i tclose then else
+			i C lit wc@ 2 lit = if i i tread nip ttake else
+			i 8 lit wc@ if i wfeed else
+				i tread wcrlf2 if i wserve i wfeed else
+				i teof? if i tclose else
+				i trwin 0= if i "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" wstatus then
+				then then
+			then then then
+		then
+	loop
+;

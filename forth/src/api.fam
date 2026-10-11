@@ -1,0 +1,500 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/api.fam — the wallet's API: JSON messages, over the WebSocket at /ws
+\ (src/web.fam hands each text message to apirun and sends its answer).
+\ The web wallet's, and any other client's.
+\
+\ A request: {"id":<number or string>,"cmd":"<command>", arguments...}.  Its
+\ answer: {"id":..,"ok":true,"result":...} or {"id":..,"ok":false,
+\ "error":"why"}.  Amounts are decimal strings of coins ("1.5"; at most 9
+\ decimals), exact -- never floating point.  Slates are their files' text:
+\ the armor ../rust/src/slate.rs writes and reads (a summary, then the slate
+\ in hex), so a slate goes between this wallet and the Rust node's (or
+\ tools/wallet's) as the very same file.
+\
+\ First, {"cmd":"auth","key":"<the API key, 64 hex digits>"}: nothing else
+\ is answered on a connection until it has.  Then:
+\   status                  height, best_peer (-1: none), fast_sync (its
+\                           phase; 0: none), peers, network, wallet ("none",
+\                           "open", "restoring"), passphrase, next_key
+\   balance                 spendable, immature, pending, locked, held,
+\                           held_until, height
+\   outputs                 [ {commitment, key, amount, status, origin,
+\                           confirmations, held_until} ]  (status: pending,
+\                           spendable, immature, locked, spending, spent,
+\                           held)
+\   send amount [fee]       {id, file, slate}: S1, for the receiver
+\   receive slate           {id, file, slate}: S2, for the sender
+\   finalize slate          {id, txid}: the transaction, relayed
+\   cancel slate_id         {}  (not "id": that's the request's)
+\   slates                  [ {id, role, state, unconfirmed, amount, fee,
+\                           txid} ]
+\
+\   apirun ( a n auth -- auth' )   a request: its answer at jout (jon
+\                                  bytes); auth: whether the connection has
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ ── Writing text into a buffer ──
+
+: jov variable ;  : jout ( -- a )  jov 40000 lit lazy ;   \ the answer
+: jon variable ;
+: jtv variable ;  : jtxt ( -- a )  jtv 10000 lit lazy ;   \ a slate's text
+: jtn variable ;
+: jdst variable ;  : jdn variable ;                       \ where text goes; its length's cell
+
+\ jto ( a cell -- )   write to a, counting in cell (from 0).
+: jto ( a cell -- )   dup jdn ! 0 lit swap ! jdst ! ;
+: jc ( c -- )   jdst @ jdn @ @ + c!  jdn @ @ 1 lit + jdn @ ! ;
+: jw ( a n -- )   ?dup if 0 lit do dup i + c@ jc loop then drop ;
+: js ( s -- )   dup strlen jw ;
+
+\ jdec ( n -- )   unsigned decimal.
+: jdec ( n -- )   dup A lit u< if 30 lit + jc else dup A lit / jdec A lit % 30 lit + jc then ;
+: jsdec ( n -- )   dup 0< if 2D lit jc 0 lit swap - then jdec ;
+
+\ jnib ( n -- )   jhex ( a n -- )   lower-case hex.
+: jnib ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then jc ;
+: jhex ( a n -- )   ?dup if 0 lit do dup i + c@ dup 4 lit rshift jnib jnib loop then drop ;
+
+\ ── Amounts (64 bits: lo hi) ──
+
+: jab variable ;  : jabuf ( -- a )  jab 40 lit lazy ;
+: jdgv variable ;  : jdgt ( -- a )  jdgv 20 lit lazy ;
+
+\ jamt ( lo hi -- )   coins: whole "." 9 decimals (../rust/src/output.rs's
+\        format_amount).
+: jamt ( lo hi -- )
+	jabuf 10 lit nzero  jabuf 4 lit + ! jabuf !
+	jabuf 8 lit 3B9ACA00 lit ndivw                              ( fraction )
+	0 lit begin                                                ( fraction k )
+		jabuf 8 lit A lit ndivw 30 lit + over jdgt + c!  1 lit +
+		jabuf @ jabuf 4 lit + @ or 0=
+	until
+	begin dup while 1 lit - dup jdgt + c@ jc repeat drop        \ the whole coins, from the top
+	2E lit jc
+	9 lit 0 lit do dup A lit % 30 lit + 8 lit i - jdgt + c!  A lit / loop drop
+	jdgt 9 lit jw
+;
+
+\ j10+ ( lo hi d -- lo hi ok )   x * 10 + d, if it fits 64 bits (x * 10 does
+\        while x's high word is at most 0x19999999; adding d may carry out).
+: jxl variable ;  : jxh variable ;
+: j10+ ( lo hi d -- lo hi ok )
+	rot rot jxh ! jxl !
+	jxh @ 19999999 lit u> if drop jxl @ jxh @ 0 lit else
+		jxl @ 3 lit lshift  jxh @ 3 lit lshift jxl @ 1D lit rshift or      ( x*8 )
+		jxl @ 1 lit lshift  jxh @ 1 lit lshift jxl @ 1F lit rshift or      ( x*8 x*2 )
+		wlq+  jxh !                                                        ( d lo10 )
+		tuck + tuck u>                                                     ( lo carry )
+		if jxh @ dup FFFFFFFF lit = if 0 lit else 1 lit + -1 lit then else jxh @ -1 lit then
+	then
+;
+
+\ jpamt ( a n -- lo hi ok )   coins, as ../rust/src/output.rs's parse_amount
+\        reads them: digits, then if a ".", 1 to 9 digits; within 64 bits.
+: jpa variable ;  : jpn variable ;  : jpw variable ;  : jpf variable ;  : jpok variable ;
+: jdig? ( c -- f )   dup 30 lit u< 0= swap 3A lit u< and ;
+: jpamt ( a n -- lo hi ok )
+	jpn ! jpa !  -1 lit jpok !  jpn @ jpw !  0 lit jpf !
+	jpn @ ?dup if 0 lit do jpa @ i + c@ 2E lit = jpw @ jpn @ = and if i jpw ! then loop then
+	jpw @ jpn @ = 0= if jpn @ jpw @ - 1 lit - jpf !  jpf @ 0=  jpf @ 9 lit u> or if 0 lit jpok ! then then
+	jpw @ 0= if 0 lit jpok ! then
+	0 lit 0 lit
+	jpw @ ?dup if 0 lit do
+		jpa @ i + c@ dup jdig? 0= if 0 lit jpok ! then  F lit and j10+ jpok @ and jpok !
+	loop then
+	9 lit 0 lit do
+		i jpf @ u< if jpa @ jpw @ + 1 lit + i + c@ dup jdig? 0= if 0 lit jpok ! then F lit and else 0 lit then
+		j10+ jpok @ and jpok !
+	loop
+	jpok @
+;
+
+\ ── Hex ──
+
+\ junhex ( a n out -- ok )   n hex digits (either case) as n/2 bytes.
+: jhv ( c -- v | -1 )
+	dup jdig? if 30 lit - else
+	dup 20 lit or dup 61 lit u< 0= swap 67 lit u< and if 20 lit or 57 lit - else drop -1 lit then then
+;
+: junhex ( a n out -- ok )
+	over 1 lit and if drop 2drop 0 lit else
+		-1 lit  2 lit pick 1 lit rshift ?dup if 0 lit do                ( a n out ok )
+			3 lit pick i 1 lit lshift + dup c@ jhv swap 1 lit + c@ jhv    ( hi lo )
+			2dup or 0< if 2drop drop 0 lit else swap 4 lit lshift or 2 lit pick i + c! then
+		loop then
+		nip nip nip
+	then
+;
+
+\ ── Slates' text (../rust/src/slate.rs: to_armored, from_armored) ──
+\ A slate: 0 "TSLT"  4 version  6 stage (1 send, 2 receive)  7 id (16)
+\ 17 amount (8)  1F fee (8) ... (src/slate.fam).
+
+: jbeg ( -- s )   "-----BEGIN TABERNACLE SLATE-----" ;
+: jend ( -- s )   "-----END TABERNACLE SLATE-----" ;
+: jle64 ( a -- lo hi )   dup tple32 swap 4 lit + tple32 ;
+
+\ jsum ( slate -- )   its summary: stage, id, amount, fee (no last newline).
+: jsum ( slate -- )
+	"stage: " js  dup 6 lit + c@ 1 lit = if "send" else "receive" then js
+	"\nid: " js  dup 7 lit + 10 lit jhex
+	"\namount: " js  dup 17 lit + jle64 jamt
+	"\nfee: " js  1F lit + jle64 jamt
+;
+
+\ jarmor ( a n -- )   the slate's text, at jtxt (jtn bytes).
+: jarmor ( a n -- )
+	jtxt jtn jto
+	jbeg js  A lit jc  over jsum  A lit jc A lit jc
+	begin dup while                                             ( a n )
+		over over 20 lit tmin jhex  A lit jc
+		dup 20 lit tmin  swap over -  rot rot + swap
+	repeat 2drop
+	jend js  A lit jc
+;
+
+\ jws? ( c -- f )   white space (as Rust's trim and split_whitespace).
+: jws? ( c -- f )   dup 20 lit = over 9 lit = or over A lit = or over D lit = or swap C lit = or ;
+
+\ jdearm ( a n -- ok )   a slate's text: the slate at jsl (jsln bytes) --
+\        armored, hex, and its summary matching it, as from_armored asks.
+: jslv variable ;  : jsl ( -- a )  jslv 8000 lit lazy ;  : jsln variable ;
+: jea variable ;  : jee variable ;  : jsa variable ;  : jse variable ;  : jhn variable ;
+: jtrim ( -- )   \ jea .. jee, trimmed
+	begin jea @ jee @ u< if jea @ c@ jws? else 0 lit then while jea @ 1 lit + jea ! repeat
+	begin jee @ jea @ u> if jee @ 1 lit - c@ jws? else 0 lit then while jee @ 1 lit - jee ! repeat
+;
+: jdearm ( a n -- ok )
+	over + jee ! jea !  jtrim
+	jee @ jea @ - 3E lit u< if 0 lit else
+	jea @ jbeg 20 lit mcmp 0=  jee @ 1E lit - jend 1E lit mcmp 0= and 0= if 0 lit else
+		jea @ 20 lit + jea !  jee @ 1E lit - jee !  jtrim
+		0 lit jsa !                                                    \ the blank line
+		jee @ jea @ - 1 lit u> if jee @ jea @ - 1 lit - 0 lit do
+			jsa @ 0= if jea @ i + c@ A lit =  jea @ i + 1 lit + c@ A lit = and if jea @ i + jsa ! then then
+		loop then
+		jsa @ 0= if 0 lit else
+			\ the hex, white space dropped
+			0 lit jhn !  -1 lit
+			jee @ jsa @ 2 lit + - ?dup if 0 lit do
+				jsa @ 2 lit + i + c@ dup jws? if drop else
+					jhn @ 10000 lit u< if jhn @ jtxt + c! jhn @ 1 lit + jhn ! else drop 0 lit and then
+				then
+			loop then
+			jhn @ 1 lit rshift jsln !
+			jtxt jhn @ jsl junhex and  jsln @ 27 lit u< 0= and
+			dup if
+				\ the summary, trimmed, as the slate's own
+				jsa @ jse !  jea @  jsa @ jee ! jtrim  jea @ jsa !  jee @ jse !  drop
+				jout jon jto  jsl jsum
+				jse @ jsa @ - jon @ = and  dup if jsa @ jout jon @ mcmp 0= and then
+			then
+		then
+	then then
+;
+
+\ ── Reading JSON ──
+\ Flat objects only: each wanted key found (as "key", then ':'), its value a
+\ string (unescaped into a scratch area: \" \\ \/ \b \f \n \r \t, \u up to
+\ 0x7F) or anything else as it stands (a number, true ...).
+
+: jin variable ;  : jinn variable ;
+: jscv variable ;  : jscr ( -- a )  jscv 20000 lit lazy ;  : jscn variable ;
+: jka variable ;  : jkl variable ;  : jp variable ;  : jq variable ;
+
+\ jget ( key -- a n kind )   kind: 0 absent, 1 a string, 2 anything else.
+: jget ( key -- a n kind )
+	dup strlen jkl ! jka !  0 lit jp !
+	jinn @ jkl @ 2 lit + u< 0= if
+		jinn @ jkl @ - 1 lit - 0 lit do
+			jp @ 0= if
+				jin @ i + c@ 22 lit =  jin @ i + 1 lit + jka @ jkl @ mcmp 0= and  jin @ i + jkl @ + 1 lit + c@ 22 lit = and
+				i 0= if -1 lit else jin @ i + 1 lit - c@ 5C lit = 0= then and
+				if jin @ i + jkl @ + 2 lit + jp ! then
+			then
+		loop
+	then
+	jin @ jinn @ + jq !
+	jp @ if
+		begin jp @ jq @ u< if jp @ c@ jws? else 0 lit then while jp @ 1 lit + jp ! repeat
+		jp @ jq @ u< if jp @ c@ 3A lit = else 0 lit then if
+			jp @ 1 lit + jp !
+			begin jp @ jq @ u< if jp @ c@ jws? else 0 lit then while jp @ 1 lit + jp ! repeat
+			jp @ jq @ u< if jp @ c@ 22 lit = else 0 lit then if
+				jscr jscn @ +  0 lit                                         ( out n )
+				jp @ 1 lit + jp !
+				begin jp @ jq @ u< if jp @ c@ 22 lit = 0= else 0 lit then while
+					jp @ c@ dup 5C lit = if drop jp @ 1 lit + jp !
+						jp @ c@
+						dup 6E lit = if drop A lit else dup 72 lit = if drop D lit else
+						dup 74 lit = if drop 9 lit else dup 62 lit = if drop 8 lit else
+						dup 66 lit = if drop C lit else dup 75 lit = if drop
+							jp @ 1 lit + 4 lit jabuf junhex if jabuf c@ 0= jabuf 1 lit + c@ 80 lit u< and if jabuf 1 lit + c@ else 0 lit then else 0 lit then
+							jp @ 4 lit + jp !
+						then then then then then then
+					then
+					2 lit pick 2 lit pick + c!  1 lit +  jp @ 1 lit + jp !
+				repeat
+				jp @ jq @ u< if
+					dup jscn @ + jscn !  1 lit
+				else 2drop 0 lit 0 lit 0 lit then
+			else
+				jp @  begin jp @ jq @ u< if jp @ c@ dup 2C lit = over 7D lit = or swap jws? or 0= else 0 lit then while jp @ 1 lit + jp ! repeat
+				jp @ over -  dup if 2 lit else 2drop 0 lit 0 lit 0 lit then
+			then
+		else 0 lit 0 lit 0 lit then
+	else 0 lit 0 lit 0 lit then
+;
+
+\ jis ( a n s -- f )   the bytes are the string s.
+: jis ( a n s -- f )   2dup strlen = if over if swap mcmp 0= else 2drop drop -1 lit then else 2drop drop 0 lit then ;
+
+\ ── Answers ──
+
+\ jstr ( a n -- )   a JSON string: quoted, escaped.
+: jstr ( a n -- )
+	22 lit jc
+	?dup if 0 lit do
+		dup i + c@
+		dup 22 lit = over 5C lit = or if 5C lit jc jc else
+		dup A lit = if drop 5C lit jc 6E lit jc else
+		dup D lit = if drop 5C lit jc 72 lit jc else
+		dup 9 lit = if drop 5C lit jc 74 lit jc else
+		dup 20 lit u< if "\\u00" js dup 4 lit rshift jnib jnib else jc then then then then then
+	loop then drop
+	22 lit jc
+;
+
+
+: jidv variable ;  : jidb ( -- a )  jidv 40 lit lazy ;  : jidn variable ;  : jidk variable ;
+
+\ jhead ( ok -- )   start the answer: {"id":..,"ok":..
+: jhead ( ok -- )
+	jout jon jto
+	"{\"id\":" js
+	jidk @ 1 lit = if jidb jidn @ jstr else jidk @ 2 lit = if jidb jidn @ jw else "null" js then then
+	if ",\"ok\":true,\"result\":" else ",\"ok\":false,\"error\":" then js
+;
+\ jerr ( s -- )   the answer: an error.
+: jdone ( -- )   7D lit jc ;
+\ jerr ( s -- )   the answer: an error, why.
+: jerr ( s -- )   0 lit jhead dup strlen jstr jdone ;
+
+\ jkey ( s -- )   "s":   ( preceded by a comma unless first: jfirst )
+: jfst variable ;
+: jkey ( s -- )   jfst @ if 0 lit jfst ! else 2C lit jc then  22 lit jc js 22 lit jc 3A lit jc ;
+: jobj ( -- )   7B lit jc -1 lit jfst ! ;
+: jqamt ( lo hi -- )   22 lit jc jamt 22 lit jc ;
+: jqhex ( a n -- )   22 lit jc jhex 22 lit jc ;
+
+\ ── The wallet's figures ──
+\ Each fills wares (warn bytes, numbers big-endian) for a command below:
+\ wastatus, wabal (the totals by status), waouts (each output, 0x38
+\ bytes), waslist (each slate, 0x44 bytes); counts first.
+
+: warv variable ;  : wares ( -- a )  warv 40000 lit lazy ;   \ the last result
+: warn variable ;
+
+: war@ ( k -- a )   wares + ;
+
+: wastatus ( -- )
+	wares 10 lit nzero
+	dbtip ?dup if 20 lit + @ else 0 lit then wares be!
+	0 lit pbest dup 0< if drop -1 lit else pp 28 lit + @ then wares 4 lit + be!
+	pfsv @ wares 8 lit + c!
+	0 lit ppn 0 lit do i pp 8 lit + @ 2 lit = if 1 lit + then loop wares 9 lit + c!
+	wl? if wlflags else 0 lit then wares A lit + c!  bnet @ wares B lit + c!
+	wl? if pgop wlm 8 lit + @ else 0 lit then wares C lit + be!
+	10 lit warn !
+;
+
+\ wasum ( lo hi k -- )   add to total k (cells at wares + 8k: lo, hi).
+: wasa variable ;
+: wasum ( lo hi k -- )
+	3 lit lshift wares + wasa !  wasa @ @ wasa @ 4 lit + @ wlq+ wasa @ 4 lit + ! wasa @ !
+;
+
+: wahu variable ;
+: wabal ( -- )
+	wares 30 lit nzero  0 lit wahu !
+	wlkey 20 lit nzero
+	begin wleach while
+		wlkey 20 lit + wlrec@ wlstat drop                  ( status )
+		wlrec@ 4 lit + @ wlrec@ 8 lit + @ rot              ( lo hi status )
+		dup 1 lit = if drop 0 lit wasum else
+		dup 2 lit = if drop 1 lit wasum else
+		dup 0 lit = if drop 2 lit wasum else
+		dup 3 lit = over 4 lit = or if drop 3 lit wasum else
+		dup 6 lit = if drop 4 lit wasum  wlrec@ 14 lit + @ wahu @ u> if wlrec@ 14 lit + @ wahu ! then else
+		drop 2drop then then then then then
+	repeat
+	\ the totals were summed little-endian at 8k: rewrite them big-endian
+	5 lit 0 lit do i 3 lit lshift wares + dup @ swap 4 lit + @  i 3 lit lshift wares + qbe! loop
+	wahu @ wares 28 lit + be!  wltip wares 2C lit + be!
+	30 lit warn !
+;
+
+: waouts ( -- )
+	wlkey 20 lit nzero  4 lit warn !
+	begin wleach warn @ 38 lit + 40000 lit u> 0= and while
+		warn @ war@ dup 38 lit nzero                       ( r )
+		wlkey 20 lit + over 20 lit ncpy
+		wlrec@ @ over 20 lit + be!
+		wlrec@ 4 lit + @ wlrec@ 8 lit + @ 2 lit pick 24 lit + qbe!
+		wlrec@ C lit + @ over 2D lit + c!
+		wlrec@ 14 lit + @ over 34 lit + be!
+		wlkey 20 lit + wlrec@ wlstat  2 lit pick 30 lit + be!  over 2C lit + c!
+		drop  warn @ 38 lit + warn !
+	repeat
+	warn @ 4 lit - 38 lit / wares be!
+;
+
+: waslist ( -- )
+	trk 20 lit nzero  4 lit warn !
+	begin treach warn @ 44 lit + 40000 lit u> 0= and while
+		warn @ war@ dup 44 lit nzero                       ( r )
+		trk 10 lit + over 10 lit ncpy
+		wsr @ over 10 lit + c!  wsr 4 lit + @ over 11 lit + c!  trpend? 1 lit and over 12 lit + c!
+		wsr 18 lit + @ wsr 1C lit + @ 2 lit pick 14 lit + qbe!
+		wsr 20 lit + @ wsr 24 lit + @ 2 lit pick 1C lit + qbe!
+		wsr 28 lit + over 24 lit + 20 lit ncpy
+		drop  warn @ 44 lit + warn !
+	repeat
+	warn @ 4 lit - 44 lit / wares be!
+;
+
+\ ── Commands ──
+
+: wstat$ ( k -- s )
+	dup 0 lit = if drop "pending" else dup 1 lit = if drop "spendable" else dup 2 lit = if drop "immature" else
+	dup 3 lit = if drop "locked" else dup 4 lit = if drop "spending" else dup 5 lit = if drop "spent" else
+	6 lit = if "held" else "unknown" then then then then then then then
+;
+
+: jstatus ( -- )
+	wastatus  -1 lit jhead jobj
+	"height" jkey wares be32 jdec
+	"best_peer" jkey wares 4 lit + be32 jsdec
+	"fast_sync" jkey wares 8 lit + c@ jdec
+	"peers" jkey wares 9 lit + c@ jdec
+	"network" jkey bnet @ if "\"dev\"" else "\"main\"" then js
+	"wallet" jkey wl? 0= if "\"none\"" else wlflags 2 lit and if "\"restoring\"" else "\"open\"" then then js
+	"passphrase" jkey wl? if wlflags 1 lit and else 0 lit then if "true" else "false" then js
+	"next_key" jkey wares C lit + be32 jdec
+	jdone jdone
+;
+
+: jbalance ( -- )
+	wabal  -1 lit jhead jobj
+	"spendable" jkey wares qbe@ jqamt  "immature" jkey wares 8 lit + qbe@ jqamt
+	"pending" jkey wares 10 lit + qbe@ jqamt  "locked" jkey wares 18 lit + qbe@ jqamt
+	"held" jkey wares 20 lit + qbe@ jqamt
+	"held_until" jkey wares 28 lit + be32 jdec  "height" jkey wares 2C lit + be32 jdec
+	jdone jdone
+;
+
+: joutputs ( -- )
+	waouts  -1 lit jhead  5B lit jc
+	wares be32 ?dup if 0 lit do
+		i if 2C lit jc then
+		wares 4 lit + i 38 lit * +  jobj
+		"commitment" jkey dup 20 lit jqhex  "key" jkey dup 20 lit + be32 jdec
+		"amount" jkey dup 24 lit + qbe@ jqamt  "status" jkey 22 lit jc dup 2C lit + c@ wstat$ js 22 lit jc
+		"origin" jkey dup 2D lit + c@ jdec  "confirmations" jkey dup 30 lit + be32 jdec
+		"held_until" jkey 34 lit + be32 jdec  7D lit jc
+	loop then
+	5D lit jc jdone
+;
+
+: jslates ( -- )
+	waslist  -1 lit jhead  5B lit jc
+	wares be32 ?dup if 0 lit do
+		i if 2C lit jc then
+		wares 4 lit + i 44 lit * +  jobj
+		"id" jkey dup 10 lit jqhex
+		"role" jkey dup 10 lit + c@ if "\"receiver\"" else "\"sender\"" then js
+		"state" jkey dup 11 lit + c@
+			dup 0= if drop "\"sent\"" else dup 1 lit = if drop "\"received\"" else 2 lit = if "\"finalized\"" else "\"cancelled\"" then then then js
+		"unconfirmed" jkey dup 12 lit + c@ if "true" else "false" then js
+		"amount" jkey dup 14 lit + qbe@ jqamt  "fee" jkey dup 1C lit + qbe@ jqamt
+		"txid" jkey 24 lit + 20 lit jqhex  7D lit jc
+	loop then
+	5D lit jc jdone
+;
+
+\ jslate ( -- )   the answer for a slate made (wsb, wsn): {id, file, slate}.
+: jslate ( -- )
+	wsb wsn @ jarmor
+	-1 lit jhead jobj
+	"id" jkey wsb 7 lit + 10 lit jqhex
+	"file" jkey 22 lit jc wsb 7 lit + 10 lit jhex wsb 6 lit + c@ 1 lit = if ".s1.slate" else ".s2.slate" then js 22 lit jc
+	"slate" jkey jtxt jtn @ jstr
+	jdone jdone
+;
+
+\ jwhy ( -- )   a slate refused: why (wserr).
+: jwhy ( -- )   wserr @ ?dup 0= if "refused" then jerr ;
+
+: jsal variable ;  : jsah variable ;  : jsfl variable ;  : jsfh variable ;  : jsok variable ;
+: jsend ( -- )
+	"amount" jget if jpamt else 2drop 0 lit 0 lit 0 lit then  jsok ! jsah ! jsal !
+	"fee" jget if jpamt jsok @ and jsok ! jsfh ! jsfl !
+	else 2drop 186A0 lit jsfl ! 0 lit jsfh ! then                             \ 0.0001 by default
+	jsok @ if jsal @ jsah @ jsfl @ jsfh @ wssend if jslate else jwhy then
+	else "amount and fee: coins, as decimal strings (\"1.5\")" jerr then
+;
+
+: jreceive ( -- )
+	"slate" jget 1 lit = if jdearm if jsl jsln @ wsrecv if jslate else jwhy then
+		else "that isn't a slate's text" jerr then
+	else 2drop "slate: the S1 slate's text" jerr then
+;
+
+: jfinal ( -- )
+	"slate" jget 1 lit = if jdearm if jsl jsln @ wsfin if
+			trsoon
+			-1 lit jhead jobj "id" jkey jsl 7 lit + 10 lit jqhex  "txid" jkey wtid 20 lit jqhex jdone jdone
+		else jwhy then
+		else "that isn't a slate's text" jerr then
+	else 2drop "slate: the S2 slate's text" jerr then
+;
+
+: jcancel ( -- )
+	"slate_id" jget 1 lit = over 20 lit = and if jabuf junhex if jabuf wscancel if -1 lit jhead "{}" js jdone else jwhy then
+		else "slate_id: a slate's id, 32 hex digits" jerr then
+	else 2drop "slate_id: a slate's id, 32 hex digits" jerr then
+;
+
+\ jauth ( -- ok )   {"cmd":"auth","key":..}: the API key, compared in full.
+: jauth ( -- ok )
+	"key" jget 1 lit = over 40 lit = and wl? and if
+		jabuf 10 lit + junhex if
+			0 lit  20 lit 0 lit do jabuf 10 lit + i + c@ pgop wlm 50 lit + i + c@ xor or loop  0=
+		else 0 lit then
+	else 2drop 0 lit then
+;
+
+\ apirun ( a n auth -- auth' )
+: jau variable ;
+: apirun ( a n auth -- auth' )
+	jau ! jinn ! jin !  0 lit jscn !
+	"id" jget dup jidk ! if dup 40 lit u> if 2drop 0 lit jidk ! else dup jidn ! jidb swap tcpy then else 2drop then
+	"cmd" jget 1 lit = if
+		2dup "auth" jis if 2drop
+			jauth if -1 lit jau !  -1 lit jhead "{}" js jdone else 0 lit jau !  "wrong key" jerr then
+		else jau @ 0= if 2drop "authenticate first: {\"cmd\":\"auth\",\"key\":\"...\"}" jerr else
+		2dup "status" jis if 2drop jstatus else
+		wl? 0= if 2drop "no wallet" jerr else
+		wlflags 2 lit and if 2drop "the wallet is being restored (once the node has caught up)" jerr else
+		2dup "balance" jis if 2drop jbalance else
+		2dup "outputs" jis if 2drop joutputs else
+		2dup "send" jis if 2drop jsend else
+		2dup "receive" jis if 2drop jreceive else
+		2dup "finalize" jis if 2drop jfinal else
+		2dup "cancel" jis if 2drop jcancel else
+		2dup "slates" jis if 2drop jslates else
+		2drop "unknown command" jerr
+		then then then then then then then then then then then then
+	else 2drop "not a request: {\"id\":..,\"cmd\":\"...\"}" jerr then
+	jau @
+;

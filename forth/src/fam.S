@@ -271,6 +271,7 @@ _start:
     #   +16 output address of the last island (where the spacing counts from)
     #   +20 the return entry the current segment's `;` jumps to
     #   +24 where the input starts (for __panic's report)
+    #   +28 the cstack pointer when the current ':' definition began
     addi    t2, t1, 32                  # first entry slot
     sw      t2, 0(t1)                   # init call-site cursor = base + 32
     sw      zero, 4(t1)
@@ -413,6 +414,14 @@ compile:
     j       .Lc_next
 .Lc_semi_word:
     beqz    ra, .Lc_unmatched           # not inside a ':' definition -> unmatched
+    # The body must leave the cstack as it found it: an `if` without its `then`
+    # (or a `begin` without its end) would leave its placeholder there, for
+    # some later `then` -- or the test harness's chain -- to patch: a jump into
+    # the wrong code, silently.
+    li      t0, 0x100000
+    add     t0, s7, t0
+    lw      t0, 28(t0)
+    bne     tp, t0, __panic             # unbalanced control flow in the definition
     # finish the word: emit its return, then backpatch the skip-jump
     li      t0, 0x100000
     add     t0, s7, t0
@@ -482,6 +491,9 @@ compile:
     sw      t0, 0(gp)
     mv      ra, gp                      # ra = skip-jump address (backpatched at ';')
     addi    gp, gp, 4
+    li      t0, 0x100000
+    add     t0, s7, t0
+    sw      tp, 28(t0)                  # the cstack as the body starts (checked at ';')
     mv      a2, t2                      # name start
     mv      a3, s1                      # name end
     li      a4, 1                       # kind = WORD

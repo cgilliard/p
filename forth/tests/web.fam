@@ -1,0 +1,64 @@
+\ tests/web.fam — the web server's pieces: SHA-1 and base64 (src/ws.fam).
+
+: tw1v variable ;  : tw1o ( -- a )  tw1v 400 lit lazy ;
+
+\ tb64 ( s expect -- f )   base64 of the string s is the string expect.
+: tb64 ( s expect -- f )   swap dup strlen tw1o b64  over strlen = swap tw1o over strlen mcmp 0= and ;
+
+\ An S1 slate's head (no inputs or outputs): id 00..0F, 1.5 coins, fee 0.0001.
+: tw1sl ( -- a n )   "54534C54020001000102030405060708090A0B0C0D0E0F002F685900000000A08601000000000000000000" tw1o 80 lit + 2B lit twput  tw1o 80 lit + 2B lit ;
+: tw1arm ( -- s )   "-----BEGIN TABERNACLE SLATE-----\nstage: send\nid: 000102030405060708090a0b0c0d0e0f\namount: 1.500000000\nfee: 0.000100000\n\n54534c54020001000102030405060708090a0b0c0d0e0f002f685900000000a0\n8601000000000000000000\n-----END TABERNACLE SLATE-----\n" ;
+
+Test {
+	sha1_vectors {
+		"abc" 3 lit tw1o sha1
+		tw1o 14 lit "A9993E364706816ABA3E25717850C26C9CD0D89D" twhex assert
+		"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" dup strlen tw1o sha1         \ two blocks
+		tw1o 14 lit "84983E441C3BD26EBAAE4AA1F95129E5E54670F1" twhex assert
+		"" 0 lit tw1o sha1
+		tw1o 14 lit "DA39A3EE5E6B4B0D3255BFEF95601890AFD80709" twhex assert
+	}
+	base64_vectors {
+		"" 0 lit tw1o b64 0 lit asrt_eq  "f" "Zg==" tb64 assert  "fo" "Zm8=" tb64 assert
+		"foo" "Zm9v" tb64 assert  "foobar" "Zm9vYmFy" tb64 assert
+	}
+	websocket_accept {
+		\ RFC 6455's example: the key, and the accept it gives.
+		"dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11" dup strlen tw1o 80 lit + sha1
+		tw1o 80 lit + 14 lit tw1o b64 1C lit asrt_eq
+		tw1o "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" 1C lit mcmp 0= assert
+	}
+	api_amounts {
+		jout jon jto  0 lit 0 lit jamt  59682F00 lit 0 lit jamt  FFFFFFFF lit FFFFFFFF lit jamt
+		jon @ 2B lit asrt_eq  jout "0.0000000001.50000000018446744073.709551615" 2B lit mcmp 0= assert
+		"1.5" dup strlen jpamt assert 0 lit asrt_eq 59682F00 lit asrt_eq
+		"3" dup strlen jpamt assert 0 lit asrt_eq B2D05E00 lit asrt_eq
+		"0.000000001" dup strlen jpamt assert 0 lit asrt_eq 1 lit asrt_eq
+		"18446744073.709551615" dup strlen jpamt assert FFFFFFFF lit asrt_eq FFFFFFFF lit asrt_eq
+		"18446744073.709551616" dup strlen jpamt 0= assert 2drop
+		"" 0 lit jpamt 0= assert 2drop  ".5" dup strlen jpamt 0= assert 2drop
+		"2." dup strlen jpamt 0= assert 2drop  "1.0000000001" dup strlen jpamt 0= assert 2drop
+		"1x" dup strlen jpamt 0= assert 2drop  "1.5.0" dup strlen jpamt 0= assert 2drop
+	}
+	api_armor {
+		\ as ../rust/src/slate.rs writes it, and read back
+		tw1sl jarmor
+		jtn @ tw1arm strlen asrt_eq  jtxt tw1arm jtn @ mcmp 0= assert
+		tw1arm dup strlen jdearm assert  jsln @ 2B lit asrt_eq  jsl tw1sl mcmp 0= assert
+	}
+	api_armor_checked {
+		tw1arm dup strlen tw1o 100 lit + swap ncpy
+		tw1o 100 lit + 32 lit + dup c@ 1 lit xor swap c!                 \ the summary's id
+		tw1o 100 lit + tw1arm strlen jdearm 0= assert
+		tw1arm dup strlen tw1o 100 lit + swap ncpy
+		tw1o 100 lit + 86 lit + dup c@ 1 lit xor swap c!                 \ the hex (the id)
+		tw1o 100 lit + tw1arm strlen jdearm 0= assert
+		tw1arm 10 lit jdearm 0= assert                                     \ no armor
+	}
+	api_needs_auth {
+		"{\"id\":7,\"cmd\":\"balance\"}" dup strlen 0 lit apirun 0= assert
+		jout "{\"id\":7,\"ok\":false," 13 lit mcmp 0= assert
+		"{\"id\":\"a\\\"b\",\"cmd\":\"auth\",\"key\":\"00\"}" dup strlen 0 lit apirun 0= assert
+		jout "{\"id\":\"a\\\"b\",\"ok\":false,\"error\":\"wrong key\"}" dup strlen mcmp 0= assert
+	}
+}

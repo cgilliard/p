@@ -125,6 +125,16 @@ else
 	( cat "$STDLIB" "$HEADER" $IN; printf '\n%s\n\004' "$TAIL" ) > "$STREAM"
 fi
 "$Q32" --in="$STREAM" --out="$OUT" "$FAMC"
+# A compile error: the compiler's "? src XXXXXXXX out XXXXXXXX" (src/fam.S's
+# __panic), and the source there.
+if [ "$(head -c 4 "$OUT" 2>/dev/null | xxd -p)" != "13000000" ]; then
+	MSG=$(head -c 80 "$OUT" | tr -d '\0' | head -1)
+	echo "fam: compile error: $MSG" >&2
+	SRC=$(printf '%s' "$MSG" | sed -n 's/.*src \([0-9A-F]\{8\}\).*/\1/p')
+	if [ -n "$SRC" ] && command -v python3 >/dev/null; then
+		python3 -c "import sys; d=open(sys.argv[1],'rb').read(); o=int(sys.argv[2],16); a=d.rfind(b'\n',0,max(o-1,0)); a=d.rfind(b'\n',0,max(a,0)); print('  near: ' + d[a+1:o].decode(errors='replace').replace(chr(10), chr(10)+'        ') + '  <<<', file=sys.stderr)" "$STREAM" "$SRC"
+	fi
+fi
 rm -f "$STREAM"
 
 # --- --append: zeros over init's return-id stack and variables, then FILE ---

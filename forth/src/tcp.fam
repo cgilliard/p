@@ -1,0 +1,322 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/tcp.fam — TCP, the server side only: the wallet's port (ntport, src/
+\ net.fam), for the web wallet and its WebSocket API.
+\
+\ Its one peer is QEMU's user network (slirp): a browser's connection ends in
+\ QEMU on the host, which opens its own to us over a virtual link that
+\ neither loses nor reorders segments -- and sends again what we drop.  So
+\ this is TCP's core and no more: answering a SYN, sequence numbers and
+\ acknowledgements, the peer's window, our MSS (1460) and the peer's, a close
+\ from either side, resets, and sending again what isn't acknowledged (from
+\ the first unacknowledged byte, after 0.5 s, doubling; given up after 8
+\ tries).  Not done: segments out of order (dropped, and the one expected
+\ asked for again), urgent data, options but MSS, congestion control, window
+\ scaling, SACK, TIME-WAIT.
+\
+\ Up to tcmax connections, each with a receive buffer (bytes in order, not
+\ yet read: our window is the room left) and a send buffer (bytes not yet
+\ acknowledged, then those not yet sent).  A buffer keeps a start offset and
+\ is moved down only when its end would run past.
+\
+\ Segments are handled as they come, even inside a yield (src/full_node.fam):
+\ only memory, and frames built in TCP's own buffer.  What reads and writes
+\ the connections runs in the main loop.
+\
+\   tin    ( -- )             the segment nrecv took (nproto 6)
+\   ttick  ( -- )             send again what's overdue
+\   tstate ( k -- s )         0 closed, 1 opening, 2 open
+\   tread  ( k -- a n )       the bytes received, in order, not yet taken
+\   ttake  ( k n -- )         take n of them
+\   twrite ( k a n -- n' )    queue bytes to send: how many fit
+\   troom  ( k -- n )         room to queue
+\   tclose ( k -- )           close, once everything queued is sent
+\   tabort ( k -- )           reset it
+\   teof?  ( k -- f )         the peer has closed its side
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: tcmax ( -- n )   8 lit ;
+: trxcap ( -- n )  4000 lit ;                       \ 16 KiB received
+: ttxcap ( -- n )  20000 lit ;                      \ 128 KiB to send
+
+\ A connection (0x40): 0 state  4 address  8 port  C snd.una  10 snd.nxt
+\ 14 rcv.nxt  18 the peer's window  1C the peer's MSS  20 receive start
+\ 24 received  28 send start  2C queued (from snd.una)  30 when last sent
+\ 34 tries  38 flags (1 close asked, 2 FIN sent, 4 FIN received)  3C iss.
+\ Record tcmax is scratch: for resets to segments that fit no connection.
+: tcbv variable ;  : tcb ( k -- a )  6 lit lshift tcbv 240 lit lazy + ;
+: trbv variable ;  : trxb ( k -- a )  E lit lshift trbv 20000 lit lazy + ;
+: ttbv variable ;  : ttxb ( k -- a )  11 lit lshift ttbv 100000 lit lazy + ;
+
+: tf@ ( k off -- v )   swap tcb + @ ;
+: tf! ( v k off -- )   swap tcb + ! ;
+: tstate ( k -- s )   0 lit tf@ ;
+: teof? ( k -- f )    38 lit tf@ 4 lit and 0= 0= ;
+: tms ( -- ms )   hnow drop ;
+: tmin ( a b -- m )   2dup u> if nip else drop then ;
+\ tcpy ( src dst n -- )   ncpy, for n that may be 0 (a `do` runs at least once).
+: tcpy ( src dst n -- )   ?dup if ncpy else 2drop then ;
+
+\ tlt ( a b -- f )   sequence number a before b (mod 2^32).
+: tlt ( a b -- f )   - 0< ;
+
+\ ── Checksums ──
+
+: tssum variable ;
+\ tsum+ ( a n -- )   n bytes as big-endian halfwords (the last padded), into
+\        tssum.
+: tsum+ ( a n -- )
+	dup 1 lit rshift ?dup if 0 lit do over i 1 lit lshift + nb16@ tssum @ + tssum ! loop then
+	dup 1 lit and if + 1 lit - c@ 8 lit lshift tssum @ + tssum ! else 2drop then
+;
+\ tpseudo ( src dst n -- )   tssum := the pseudo-header's sum.
+: tpseudo ( src dst n -- )
+	6 lit + tssum !
+	dup 10 lit rshift swap FFFF lit and + tssum @ + tssum !
+	dup 10 lit rshift swap FFFF lit and + tssum @ + tssum !
+;
+: tfold ( s -- s' )   dup FFFF lit and swap 10 lit rshift +  dup FFFF lit and swap 10 lit rshift + ;
+
+\ ── Sending a segment ──
+
+: tsk variable ;  : tsseq variable ;  : tsfl variable ;  : tsa variable ;  : tsn variable ;
+: tsh variable ;  : tshl variable ;  : tsnfb variable ;
+
+\ trwin ( k -- w )   our window: the receive buffer's room.
+: trwin ( k -- w )   trxcap swap 24 lit tf@ - ;
+
+\ tseg ( k seq flags a n -- )   a segment to connection k: seq, flags (FIN 1
+\        SYN 2 RST 4 PSH 8 ACK 10), n bytes from a, acknowledging its rcv.nxt.
+\        A SYN carries our MSS.
+: tseg ( k seq flags a n -- )
+	tsn ! tsa ! tsfl ! tsseq ! tsk !
+	nfb @ tsnfb !  B000 lit nfb !
+	tsfl @ 2 lit and if 18 lit else 14 lit then tshl !
+	tsk @ 4 lit tf@ 6 lit  tshl @ tsn @ +  nipout ?dup if
+		tsh !
+		tsh @ tshl @ nzero
+		ntport @ tsh @ nb16!  tsk @ 8 lit tf@ tsh @ 2 lit + nb16!
+		tsseq @ tsh @ 4 lit + be!  tsk @ 14 lit tf@ tsh @ 8 lit + be!
+		tshl @ 2 lit rshift 4 lit lshift tsh @ C lit + c!
+		tsfl @ tsh @ D lit + c!
+		tsk @ trwin FFFF lit tmin tsh @ E lit + nb16!
+		tsfl @ 2 lit and if 204 lit tsh @ 14 lit + nb16!  5B4 lit tsh @ 16 lit + nb16! then   \ MSS 1460
+		tsa @ tsh @ tshl @ + tsn @ tcpy
+		nadr @ tsk @ 4 lit tf@ tshl @ tsn @ + tpseudo
+		tsh @ tshl @ tsn @ + tsum+
+		tssum @ tfold FFFF lit xor tsh @ 10 lit + nb16!
+		tshl @ tsn @ + 22 lit + dup 3C lit u< if drop 3C lit then ntx
+	then
+	tsnfb @ nfb !
+	tms tsk @ 30 lit tf!
+;
+
+\ tack ( k -- )   a bare acknowledgement.
+: tack ( k -- )   dup 10 lit tf@ 10 lit 0 lit 0 lit tseg ;
+
+\ ── Sending what's queued ──
+
+: tok variable ;  : tosent variable ;
+\ tsend ( k -- f )   send what the peer's window and MSS allow; the FIN once
+\        everything queued is out, if the close was asked.  Whether anything
+\        went.
+: tsend ( k -- f )
+	tok !  0 lit tosent !
+	tok @ tstate 2 lit = if
+		begin
+			tok @ 2C lit tf@  tok @ 10 lit tf@ tok @ C lit tf@ -  -          ( unsent )
+			tok @ 38 lit tf@ 2 lit and if drop 0 lit then
+			tok @ 1C lit tf@ tmin
+			tok @ 18 lit tf@  tok @ 10 lit tf@ tok @ C lit tf@ -  -  dup 0< if drop 0 lit then  tmin
+			?dup
+		while
+			tok @  tok @ 10 lit tf@  18 lit
+			tok @ ttxb tok @ 28 lit tf@ +  tok @ 10 lit tf@ tok @ C lit tf@ - +
+			4 lit pick tseg
+			tok @ 10 lit tf@ + tok @ 10 lit tf!  -1 lit tosent !
+		repeat
+		tok @ 38 lit tf@ 3 lit and 1 lit =
+		tok @ 10 lit tf@ tok @ C lit tf@ -  tok @ 2C lit tf@ = and if
+			tok @  tok @ 10 lit tf@  11 lit 0 lit 0 lit tseg
+			tok @ 10 lit tf@ 1 lit + tok @ 10 lit tf!
+			tok @ 38 lit tf@ 2 lit or tok @ 38 lit tf!  -1 lit tosent !
+		then
+	then
+	tosent @
+;
+
+\ ── The application's side ──
+
+: tread ( k -- a n )   dup trxb over 20 lit tf@ +  swap 24 lit tf@ ;
+: troom ( k -- n )     ttxcap swap 2C lit tf@ - ;
+
+\ ttake ( k n -- )   take n bytes received; a window opening up from under
+\        half is announced.
+: ttk variable ;
+: ttake ( k n -- )
+	swap ttk !
+	ttk @ trwin trxcap 1 lit rshift u<  swap                          ( small n )
+	dup ttk @ 20 lit tf@ + ttk @ 20 lit tf!  ttk @ 24 lit tf@ swap - ttk @ 24 lit tf!
+	ttk @ 24 lit tf@ 0= if 0 lit ttk @ 20 lit tf! then
+	ttk @ tstate 2 lit = and if ttk @ tack then
+;
+
+\ twrite ( k a n -- n' )   queue bytes to send (as many as fit).
+: twrk variable ;
+: twrite ( k a n -- n' )
+	rot twrk !  twrk @ troom tmin                                       ( a n )
+	twrk @ 28 lit tf@ twrk @ 2C lit tf@ + over + ttxcap u> if           \ move the queue down
+		twrk @ ttxb twrk @ 28 lit tf@ + twrk @ ttxb twrk @ 2C lit tf@ tcpy  0 lit twrk @ 28 lit tf!
+	then
+	tuck twrk @ ttxb twrk @ 28 lit tf@ + twrk @ 2C lit tf@ + swap tcpy
+	dup twrk @ 2C lit tf@ + twrk @ 2C lit tf!
+	twrk @ tsend drop
+;
+
+\ tclose ( k -- )   tabort ( k -- )
+: tclose ( k -- )   dup 38 lit tf@ 1 lit or over 38 lit tf!  tsend drop ;
+: tabort ( k -- )
+	dup tstate if dup dup 10 lit tf@ 4 lit 0 lit 0 lit tseg then
+	0 lit swap 0 lit tf!
+;
+
+\ ── Segments in ──
+
+: tia variable ;  : tiseq variable ;  : tiack variable ;  : tiofs variable ;  : tifl variable ;
+: tiwin variable ;  : tidn variable ;  : tik variable ;  : tiacked variable ;
+
+\ tfind ( ip port -- k | -1 )   the connection with that peer.
+: tfk variable ;
+: tfind ( ip port -- k | -1 )
+	-1 lit tfk !
+	tcmax 0 lit do
+		i tstate if over i 4 lit tf@ = over i 8 lit tf@ = and if i tfk ! then then
+	loop 2drop tfk @
+;
+
+\ treset ( -- )   answer a segment that fits no connection with a reset (as
+\        RFC 793 does), through the scratch record.
+: treset ( -- )
+	tcmax tcb 40 lit nzero
+	nsrc @ tcmax 4 lit tf!  nsport @ tcmax 8 lit tf!
+	tifl @ 10 lit and if
+		tcmax tiack @ 4 lit 0 lit 0 lit tseg
+	else
+		tiseq @ tidn @ +  tifl @ 3 lit and if 1 lit + then  tcmax 14 lit tf!
+		tcmax 0 lit 14 lit 0 lit 0 lit tseg
+	then
+;
+
+\ tmss ( -- mss )   the MSS option of the SYN in hand (536 if none).
+: tmo variable ;
+: tmss ( -- mss )
+	218 lit tmo !
+	tiofs @ 14 lit u> if
+		tia @ 14 lit +
+		begin dup tia @ tiofs @ + u< while
+			dup c@ 0= if drop tia @ tiofs @ + else
+			dup c@ 1 lit = if 1 lit + else
+				dup c@ 2 lit = if dup 2 lit + nb16@ tmo ! then
+				dup 1 lit + c@ dup 2 lit u< if drop tia @ tiofs @ + nip else + then
+			then then
+		repeat drop
+	then
+	tmo @ 5B4 lit tmin
+;
+
+\ topen ( -- )   a SYN for a new connection: a free record, answered SYN-ACK;
+\        none free: a reset.
+: topen ( -- )
+	-1 lit tik !
+	tcmax 0 lit do i tstate 0= tik @ 0< and if i tik ! then loop
+	tik @ 0< if treset else
+		tik @ tcb 40 lit nzero
+		nsrc @ tik @ 4 lit tf!  nsport @ tik @ 8 lit tf!
+		tiseq @ 1 lit + tik @ 14 lit tf!
+		101000 lit @ 101004 lit @ xor tiseq @ xor  dup tik @ 3C lit tf!  dup tik @ C lit tf!  1 lit + tik @ 10 lit tf!
+		tiwin @ tik @ 18 lit tf!  tmss tik @ 1C lit tf!
+		1 lit tik @ 0 lit tf!
+		tik @ tik @ 3C lit tf@ 12 lit 0 lit 0 lit tseg
+	then
+;
+
+\ trecv ( -- )   the bytes in hand (seq = rcv.nxt), as many as there's room
+\        for, into connection tik's buffer.
+: trn variable ;
+: trecv ( -- )
+	tidn @ tik @ trwin tmin trn !
+	tik @ 20 lit tf@ tik @ 24 lit tf@ + trn @ + trxcap u> if          \ move the bytes down
+		tik @ trxb tik @ 20 lit tf@ + tik @ trxb tik @ 24 lit tf@ tcpy  0 lit tik @ 20 lit tf!
+	then
+	tia @ tiofs @ +  tik @ trxb tik @ 20 lit tf@ + tik @ 24 lit tf@ +  trn @ tcpy
+	tik @ 24 lit tf@ trn @ + tik @ 24 lit tf!
+	tik @ 14 lit tf@ trn @ + tik @ 14 lit tf!
+;
+
+\ tin ( -- )   the segment nrecv took.
+: tin ( -- )
+	npay @ tia !
+	tia @ C lit + c@ 4 lit rshift 2 lit lshift tiofs !
+	tiofs @ 14 lit u< 0=  tiofs @ npn @ u> 0= and if
+		nsrc @ nadr @ npn @ tpseudo  tia @ npn @ tsum+
+		tssum @ tfold FFFF lit = if
+			tia @ 4 lit + be32 tiseq !  tia @ 8 lit + be32 tiack !
+			tia @ D lit + c@ tifl !  tia @ E lit + nb16@ tiwin !
+			npn @ tiofs @ - tidn !
+			nsrc @ nsport @ tfind dup tik ! 0< if
+				tifl @ 4 lit and 0= if
+					tifl @ 12 lit and 2 lit = if topen else treset then
+				then
+			else tifl @ 4 lit and if 0 lit tik @ 0 lit tf! else           \ reset: gone
+			tifl @ 2 lit and if                                            \ a SYN again: our SYN-ACK was lost
+				tik @ tstate 1 lit = if tik @ tik @ 3C lit tf@ 12 lit 0 lit 0 lit tseg then
+			else
+				0 lit tiacked !
+				tifl @ 10 lit and if
+					tik @ tstate 1 lit =  tiack @ tik @ 3C lit tf@ 1 lit + = and if
+						2 lit tik @ 0 lit tf!  tiack @ tik @ C lit tf!  0 lit tik @ 34 lit tf!
+					then
+					tik @ C lit tf@ tiack @ tlt  tiack @ tik @ 10 lit tf@ tlt tiack @ tik @ 10 lit tf@ = or and if
+						tiack @ tik @ C lit tf@ -  tik @ 2C lit tf@ tmin           ( data acknowledged )
+						dup tik @ 28 lit tf@ + tik @ 28 lit tf!  tik @ 2C lit tf@ swap - tik @ 2C lit tf!
+						tik @ 2C lit tf@ 0= if 0 lit tik @ 28 lit tf! then
+						tiack @ tik @ C lit tf!  0 lit tik @ 34 lit tf!  -1 lit tiacked !
+					then
+					tiwin @ tik @ 18 lit tf!
+				then
+				tik @ tstate 2 lit = if
+					0 lit                                                           ( ack? )
+					tidn @ if
+						tiseq @ tik @ 14 lit tf@ = if trecv then  drop -1 lit
+					then
+					tifl @ 1 lit and  tik @ teof? 0= and
+					tiseq @ tidn @ + tik @ 14 lit tf@ = and if                     \ a FIN, everything before it in
+						tik @ 14 lit tf@ 1 lit + tik @ 14 lit tf!
+						tik @ 38 lit tf@ 4 lit or tik @ 38 lit tf!  drop -1 lit
+					then
+					tik @ tsend 0= and if tik @ tack then
+					tik @ 38 lit tf@ 6 lit and 6 lit =
+					tik @ C lit tf@ tik @ 10 lit tf@ = and if 0 lit tik @ 0 lit tf! then   \ both closed, all acknowledged
+				then
+			then then
+		then
+	then then
+;
+
+\ ttick ( -- )   send again what's overdue: 0.5 s after the last send,
+\        doubling with each try; given up (reset) after 8.
+: ttick ( -- )
+	tcmax 0 lit do
+		i tstate if
+			i tstate 1 lit =  i C lit tf@ i 10 lit tf@ = 0= or
+			tms i 30 lit tf@ -  1F4 lit i 34 lit tf@ lshift u> and if
+				i 34 lit tf@ 1 lit + dup i 34 lit tf!  8 lit u> if i tabort else
+					i tstate 1 lit = if i i 3C lit tf@ 12 lit 0 lit 0 lit tseg else
+						i C lit tf@ i 10 lit tf!                                  \ back to the first unacknowledged
+						i 38 lit tf@ 2 lit invert and i 38 lit tf!
+						i tsend drop
+					then
+				then
+			then
+		then
+	loop
+;

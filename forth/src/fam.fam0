@@ -248,7 +248,7 @@
 # _start:
 #     LOAD_ADDRESS s10, data
 17 1D 00 00	# auipc s10,0x1
-13 0D 8D 2B	# addi s10,s10,696 # 12b8 <data>
+13 0D 4D 2D	# addi s10,s10,724 # 12d4 <data>
 #     li      t0, 0x1000
 B7 12 00 00	# lui t0,0x1
 #     add     s9, s10, t0                 # cstack bottom = data+0x1000 (= RID top)
@@ -288,6 +288,7 @@ B7 02 10 00	# lui t0,0x100
     #   +16 output address of the last island (where the spacing counts from)
     #   +20 the return entry the current segment's `;` jumps to
     #   +24 where the input starts (for __panic's report)
+    #   +28 the cstack pointer when the current ':' definition began
 #     addi    t2, t1, 32                  # first entry slot
 93 03 03 02	# addi t2,t1,32
 #     sw      t2, 0(t1)                   # init call-site cursor = base + 32
@@ -323,26 +324,26 @@ B3 82 5B 00	# add t0,s7,t0
 23 AC A2 00	# sw a0,24(t0) # 100018 <ISLAND_GAP+0xc0018>
 #     CALL    read_all_bytes              # slurp stdin into the heap until EOT
 93 8D CD FF	# addi s11,s11,-4
-E3 E8 AD 75	# bltu s11,s10,fcc <__panic>
+E3 E6 AD 77	# bltu s11,s10,fe8 <__panic>
 93 02 00 00	# li t0,0
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 D0 6F	# j f84 <read_all_bytes>
+6F 00 90 71	# j fa0 <read_all_bytes>
 #     mv      a1, gp                      # input end
 93 85 01 00	# mv a1,gp
 #     CALL    compile
 93 8D CD FF	# addi s11,s11,-4
-E3 EC AD 73	# bltu s11,s10,fcc <__panic>
+E3 EA AD 75	# bltu s11,s10,fe8 <__panic>
 93 02 10 00	# li t0,1
 23 A0 5D 00	# sw t0,0(s11)
 6F 00 C0 01	# j bc <compile>
 #     CALL    write_output
 93 8D CD FF	# addi s11,s11,-4
-E3 E2 AD 73	# bltu s11,s10,fcc <__panic>
+E3 E0 AD 75	# bltu s11,s10,fe8 <__panic>
 93 02 20 00	# li t0,2
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 90 6A	# j f5c <write_output>
+6F 00 50 6C	# j f78 <write_output>
 #     j       exit
-6F 00 10 70	# j fb8 <exit>
+6F 00 D0 71	# j fd4 <exit>
 
 # compile -- tokenize and process the input [a0,a1).
 #   in:  a0 = input start, a1 = input end, gp = input end (heap top)
@@ -374,7 +375,7 @@ E3 E2 AD 73	# bltu s11,s10,fcc <__panic>
     # binary: the magic q32 checks for, plus a harmless first instruction.
 #     CHECK_HEAP 4, t1                    # room for the 4-byte header?
 13 83 41 40	# addi t1,gp,1028
-E3 EA 69 6E	# bltu s3,t1,fcc <__panic>
+E3 E8 69 70	# bltu s3,t1,fe8 <__panic>
 #     li      t0, 0x13
 93 02 30 01	# li t0,19
 #     sb      t0, 0(gp)
@@ -395,13 +396,13 @@ A3 81 01 00	# sb zero,3(gp)
 13 05 04 01	# addi a0,s0,16
 #     CALL    emit_j                      # `j +12` at s0+4 -> s0+16
 93 8D CD FF	# addi s11,s11,-4
-E3 E8 AD 6D	# bltu s11,s10,fcc <__panic>
+E3 E6 AD 6F	# bltu s11,s10,fe8 <__panic>
 93 02 30 00	# li t0,3
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 90 0F	# j a00 <emit_j>
+6F 00 50 11	# j a1c <emit_j>
 #     CHECK_HEAP 4, t0
 93 82 41 40	# addi t0,gp,1028
-E3 EE 59 6A	# bltu s3,t0,fcc <__panic>
+E3 EC 59 6C	# bltu s3,t0,fe8 <__panic>
 #     li      t0, 0x6F                    # __ret slot (s0+8): jal x0, 0 (patched at EOT)
 93 02 F0 06	# li t0,111
 #     sw      t0, 0(gp)
@@ -410,7 +411,7 @@ E3 EE 59 6A	# bltu s3,t0,fcc <__panic>
 93 81 41 00	# addi gp,gp,4
 #     CHECK_HEAP 4, t0
 93 82 41 40	# addi t0,gp,1028
-E3 E4 59 6A	# bltu s3,t0,fcc <__panic>
+E3 E2 59 6C	# bltu s3,t0,fe8 <__panic>
 #     li      t0, 0x6F                    # __ovf slot (s0+12): jal x0, 0 = self-loop halt
 93 02 F0 06	# li t0,111
 #     sw      t0, 0(gp)
@@ -422,7 +423,7 @@ E3 E4 59 6A	# bltu s3,t0,fcc <__panic>
     # whole output. The program derives s10/s11/sp/heap from gp.
 #     CHECK_HEAP 4, t0
 93 82 41 40	# addi t0,gp,1028
-E3 EA 59 68	# bltu s3,t0,fcc <__panic>
+E3 E8 59 6A	# bltu s3,t0,fe8 <__panic>
 #     li      t0, 0x00000197              # auipc gp, 0   (at s0+16, patched at EOT)
 93 02 70 19	# li t0,407
 #     sw      t0, 0(gp)
@@ -431,10 +432,10 @@ E3 EA 59 68	# bltu s3,t0,fcc <__panic>
 93 81 41 00	# addi gp,gp,4
 #     CHECK_HEAP 4, t0
 93 82 41 40	# addi t0,gp,1028
-E3 E0 59 68	# bltu s3,t0,fcc <__panic>
+E3 EE 59 68	# bltu s3,t0,fe8 <__panic>
 #     li      t0, 0x00018193              # addi gp, gp, 0  (at s0+20, patched at EOT)
 B7 82 01 00	# lui t0,0x18
-93 82 32 19	# addi t0,t0,403 # 18193 <data+0x16edb>
+93 82 32 19	# addi t0,t0,403 # 18193 <data+0x16ebf>
 #     sw      t0, 0(gp)
 23 A0 51 00	# sw t0,0(gp)
 #     addi    gp, gp, 4                   # gp = s0+24 (user program starts here)
@@ -454,7 +455,7 @@ B3 82 5B 00	# add t0,s7,t0
     # word1 != 0), the cursor (gp) must stay below s7 (name table = region end).
 #     li      t0, 0x1400
 B7 12 00 00	# lui t0,0x1
-93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x148>
+93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x12c>
 #     add     t0, s10, t0                 # region base
 B3 02 5D 00	# add t0,s10,t0
 #     lw      t1, 4(t0)                   # word1: in-:I flag
@@ -462,10 +463,10 @@ B3 02 5D 00	# add t0,s10,t0
 #     beqz    t1, .Lc_next_tok
 63 04 03 00	# beqz t1,18c <.Lc_next_tok>
 #     bgeu    gp, s7, __panic             # immediate region full
-E3 F2 71 65	# bgeu gp,s7,fcc <__panic>
+E3 F0 71 67	# bgeu gp,s7,fe8 <__panic>
 # .Lc_next_tok:
 #     NEXT_TOKEN s1, s2, t2, .Lc_endspan  # token = [t2, s1)
-63 F8 24 69	# bgeu s1,s2,81c <.Lc_endspan>
+63 F6 24 6B	# bgeu s1,s2,838 <.Lc_endspan>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
 63 8C 62 00	# beq t0,t1,1b0 <.Lnt_skip14>
@@ -508,7 +509,7 @@ E3 F2 71 65	# bgeu gp,s7,fcc <__panic>
 #     li      t4, ':'
 93 0E A0 03	# li t4,58
 #     beq     t0, t4, .Lc_defcolon
-63 80 D2 29	# beq t0,t4,48c <.Lc_defcolon>
+63 88 D2 29	# beq t0,t4,49c <.Lc_defcolon>
 #     j       .Lc_hexword
 6F 00 00 03	# j 240 <.Lc_hexword>
 # .Lc_len2:
@@ -528,47 +529,47 @@ E3 F2 71 65	# bgeu gp,s7,fcc <__panic>
 #     li      t4, 'M'
 93 0E D0 04	# li t4,77
 #     beq     t0, t4, .Lc_defm            # ':M' -> macro definition
-63 84 D2 15	# beq t0,t4,378 <.Lc_defm>
+63 8C D2 15	# beq t0,t4,388 <.Lc_defm>
 #     li      t4, 'I'
 93 0E 90 04	# li t4,73
 #     beq     t0, t4, .Lc_defimm          # ':I' -> immediate-word definition
-63 84 D2 35	# beq t0,t4,580 <.Lc_defimm>
+63 82 D2 37	# beq t0,t4,59c <.Lc_defimm>
 #     j       .Lc_hexword
 6F 00 40 00	# j 240 <.Lc_hexword>
 # .Lc_hexword:
 #     PROC_HEX t2, s1, .Lc_word           # hex literal? else word/name reference
 B3 82 74 40	# sub t0,s1,t2
 13 03 80 00	# li t1,8
-63 68 53 3E	# bltu t1,t0,638 <.Lc_word>
+63 66 53 40	# bltu t1,t0,654 <.Lc_word>
 93 02 00 00	# li t0,0
 13 8E 03 00	# mv t3,t2
 63 72 9E 04	# bgeu t3,s1,298 <.Lph_push17>
 03 43 0E 00	# lbu t1,0(t3)
 93 0E 00 03	# li t4,48
-63 4C D3 3D	# blt t1,t4,638 <.Lc_word>
+63 4A D3 3F	# blt t1,t4,654 <.Lc_word>
 93 0E 90 03	# li t4,57
 63 C6 6E 00	# blt t4,t1,274 <.Lph_a17>
 13 03 03 FD	# addi t1,t1,-48
 6F 00 80 01	# j 288 <.Lph_v17>
 93 0E 10 04	# li t4,65
-63 40 D3 3D	# blt t1,t4,638 <.Lc_word>
+63 4E D3 3D	# blt t1,t4,654 <.Lc_word>
 93 0E 60 04	# li t4,70
-63 CC 6E 3A	# blt t4,t1,638 <.Lc_word>
+63 CA 6E 3C	# blt t4,t1,654 <.Lc_word>
 13 03 93 FC	# addi t1,t1,-55
 93 92 42 00	# slli t0,t0,0x4
 B3 E2 62 00	# or t0,t0,t1
 13 0E 1E 00	# addi t3,t3,1
 6F F0 1F FC	# j 254 <.Lph_d17>
 13 02 C2 FF	# addi tp,tp,-4 # fffffffc <ISLAND_GAP+0xfffbfffc>
-E3 68 92 53	# bltu tp,s9,fcc <__panic>
+E3 66 92 55	# bltu tp,s9,fe8 <__panic>
 23 20 52 00	# sw t0,0(tp) # 0 <_base0>
 #     j       .Lc_next
 6F F0 1F ED	# j 174 <.Lc_next>
 # .Lc_comma:
 #     PROC_COMMA
-E3 72 82 53	# bgeu tp,s8,fcc <__panic>
+E3 70 82 55	# bgeu tp,s8,fe8 <__panic>
 13 83 41 40	# addi t1,gp,1028
-E3 EE 69 50	# bltu s3,t1,fcc <__panic>
+E3 EC 69 52	# bltu s3,t1,fe8 <__panic>
 83 22 02 00	# lw t0,0(tp) # 0 <_base0>
 13 02 42 00	# addi tp,tp,4 # 4 <_base0+0x4>
 13 D3 82 01	# srli t1,t0,0x18
@@ -585,7 +586,7 @@ A3 81 51 00	# sb t0,3(gp)
     # In a :I definition? region word1 (!= 0) holds the stashed output-gp.
 #     li      t0, 0x1400
 B7 12 00 00	# lui t0,0x1
-93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x148>
+93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x12c>
 #     add     t3, s10, t0                 # region base
 33 0E 5D 00	# add t3,s10,t0
 #     lw      t4, 4(t3)                   # stashed output-gp (0 = not in :I)
@@ -596,16 +597,16 @@ B7 12 00 00	# lui t0,0x1
     # the advanced cursor, restore output-gp, clear the in-:I flag.
 #     LOAD_ADDRESS a0, __dispatch
 17 15 00 00	# auipc a0,0x1
-13 05 05 DB	# addi a0,a0,-592 # 10a4 <__dispatch>
+13 05 C5 DC	# addi a0,a0,-564 # 10c0 <__dispatch>
 #     CALL    emit_j                      # emit `j __dispatch` at the immediate cursor
 93 8D CD FF	# addi s11,s11,-4
-E3 E6 AD 4D	# bltu s11,s10,fcc <__panic>
+E3 E4 AD 4F	# bltu s11,s10,fe8 <__panic>
 93 02 40 00	# li t0,4
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 40 6F	# j a00 <emit_j>
+6F 00 00 71	# j a1c <emit_j>
 #     li      t0, 0x1400
 B7 12 00 00	# lui t0,0x1
-93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x148>
+93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x12c>
 #     add     t3, s10, t0                 # reload region base (emit_j clobbered t3)
 33 0E 5D 00	# add t3,s10,t0
 #     sw      gp, 0(t3)                   # word0 = new immediate cursor (past this word)
@@ -618,7 +619,19 @@ B7 12 00 00	# lui t0,0x1
 6F F0 DF E4	# j 174 <.Lc_next>
 # .Lc_semi_word:
 #     beqz    ra, .Lc_unmatched           # not inside a ':' definition -> unmatched
-63 84 00 04	# beqz ra,374 <.Lc_unmatched>
+63 8C 00 04	# beqz ra,384 <.Lc_unmatched>
+    # The body must leave the cstack as it found it: an `if` without its `then`
+    # (or a `begin` without its end) would leave its placeholder there, for
+    # some later `then` -- or the test harness's chain -- to patch: a jump into
+    # the wrong code, silently.
+#     li      t0, 0x100000
+B7 02 10 00	# lui t0,0x100
+#     add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+#     lw      t0, 28(t0)
+83 A2 C2 01	# lw t0,28(t0) # 10001c <ISLAND_GAP+0xc001c>
+#     bne     tp, t0, __panic             # unbalanced control flow in the definition
+E3 16 52 4A	# bne tp,t0,fe8 <__panic>
     # finish the word: emit its return, then backpatch the skip-jump
 #     li      t0, 0x100000
 B7 02 10 00	# lui t0,0x100
@@ -628,101 +641,101 @@ B3 82 5B 00	# add t0,s7,t0
 03 A5 42 01	# lw a0,20(t0) # 100014 <ISLAND_GAP+0xc0014>
 #     CALL    emit_j                      # emit `j <return entry>` at gp
 93 8D CD FF	# addi s11,s11,-4
-E3 E6 AD 49	# bltu s11,s10,fcc <__panic>
+E3 EC AD 49	# bltu s11,s10,fe8 <__panic>
 93 02 50 00	# li t0,5
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 40 6B	# j a00 <emit_j>
+6F 00 00 6C	# j a1c <emit_j>
 #     mv      a0, ra                      # the skip-jump placeholder
 13 85 00 00	# mv a0,ra
 #     mv      a1, gp                      # patch it to here (.skip = past body+return)
 93 85 01 00	# mv a1,gp
 #     CALL    patch_j
 93 8D CD FF	# addi s11,s11,-4
-E3 E8 AD 47	# bltu s11,s10,fcc <__panic>
+E3 EE AD 47	# bltu s11,s10,fe8 <__panic>
 93 02 60 00	# li t0,6
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 40 6C	# j a2c <patch_j>
+6F 00 00 6D	# j a48 <patch_j>
 #     li      ra, 0                       # leave the definition
 93 00 00 00	# li ra,0
 #     j       .Lc_next
-6F F0 5F E0	# j 174 <.Lc_next>
+6F F0 5F DF	# j 174 <.Lc_next>
 # .Lc_unmatched:
 #     j       __panic                     # ';' with no matching definition
-6F 00 90 45	# j fcc <__panic>
+6F 00 50 46	# j fe8 <__panic>
 
 # ':M name <body> ;' -- record the body source span as a macro; emit nothing.
 # .Lc_defm:
 #     NEXT_TOKEN s1, s2, t2, .Lc_deferr   # read macro name = [t2, s1)
-63 F8 24 11	# bgeu s1,s2,488 <.Lc_deferr>
+63 F8 24 11	# bgeu s1,s2,498 <.Lc_deferr>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 8C 62 00	# beq t0,t1,39c <.Lnt_skip27>
+63 8C 62 00	# beq t0,t1,3ac <.Lnt_skip27>
 13 03 90 00	# li t1,9
-63 CC 62 00	# blt t0,t1,3a4 <.Lnt_beg27>
+63 CC 62 00	# blt t0,t1,3b4 <.Lnt_beg27>
 13 03 D0 00	# li t1,13
-63 54 53 00	# bge t1,t0,39c <.Lnt_skip27>
-6F 00 C0 00	# j 3a4 <.Lnt_beg27>
+63 54 53 00	# bge t1,t0,3ac <.Lnt_skip27>
+6F 00 C0 00	# j 3b4 <.Lnt_beg27>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 378 <.Lc_defm>
+6F F0 9F FD	# j 388 <.Lc_defm>
 93 83 04 00	# mv t2,s1
-63 F6 24 03	# bgeu s1,s2,3d4 <.Lnt_end27>
+63 F6 24 03	# bgeu s1,s2,3e4 <.Lnt_end27>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 80 62 02	# beq t0,t1,3d4 <.Lnt_end27>
+63 80 62 02	# beq t0,t1,3e4 <.Lnt_end27>
 13 03 90 00	# li t1,9
-63 C8 62 00	# blt t0,t1,3cc <.Lnt_chr27>
+63 C8 62 00	# blt t0,t1,3dc <.Lnt_chr27>
 13 03 D0 00	# li t1,13
-63 58 53 00	# bge t1,t0,3d4 <.Lnt_end27>
-6F 00 40 00	# j 3cc <.Lnt_chr27>
+63 58 53 00	# bge t1,t0,3e4 <.Lnt_end27>
+6F 00 40 00	# j 3dc <.Lnt_chr27>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 3a8 <.Lnt_scan27>
+6F F0 9F FD	# j 3b8 <.Lnt_scan27>
 #     sub     t0, s1, t2                  # names are capped at 8 bytes
 B3 82 74 40	# sub t0,s1,t2
 #     li      t1, 8
 13 03 80 00	# li t1,8
 #     bgtu    t0, t1, __panic
-E3 68 53 3E	# bltu t1,t0,fcc <__panic>
+E3 6E 53 3E	# bltu t1,t0,fe8 <__panic>
 #     mv      s4, t2                      # name start
 13 8A 03 00	# mv s4,t2
 #     mv      s5, s1                      # name end = body start
 93 8A 04 00	# mv s5,s1
 # .Lc_defb:
 #     NEXT_TOKEN s1, s2, t2, .Lc_deferr   # scan body tokens until ';'
-63 F0 24 0B	# bgeu s1,s2,488 <.Lc_deferr>
+63 F0 24 0B	# bgeu s1,s2,498 <.Lc_deferr>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 8C 62 00	# beq t0,t1,40c <.Lnt_skip30>
+63 8C 62 00	# beq t0,t1,41c <.Lnt_skip30>
 13 03 90 00	# li t1,9
-63 CC 62 00	# blt t0,t1,414 <.Lnt_beg30>
+63 CC 62 00	# blt t0,t1,424 <.Lnt_beg30>
 13 03 D0 00	# li t1,13
-63 54 53 00	# bge t1,t0,40c <.Lnt_skip30>
-6F 00 C0 00	# j 414 <.Lnt_beg30>
+63 54 53 00	# bge t1,t0,41c <.Lnt_skip30>
+6F 00 C0 00	# j 424 <.Lnt_beg30>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 3e8 <.Lc_defb>
+6F F0 9F FD	# j 3f8 <.Lc_defb>
 93 83 04 00	# mv t2,s1
-63 F6 24 03	# bgeu s1,s2,444 <.Lnt_end30>
+63 F6 24 03	# bgeu s1,s2,454 <.Lnt_end30>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 80 62 02	# beq t0,t1,444 <.Lnt_end30>
+63 80 62 02	# beq t0,t1,454 <.Lnt_end30>
 13 03 90 00	# li t1,9
-63 C8 62 00	# blt t0,t1,43c <.Lnt_chr30>
+63 C8 62 00	# blt t0,t1,44c <.Lnt_chr30>
 13 03 D0 00	# li t1,13
-63 58 53 00	# bge t1,t0,444 <.Lnt_end30>
-6F 00 40 00	# j 43c <.Lnt_chr30>
+63 58 53 00	# bge t1,t0,454 <.Lnt_end30>
+6F 00 40 00	# j 44c <.Lnt_chr30>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 418 <.Lnt_scan30>
+6F F0 9F FD	# j 428 <.Lnt_scan30>
 #     sub     t3, s1, t2
 33 8E 74 40	# sub t3,s1,t2
 #     li      t4, 1
 93 0E 10 00	# li t4,1
 #     bne     t3, t4, .Lc_defb
-E3 1E DE F9	# bne t3,t4,3e8 <.Lc_defb>
+E3 1E DE F9	# bne t3,t4,3f8 <.Lc_defb>
 #     lbu     t0, 0(t2)
 83 C2 03 00	# lbu t0,0(t2)
 #     li      t4, ';'
 93 0E B0 03	# li t4,59
 #     bne     t0, t4, .Lc_defb
-E3 98 D2 F9	# bne t0,t4,3e8 <.Lc_defb>
+E3 98 D2 F9	# bne t0,t4,3f8 <.Lc_defb>
     # ';' at [t2, s1): body = [s5, t2)
 #     mv      a2, s4                      # name start
 13 06 0A 00	# mv a2,s4
@@ -736,15 +749,15 @@ E3 98 D2 F9	# bne t0,t4,3e8 <.Lc_defb>
 13 88 03 00	# mv a6,t2
 #     CALL    nt_insert
 93 8D CD FF	# addi s11,s11,-4
-E3 EC AD 35	# bltu s11,s10,fcc <__panic>
+E3 E2 AD 37	# bltu s11,s10,fe8 <__panic>
 93 02 70 00	# li t0,7
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 80 40	# j 888 <nt_insert>
+6F 00 40 41	# j 8a4 <nt_insert>
 #     j       .Lc_next
-6F F0 1F CF	# j 174 <.Lc_next>
+6F F0 1F CE	# j 174 <.Lc_next>
 # .Lc_deferr:
 #     j       __panic                     # malformed definition (premature EOF)
-6F 00 50 34	# j fcc <__panic>
+6F 00 10 35	# j fe8 <__panic>
 
 # ': name <body> ;' -- ordinary word. Emit a skip-jump over the body, record
 # the entry (kind=word), then let the main loop compile the body until ';'.
@@ -754,15 +767,15 @@ E3 EC AD 35	# bltu s11,s10,fcc <__panic>
 # .Lc_defcolon:
 #     li      t0, 0x1400
 B7 12 00 00	# lui t0,0x1
-93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x148>
+93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x12c>
 #     add     t0, s10, t0
 B3 02 5D 00	# add t0,s10,t0
 #     lw      t1, 4(t0)                   # in a :I body -> no island
 03 A3 42 00	# lw t1,4(t0)
 #     bnez    t1, .Lc_defname
-63 1C 03 02	# bnez t1,4d4 <Lret_8>
+63 1C 03 02	# bnez t1,4e4 <Lret_8>
 #     bnez    ra, .Lc_defname             # inside a ':' definition -> no island
-63 9A 00 02	# bnez ra,4d4 <Lret_8>
+63 9A 00 02	# bnez ra,4e4 <Lret_8>
 #     li      t0, 0x100000
 B7 02 10 00	# lui t0,0x100
 #     add     t0, s7, t0
@@ -774,49 +787,49 @@ B3 82 5B 00	# add t0,s7,t0
 #     li      t0, ISLAND_GAP
 B7 02 04 00	# lui t0,0x40
 #     bltu    t1, t0, .Lc_defname
-63 6E 53 00	# bltu t1,t0,4d4 <Lret_8>
+63 6E 53 00	# bltu t1,t0,4e4 <Lret_8>
 #     li      a0, 0                       # not the last
 13 05 00 00	# li a0,0
 #     CALL    emit_island
 93 8D CD FF	# addi s11,s11,-4
-E3 E4 AD 31	# bltu s11,s10,fcc <__panic>
+E3 EA AD 31	# bltu s11,s10,fe8 <__panic>
 93 02 80 00	# li t0,8
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 74	# j c1c <emit_island>
+6F 00 80 75	# j c38 <emit_island>
 # .Lc_defname:
 #     NEXT_TOKEN s1, s2, t2, .Lc_deferr   # read word name = [t2, s1)
-E3 FA 24 FB	# bgeu s1,s2,488 <.Lc_deferr>
+E3 FA 24 FB	# bgeu s1,s2,498 <.Lc_deferr>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 8C 62 00	# beq t0,t1,4f8 <.Lnt_skip37>
+63 8C 62 00	# beq t0,t1,508 <.Lnt_skip37>
 13 03 90 00	# li t1,9
-63 CC 62 00	# blt t0,t1,500 <.Lnt_beg37>
+63 CC 62 00	# blt t0,t1,510 <.Lnt_beg37>
 13 03 D0 00	# li t1,13
-63 54 53 00	# bge t1,t0,4f8 <.Lnt_skip37>
-6F 00 C0 00	# j 500 <.Lnt_beg37>
+63 54 53 00	# bge t1,t0,508 <.Lnt_skip37>
+6F 00 C0 00	# j 510 <.Lnt_beg37>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 4d4 <Lret_8>
+6F F0 9F FD	# j 4e4 <Lret_8>
 93 83 04 00	# mv t2,s1
-63 F6 24 03	# bgeu s1,s2,530 <.Lnt_end37>
+63 F6 24 03	# bgeu s1,s2,540 <.Lnt_end37>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 80 62 02	# beq t0,t1,530 <.Lnt_end37>
+63 80 62 02	# beq t0,t1,540 <.Lnt_end37>
 13 03 90 00	# li t1,9
-63 C8 62 00	# blt t0,t1,528 <.Lnt_chr37>
+63 C8 62 00	# blt t0,t1,538 <.Lnt_chr37>
 13 03 D0 00	# li t1,13
-63 58 53 00	# bge t1,t0,530 <.Lnt_end37>
-6F 00 40 00	# j 528 <.Lnt_chr37>
+63 58 53 00	# bge t1,t0,540 <.Lnt_end37>
+6F 00 40 00	# j 538 <.Lnt_chr37>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 504 <.Lnt_scan37>
+6F F0 9F FD	# j 514 <.Lnt_scan37>
 #     sub     t0, s1, t2                  # names are packed into 2 words -> max 8 bytes
 B3 82 74 40	# sub t0,s1,t2
 #     li      t1, 8
 13 03 80 00	# li t1,8
 #     bgtu    t0, t1, __panic
-E3 6A 53 28	# bltu t1,t0,fcc <__panic>
+E3 60 53 2A	# bltu t1,t0,fe8 <__panic>
 #     CHECK_HEAP 4, t0
 93 82 41 40	# addi t0,gp,1028
-E3 E6 59 28	# bltu s3,t0,fcc <__panic>
+E3 EC 59 28	# bltu s3,t0,fe8 <__panic>
 #     li      t0, 0x6F                    # skip-jump placeholder: jal x0, 0
 93 02 F0 06	# li t0,111
 #     sw      t0, 0(gp)
@@ -825,6 +838,12 @@ E3 E6 59 28	# bltu s3,t0,fcc <__panic>
 93 80 01 00	# mv ra,gp
 #     addi    gp, gp, 4
 93 81 41 00	# addi gp,gp,4
+#     li      t0, 0x100000
+B7 02 10 00	# lui t0,0x100
+#     add     t0, s7, t0
+B3 82 5B 00	# add t0,s7,t0
+#     sw      tp, 28(t0)                  # the cstack as the body starts (checked at ';')
+23 AE 42 00	# sw tp,28(t0) # 10001c <ISLAND_GAP+0xc001c>
 #     mv      a2, t2                      # name start
 13 86 03 00	# mv a2,t2
 #     mv      a3, s1                      # name end
@@ -837,50 +856,50 @@ E3 E6 59 28	# bltu s3,t0,fcc <__panic>
 13 08 00 00	# li a6,0
 #     CALL    nt_insert
 93 8D CD FF	# addi s11,s11,-4
-E3 E0 AD 27	# bltu s11,s10,fcc <__panic>
+E3 E0 AD 27	# bltu s11,s10,fe8 <__panic>
 93 02 90 00	# li t0,9
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 31	# j 888 <nt_insert>
+6F 00 00 31	# j 8a4 <nt_insert>
 #     j       .Lc_next                    # body compiled by the main loop
-6F F0 9F BF	# j 174 <.Lc_next>
+6F F0 DF BD	# j 174 <.Lc_next>
 
 # ':I name <body> ;' -- immediate word. Record (kind=2, entry = immediate
 # cursor), swap gp to the immediate region so the body compiles THERE, then let
 # the main loop compile it. ';' appends `j __dispatch` and restores output-gp.
 # .Lc_defimm:
 #     NEXT_TOKEN s1, s2, t2, .Lc_deferr   # read word name = [t2, s1)
-E3 F4 24 F1	# bgeu s1,s2,488 <.Lc_deferr>
+E3 FE 24 EF	# bgeu s1,s2,498 <.Lc_deferr>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 8C 62 00	# beq t0,t1,5a4 <.Lnt_skip43>
+63 8C 62 00	# beq t0,t1,5c0 <.Lnt_skip43>
 13 03 90 00	# li t1,9
-63 CC 62 00	# blt t0,t1,5ac <.Lnt_beg43>
+63 CC 62 00	# blt t0,t1,5c8 <.Lnt_beg43>
 13 03 D0 00	# li t1,13
-63 54 53 00	# bge t1,t0,5a4 <.Lnt_skip43>
-6F 00 C0 00	# j 5ac <.Lnt_beg43>
+63 54 53 00	# bge t1,t0,5c0 <.Lnt_skip43>
+6F 00 C0 00	# j 5c8 <.Lnt_beg43>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 580 <.Lc_defimm>
+6F F0 9F FD	# j 59c <.Lc_defimm>
 93 83 04 00	# mv t2,s1
-63 F6 24 03	# bgeu s1,s2,5dc <.Lnt_end43>
+63 F6 24 03	# bgeu s1,s2,5f8 <.Lnt_end43>
 83 C2 04 00	# lbu t0,0(s1)
 13 03 00 02	# li t1,32
-63 80 62 02	# beq t0,t1,5dc <.Lnt_end43>
+63 80 62 02	# beq t0,t1,5f8 <.Lnt_end43>
 13 03 90 00	# li t1,9
-63 C8 62 00	# blt t0,t1,5d4 <.Lnt_chr43>
+63 C8 62 00	# blt t0,t1,5f0 <.Lnt_chr43>
 13 03 D0 00	# li t1,13
-63 58 53 00	# bge t1,t0,5dc <.Lnt_end43>
-6F 00 40 00	# j 5d4 <.Lnt_chr43>
+63 58 53 00	# bge t1,t0,5f8 <.Lnt_end43>
+6F 00 40 00	# j 5f0 <.Lnt_chr43>
 93 84 14 00	# addi s1,s1,1
-6F F0 9F FD	# j 5b0 <.Lnt_scan43>
+6F F0 9F FD	# j 5cc <.Lnt_scan43>
 #     sub     t0, s1, t2                  # names are capped at 8 bytes
 B3 82 74 40	# sub t0,s1,t2
 #     li      t1, 8
 13 03 80 00	# li t1,8
 #     bgtu    t0, t1, __panic
-E3 64 53 1E	# bltu t1,t0,fcc <__panic>
+E3 64 53 1E	# bltu t1,t0,fe8 <__panic>
 #     li      t0, 0x1400
 B7 12 00 00	# lui t0,0x1
-93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x148>
+93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x12c>
 #     add     t3, s10, t0                 # region base
 33 0E 5D 00	# add t3,s10,t0
 #     lw      t4, 0(t3)                   # immediate cursor = this word's entry
@@ -897,13 +916,13 @@ B7 12 00 00	# lui t0,0x1
 13 08 00 00	# li a6,0
 #     CALL    nt_insert
 93 8D CD FF	# addi s11,s11,-4
-E3 EE AD 1B	# bltu s11,s10,fcc <__panic>
+E3 EE AD 1B	# bltu s11,s10,fe8 <__panic>
 93 02 A0 00	# li t0,10
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 26	# j 888 <nt_insert>
+6F 00 C0 26	# j 8a4 <nt_insert>
 #     li      t0, 0x1400
 B7 12 00 00	# lui t0,0x1
-93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x148>
+93 82 02 40	# addi t0,t0,1024 # 1400 <data+0x12c>
 #     add     t3, s10, t0                 # reload region base (nt_insert clobbered t3)
 33 0E 5D 00	# add t3,s10,t0
 #     sw      gp, 4(t3)                   # word1 = stashed output-gp (in-:I flag)
@@ -911,7 +930,7 @@ B7 12 00 00	# lui t0,0x1
 #     lw      gp, 0(t3)                   # gp = immediate cursor -> body emits to region
 83 21 0E 00	# lw gp,0(t3)
 #     j       .Lc_next
-6F F0 1F B4	# j 174 <.Lc_next>
+6F F0 5F B2	# j 174 <.Lc_next>
 
 # A name token -- look it up; macro -> expand inline, word -> call, immediate -> run.
 # .Lc_word:
@@ -922,32 +941,32 @@ B3 82 74 40	# sub t0,s1,t2
 #     li      t1, 8
 13 03 80 00	# li t1,8
 #     bgtu    t0, t1, .Lc_tryunk          # >8 chars: not a name -> ??? hook
-63 62 53 14	# bltu t1,t0,788 <.Lc_tryunk>
+63 62 53 14	# bltu t1,t0,7a4 <.Lc_tryunk>
 #     mv      a2, t2                      # name start
 13 86 03 00	# mv a2,t2
 #     mv      a3, s1                      # name end
 93 86 04 00	# mv a3,s1
 #     CALL    nt_lookup                   # a4=found, a5=kind, a6=field0, a7=field1
 93 8D CD FF	# addi s11,s11,-4
-E3 EC AD 17	# bltu s11,s10,fcc <__panic>
+E3 EC AD 17	# bltu s11,s10,fe8 <__panic>
 93 02 B0 00	# li t0,11
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 2C	# j 920 <nt_lookup>
+6F 00 00 2C	# j 93c <nt_lookup>
 #     beqz    a4, .Lc_tryunk              # not defined -> ??? hook
-63 02 07 12	# beqz a4,788 <.Lc_tryunk>
+63 02 07 12	# beqz a4,7a4 <.Lc_tryunk>
 #     li      t0, 2
 93 02 20 00	# li t0,2
 #     beq     a5, t0, .Lc_invimm          # kind == 2 -> run the immediate word now
-63 8C 57 16	# beq a5,t0,7e4 <_base69>
+63 8C 57 16	# beq a5,t0,800 <_base69>
 #     bnez    a5, .Lc_callword            # kind == 1 (word) -> call (Part 2)
-63 92 07 02	# bnez a5,694 <.Lc_callword>
+63 92 07 02	# bnez a5,6b0 <.Lc_callword>
     # macro -- save resume point, jump into the body
 #     addi    sp, sp, -8
 13 01 81 FF	# addi sp,sp,-8
 #     addi    t0, s3, -0x400              # t0 = stack floor (= heap top)
 93 82 09 C0	# addi t0,s3,-1024
 #     bltu    sp, t0, __panic             # macro nesting overflowed its 1 KiB stack
-E3 68 51 14	# bltu sp,t0,fcc <__panic>
+E3 68 51 14	# bltu sp,t0,fe8 <__panic>
 #     sw      s1, 0(sp)                   # resume cursor
 23 20 91 00	# sw s1,0(sp)
 #     sw      s2, 4(sp)                   # resume limit
@@ -957,7 +976,7 @@ E3 68 51 14	# bltu sp,t0,fcc <__panic>
 #     mv      s2, a7                      # limit  = body end
 13 89 08 00	# mv s2,a7
 #     j       .Lc_next
-6F F0 5F AE	# j 174 <.Lc_next>
+6F F0 9F AC	# j 174 <.Lc_next>
 # A reference to a word (a6 = entry from nt_lookup): emit a call --
 #   push a fresh return-id onto the OUTPUT's RID stack, then `j entry` (or
 #   `j` its relay, out of reach).  Record (return-id -> return-site) in the
@@ -980,49 +999,49 @@ E3 68 51 14	# bltu sp,t0,fcc <__panic>
 13 05 35 D9	# addi a0,a0,-621 # ffcd8d93 <ISLAND_GAP+0xffc98d93>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-E3 EA AD 11	# bltu s11,s10,fcc <__panic>
+E3 EA AD 11	# bltu s11,s10,fe8 <__panic>
 93 02 C0 00	# li t0,12
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 10 03	# j ef4 <emit_word>
+6F 00 10 03	# j f10 <emit_word>
 #     li      a0, 0x01ADF463             # bgeu s11, s10, +8  (skip trap-jump if no overflow)
 37 F5 AD 01	# lui a0,0x1adf
 13 05 35 46	# addi a0,a0,1123 # 1adf463 <ISLAND_GAP+0x1a9f463>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-E3 EC AD 0F	# bltu s11,s10,fcc <__panic>
+E3 EC AD 0F	# bltu s11,s10,fe8 <__panic>
 93 02 D0 00	# li t0,13
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 50 01	# j ef4 <emit_word>
+6F 00 50 01	# j f10 <emit_word>
 #     li      a0, 0x6F                   # j .  (RID-overflow halt, in place)
 13 05 F0 06	# li a0,111
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-E3 E0 AD 0F	# bltu s11,s10,fcc <__panic>
+E3 E0 AD 0F	# bltu s11,s10,fe8 <__panic>
 93 02 E0 00	# li t0,14
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 7F	# j ef4 <emit_word>
+6F 00 C0 7F	# j f10 <emit_word>
 #     mv      a0, t5                      # li t0, r   (lui+addi: r may exceed 2047)
 13 05 0F 00	# mv a0,t5
 #     li      a1, 0x2B7                   #   lui t0, 0
 93 05 70 2B	# li a1,695
 #     li      a2, 0x28293                 #   addi t0, t0, 0
 37 86 02 00	# lui a2,0x28
-13 06 36 29	# addi a2,a2,659 # 28293 <data+0x26fdb>
+13 06 36 29	# addi a2,a2,659 # 28293 <data+0x26fbf>
 #     CALL    emit_li
 93 8D CD FF	# addi s11,s11,-4
-E3 EE AD 0B	# bltu s11,s10,fcc <__panic>
+E3 EE AD 0B	# bltu s11,s10,fe8 <__panic>
 93 02 F0 00	# li t0,15
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 7E	# j f08 <emit_li>
+6F 00 C0 7E	# j f24 <emit_li>
 #     li      a0, 0x005DA023              # sw t0, 0(s11)
 37 A5 5D 00	# lui a0,0x5da
 13 05 35 02	# addi a0,a0,35 # 5da023 <ISLAND_GAP+0x59a023>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-E3 E0 AD 0B	# bltu s11,s10,fcc <__panic>
+E3 E0 AD 0B	# bltu s11,s10,fe8 <__panic>
 93 02 00 01	# li t0,16
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 7B	# j ef4 <emit_word>
+6F 00 C0 7B	# j f10 <emit_word>
 #     mv      a0, a6                      # j entry, if it's in reach;
 13 05 08 00	# mv a0,a6
 #     sub     t0, a6, gp
@@ -1030,19 +1049,19 @@ B3 02 38 40	# sub t0,a6,gp
 #     srai    t0, t0, 20
 93 D2 42 41	# srai t0,t0,0x14
 #     beqz    t0, 1f
-63 88 02 00	# beqz t0,758 <.L1^B1>
+63 88 02 00	# beqz t0,774 <.L1^B1>
 #     li      t1, -1
 13 03 F0 FF	# li t1,-1
 #     beq     t0, t1, 1f
-63 84 62 00	# beq t0,t1,758 <.L1^B1>
+63 84 62 00	# beq t0,t1,774 <.L1^B1>
 #     mv      a0, a7                      # else j its relay in the last island
 13 85 08 00	# mv a0,a7
 # 1:  CALL    emit_j
 93 8D CD FF	# addi s11,s11,-4
-E3 E8 AD 07	# bltu s11,s10,fcc <__panic>
+E3 E8 AD 07	# bltu s11,s10,fe8 <__panic>
 93 02 10 01	# li t0,17
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 80 29	# j a00 <emit_j>
+6F 00 80 29	# j a1c <emit_j>
 #     sw      gp, 0(t4)                   # site[r] = return point (current gp)
 23 A0 3E 00	# sw gp,0(t4)
 #     addi    t4, t4, 4
@@ -1052,11 +1071,11 @@ B7 02 10 00	# lui t0,0x100
 #     add     t0, t3, t0                  # call-site table end
 B3 02 5E 00	# add t0,t3,t0
 #     bgeu    t4, t0, __panic             # call-site table overflow
-E3 F8 5E 04	# bgeu t4,t0,fcc <__panic>
+E3 F8 5E 04	# bgeu t4,t0,fe8 <__panic>
 #     sw      t4, 0(t3)                   # store updated cursor
 23 20 DE 01	# sw t4,0(t3)
 #     j       .Lc_next
-6F F0 1F 9F	# j 174 <.Lc_next>
+6F F0 5F 9D	# j 174 <.Lc_next>
 # Unknown token: not a builtin, not hex, not a defined word, or longer than 8
 # bytes. Invoke the user's ':I ???' handler if defined -- a0 = token start,
 # a1 = token length; ??? reads those and may advance s1 (the source cursor) to
@@ -1064,38 +1083,38 @@ E3 F8 5E 04	# bgeu t4,t0,fcc <__panic>
 # .Lc_tryunk:
 #     CALL    find_qqq                    # a4 = found, a6 = ??? entry (kind=2)
 93 8D CD FF	# addi s11,s11,-4
-E3 E0 AD 05	# bltu s11,s10,fcc <__panic>
+E3 E0 AD 05	# bltu s11,s10,fe8 <__panic>
 93 02 20 01	# li t0,18
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 71	# j ea8 <find_qqq>
+6F 00 00 71	# j ec4 <find_qqq>
 #     beqz    a4, .Lc_undef               # no ??? defined -> undefined token
-63 02 07 04	# beqz a4,7e0 <.Lc_undef>
+63 02 07 04	# beqz a4,7fc <.Lc_undef>
 #     LOAD_ADDRESS a0, imm_tramp
 17 05 00 00	# auipc a0,0x0
-13 05 45 70	# addi a0,a0,1796 # ea4 <imm_tramp>
+13 05 45 70	# addi a0,a0,1796 # ec0 <imm_tramp>
 #     mv      a1, a6                      # target = ??? entry
 93 05 08 00	# mv a1,a6
 #     CALL    patch_j                     # imm_tramp := `j ???`
 93 8D CD FF	# addi s11,s11,-4
-E3 EE AD 01	# bltu s11,s10,fcc <__panic>
+E3 EE AD 01	# bltu s11,s10,fe8 <__panic>
 93 02 30 01	# li t0,19
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 27	# j a2c <patch_j>
+6F 00 00 27	# j a48 <patch_j>
 #     mv      a0, s4                      # a0 = token start (t2 was clobbered by nt_lookup)
 13 05 0A 00	# mv a0,s4
 #     sub     a1, s1, s4                  # a1 = token length
 B3 85 44 41	# sub a1,s1,s4
 #     CALL    imm_tramp                   # run ??? with the token in a0/a1
 93 8D CD FF	# addi s11,s11,-4
-E3 E0 AD 01	# bltu s11,s10,fcc <__panic>
+E3 E0 AD 01	# bltu s11,s10,fe8 <__panic>
 93 02 40 01	# li t0,20
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 6C	# j ea4 <imm_tramp>
+6F 00 C0 6C	# j ec0 <imm_tramp>
 #     j       .Lc_next
-6F F0 9F 99	# j 174 <.Lc_next>
+6F F0 DF 97	# j 174 <.Lc_next>
 # .Lc_undef:
 #     j       __panic                     # unknown token and no ??? handler
-6F 00 C0 7E	# j fcc <__panic>
+6F 00 C0 7E	# j fe8 <__panic>
 
 # An immediate-word reference (a6 = entry in the region): run it now. Patch the
 # shared trampoline to `j entry`, then CALL it; the body returns via `j __dispatch`,
@@ -1104,28 +1123,28 @@ E3 E0 AD 01	# bltu s11,s10,fcc <__panic>
 # .Lc_invimm:
 #     LOAD_ADDRESS a0, imm_tramp          # trampoline slot address
 17 05 00 00	# auipc a0,0x0
-13 05 05 6C	# addi a0,a0,1728 # ea4 <imm_tramp>
+13 05 05 6C	# addi a0,a0,1728 # ec0 <imm_tramp>
 #     mv      a1, a6                      # target = immediate entry
 93 05 08 00	# mv a1,a6
 #     CALL    patch_j                     # imm_tramp := `j entry`
 93 8D CD FF	# addi s11,s11,-4
-63 EC AD 7D	# bltu s11,s10,fcc <__panic>
+63 EC AD 7D	# bltu s11,s10,fe8 <__panic>
 93 02 50 01	# li t0,21
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 22	# j a2c <patch_j>
+6F 00 C0 22	# j a48 <patch_j>
 #     CALL    imm_tramp                   # push return-id, j imm_tramp -> entry -> __dispatch
 93 8D CD FF	# addi s11,s11,-4
-63 E2 AD 7D	# bltu s11,s10,fcc <__panic>
+63 E2 AD 7D	# bltu s11,s10,fe8 <__panic>
 93 02 60 01	# li t0,22
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 69	# j ea4 <imm_tramp>
+6F 00 00 69	# j ec0 <imm_tramp>
 #     j       .Lc_next
-6F F0 DF 95	# j 174 <.Lc_next>
+6F F0 1F 94	# j 174 <.Lc_next>
 
 # Reached the current limit. Pop a saved macro frame, or finish at top level.
 # .Lc_endspan:
 #     beq     sp, s3, .Lc_done            # macro stack empty -> done
-63 0A 31 01	# beq sp,s3,830 <.Lc_done>
+63 0A 31 01	# beq sp,s3,84c <.Lc_done>
 #     lw      s1, 0(sp)                   # resume cursor
 83 24 01 00	# lw s1,0(sp)
 #     lw      s2, 4(sp)                   # resume limit
@@ -1133,7 +1152,7 @@ E3 E0 AD 01	# bltu s11,s10,fcc <__panic>
 #     addi    sp, sp, 8
 13 01 81 00	# addi sp,sp,8
 #     j       .Lc_next
-6F F0 9F 94	# j 174 <.Lc_next>
+6F F0 DF 92	# j 174 <.Lc_next>
 # .Lc_done:
     # Halt at the program end: a program that runs off its end -- or whose
     # final action is a call that returns to the EOT position -- lands here
@@ -1142,34 +1161,34 @@ E3 E0 AD 01	# bltu s11,s10,fcc <__panic>
 13 85 01 00	# mv a0,gp
 #     CALL    emit_j                      # `j .` at the program end
 93 8D CD FF	# addi s11,s11,-4
-63 EA AD 79	# bltu s11,s10,fcc <__panic>
+63 EA AD 79	# bltu s11,s10,fe8 <__panic>
 93 02 70 01	# li t0,23
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 1B	# j a00 <emit_j>
+6F 00 C0 1B	# j a1c <emit_j>
 #     li      a0, 1                       # the last island: the rest of the returns
 13 05 10 00	# li a0,1
 #     CALL    emit_island
 93 8D CD FF	# addi s11,s11,-4
-63 EE AD 77	# bltu s11,s10,fcc <__panic>
+63 EE AD 77	# bltu s11,s10,fe8 <__panic>
 93 02 80 01	# li t0,24
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 3C	# j c1c <emit_island>
+6F 00 00 3C	# j c38 <emit_island>
 #     addi    a0, s0, 16                  # patch the prologue gp-load (auipc @ s0+16) ...
 13 05 04 01	# addi a0,s0,16
 #     mv      a1, gp                      # ... to point gp at the end of the output
 93 85 01 00	# mv a1,gp
 #     CALL    patch_la
 93 8D CD FF	# addi s11,s11,-4
-63 E0 AD 77	# bltu s11,s10,fcc <__panic>
+63 E0 AD 77	# bltu s11,s10,fe8 <__panic>
 93 02 90 01	# li t0,25
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 80 1D	# j a50 <patch_la>
+6F 00 80 1D	# j a6c <patch_la>
 #     mv      a0, s0                      # output start
 13 05 04 00	# mv a0,s0
 #     mv      a1, gp                      # output end
 93 85 01 00	# mv a1,gp
 #     RET
-6F 00 10 02	# j 10a4 <__dispatch>
+6F 00 10 02	# j 10c0 <__dispatch>
 
 # nt_insert -- a2=tok start, a3=tok end, a4=kind, a5=field0, a6=field1.
 #   Appends a 20-byte entry to the name table. __panic on a duplicate name
@@ -1181,28 +1200,28 @@ E3 E0 AD 01	# bltu s11,s10,fcc <__panic>
 93 0F 00 00	# li t6,0
 93 03 06 00	# mv t2,a2
 13 0E 00 00	# li t3,0
-63 FA D3 02	# bgeu t2,a3,8cc <.Lsn_sc81>
+63 FA D3 02	# bgeu t2,a3,8e8 <.Lsn_sc81>
 83 C2 03 00	# lbu t0,0(t2)
 13 73 3E 00	# andi t1,t3,3
 13 13 33 00	# slli t1,t1,0x3
 B3 92 62 00	# sll t0,t0,t1
 13 03 40 00	# li t1,4
-63 46 6E 00	# blt t3,t1,8bc <.Lsn_lo81>
+63 46 6E 00	# blt t3,t1,8d8 <.Lsn_lo81>
 B3 EF 5F 00	# or t6,t6,t0
-6F 00 80 00	# j 8c0 <.Lsn_pn81>
+6F 00 80 00	# j 8dc <.Lsn_pn81>
 33 6F 5F 00	# or t5,t5,t0
 93 83 13 00	# addi t2,t2,1
 13 0E 1E 00	# addi t3,t3,1
-6F F0 1F FD	# j 898 <.Lsn_pk81>
+6F F0 1F FD	# j 8b4 <.Lsn_pk81>
 93 82 0B 00	# mv t0,s7
-63 F0 62 03	# bgeu t0,s6,8f0 <.Lsn_nf81>
+63 F0 62 03	# bgeu t0,s6,90c <.Lsn_nf81>
 03 A3 02 00	# lw t1,0(t0) # 100000 <ISLAND_GAP+0xc0000>
-63 18 E3 01	# bne t1,t5,8e8 <.Lsn_adv81>
+63 18 E3 01	# bne t1,t5,904 <.Lsn_adv81>
 03 A3 42 00	# lw t1,4(t0)
-63 14 F3 01	# bne t1,t6,8e8 <.Lsn_adv81>
-6F 00 80 03	# j 91c <.Lin_dup>
+63 14 F3 01	# bne t1,t6,904 <.Lsn_adv81>
+6F 00 80 03	# j 938 <.Lin_dup>
 93 82 42 01	# addi t0,t0,20
-6F F0 5F FE	# j 8d0 <.Lsn_lp81>
+6F F0 5F FE	# j 8ec <.Lsn_lp81>
 #     addi    t1, s6, 20                  # cursor after this entry
 13 03 4B 01	# addi t1,s6,20
 #     li      t2, 0x100000
@@ -1210,7 +1229,7 @@ B7 03 10 00	# lui t2,0x100
 #     add     t2, s7, t2                  # name table end
 B3 83 7B 00	# add t2,s7,t2
 #     bgtu    t1, t2, __panic             # table overflow
-63 E8 63 6C	# bltu t2,t1,fcc <__panic>
+63 E8 63 6C	# bltu t2,t1,fe8 <__panic>
 #     sw      t5, 0(s6)                   # name lo
 23 20 EB 01	# sw t5,0(s6)
 #     sw      t6, 4(s6)                   # name hi
@@ -1224,10 +1243,10 @@ B3 83 7B 00	# add t2,s7,t2
 #     addi    s6, s6, 20                  # advance cursor
 13 0B 4B 01	# addi s6,s6,20
 #     RET
-6F 00 C0 78	# j 10a4 <__dispatch>
+6F 00 C0 78	# j 10c0 <__dispatch>
 # .Lin_dup:
 #     j       __panic                     # redefinition is a compile error
-6F 00 00 6B	# j fcc <__panic>
+6F 00 00 6B	# j fe8 <__panic>
 
 # nt_lookup -- a2=tok start, a3=tok end. Returns a4=found(1/0); when found,
 #   a5=kind, a6=field0, a7=field1. Preserves a0/a1. Clobbers t0-t6, a2, a3.
@@ -1238,32 +1257,32 @@ B3 83 7B 00	# add t2,s7,t2
 93 0F 00 00	# li t6,0
 93 03 06 00	# mv t2,a2
 13 0E 00 00	# li t3,0
-63 FA D3 02	# bgeu t2,a3,964 <.Lsn_sc83>
+63 FA D3 02	# bgeu t2,a3,980 <.Lsn_sc83>
 83 C2 03 00	# lbu t0,0(t2) # 100000 <ISLAND_GAP+0xc0000>
 13 73 3E 00	# andi t1,t3,3
 13 13 33 00	# slli t1,t1,0x3
 B3 92 62 00	# sll t0,t0,t1
 13 03 40 00	# li t1,4
-63 46 6E 00	# blt t3,t1,954 <.Lsn_lo83>
+63 46 6E 00	# blt t3,t1,970 <.Lsn_lo83>
 B3 EF 5F 00	# or t6,t6,t0
-6F 00 80 00	# j 958 <.Lsn_pn83>
+6F 00 80 00	# j 974 <.Lsn_pn83>
 33 6F 5F 00	# or t5,t5,t0
 93 83 13 00	# addi t2,t2,1
 13 0E 1E 00	# addi t3,t3,1
-6F F0 1F FD	# j 930 <.Lsn_pk83>
+6F F0 1F FD	# j 94c <.Lsn_pk83>
 93 82 0B 00	# mv t0,s7
-63 F0 62 03	# bgeu t0,s6,988 <.Lsn_nf83>
+63 F0 62 03	# bgeu t0,s6,9a4 <.Lsn_nf83>
 03 A3 02 00	# lw t1,0(t0)
-63 18 E3 01	# bne t1,t5,980 <.Lsn_adv83>
+63 18 E3 01	# bne t1,t5,99c <.Lsn_adv83>
 03 A3 42 00	# lw t1,4(t0)
-63 14 F3 01	# bne t1,t6,980 <.Lsn_adv83>
-6F 00 40 01	# j 990 <.Llk_found>
+63 14 F3 01	# bne t1,t6,99c <.Lsn_adv83>
+6F 00 40 01	# j 9ac <.Llk_found>
 93 82 42 01	# addi t0,t0,20
-6F F0 5F FE	# j 968 <.Lsn_lp83>
+6F F0 5F FE	# j 984 <.Lsn_lp83>
 #     li      a4, 0                       # not found
 13 07 00 00	# li a4,0
 #     RET
-6F 00 80 71	# j 10a4 <__dispatch>
+6F 00 80 71	# j 10c0 <__dispatch>
 # .Llk_found:
 #     lw      a5, 8(t0)                   # kind
 83 A7 82 00	# lw a5,8(t0)
@@ -1274,7 +1293,7 @@ B3 EF 5F 00	# or t6,t6,t0
 #     li      a4, 1                       # found
 13 07 10 00	# li a4,1
 #     RET
-6F 00 40 70	# j 10a4 <__dispatch>
+6F 00 40 70	# j 10c0 <__dispatch>
 
 # encode_jal -- a0 = signed byte offset; returns a0 = `jal x0, offset` word
 #   (builds the scrambled J-type immediate). Clobbers t0, t1.
@@ -1285,11 +1304,11 @@ B3 EF 5F 00	# or t6,t6,t0
 #     srai    t0, a0, 20                  # in range iff offset>>20 is 0 or -1
 93 52 45 41	# srai t0,a0,0x14
 #     beqz    t0, 1f
-63 86 02 00	# beqz t0,9b4 <.L1^B2>
+63 86 02 00	# beqz t0,9d0 <.L1^B2>
 #     li      t1, -1
 13 03 F0 FF	# li t1,-1
 #     bne     t0, t1, __panic             # |offset| >= 1 MiB -> not encodable
-63 9E 62 60	# bne t0,t1,fcc <__panic>
+63 9E 62 60	# bne t0,t1,fe8 <__panic>
 # 1:
 #     li      t0, 0x6F                    # opcode | rd=x0
 93 02 F0 06	# li t0,111
@@ -1328,7 +1347,7 @@ B3 E2 62 00	# or t0,t0,t1
 #     mv      a0, t0
 13 85 02 00	# mv a0,t0
 #     RET
-6F 00 80 6A	# j 10a4 <__dispatch>
+6F 00 80 6A	# j 10c0 <__dispatch>
 
 # emit_j -- a0 = target address; emit `jal x0, target-gp` at gp, advance gp.
 #   The word is stored little-endian (the CPU's fetch order), unlike ',' which
@@ -1338,19 +1357,19 @@ B3 E2 62 00	# or t0,t0,t1
 33 05 35 40	# sub a0,a0,gp
 #     CALL    encode_jal                  # a0 = instruction word
 93 8D CD FF	# addi s11,s11,-4
-63 E2 AD 5D	# bltu s11,s10,fcc <__panic>
+63 E2 AD 5D	# bltu s11,s10,fe8 <__panic>
 93 02 A0 01	# li t0,26
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 1F F9	# j 9a4 <encode_jal>
+6F F0 1F F9	# j 9c0 <encode_jal>
 #     CHECK_HEAP 4, t0
 93 82 41 40	# addi t0,gp,1028
-63 E8 59 5A	# bltu s3,t0,fcc <__panic>
+63 E8 59 5A	# bltu s3,t0,fe8 <__panic>
 #     sw      a0, 0(gp)
 23 A0 A1 00	# sw a0,0(gp)
 #     addi    gp, gp, 4
 93 81 41 00	# addi gp,gp,4
 #     RET
-6F 00 C0 67	# j 10a4 <__dispatch>
+6F 00 C0 67	# j 10c0 <__dispatch>
 
 # patch_j -- a0 = jump-slot address, a1 = target; overwrite the slot with
 #   `jal x0, target-slot`. Clobbers t0, t1, a0, a1, a2.
@@ -1361,14 +1380,14 @@ B3 E2 62 00	# or t0,t0,t1
 33 85 C5 40	# sub a0,a1,a2
 #     CALL    encode_jal                  # a0 = instruction word
 93 8D CD FF	# addi s11,s11,-4
-63 EA AD 59	# bltu s11,s10,fcc <__panic>
+63 EA AD 59	# bltu s11,s10,fe8 <__panic>
 93 02 B0 01	# li t0,27
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 1F F6	# j 9a4 <encode_jal>
+6F F0 1F F6	# j 9c0 <encode_jal>
 #     sw      a0, 0(a2)
 23 20 A6 00	# sw a0,0(a2)
 #     RET
-6F 00 80 65	# j 10a4 <__dispatch>
+6F 00 80 65	# j 10c0 <__dispatch>
 
 # patch_la -- a0 = address of an `auipc gp` (paired `addi gp,gp` at a0+4),
 #   a1 = target. Rewrites the pair to load `target` PC-relative: off = target-a0;
@@ -1380,7 +1399,7 @@ B3 E2 62 00	# or t0,t0,t1
 33 86 A5 40	# sub a2,a1,a0
 #     li      a3, 0x800
 B7 16 00 00	# lui a3,0x1
-93 86 06 80	# addi a3,a3,-2048 # 800 <_base69+0x1c>
+93 86 06 80	# addi a3,a3,-2048 # 800 <_base69>
 #     add     a3, a2, a3
 B3 06 D6 00	# add a3,a2,a3
 #     srli    a3, a3, 12                  # a3 = %hi(off)
@@ -1395,13 +1414,13 @@ B3 06 D6 00	# add a3,a2,a3
 13 17 46 01	# slli a4,a2,0x14
 #     li      a5, 0x18193
 B7 87 01 00	# lui a5,0x18
-93 87 37 19	# addi a5,a5,403 # 18193 <data+0x16edb>
+93 87 37 19	# addi a5,a5,403 # 18193 <data+0x16ebf>
 #     or      a4, a4, a5                  # rebuild `addi gp, gp, %lo`
 33 67 F7 00	# or a4,a4,a5
 #     sw      a4, 4(a0)
 23 22 E5 00	# sw a4,4(a0)
 #     RET
-6F 00 00 62	# j 10a4 <__dispatch>
+6F 00 00 62	# j 10c0 <__dispatch>
 
 # gen_bst -- a0 = lo, a1 = hi.  Emit a balanced BST node covering return-id
 #   range [lo, hi] into the output at gp:
@@ -1414,9 +1433,9 @@ B7 87 01 00	# lui a5,0x18
 #   + 32 + id*4).  Clobbers t0-t6, a0-a1 (frame-saved values reloaded each time).
 # gen_bst:
 #     blt     a1, a0, .Lgb_done           # lo > hi: empty subtree
-63 CA A5 02	# blt a1,a0,abc <Lret_28>
+63 CA A5 02	# blt a1,a0,ad8 <Lret_28>
 #     bne     a0, a1, .Lgb_node           # lo != hi: internal node
-63 1A B5 02	# bne a0,a1,ac0 <.Lgb_node>
+63 1A B5 02	# bne a0,a1,adc <.Lgb_node>
 #     li      t3, 0x100020                # leaf: lo == hi -> j site[lo]
 37 0E 10 00	# lui t3,0x100
 13 0E 0E 02	# addi t3,t3,32 # 100020 <ISLAND_GAP+0xc0020>
@@ -1430,20 +1449,20 @@ B7 87 01 00	# lui a5,0x18
 03 25 0E 00	# lw a0,0(t3)
 #     CALL    emit_j
 93 8D CD FF	# addi s11,s11,-4
-63 E0 AD 53	# bltu s11,s10,fcc <__panic>
+63 E0 AD 53	# bltu s11,s10,fe8 <__panic>
 93 02 C0 01	# li t0,28
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 9F F4	# j a00 <emit_j>
+6F F0 9F F4	# j a1c <emit_j>
 # .Lgb_done:
 #     RET
-6F 00 80 5E	# j 10a4 <__dispatch>
+6F 00 80 5E	# j 10c0 <__dispatch>
 # .Lgb_node:
 #     addi    sp, sp, -16                 # frame: [lo, hi, mid, jleft]
 13 01 01 FF	# addi sp,sp,-16
 #     addi    t0, s3, -0x400              # t0 = stack floor (= heap top)
 93 82 09 C0	# addi t0,s3,-1024
 #     bltu    sp, t0, __panic             # frame overflowed its 1 KiB stack
-63 62 51 50	# bltu sp,t0,fcc <__panic>
+63 62 51 50	# bltu sp,t0,fe8 <__panic>
 #     sw      a0, 0(sp)                   # lo
 23 20 A1 00	# sw a0,0(sp)
 #     sw      a1, 4(sp)                   # hi
@@ -1460,22 +1479,22 @@ B7 87 01 00	# lui a5,0x18
 93 05 70 33	# li a1,823
 #     li      a2, 0x30313                 #   addi t1, t1, 0
 37 06 03 00	# lui a2,0x30
-13 06 36 31	# addi a2,a2,787 # 30313 <data+0x2f05b>
+13 06 36 31	# addi a2,a2,787 # 30313 <data+0x2f03f>
 #     CALL    emit_li
 93 8D CD FF	# addi s11,s11,-4
-63 EC AD 4D	# bltu s11,s10,fcc <__panic>
+63 EC AD 4D	# bltu s11,s10,fe8 <__panic>
 93 02 D0 01	# li t0,29
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 80 40	# j f08 <emit_li>
+6F 00 80 40	# j f24 <emit_li>
 #     li      a0, 0x00629463             # bne t0, t1, +8  (skip the hit jump)
 37 95 62 00	# lui a0,0x629
 13 05 35 46	# addi a0,a0,1123 # 629463 <ISLAND_GAP+0x5e9463>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 EE AD 4B	# bltu s11,s10,fcc <__panic>
+63 EE AD 4B	# bltu s11,s10,fe8 <__panic>
 93 02 E0 01	# li t0,30
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 80 3D	# j ef4 <emit_word>
+6F 00 80 3D	# j f10 <emit_word>
 #     li      t3, 0x100020                # j site[mid]
 37 0E 10 00	# lui t3,0x100
 13 0E 0E 02	# addi t3,t3,32 # 100020 <ISLAND_GAP+0xc0020>
@@ -1491,19 +1510,19 @@ B7 87 01 00	# lui a5,0x18
 03 25 0E 00	# lw a0,0(t3)
 #     CALL    emit_j
 93 8D CD FF	# addi s11,s11,-4
-63 E6 AD 49	# bltu s11,s10,fcc <__panic>
+63 E6 AD 49	# bltu s11,s10,fe8 <__panic>
 93 02 F0 01	# li t0,31
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 5F EB	# j a00 <emit_j>
+6F F0 5F EB	# j a1c <emit_j>
 #     li      a0, 0x0062D463             # bge t0, t1, +8  (t0>=mid -> skip left jump)
 37 D5 62 00	# lui a0,0x62d
 13 05 35 46	# addi a0,a0,1123 # 62d463 <ISLAND_GAP+0x5ed463>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 E8 AD 47	# bltu s11,s10,fcc <__panic>
+63 E8 AD 47	# bltu s11,s10,fe8 <__panic>
 93 02 00 02	# li t0,32
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 38	# j ef4 <emit_word>
+6F 00 C0 38	# j f10 <emit_word>
 #     mv      t5, gp                      # jleft = slot of the placeholder j
 13 8F 01 00	# mv t5,gp
 #     sw      t5, 12(sp)
@@ -1512,10 +1531,10 @@ B7 87 01 00	# lui a5,0x18
 13 05 F0 06	# li a0,111
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 E8 AD 45	# bltu s11,s10,fcc <__panic>
+63 E8 AD 45	# bltu s11,s10,fe8 <__panic>
 93 02 10 02	# li t0,33
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 36	# j ef4 <emit_word>
+6F 00 C0 36	# j f10 <emit_word>
 #     lw      t3, 8(sp)                   # recurse right: gen_bst(mid+1, hi)
 03 2E 81 00	# lw t3,8(sp)
 #     addi    a0, t3, 1
@@ -1524,10 +1543,10 @@ B7 87 01 00	# lui a5,0x18
 83 25 41 00	# lw a1,4(sp)
 #     CALL    gen_bst
 93 8D CD FF	# addi s11,s11,-4
-63 E8 AD 43	# bltu s11,s10,fcc <__panic>
+63 E8 AD 43	# bltu s11,s10,fe8 <__panic>
 93 02 20 02	# li t0,34
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 1F EE	# j a88 <gen_bst>
+6F F0 1F EE	# j aa4 <gen_bst>
     # Patch the left-jump placeholder. The left subtree is gen_bst(lo, mid-1),
     # which is EMPTY when mid==lo (a 2-element node [lo, lo+1]). For a valid id
     # the t0<mid edge is then unreachable -- but a corrupt RID could take it, so
@@ -1541,15 +1560,15 @@ B7 87 01 00	# lui a5,0x18
 #     lw      a0, 12(sp)                  # Lleft placeholder slot
 03 25 C1 00	# lw a0,12(sp)
 #     beq     t3, t4, .Lgb_left_empty     # mid==lo -> left empty -> halt, no recurse
-63 02 DE 05	# beq t3,t4,bfc <.Lgb_left_empty>
+63 02 DE 05	# beq t3,t4,c18 <.Lgb_left_empty>
 #     mv      a1, gp                      # left non-empty: Lleft -> left subtree (gp)
 93 85 01 00	# mv a1,gp
 #     CALL    patch_j
 93 8D CD FF	# addi s11,s11,-4
-63 E4 AD 41	# bltu s11,s10,fcc <__panic>
+63 E4 AD 41	# bltu s11,s10,fe8 <__panic>
 93 02 30 02	# li t0,35
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 DF E5	# j a2c <patch_j>
+6F F0 DF E5	# j a48 <patch_j>
 #     lw      a0, 0(sp)                   # recurse left: gen_bst(lo, mid-1)
 03 25 01 00	# lw a0,0(sp)
 #     lw      t3, 8(sp)
@@ -1558,27 +1577,27 @@ B7 87 01 00	# lui a5,0x18
 93 05 FE FF	# addi a1,t3,-1
 #     CALL    gen_bst
 93 8D CD FF	# addi s11,s11,-4
-63 E4 AD 3F	# bltu s11,s10,fcc <__panic>
+63 E4 AD 3F	# bltu s11,s10,fe8 <__panic>
 93 02 40 02	# li t0,36
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 9F E9	# j a88 <gen_bst>
+6F F0 9F E9	# j aa4 <gen_bst>
 #     addi    sp, sp, 16
 13 01 01 01	# addi sp,sp,16
 #     RET
-6F 00 C0 4A	# j 10a4 <__dispatch>
+6F 00 C0 4A	# j 10c0 <__dispatch>
 # .Lgb_left_empty:
 #     mv      a1, a0                      # target = the j's own address -> `j .` halt
 93 05 05 00	# mv a1,a0
 #     CALL    patch_j
 93 8D CD FF	# addi s11,s11,-4
-63 E4 AD 3D	# bltu s11,s10,fcc <__panic>
+63 E4 AD 3D	# bltu s11,s10,fe8 <__panic>
 93 02 50 02	# li t0,37
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 DF E1	# j a2c <patch_j>
+6F F0 DF E1	# j a48 <patch_j>
 #     addi    sp, sp, 16
 13 01 01 01	# addi sp,sp,16
 #     RET
-6F 00 C0 48	# j 10a4 <__dispatch>
+6F 00 C0 48	# j 10c0 <__dispatch>
 
 # emit_island -- a0 = 1 for the last (at EOT), 0 otherwise.  Every jump the
 #   output makes is a `jal` (no jalr), reaching +-1 MiB; islands are what let
@@ -1607,21 +1626,21 @@ B7 87 01 00	# lui a5,0x18
 #     addi    t0, s3, -0x400              # t0 = stack floor (= heap top)
 93 82 09 C0	# addi t0,s3,-1024
 #     bltu    sp, t0, __panic             # frame overflowed its 1 KiB stack
-63 64 51 3A	# bltu sp,t0,fcc <__panic>
+63 64 51 3A	# bltu sp,t0,fe8 <__panic>
 #     sw      a0, 0(sp)                   # last?
 23 20 A1 00	# sw a0,0(sp)
 #     bnez    a0, 1f
-63 10 05 02	# bnez a0,c4c <Lret_38>
+63 10 05 02	# bnez a0,c68 <Lret_38>
 #     sw      gp, 4(sp)                   # the `j over` slot
 23 22 31 00	# sw gp,4(sp)
 #     li      a0, 0x6F                    # j over  (placeholder, patched below)
 13 05 F0 06	# li a0,111
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 E8 AD 39	# bltu s11,s10,fcc <__panic>
+63 E8 AD 39	# bltu s11,s10,fe8 <__panic>
 93 02 60 02	# li t0,38
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 2A	# j ef4 <emit_word>
+6F 00 C0 2A	# j f10 <emit_word>
 # 1:  sw      gp, 8(sp)                   # ret
 23 24 31 00	# sw gp,8(sp)
 #     li      a0, 0x000DA283              # lw t0, 0(s11)   (pop return-id)
@@ -1629,19 +1648,19 @@ B7 87 01 00	# lui a5,0x18
 13 05 35 28	# addi a0,a0,643 # da283 <ISLAND_GAP+0x9a283>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 E8 AD 37	# bltu s11,s10,fcc <__panic>
+63 E8 AD 37	# bltu s11,s10,fe8 <__panic>
 93 02 70 02	# li t0,39
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 C0 28	# j ef4 <emit_word>
+6F 00 C0 28	# j f10 <emit_word>
 #     li      a0, 0x004D8D93              # addi s11, s11, 4
 37 95 4D 00	# lui a0,0x4d9
 13 05 35 D9	# addi a0,a0,-621 # 4d8d93 <ISLAND_GAP+0x498d93>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 EA AD 35	# bltu s11,s10,fcc <__panic>
+63 EA AD 35	# bltu s11,s10,fe8 <__panic>
 93 02 80 02	# li t0,40
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 27	# j ef4 <emit_word>
+6F 00 00 27	# j f10 <emit_word>
 #     sw      gp, 12(sp)                  # chk
 23 26 31 00	# sw gp,12(sp)
 #     li      t3, 0x100000
@@ -1651,15 +1670,15 @@ B7 87 01 00	# lui a5,0x18
 #     lw      a0, 8(t3)                   # the previous island's forward jump ...
 03 25 8E 00	# lw a0,8(t3) # 100008 <ISLAND_GAP+0xc0008>
 #     beqz    a0, 2f
-63 0E 05 00	# beqz a0,cb4 <Lret_41>
+63 0E 05 00	# beqz a0,cd0 <Lret_41>
 #     mv      a1, gp                      # ... comes here
 93 85 01 00	# mv a1,gp
 #     CALL    patch_j
 93 8D CD FF	# addi s11,s11,-4
-63 E4 AD 33	# bltu s11,s10,fcc <__panic>
+63 E4 AD 33	# bltu s11,s10,fe8 <__panic>
 93 02 90 02	# li t0,41
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 DF D7	# j a2c <patch_j>
+6F F0 DF D7	# j a48 <patch_j>
 # 2:  li      t3, 0x100000
 37 0E 10 00	# lui t3,0x100
 #     add     t3, s7, t3
@@ -1667,17 +1686,17 @@ B7 87 01 00	# lui a5,0x18
 #     lw      t4, 4(t3)                   # the first island?
 83 2E 4E 00	# lw t4,4(t3) # 100004 <ISLAND_GAP+0xc0004>
 #     bnez    t4, 3f
-63 90 0E 02	# bnez t4,ce0 <Lret_42>
+63 90 0E 02	# bnez t4,cfc <Lret_42>
 #     addi    a0, s0, 8                   # then __ret (s0+8) ...
 13 05 84 00	# addi a0,s0,8
 #     lw      a1, 8(sp)                   # ... jumps to its ret
 83 25 81 00	# lw a1,8(sp)
 #     CALL    patch_j
 93 8D CD FF	# addi s11,s11,-4
-63 EE AD 2F	# bltu s11,s10,fcc <__panic>
+63 EE AD 2F	# bltu s11,s10,fe8 <__panic>
 93 02 A0 02	# li t0,42
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 1F D5	# j a2c <patch_j>
+6F F0 1F D5	# j a48 <patch_j>
 # 3:  li      t3, 0x100000
 37 0E 10 00	# lui t3,0x100
 #     add     t3, s7, t3
@@ -1688,22 +1707,22 @@ B7 87 01 00	# lui a5,0x18
 93 05 70 33	# li a1,823
 #     li      a2, 0x30313                 #   addi t1, t1, 0
 37 06 03 00	# lui a2,0x30
-13 06 36 31	# addi a2,a2,787 # 30313 <data+0x2f05b>
+13 06 36 31	# addi a2,a2,787 # 30313 <data+0x2f03f>
 #     CALL    emit_li
 93 8D CD FF	# addi s11,s11,-4
-63 E8 AD 2D	# bltu s11,s10,fcc <__panic>
+63 E8 AD 2D	# bltu s11,s10,fe8 <__panic>
 93 02 B0 02	# li t0,43
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 20	# j f08 <emit_li>
+6F 00 00 20	# j f24 <emit_li>
 #     li      a0, 0x0062F463              # bgeu t0, t1, +8  (id >= lo: stay)
 37 F5 62 00	# lui a0,0x62f
 13 05 35 46	# addi a0,a0,1123 # 62f463 <ISLAND_GAP+0x5ef463>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 EA AD 2B	# bltu s11,s10,fcc <__panic>
+63 EA AD 2B	# bltu s11,s10,fe8 <__panic>
 93 02 C0 02	# li t0,44
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 00 1D	# j ef4 <emit_word>
+6F 00 00 1D	# j f10 <emit_word>
 #     li      t3, 0x100000
 37 0E 10 00	# lui t3,0x100
 #     add     t3, s7, t3
@@ -1711,15 +1730,15 @@ B7 87 01 00	# lui a5,0x18
 #     lw      a0, 4(t3)                   # j <previous chk>
 03 25 4E 00	# lw a0,4(t3) # 100004 <ISLAND_GAP+0xc0004>
 #     bnez    a0, 4f
-63 14 05 00	# bnez a0,d3c <.L4^B1>
+63 14 05 00	# bnez a0,d58 <.L4^B1>
 #     mv      a0, gp                      # none: j .  (an id below 0 can't happen)
 13 85 01 00	# mv a0,gp
 # 4:  CALL    emit_j
 93 8D CD FF	# addi s11,s11,-4
-63 E6 AD 29	# bltu s11,s10,fcc <__panic>
+63 E6 AD 29	# bltu s11,s10,fe8 <__panic>
 93 02 D0 02	# li t0,45
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 5F CB	# j a00 <emit_j>
+6F F0 5F CB	# j a1c <emit_j>
 #     li      t3, 0x100000
 37 0E 10 00	# lui t3,0x100
 #     add     t3, s7, t3
@@ -1736,22 +1755,22 @@ B7 87 01 00	# lui a5,0x18
 93 05 70 33	# li a1,823
 #     li      a2, 0x30313
 37 06 03 00	# lui a2,0x30
-13 06 36 31	# addi a2,a2,787 # 30313 <data+0x2f05b>
+13 06 36 31	# addi a2,a2,787 # 30313 <data+0x2f03f>
 #     CALL    emit_li
 93 8D CD FF	# addi s11,s11,-4
-63 EA AD 25	# bltu s11,s10,fcc <__panic>
+63 EA AD 25	# bltu s11,s10,fe8 <__panic>
 93 02 E0 02	# li t0,46
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 40 18	# j f08 <emit_li>
+6F 00 40 18	# j f24 <emit_li>
 #     li      a0, 0x0062E463              # bltu t0, t1, +8  (id < N: stay)
 37 E5 62 00	# lui a0,0x62e
 13 05 35 46	# addi a0,a0,1123 # 62e463 <ISLAND_GAP+0x5ee463>
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 EC AD 23	# bltu s11,s10,fcc <__panic>
+63 EC AD 23	# bltu s11,s10,fe8 <__panic>
 93 02 F0 02	# li t0,47
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 40 15	# j ef4 <emit_word>
+6F 00 40 15	# j f10 <emit_word>
 #     li      t3, 0x100000
 37 0E 10 00	# lui t3,0x100
 #     add     t3, s7, t3
@@ -1761,17 +1780,17 @@ B7 87 01 00	# lui a5,0x18
 #     lw      t4, 0(sp)
 83 2E 01 00	# lw t4,0(sp)
 #     bnez    t4, 5f                      # the last: j .  (a corrupt id halts)
-63 94 0E 00	# bnez t4,dbc <.L5^B1>
+63 94 0E 00	# bnez t4,dd8 <.L5^B1>
 #     sw      gp, 8(t3)                   # else the next island patches it
 23 24 3E 00	# sw gp,8(t3)
 # 5:  li      a0, 0x6F                    # j .  (placeholder)
 13 05 F0 06	# li a0,111
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 E4 AD 21	# bltu s11,s10,fcc <__panic>
+63 E4 AD 21	# bltu s11,s10,fe8 <__panic>
 93 02 00 03	# li t0,48
 23 A0 5D 00	# sw t0,0(s11)
-6F 00 40 12	# j ef4 <emit_word>
+6F 00 40 12	# j f10 <emit_word>
 #     li      t3, 0x100000
 37 0E 10 00	# lui t3,0x100
 #     add     t3, s7, t3
@@ -1800,24 +1819,24 @@ B7 87 01 00	# lui a5,0x18
 23 2A DE 01	# sw t4,20(t3)
 #     CALL    gen_bst                     # this segment's return sites
 93 8D CD FF	# addi s11,s11,-4
-63 E0 AD 1D	# bltu s11,s10,fcc <__panic>
+63 E0 AD 1D	# bltu s11,s10,fe8 <__panic>
 93 02 10 03	# li t0,49
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 1F C7	# j a88 <gen_bst>
+6F F0 1F C7	# j aa4 <gen_bst>
 #     lw      t4, 0(sp)
 83 2E 01 00	# lw t4,0(sp)
 #     bnez    t4, 9f
-63 9E 0E 06	# bnez t4,e9c <.L9^B1>
+63 9E 0E 06	# bnez t4,eb8 <.L9^B1>
 #     mv      t2, s7                      # a relay for every ':' word
 93 83 0B 00	# mv t2,s7
 # 6:  bgeu    t2, s6, 8f
-63 F6 63 05	# bgeu t2,s6,e74 <.L8^B1>
+63 F6 63 05	# bgeu t2,s6,e90 <.L8^B1>
 #     lw      t0, 8(t2)                   # kind
 83 A2 83 00	# lw t0,8(t2)
 #     li      t1, 1
 13 03 10 00	# li t1,1
 #     bne     t0, t1, 7f
-63 9C 62 02	# bne t0,t1,e6c <Lret_50>
+63 9C 62 02	# bne t0,t1,e88 <Lret_50>
 #     lw      a0, 12(t2)                  # the word's entry, if it's in reach
 03 A5 C3 00	# lw a0,12(t2)
 #     sub     t0, a0, gp
@@ -1825,35 +1844,35 @@ B3 02 35 40	# sub t0,a0,gp
 #     srai    t0, t0, 20
 93 D2 42 41	# srai t0,t0,0x14
 #     beqz    t0, 65f
-63 88 02 00	# beqz t0,e54 <.L65^B1>
+63 88 02 00	# beqz t0,e70 <.L65^B1>
 #     li      t1, -1
 13 03 F0 FF	# li t1,-1
 #     beq     t0, t1, 65f
-63 84 62 00	# beq t0,t1,e54 <.L65^B1>
+63 84 62 00	# beq t0,t1,e70 <.L65^B1>
 #     lw      a0, 16(t2)                  # else its relay in the island before
 03 A5 03 01	# lw a0,16(t2)
 # 65: sw      gp, 16(t2)                  # field1 = this relay
 23 A8 33 00	# sw gp,16(t2)
 #     CALL    emit_j
 93 8D CD FF	# addi s11,s11,-4
-63 E8 AD 17	# bltu s11,s10,fcc <__panic>
+63 E8 AD 17	# bltu s11,s10,fe8 <__panic>
 93 02 20 03	# li t0,50
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 9F B9	# j a00 <emit_j>
+6F F0 9F B9	# j a1c <emit_j>
 # 7:  addi    t2, t2, 20
 93 83 43 01	# addi t2,t2,20
 #     j       6b
-6F F0 9F FB	# j e28 <.L6^B1>
+6F F0 9F FB	# j e44 <.L6^B1>
 # 8:  lw      a0, 4(sp)                   # j over -> here
 03 25 41 00	# lw a0,4(sp)
 #     mv      a1, gp
 93 85 01 00	# mv a1,gp
 #     CALL    patch_j
 93 8D CD FF	# addi s11,s11,-4
-63 E6 AD 15	# bltu s11,s10,fcc <__panic>
+63 E6 AD 15	# bltu s11,s10,fe8 <__panic>
 93 02 30 03	# li t0,51
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 1F BA	# j a2c <patch_j>
+6F F0 1F BA	# j a48 <patch_j>
 #     li      t3, 0x100000
 37 0E 10 00	# lui t3,0x100
 #     add     t3, s7, t3
@@ -1863,7 +1882,7 @@ B3 02 35 40	# sub t0,a0,gp
 # 9:  addi    sp, sp, 16
 13 01 01 01	# addi sp,sp,16
 #     RET
-6F 00 40 20	# j 10a4 <__dispatch>
+6F 00 40 20	# j 10c0 <__dispatch>
 
 # imm_tramp -- one-slot trampoline for invoking an immediate word at a runtime-
 #   determined address without jalr. .Lc_invimm patches this to `j <entry>` then
@@ -1872,7 +1891,7 @@ B3 02 35 40	# sub t0,a0,gp
 #   a safe placeholder if it somehow runs unpatched.
 # imm_tramp:
 #     j       imm_tramp
-6F 00 00 00	# j ea4 <imm_tramp>
+6F 00 00 00	# j ec0 <imm_tramp>
 
 # find_qqq -- look up the immediate word named "???" (packed name lo=0x003F3F3F,
 #   hi=0). Returns a4=1 and a6=entry if a kind=2 entry exists, else a4=0.
@@ -1887,50 +1906,50 @@ B3 02 35 40	# sub t0,a0,gp
 13 8E 0B 00	# mv t3,s7
 # .Lfq_lp:
 #     bgeu    t3, s6, .Lfq_nf             # scanned all entries -> not found
-63 7A 6E 03	# bgeu t3,s6,eec <.Lfq_nf>
+63 7A 6E 03	# bgeu t3,s6,f08 <.Lfq_nf>
 #     lw      t0, 0(t3)
 83 22 0E 00	# lw t0,0(t3)
 #     bne     t0, t5, .Lfq_adv
-63 92 E2 03	# bne t0,t5,ee4 <.Lfq_adv>
+63 92 E2 03	# bne t0,t5,f00 <.Lfq_adv>
 #     lw      t0, 4(t3)
 83 22 4E 00	# lw t0,4(t3)
 #     bne     t0, t6, .Lfq_adv
-63 9E F2 01	# bne t0,t6,ee4 <.Lfq_adv>
+63 9E F2 01	# bne t0,t6,f00 <.Lfq_adv>
 #     lw      t0, 8(t3)                   # kind
 83 22 8E 00	# lw t0,8(t3)
 #     li      t1, 2
 13 03 20 00	# li t1,2
 #     bne     t0, t1, .Lfq_adv            # only an immediate ??? is invocable
-63 98 62 00	# bne t0,t1,ee4 <.Lfq_adv>
+63 98 62 00	# bne t0,t1,f00 <.Lfq_adv>
 #     lw      a6, 12(t3)                  # field0 = entry
 03 28 CE 00	# lw a6,12(t3)
 #     li      a4, 1
 13 07 10 00	# li a4,1
 #     RET
-6F 00 40 1C	# j 10a4 <__dispatch>
+6F 00 40 1C	# j 10c0 <__dispatch>
 # .Lfq_adv:
 #     addi    t3, t3, 20
 13 0E 4E 01	# addi t3,t3,20
 #     j       .Lfq_lp
-6F F0 1F FD	# j eb8 <.Lfq_lp>
+6F F0 1F FD	# j ed4 <.Lfq_lp>
 # .Lfq_nf:
 #     li      a4, 0
 13 07 00 00	# li a4,0
 #     RET
-6F 00 40 1B	# j 10a4 <__dispatch>
+6F 00 40 1B	# j 10c0 <__dispatch>
 
 # emit_word -- a0 = instruction word; store it at gp (little-endian), advance gp.
 #   Clobbers t0, a0.
 # emit_word:
 #     CHECK_HEAP 4, t0
 93 82 41 40	# addi t0,gp,1028
-63 EA 59 0C	# bltu s3,t0,fcc <__panic>
+63 EA 59 0C	# bltu s3,t0,fe8 <__panic>
 #     sw      a0, 0(gp)
 23 A0 A1 00	# sw a0,0(gp)
 #     addi    gp, gp, 4
 93 81 41 00	# addi gp,gp,4
 #     RET
-6F 00 00 1A	# j 10a4 <__dispatch>
+6F 00 00 1A	# j 10c0 <__dispatch>
 
 # emit_li -- emit `li <reg>, a0` as lui+addi so the value can be any 32-bit number
 #   (a single addi caps at +-2048; this is what lifts the 2047 call-site limit).
@@ -1941,7 +1960,7 @@ B3 02 35 40	# sub t0,a0,gp
 # emit_li:
 #     li      t0, 0x800
 B7 12 00 00	# lui t0,0x1
-93 82 02 80	# addi t0,t0,-2048 # 800 <_base69+0x1c>
+93 82 02 80	# addi t0,t0,-2048 # 800 <_base69>
 #     add     t0, a0, t0
 B3 02 55 00	# add t0,a0,t0
 #     srli    t0, t0, 12                  # hi = (v + 0x800) >> 12
@@ -1958,20 +1977,20 @@ B3 E6 B2 00	# or a3,t0,a1
 13 85 06 00	# mv a0,a3
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 EE AD 09	# bltu s11,s10,fcc <__panic>
+63 EE AD 09	# bltu s11,s10,fe8 <__panic>
 93 02 40 03	# li t0,52
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 9F FB	# j ef4 <emit_word>
+6F F0 9F FB	# j f10 <emit_word>
 #     mv      a0, a4
 13 05 07 00	# mv a0,a4
 #     CALL    emit_word
 93 8D CD FF	# addi s11,s11,-4
-63 E2 AD 09	# bltu s11,s10,fcc <__panic>
+63 E2 AD 09	# bltu s11,s10,fe8 <__panic>
 93 02 50 03	# li t0,53
 23 A0 5D 00	# sw t0,0(s11)
-6F F0 1F FA	# j ef4 <emit_word>
+6F F0 1F FA	# j f10 <emit_word>
 #     RET
-6F 00 C0 14	# j 10a4 <__dispatch>
+6F 00 C0 14	# j 10c0 <__dispatch>
 
 # write_output:
 #     li      t0, 0x10000000              # UART base
@@ -1981,9 +2000,9 @@ B7 02 00 10	# lui t0,0x10000
 #     andi    t1, t1, 0x20                # LSR THR-empty
 13 73 03 02	# andi t1,t1,32
 #     beqz    t1, 1b
-E3 0C 03 FE	# beqz t1,f60 <.L1^B4>
+E3 0C 03 FE	# beqz t1,f7c <.L1^B4>
 #     bgeu     a0, a1, 2f
-63 7A B5 00	# bgeu a0,a1,f80 <.L2^B2>
+63 7A B5 00	# bgeu a0,a1,f9c <.L2^B2>
 #     lbu     t1, 0(a0)
 03 43 05 00	# lbu t1,0(a0)
 #     sb      t1, 0(t0)                   # THR
@@ -1991,9 +2010,9 @@ E3 0C 03 FE	# beqz t1,f60 <.L1^B4>
 #     addi    a0, a0, 1
 13 05 15 00	# addi a0,a0,1
 #     j       1b
-6F F0 5F FE	# j f60 <.L1^B4>
+6F F0 5F FE	# j f7c <.L1^B4>
 # 2:  RET
-6F 00 40 12	# j 10a4 <__dispatch>
+6F 00 40 12	# j 10c0 <__dispatch>
 
 # read_all_bytes:
 #     li      t0, 0x10000000              # UART base
@@ -2005,33 +2024,33 @@ B7 02 00 10	# lui t0,0x10000
 #     andi    t1, t1, 0x01                # DR bit -- byte available?
 13 73 13 00	# andi t1,t1,1
 #     beqz    t1, 1b
-E3 0C 03 FE	# beqz t1,f8c <.L1^B5>
+E3 0C 03 FE	# beqz t1,fa8 <.L1^B5>
 #     lbu     t1, 0(t0)                   # RBR -- read byte
 03 C3 02 00	# lbu t1,0(t0)
 #     beq     t1, t2, 2f                  # EOT -> stop
-63 0C 73 00	# beq t1,t2,fb4 <.L2^B3>
+63 0C 73 00	# beq t1,t2,fd0 <.L2^B3>
 #     CHECK_HEAP 1, t3                    # room for 1 input byte?
 13 8E 11 40	# addi t3,gp,1025
-63 E4 C9 03	# bltu s3,t3,fcc <__panic>
+63 E4 C9 03	# bltu s3,t3,fe8 <__panic>
 #     sb      t1, 0(gp)                   # store at heap
 23 80 61 00	# sb t1,0(gp)
 #     addi    gp, gp, 1                   # bump
 93 81 11 00	# addi gp,gp,1
 #     j       1b
-6F F0 DF FD	# j f8c <.L1^B5>
+6F F0 DF FD	# j fa8 <.L1^B5>
 # 2:  RET
-6F 00 00 0F	# j 10a4 <__dispatch>
+6F 00 00 0F	# j 10c0 <__dispatch>
 
 # exit:
 #     li      t0, 0x100000                # SiFive test finisher
 B7 02 10 00	# lui t0,0x100
 #     li      t1, 0x5555                  # shutdown
 37 53 00 00	# lui t1,0x5
-13 03 53 55	# addi t1,t1,1365 # 5555 <data+0x429d>
+13 03 53 55	# addi t1,t1,1365 # 5555 <data+0x4281>
 #     sw      t1, 0(t0)
 23 A0 62 00	# sw t1,0(t0) # 100000 <ISLAND_GAP+0xc0000>
 # 1:  j       1b
-6F 00 00 00	# j fc8 <.L1^B6>
+6F 00 00 00	# j fe4 <.L1^B6>
 
 # __panic -- '?', then where: "? src XXXXXXXX out XXXXXXXX" -- the source
 #   byte the compiler had reached (s1, from the input's start; in a macro, its
@@ -2047,7 +2066,7 @@ B7 02 00 10	# lui t0,0x10000
 #     andi    t1, t1, 0x20
 13 73 03 02	# andi t1,t1,32
 #     beqz    t1, 1b
-E3 0C 03 FE	# beqz t1,fd4 <.L1^B7>
+E3 0C 03 FE	# beqz t1,ff0 <.L1^B7>
 #     sb      a0, 0(t0)
 23 80 A2 00	# sb a0,0(t0)
 #     li      t3, 0x100000
@@ -2070,7 +2089,7 @@ B3 85 C4 41	# sub a1,s1,t3
 #     andi    t1, t1, 0x20
 13 73 03 02	# andi t1,t1,32
 #     beqz    t1, 4b
-E3 0C 03 FE	# beqz t1,1004 <.L4^B2>
+E3 0C 03 FE	# beqz t1,1020 <.L4^B2>
 #     sb      a2, 0(t0)
 23 80 C2 00	# sb a2,0(t0)
 #     srli    a2, a2, 8
@@ -2078,7 +2097,7 @@ E3 0C 03 FE	# beqz t1,1004 <.L4^B2>
 #     addi    t5, t5, -1
 13 0F FF FF	# addi t5,t5,-1
 #     bnez    t5, 4b
-E3 14 0F FE	# bnez t5,1004 <.L4^B2>
+E3 14 0F FE	# bnez t5,1020 <.L4^B2>
 #     li      a0, ' '
 13 05 00 02	# li a0,32
 # 5:  lbu     t1, 5(t0)
@@ -2086,7 +2105,7 @@ E3 14 0F FE	# bnez t5,1004 <.L4^B2>
 #     andi    t1, t1, 0x20
 13 73 03 02	# andi t1,t1,32
 #     beqz    t1, 5b
-E3 0C 03 FE	# beqz t1,1024 <.L5^B2>
+E3 0C 03 FE	# beqz t1,1040 <.L5^B2>
 #     sb      a0, 0(t0)
 23 80 A2 00	# sb a0,0(t0)
 #     li      t5, 8                       # 8 hex digits
@@ -2098,7 +2117,7 @@ E3 0C 03 FE	# beqz t1,1024 <.L5^B2>
 #     li      t2, 10
 93 03 A0 00	# li t2,10
 #     blt     a0, t2, 7f
-63 44 75 00	# blt a0,t2,104c <.L7^B2>
+63 44 75 00	# blt a0,t2,1068 <.L7^B2>
 #     addi    a0, a0, 'A' - '0' - 10
 13 05 75 00	# addi a0,a0,7
 # 7:  addi    a0, a0, '0'
@@ -2108,13 +2127,13 @@ E3 0C 03 FE	# beqz t1,1024 <.L5^B2>
 #     andi    t1, t1, 0x20
 13 73 03 02	# andi t1,t1,32
 #     beqz    t1, 8b
-E3 0C 03 FE	# beqz t1,1050 <.L8^B2>
+E3 0C 03 FE	# beqz t1,106c <.L8^B2>
 #     sb      a0, 0(t0)
 23 80 A2 00	# sb a0,0(t0)
 #     addi    t5, t5, -1
 13 0F FF FF	# addi t5,t5,-1
 #     bnez    t5, 6b
-E3 1A 0F FC	# bnez t5,1038 <.L6^B2>
+E3 1A 0F FC	# bnez t5,1054 <.L6^B2>
 #     sub     a1, gp, s0                  # then the output offset
 B3 85 81 40	# sub a1,gp,s0
 #     li      a2, 0x74756F20              # " out"
@@ -2123,7 +2142,7 @@ B3 85 81 40	# sub a1,gp,s0
 #     addi    t4, t4, -1
 93 8E FE FF	# addi t4,t4,-1
 #     bnez    t4, 3b
-E3 94 0E F8	# bnez t4,1000 <.L3^B2>
+E3 94 0E F8	# bnez t4,101c <.L3^B2>
 #     li      a0, '\n'
 13 05 A0 00	# li a0,10
 # 2:  lbu     t1, 5(t0)
@@ -2131,18 +2150,18 @@ E3 94 0E F8	# bnez t4,1000 <.L3^B2>
 #     andi    t1, t1, 0x20
 13 73 03 02	# andi t1,t1,32
 #     beqz    t1, 2b
-E3 0C 03 FE	# beqz t1,1080 <.L2^B4>
+E3 0C 03 FE	# beqz t1,109c <.L2^B4>
 #     sb      a0, 0(t0)
 23 80 A2 00	# sb a0,0(t0)
 #     li      t0, 0x100000                # SiFive test finisher
 B7 02 10 00	# lui t0,0x100
 #     li      t1, 0x00013333              # FAIL with exit code 1 (NOT 0x5555/PASS)
 37 33 01 00	# lui t1,0x13
-13 03 33 33	# addi t1,t1,819 # 13333 <data+0x1207b>
+13 03 33 33	# addi t1,t1,819 # 13333 <data+0x1205f>
 #     sw      t1, 0(t0)
 23 A0 62 00	# sw t1,0(t0) # 100000 <ISLAND_GAP+0xc0000>
 # 1:  j       1b                          # spin until QEMU exits
-6F 00 00 00	# j 10a0 <.L1^B8>
+6F 00 00 00	# j 10bc <.L1^B8>
 
 # __dispatch:
 #     lw      t0, 0(s11)                  # pop return id
@@ -2152,136 +2171,136 @@ B7 02 10 00	# lui t0,0x100
 #     li      t1, N_CALLS
 13 03 60 03	# li t1,54
 #     bgeu    t0, t1, __dispatch_trap     # out-of-range id -> trap
-63 F2 62 20	# bgeu t0,t1,12b4 <__dispatch_trap>
+63 F2 62 20	# bgeu t0,t1,12d0 <__dispatch_trap>
 #     BST     0, %(N_CALLS - 1)
 13 03 A0 01	# li t1,26
-E3 80 62 96	# beq t0,t1,a18 <Lret_26>
-63 CC 62 0E	# blt t0,t1,11b4 <Lleft_26>
+E3 80 62 96	# beq t0,t1,a34 <Lret_26>
+63 CC 62 0E	# blt t0,t1,11d0 <Lleft_26>
 13 03 80 02	# li t1,40
-E3 82 62 BC	# beq t0,t1,c88 <Lret_40>
-63 CC 62 06	# blt t0,t1,1140 <Lleft_40>
+E3 82 62 BC	# beq t0,t1,ca4 <Lret_40>
+63 CC 62 06	# blt t0,t1,115c <Lleft_40>
 13 03 F0 02	# li t1,47
-E3 8A 62 CC	# beq t0,t1,da4 <Lret_47>
-63 CC 62 02	# blt t0,t1,110c <Lleft_47>
+E3 8A 62 CC	# beq t0,t1,dc0 <Lret_47>
+63 CC 62 02	# blt t0,t1,1128 <Lleft_47>
 13 03 20 03	# li t1,50
-E3 88 62 D8	# beq t0,t1,e6c <Lret_50>
-63 CC 62 00	# blt t0,t1,10f8 <Lleft_50>
+E3 88 62 D8	# beq t0,t1,e88 <Lret_50>
+63 CC 62 00	# blt t0,t1,1114 <Lleft_50>
 13 03 40 03	# li t1,52
-E3 8C 62 E4	# beq t0,t1,f40 <Lret_52>
-63 C4 62 00	# blt t0,t1,10f4 <Lleft_52>
-6F F0 9F E6	# j f58 <Lret_53>
-6F F0 DF D9	# j e90 <Lret_51>
+E3 8C 62 E4	# beq t0,t1,f5c <Lret_52>
+63 C4 62 00	# blt t0,t1,1110 <Lleft_52>
+6F F0 9F E6	# j f74 <Lret_53>
+6F F0 DF D9	# j eac <Lret_51>
 13 03 00 03	# li t1,48
-E3 8C 62 CC	# beq t0,t1,dd4 <Lret_48>
-63 C4 62 00	# blt t0,t1,1108 <Lleft_48>
-6F F0 9F D1	# j e1c <Lret_49>
-6F 00 C0 1A	# j 12b4 <__dispatch_trap>
+E3 8C 62 CC	# beq t0,t1,df0 <Lret_48>
+63 C4 62 00	# blt t0,t1,1124 <Lleft_48>
+6F F0 9F D1	# j e38 <Lret_49>
+6F 00 C0 1A	# j 12d0 <__dispatch_trap>
 13 03 B0 02	# li t1,43
-E3 8E 62 BE	# beq t0,t1,d0c <Lret_43>
-63 CC 62 00	# blt t0,t1,112c <Lleft_43>
+E3 8E 62 BE	# beq t0,t1,d28 <Lret_43>
+63 CC 62 00	# blt t0,t1,1148 <Lleft_43>
 13 03 D0 02	# li t1,45
-E3 8A 62 C2	# beq t0,t1,d50 <Lret_45>
-63 C4 62 00	# blt t0,t1,1128 <Lleft_45>
-6F F0 5F C6	# j d88 <Lret_46>
-6F F0 1F C0	# j d28 <Lret_44>
+E3 8A 62 C2	# beq t0,t1,d6c <Lret_45>
+63 C4 62 00	# blt t0,t1,1144 <Lleft_45>
+6F F0 5F C6	# j da4 <Lret_46>
+6F F0 1F C0	# j d44 <Lret_44>
 13 03 90 02	# li t1,41
-E3 82 62 B8	# beq t0,t1,cb4 <Lret_41>
-63 C4 62 00	# blt t0,t1,113c <Lleft_41>
-6F F0 9F BA	# j ce0 <Lret_42>
-6F 00 80 17	# j 12b4 <__dispatch_trap>
+E3 82 62 B8	# beq t0,t1,cd0 <Lret_41>
+63 C4 62 00	# blt t0,t1,1158 <Lleft_41>
+6F F0 9F BA	# j cfc <Lret_42>
+6F 00 80 17	# j 12d0 <__dispatch_trap>
 13 03 10 02	# li t1,33
-E3 84 62 A4	# beq t0,t1,b8c <Lret_33>
-63 CC 62 02	# blt t0,t1,1180 <Lleft_33>
+E3 84 62 A4	# beq t0,t1,ba8 <Lret_33>
+63 CC 62 02	# blt t0,t1,119c <Lleft_33>
 13 03 40 02	# li t1,36
-E3 82 62 AA	# beq t0,t1,bf4 <Lret_36>
-63 CC 62 00	# blt t0,t1,116c <Lleft_36>
+E3 82 62 AA	# beq t0,t1,c10 <Lret_36>
+63 CC 62 00	# blt t0,t1,1188 <Lleft_36>
 13 03 60 02	# li t1,38
-E3 88 62 AE	# beq t0,t1,c4c <Lret_38>
-63 C4 62 00	# blt t0,t1,1168 <Lleft_38>
-6F F0 9F B0	# j c6c <Lret_39>
-6F F0 DF AA	# j c14 <Lret_37>
+E3 88 62 AE	# beq t0,t1,c68 <Lret_38>
+63 C4 62 00	# blt t0,t1,1184 <Lleft_38>
+6F F0 9F B0	# j c88 <Lret_39>
+6F F0 DF AA	# j c30 <Lret_37>
 13 03 20 02	# li t1,34
-E3 8E 62 A2	# beq t0,t1,bac <Lret_34>
-63 C4 62 00	# blt t0,t1,117c <Lleft_34>
-6F F0 DF A5	# j bd4 <Lret_35>
-6F 00 80 13	# j 12b4 <__dispatch_trap>
+E3 8E 62 A2	# beq t0,t1,bc8 <Lret_34>
+63 C4 62 00	# blt t0,t1,1198 <Lleft_34>
+6F F0 DF A5	# j bf0 <Lret_35>
+6F 00 80 13	# j 12d0 <__dispatch_trap>
 13 03 D0 01	# li t1,29
-E3 80 62 98	# beq t0,t1,b04 <Lret_29>
-63 CC 62 00	# blt t0,t1,11a0 <Lleft_29>
+E3 80 62 98	# beq t0,t1,b20 <Lret_29>
+63 CC 62 00	# blt t0,t1,11bc <Lleft_29>
 13 03 F0 01	# li t1,31
-E3 80 62 9C	# beq t0,t1,b50 <Lret_31>
-63 C4 62 00	# blt t0,t1,119c <Lleft_31>
-6F F0 5F 9D	# j b6c <Lret_32>
-6F F0 5F 98	# j b20 <Lret_30>
+E3 80 62 9C	# beq t0,t1,b6c <Lret_31>
+63 C4 62 00	# blt t0,t1,11b8 <Lleft_31>
+6F F0 5F 9D	# j b88 <Lret_32>
+6F F0 5F 98	# j b3c <Lret_30>
 13 03 B0 01	# li t1,27
-E3 82 62 8A	# beq t0,t1,a48 <Lret_27>
-63 C4 62 00	# blt t0,t1,11b0 <Lleft_27>
-6F F0 1F 91	# j abc <Lret_28>
-6F 00 40 10	# j 12b4 <__dispatch_trap>
+E3 82 62 8A	# beq t0,t1,a64 <Lret_27>
+63 C4 62 00	# blt t0,t1,11cc <Lleft_27>
+6F F0 1F 91	# j ad8 <Lret_28>
+6F 00 40 10	# j 12d0 <__dispatch_trap>
 13 03 C0 00	# li t1,12
-63 88 62 D0	# beq t0,t1,6c8 <Lret_12>
-63 CC 62 06	# blt t0,t1,1234 <Lleft_12>
+63 88 62 D0	# beq t0,t1,6e4 <Lret_12>
+63 CC 62 06	# blt t0,t1,1250 <Lleft_12>
 13 03 30 01	# li t1,19
-63 8E 62 DE	# beq t0,t1,7c0 <Lret_19>
-63 CC 62 02	# blt t0,t1,1200 <Lleft_19>
+63 8E 62 DE	# beq t0,t1,7dc <Lret_19>
+63 CC 62 02	# blt t0,t1,121c <Lleft_19>
 13 03 60 01	# li t1,22
-63 84 62 E4	# beq t0,t1,818 <Lret_22>
-63 CC 62 00	# blt t0,t1,11ec <Lleft_22>
+63 84 62 E4	# beq t0,t1,834 <Lret_22>
+63 CC 62 00	# blt t0,t1,1208 <Lleft_22>
 13 03 80 01	# li t1,24
-63 82 62 E8	# beq t0,t1,860 <Lret_24>
-63 C4 62 00	# blt t0,t1,11e8 <Lleft_24>
-6F F0 8F E9	# j 87c <Lret_25>
-6F F0 0F E6	# j 848 <Lret_23>
+63 82 62 E8	# beq t0,t1,87c <Lret_24>
+63 C4 62 00	# blt t0,t1,1204 <Lleft_24>
+6F F0 8F E9	# j 898 <Lret_25>
+6F F0 0F E6	# j 864 <Lret_23>
 13 03 40 01	# li t1,20
-63 86 62 DE	# beq t0,t1,7dc <Lret_20>
-63 C4 62 00	# blt t0,t1,11fc <Lleft_20>
-6F F0 CF E0	# j 804 <Lret_21>
-6F 00 80 0B	# j 12b4 <__dispatch_trap>
+63 86 62 DE	# beq t0,t1,7f8 <Lret_20>
+63 C4 62 00	# blt t0,t1,1218 <Lleft_20>
+6F F0 CF E0	# j 820 <Lret_21>
+6F 00 80 0B	# j 12d0 <__dispatch_trap>
 13 03 F0 00	# li t1,15
-63 8E 62 D0	# beq t0,t1,720 <Lret_15>
-63 CC 62 00	# blt t0,t1,1220 <Lleft_15>
+63 8E 62 D0	# beq t0,t1,73c <Lret_15>
+63 CC 62 00	# blt t0,t1,123c <Lleft_15>
 13 03 10 01	# li t1,17
-63 8E 62 D4	# beq t0,t1,76c <Lret_17>
-63 C4 62 00	# blt t0,t1,121c <Lleft_17>
-6F F0 4F D8	# j 79c <Lret_18>
-6F F0 0F D2	# j 73c <Lret_16>
+63 8E 62 D4	# beq t0,t1,788 <Lret_17>
+63 C4 62 00	# blt t0,t1,1238 <Lleft_17>
+6F F0 4F D8	# j 7b8 <Lret_18>
+6F F0 0F D2	# j 758 <Lret_16>
 13 03 D0 00	# li t1,13
-63 80 62 CC	# beq t0,t1,6e4 <Lret_13>
-63 C4 62 00	# blt t0,t1,1230 <Lleft_13>
-6F F0 0F CD	# j 6fc <Lret_14>
-6F 00 40 08	# j 12b4 <__dispatch_trap>
+63 80 62 CC	# beq t0,t1,700 <Lret_13>
+63 C4 62 00	# blt t0,t1,124c <Lleft_13>
+6F F0 0F CD	# j 718 <Lret_14>
+6F 00 40 08	# j 12d0 <__dispatch_trap>
 13 03 50 00	# li t1,5
-63 8C 62 90	# beq t0,t1,350 <Lret_5>
-63 CC 62 02	# blt t0,t1,1274 <Lleft_5>
+63 86 62 90	# beq t0,t1,360 <Lret_5>
+63 CC 62 02	# blt t0,t1,1290 <Lleft_5>
 13 03 80 00	# li t1,8
-63 88 62 A8	# beq t0,t1,4d4 <Lret_8>
-63 CC 62 00	# blt t0,t1,1260 <Lleft_8>
+63 82 62 A8	# beq t0,t1,4e4 <Lret_8>
+63 CC 62 00	# blt t0,t1,127c <Lleft_8>
 13 03 A0 00	# li t1,10
-63 88 62 BC	# beq t0,t1,620 <Lret_10>
-63 C4 62 00	# blt t0,t1,125c <Lleft_10>
-6F F0 CF C0	# j 664 <Lret_11>
-6F F0 0F B2	# j 57c <Lret_9>
+63 88 62 BC	# beq t0,t1,63c <Lret_10>
+63 C4 62 00	# blt t0,t1,1278 <Lleft_10>
+6F F0 CF C0	# j 680 <Lret_11>
+6F F0 0F B2	# j 598 <Lret_9>
 13 03 60 00	# li t1,6
-63 84 62 90	# beq t0,t1,36c <Lret_6>
-63 C4 62 00	# blt t0,t1,1270 <Lleft_6>
-6F F0 8F A1	# j 484 <Lret_7>
-6F 00 40 04	# j 12b4 <__dispatch_trap>
+63 8E 62 8E	# beq t0,t1,37c <Lret_6>
+63 C4 62 00	# blt t0,t1,128c <Lleft_6>
+6F F0 CF A0	# j 494 <Lret_7>
+6F 00 40 04	# j 12d0 <__dispatch_trap>
 13 03 20 00	# li t1,2
-63 94 62 00	# bne t0,t1,1280 <Lleft_5+0xc>
-6F E0 DF E3	# j b8 <Lret_2>
-63 CE 62 00	# blt t0,t1,129c <Lleft_2>
+63 94 62 00	# bne t0,t1,129c <Lleft_5+0xc>
+6F E0 1F E2	# j b8 <Lret_2>
+63 CE 62 00	# blt t0,t1,12b8 <Lleft_2>
 13 03 30 00	# li t1,3
-63 94 62 00	# bne t0,t1,1290 <Lleft_5+0x1c>
-6F E0 1F E8	# j 10c <Lret_3>
-63 C4 62 00	# blt t0,t1,1298 <Lleft_3>
-6F F0 CF 87	# j 310 <Lret_4>
-6F 00 C0 01	# j 12b4 <__dispatch_trap>
+63 94 62 00	# bne t0,t1,12ac <Lleft_5+0x1c>
+6F E0 5F E6	# j 10c <Lret_3>
+63 C4 62 00	# blt t0,t1,12b4 <Lleft_3>
+6F F0 0F 86	# j 310 <Lret_4>
+6F 00 C0 01	# j 12d0 <__dispatch_trap>
 13 03 00 00	# li t1,0
-63 94 62 00	# bne t0,t1,12a8 <Lleft_2+0xc>
-6F E0 9F DE	# j 8c <Lret_0>
-63 C4 62 00	# blt t0,t1,12b0 <Lleft_0>
-6F E0 9F DF	# j a4 <Lret_1>
-6F 00 40 00	# j 12b4 <__dispatch_trap>
+63 94 62 00	# bne t0,t1,12c4 <Lleft_2+0xc>
+6F E0 DF DC	# j 8c <Lret_0>
+63 C4 62 00	# blt t0,t1,12cc <Lleft_0>
+6F E0 DF DD	# j a4 <Lret_1>
+6F 00 40 00	# j 12d0 <__dispatch_trap>
 # __dispatch_trap:
 # 1:  j       1b
-6F 00 00 00	# j 12b4 <__dispatch_trap>
+6F 00 00 00	# j 12d0 <__dispatch_trap>

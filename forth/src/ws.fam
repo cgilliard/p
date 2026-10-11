@@ -1,0 +1,77 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/ws.fam — what a WebSocket handshake needs (RFC 6455): SHA-1 (FIPS
+\ 180-4) and base64 (RFC 4648).  Sec-WebSocket-Accept is base64(SHA-1(the
+\ client's key ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")).  Used once per
+\ connection, so written plainly.
+\
+\   sha1 ( a n out -- )      the 20-byte digest of n bytes
+\   b64  ( a n out -- n' )   base64 of n bytes (padded): its length
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: s1hv variable ;  : s1h ( -- a )  s1hv 14 lit lazy ;     \ h0 .. h4
+: s1wv variable ;  : s1w ( -- a )  s1wv 140 lit lazy ;    \ the schedule, W0 .. W79
+: s1bv variable ;  : s1b ( -- a )  s1bv 80 lit lazy ;     \ the padded tail
+: s1a variable ;  : s1bb variable ;  : s1c variable ;  : s1d variable ;  : s1e variable ;
+
+\ rotl ( x n -- x' )   rotate left n bits (0 < n < 32).
+: rotl ( x n -- x' )   2dup lshift rot rot 20 lit swap - rshift or ;
+
+: s1wi ( i -- a )   2 lit lshift s1w + ;
+
+\ s1blk ( a -- )   one 64-byte block into h.
+: s1blk ( a -- )
+	10 lit 0 lit do dup i 2 lit lshift + be32 i s1wi ! loop drop
+	50 lit 10 lit do
+		i 3 lit - s1wi @  i 8 lit - s1wi @ xor  i E lit - s1wi @ xor  i 10 lit - s1wi @ xor  1 lit rotl  i s1wi !
+	loop
+	s1h @ s1a !  s1h 4 lit + @ s1bb !  s1h 8 lit + @ s1c !  s1h C lit + @ s1d !  s1h 10 lit + @ s1e !
+	50 lit 0 lit do
+		i 14 lit u< if
+			s1bb @ s1c @ and  s1bb @ invert s1d @ and or  5A827999 lit
+		else i 28 lit u< if
+			s1bb @ s1c @ xor s1d @ xor  6ED9EBA1 lit
+		else i 3C lit u< if
+			s1bb @ s1c @ and  s1bb @ s1d @ and or  s1c @ s1d @ and or  8F1BBCDC lit
+		else
+			s1bb @ s1c @ xor s1d @ xor  CA62C1D6 lit
+		then then then                                         ( f k )
+		+  s1a @ 5 lit rotl +  s1e @ +  i s1wi @ +             ( temp )
+		s1d @ s1e !  s1c @ s1d !  s1bb @ 1E lit rotl s1c !  s1a @ s1bb !  s1a !
+	loop
+	s1a @ s1h @ + s1h !  s1bb @ s1h 4 lit + @ + s1h 4 lit + !  s1c @ s1h 8 lit + @ + s1h 8 lit + !
+	s1d @ s1h C lit + @ + s1h C lit + !  s1e @ s1h 10 lit + @ + s1h 10 lit + !
+;
+
+\ sha1 ( a n out -- )
+: s1n variable ;  : s1o variable ;
+: sha1 ( a n out -- )
+	s1o !  dup s1n !
+	67452301 lit s1h !  EFCDAB89 lit s1h 4 lit + !  98BADCFE lit s1h 8 lit + !
+	10325476 lit s1h C lit + !  C3D2E1F0 lit s1h 10 lit + !
+	begin dup 3F lit u> while over s1blk  40 lit -  swap 40 lit + swap repeat   ( a rest )
+	s1b 80 lit nzero
+	dup if over s1b 2 lit pick ncpy then
+	80 lit over s1b + c!  nip                                   ( rest )
+	38 lit u< if 40 lit else 80 lit then                        ( the tail's length )
+	s1n @ 3 lit lshift  over s1b + 4 lit - be!
+	s1b s1blk  80 lit = if s1b 40 lit + s1blk then
+	5 lit 0 lit do s1h i 2 lit lshift + @  s1o @ i 2 lit lshift + be! loop
+;
+
+\ b64 ( a n out -- n' )
+: b64t ( -- s )   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" ;
+: b6o variable ;  : b6k variable ;  : b6v variable ;
+: b64c ( i -- )   3F lit and b64t + c@  b6o @ b6k @ + c!  b6k @ 1 lit + b6k ! ;
+: b64 ( a n out -- n' )
+	b6o !  0 lit b6k !
+	begin dup while                                             ( a n )
+		over c@ 10 lit lshift
+		over 1 lit u> if 2 lit pick 1 lit + c@ 8 lit lshift or then
+		over 2 lit u> if 2 lit pick 2 lit + c@ or then  b6v !
+		b6v @ 12 lit rshift b64c  b6v @ C lit rshift b64c
+		dup 1 lit u> if b6v @ 6 lit rshift b64c else 3D lit b6o @ b6k @ + c!  b6k @ 1 lit + b6k ! then
+		dup 2 lit u> if b6v @ b64c else 3D lit b6o @ b6k @ + c!  b6k @ 1 lit + b6k ! then
+		dup 3 lit tmin -  swap 3 lit + swap
+	repeat 2drop
+	b6k @
+;

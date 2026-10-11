@@ -3746,13 +3746,73 @@ E340C9F2 ,   \ blt s2,a2,2bbc <pi>
 \ ── Time-sharing ──
 \ Nearly all of the node's long work -- checking a block, applying it -- is
 \ permutations, so every 256th of them is a chance to answer the network:
-\ p2perm calls p2hook, which does nothing -- until src/full_node.fam (hookp2,
-\ at compile time) rewrites its first instruction, a `jal x0, +4`, to jump
-\ to the node's yield.  No call through a pointer (no jalr): the jump is
-\ fixed when the node is compiled.  p2off, while nonzero, holds it off (a
-\ hash the yield itself makes; one it would disturb).
+\ p2perm calls p2hook, which does nothing -- until the node is compiled:
+\ hookto (below, at compile time) rewrites its first instruction, a `jal x0,
+\ +4`, to jump to p2rly (src/net.fam), and p2rly's to the node's yield
+\ (src/full_node.fam's p2yhk).  A jal reaches 1 MiB; the relay, half way,
+\ lets the yield sit up to 2 MiB from here.  No call through a pointer (no
+\ jalr): the jumps are fixed when the node is compiled.  p2off, while
+\ nonzero, holds it off (a hash the yield itself makes; one it would
+\ disturb).
 : p2hook ( -- )
-6F004000 ,   \ jal x0,+4: rewritten by hookp2
+6F004000 ,   \ jal x0,+4: rewritten by hookto
+;
+
+\ hookto ( C: lo hi -- )   compile time: point the word named by lo hi (its
+\        name as the compiler's name table packs it: 8 bytes, two little-
+\        endian words), whose body starts with a `jal x0, +4`, here
+\        (src/hookto.S, assembled by tools/s2words.py).
+:I hookto
+832F0200 ,   \ lw t6,0(tp) # 0 <look-0x10>
+032F4200 ,   \ lw t5,4(tp) # 4 <look-0xc>
+13028200 ,   \ addi tp,tp,8 # 8 <look-0x8>
+93820B00 ,   \ addi t0,s7,0
+63F86209 ,   \ bgeu t0,s6,a0 <fail>
+03A30200 ,   \ lw t1,0(t0)
+6310E303 ,   \ bne t1,t5,38 <next>
+03A34200 ,   \ lw t1,4(t0)
+631CF301 ,   \ bne t1,t6,38 <next>
+03A38200 ,   \ lw t1,8(t0)
+93031000 ,   \ addi t2,zero,1
+63167300 ,   \ bne t1,t2,38 <next>
+83A2C200 ,   \ lw t0,12(t0)
+6F00C000 ,   \ jal zero,40 <found>
+93824201 ,   \ addi t0,t0,20
+6FF05FFD ,   \ jal zero,10 <look>
+33835140 ,   \ sub t1,gp,t0
+93534341 ,   \ srai t2,t1,0x14
+63860300 ,   \ beq t2,zero,54 <ok>
+130EF0FF ,   \ addi t3,zero,-1
+6398C305 ,   \ bne t2,t3,a0 <fail>
+9303F006 ,   \ addi t2,zero,111
+135EC300 ,   \ srli t3,t1,0xc
+137EFE0F ,   \ andi t3,t3,255
+131ECE00 ,   \ slli t3,t3,0xc
+B3E3C301 ,   \ or t2,t2,t3
+135EB300 ,   \ srli t3,t1,0xb
+137E1E00 ,   \ andi t3,t3,1
+131E4E01 ,   \ slli t3,t3,0x14
+B3E3C301 ,   \ or t2,t2,t3
+135E1300 ,   \ srli t3,t1,0x1
+137EFE3F ,   \ andi t3,t3,1023
+131E5E01 ,   \ slli t3,t3,0x15
+B3E3C301 ,   \ or t2,t2,t3
+135E4301 ,   \ srli t3,t1,0x14
+137E1E00 ,   \ andi t3,t3,1
+131EFE01 ,   \ slli t3,t3,0x1f
+B3E3C301 ,   \ or t2,t2,t3
+23A07200 ,   \ sw t2,0(t0)
+6F00C002 ,   \ jal zero,c8 <end>
+B7020010 ,   \ lui t0,0x10000
+1303F003 ,   \ addi t1,zero,63
+23806200 ,   \ sb t1,0(t0) # 10000000 <__global_pointer$+0xfffe738>
+1303A000 ,   \ addi t1,zero,10
+23806200 ,   \ sb t1,0(t0)
+B7021000 ,   \ lui t0,0x100
+37330100 ,   \ lui t1,0x13
+13033333 ,   \ addi t1,t1,819 # 13333 <__global_pointer$+0x11a6b>
+23A06200 ,   \ sw t1,0(t0) # 100000 <__global_pointer$+0xfe738>
+6F000000 ,   \ jal zero,c4 <spin>
 ;
 : p2off variable ;
 : p2cnt variable ;                                 \ permutations so far (both widths)

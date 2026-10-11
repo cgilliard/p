@@ -1,12 +1,15 @@
-# hookp2 -- run at compile time (a :I body): point p2hook (src/poseidon2.fam),
-# whose body starts with a `jal x0, +4` (a no-op), at here: find its entry in
-# the compiler's name table (s7 .. s6, 20-byte entries: name lo, hi, kind,
-# field0 = entry, field1), and rewrite that first instruction as a jal to the
-# output cursor (gp).  Not found, or out of a jal's reach: '?' and the build
-# stops, as the compiler's own panic does.
+# hookto -- run at compile time (a :I body): point a word whose body starts
+# with a `jal x0, +4` (a no-op) at here.  Its name is on the compile-time
+# stack (tp), as the two words the name table packs it in (low pushed first,
+# then high): find its entry in the compiler's name table (s7 .. s6, 20-byte
+# entries: name lo, hi, kind, field0 = entry, field1), and rewrite that first
+# instruction as a jal to the output cursor (gp).  Not found, or out of a
+# jal's reach (+-1 MiB): '?' and the build stops, as the compiler's own panic
+# does.
 	.option norelax
-	li      t5, 0x6F683270          # "p2ho"
-	li      t6, 0x00006B6F          # "ok"
+	lw      t6, 0(tp)               # the name's high word
+	lw      t5, 4(tp)               # and its low word
+	addi    tp, tp, 8
 	mv      t0, s7
 look:
 	bgeu    t0, s6, fail

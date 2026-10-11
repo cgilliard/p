@@ -601,7 +601,7 @@
 
 \ ── The wallet's own ──
 
-: trkv variable ;  : trk ( -- a )  trkv 20 lit lazy ;   \ a slate id, and one read (src/wapi.fam too)
+: trkv variable ;  : trk ( -- a )  trkv 20 lit lazy ;   \ a slate id, and one read (src/api.fam too)
 
 \ treach ( -- f )   the next slate record (from trk) into wsr.
 : treach ( -- f )

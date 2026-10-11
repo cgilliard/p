@@ -19,7 +19,7 @@
 \ On the disk: the pager's meta page (src/pager.fam) from 0x200 -- 0 "WALT",
 \ 4 flags (1: a passphrase was set, 2: restored, not yet recovered), 8 the
 \ next key index, C the records' version (2), 10 the seed, 30 the entropy (the words), 50 the API key
-\ (src/wapi.fam) -- written in one commit, and kept by `pgfmt`.  So a node that starts its chain over keeps
+\ (src/api.fam) -- written in one commit, and kept by `pgfmt`.  So a node that starts its chain over keeps
 \ its wallet; a new disk is a new wallet, restored from the words.
 \
 \ The words and passphrase are typed on the serial console (`wlboot`), never
