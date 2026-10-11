@@ -28,6 +28,9 @@ const HELP: &str = "commands:
   status                         chain height, peers, mempool, mining
   mine on|off                    start or stop mining
   seed                           show the wallet's 24 backup words (keep them secret!)
+  debug-big-block <count>        with --debug-disable-verification: mine a block of <count>
+                                 fabricated outputs, then one spending them all and making
+                                 <count> more (12000 makes a block of about 1 MB)
   help                           this
   quit                           stop the node
 
@@ -98,6 +101,11 @@ pub fn parse(line: &str) -> Option<Result<Request, String>> {
         ("mine", ["off"]) => Ok(Request::Mine(false)),
         ("mine", _) => usage("mine on|off"),
         ("seed", []) => Ok(Request::Seed),
+        ("debug-big-block", [n]) => match n.parse::<usize>() {
+            Ok(count) if count > 0 => Ok(Request::DebugBigBlock { count }),
+            _ => Err(format!("not a count: {n}")),
+        },
+        ("debug-big-block", _) => usage("debug-big-block <count>"),
         ("key", []) => Ok(Request::ContractKey { height: 0 }),
         ("key", [h]) => match h.parse::<usize>() {
             Ok(height) if height <= crate::keytree::MAX_HEIGHT => Ok(Request::ContractKey { height }),
@@ -233,6 +241,7 @@ mod tests {
         assert!(matches!(ok("finalize a.s2.slate"), Request::Finalize { .. }));
         assert!(matches!(ok("cancel 00112233445566778899aabbccddeeff"), Request::Cancel { id } if id[15] == 0xff));
         assert!(matches!(ok("mine off"), Request::Mine(false)));
+        assert!(matches!(ok("debug-big-block 22000"), Request::DebugBigBlock { count: 22000 }));
         assert!(matches!(ok("quit"), Request::Quit));
     }
 

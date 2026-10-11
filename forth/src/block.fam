@@ -235,9 +235,11 @@ CF82BB19 , 7BBBAC50 , 274EC66D , B6F7DC65 , 5579EE29 , BA497A31 , 453EAC75 , 10E
 : bhcnt ( -- lo hi )  bhdr @ 88 lit + be32  bhdr @ 84 lit + be32 ;
 : bheight ( -- lo hi ) bhdr @ 90 lit + be32  bhdr @ 8C lit + be32 ;
 
-\ canon? ( a n -- flag )   whether n words in bytes at a are all below p.
+\ canon? ( a n -- flag )   whether n words in bytes at a are all below p
+\        (none: true -- a block with no inputs, whose list is followed by
+\        the outputs' count, which needn't be below p read as a word).
 : canon? ( a n -- flag )
-	-1 lit swap 0 lit do over i 2 lit lshift + u@ 2013265921u lit u< and loop nip
+	-1 lit swap ?dup if 0 lit do over i 2 lit lshift + u@ 2013265921u lit u< and loop then nip
 ;
 
 \ ── The root's statement ──
@@ -379,6 +381,9 @@ CF82BB19 , 7BBBAC50 , 274EC66D , B6F7DC65 , 5579EE29 , BA497A31 , 453EAC75 , 10E
 \ bverify ( a n -- ok )   whether the block's bytes parse and its proof
 \        proves its body, its state change from the parent (bproot, bpcl/
 \        bpch) and the reward (brwl/brwh) -- `Block::proof_is_valid`.
+\        With bnover set (the `noverify` setting, a debugging aid) the proof
+\        isn't looked at: its header nor the STARK.
+: bnover variable ;
 : bverify ( a n -- ok )
 	bparse drop
 	blok @ if
@@ -389,6 +394,8 @@ CF82BB19 , 7BBBAC50 , 274EC66D , B6F7DC65 , 5579EE29 , BA497A31 , 453EAC75 , 10E
 		\ The outputs fill the window from the parent's count to the block's.
 		bhcnt bpcl @ bpch @ du< 0= bcheck
 		bhcnt bpcl @ bpch @ d- 0= swap bnout @ = and bcheck
+	then
+	blok @ bnover @ 0= and if
 		\ The proof's header.
 		bpr @ bpl @ rinit
 		r8 1 lit = bcheck
@@ -400,7 +407,7 @@ CF82BB19 , 7BBBAC50 , 274EC66D , B6F7DC65 , 5579EE29 , BA497A31 , 453EAC75 , 10E
 		bal @ bah @ bbl @ bbh @ du< 0= bcheck
 		bal @ bah @ bbl @ bbh @ d- brwh @ = swap brwl @ = and bcheck
 	then
-	blok @ if
+	blok @ bnover @ 0= and if
 		rpos @ rend @ over -                                  ( stark len )
 		bchall bproduct bpublic
 		btparm

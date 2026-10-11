@@ -1910,7 +1910,17 @@ D0 lit
 	1000000000u lit brwl !  0 lit brwh !
 ;
 
+: tcnv variable ;  : tcn ( -- a )  tcnv 10 lit lazy ;
+
 Test {
+	canonical_words {
+		\ No words: canonical, whatever follows (a block with no inputs: the
+		\ outputs' count after it, 22,001 read as a word, is above p).
+		tcn 10 lit nzero  55 lit tcn 2 lit + c!  F1 lit tcn 3 lit + c!
+		tcn 0 lit canon? assert
+		tcn 1 lit canon? 0= assert
+		0 lit tcn 3 lit + c!  tcn 1 lit canon? assert
+	}
 	block_parses {
 		bsetup
 		bfix mcopy bparse assert

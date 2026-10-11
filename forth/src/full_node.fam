@@ -28,6 +28,10 @@
 \                       (webui)
 \   logmax=N            the most log lines kept for the Log tab (10,000; at
 \                       most 1,000,000)
+\   noverify            debugging: don't check blocks' proofs (block or chain
+\                       proofs; everything else is checked), to time the rest
+\                       of what a block costs.  Only with a private network
+\                       (a miner run with --debug-disable-verification)
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : fncv variable ;  : fncfg ( -- a )  fncv 400 lit lazy ;
@@ -88,7 +92,8 @@
 		else "log=console" fnpre? if 1 lit lgdst !
 		else "log=both" fnpre? if 3 lit lgdst !
 		else "logmax=" fnpre? if fnnum F4240 lit pumin dup 0= if drop 1 lit then lgmax !
-		else fnbad then then then then then then then then then then then then then then then then
+		else "noverify" fnpre? if -1 lit bnover !
+		else fnbad then then then then then then then then then then then then then then then then then
 	repeat
 ;
 
@@ -243,6 +248,7 @@
 	then
 	"node: " lputs  bnet @ if "dev" else "main" then lputs  " network, UDP port " lputs nport @ fndec
 	", fast sync depth " lputs pfdep @ fndec  ", wallet API port " lputs naport @ fndec A lit lputc
+	bnover @ if "node: noverify: blocks' proofs are NOT checked (a debugging aid, for a private network)\n" lputs then
 	acopen 0= if
 		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"
 		else "node: no disk" then lputs A lit lputc lfail

@@ -126,12 +126,28 @@
 	then
 ;
 
+\ ── Timing a block (logged for one of 64 KiB or more) ──
+\ Milliseconds: its download (acfet) and cheap checks before relaying it
+\ (acrly), both set by src/peer.fam; its checks here (actc), keeping it
+\ (acts), and the state's update (actst: reading its delta back, applying
+\ it) and commit (actcm).
+: acms ( -- ms )   hnow drop ;
+: acfet variable ;  : acrly variable ;  : act0 variable ;  : actx variable ;
+: actc variable ;  : acts variable ;  : actst variable ;  : actcm variable ;
+: actrd variable ;
+
 \ acapply ( k -- )   apply list entry k to the state, and commit.
 : acapply ( k -- )
 	5 lit lshift acl + acA 20 lit ncpy
+	acms actx !
 	acA acdget  2dup or 0= if "missing delta" lputs A lit lputc lfail then
 	bparse drop
-	acA stapply if acA bheight drop blat! pgcommit drop else pgabort "the state rejected a valid block" lputs A lit lputc lfail then
+	acms actx @ - actrd !
+	acA stapply if
+		acms actx @ - actst !  acms actx !
+		acA bheight drop blat! pgcommit drop
+		acms actx @ - actcm !
+	else pgabort "the state rejected a valid block" lputs A lit lputc lfail then
 	bheight drop acha !
 	acprune
 ;
@@ -162,8 +178,24 @@
 \ acblock ( a n -- ok )   take a block: if it's new, valid on its parent's tip
 \        (kept), and less than 1,000 below the best, keep it, its delta and
 \        its tip, and move the state to the best tip.
+\ acdec ( n -- )   decimal, to the log (as src/net.fam's fndec, compiled later).
+: acdec ( n -- )   dup A lit u< if 30 lit + lputc else dup A lit / acdec A lit % 30 lit + lputc then ;
+
+\ actime ( -- )   the block just taken, if a big one: what it took.
+: actime ( -- )
+	acbn @ 10000 lit u< 0= if
+		"block " lputs bheight drop acdec ": " lputs acbn @ acdec " bytes, " lputs
+		bnin @ acdec " inputs, " lputs bnout @ acdec " outputs -- fetched in " lputs acfet @ acdec
+		" ms, relayed after " lputs acrly @ acdec " ms, checked " lputs actc @ acdec
+		bnover @ if " ms (proofs not checked), kept " else " ms, kept " then lputs acts @ acdec
+		" ms, state updated " lputs actst @ acdec " ms (the block read back " lputs actrd @ acdec
+		" ms, its records " lputs sttr @ acdec " ms, the tree " lputs sttn @ acdec " ms), committed " lputs actcm @ acdec " ms" lputs A lit lputc
+	then
+	0 lit acfet !  0 lit acrly !
+;
+
 : acblock ( a n -- ok )
-	0 lit acok !  2dup acbn ! acba !
+	0 lit acok !  2dup acbn ! acba !  acms act0 !
 	2dup bparse if
 		bhdr @ dbid hdrid
 		dbid dbfind 0< 0= if 2drop -1 lit acok ! else
@@ -179,6 +211,7 @@
 			then
 		then
 		if
+			acms act0 @ - actc !  acms act0 !
 			\ Its delta: the header and body up to the proofs, then empty proofs.
 			bhdr @ acbuf  bnon @ bnnon @ 4 lit lshift + bhdr @ -  dup acdz !  ncpy
 			acbuf acdz @ + 8 lit nzero
@@ -186,7 +219,10 @@
 			dbid acba @ acbn @ bheight drop blput            \ the block, to serve (src/blocks.fam)
 			pgcommit drop
 			bhdr @ dbnt dbput drop
+			acms act0 @ - acts !
+			0 lit actst !  0 lit actcm !
 			acmove
+			actime
 			-1 lit acok !
 		then
 		then then

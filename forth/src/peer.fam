@@ -350,10 +350,16 @@
 \ pdisc ( -- )   time requests out (a host silent 5 s isn't answering: back
 \        to known -- and gone, not a seed, if it never answered in 3 asks or
 \        not in a week); ask every host due (pint).
+\ (pdisc and pheights read the clock once a pass -- pnw -- not for each of
+\ the table's slots: run in yields, they'd cost more than the work they
+\ interrupt.)
+: pnw variable ;
+: pnago ( t -- ms )   pnw @ swap - ;
 : pdisc ( -- )
+	pms pnw !
 	ppn 0 lit do
 		i pp 8 lit + @ if
-			i pp 1C lit + @ i pp 20 lit + @ pago 1388 lit u> and if          \ 5 s: a failure
+			i pp 1C lit + @ if i pp 20 lit + @ pnago 1388 lit u> else 0 lit then if   \ 5 s: a failure
 				0 lit i pp 1C lit + !  i pp 30 lit + @ 1 lit + i pp 30 lit + !
 				1 lit i pp 8 lit + !
 				i pp 38 lit + @ 0= if
@@ -362,7 +368,7 @@
 				then
 			then
 			i pp 8 lit + @ i pp 1C lit + @ 0= and if
-				i pp 24 lit + @ 0=  i pp 24 lit + @ pago i pint u> or if i pprobe then
+				i pp 24 lit + @ 0= if -1 lit else i pp 24 lit + @ pnago i pint u> then if i pprobe then
 			then
 		then
 	loop
@@ -429,9 +435,12 @@
 \ pheights ( -- )   ask each answered peer whose height we haven't heard
 \        in a minute (at most every 5 s).
 : pheights ( -- )
+	pms pnw !
 	ppn 0 lit do
-		i pp 8 lit + @ 2 lit =  i pp 2C lit + @ 0=  i pp 34 lit + @ pago EA60 lit u> or and
-		i pp 40 lit + @ pago 1388 lit u> and if
+		i pp 8 lit + @ 2 lit = if
+			i pp 2C lit + @ 0=  i pp 34 lit + @ pnago EA60 lit u> or  i pp 40 lit + @ pnago 1388 lit u> and
+		else 0 lit then
+		if
 			pms i pp 40 lit + !  i dbtip ?dup if 20 lit + @ 1 lit + else 0 lit then pgetinv
 		then
 	loop
@@ -498,8 +507,9 @@
 \ dlstart ( k hash height size purpose -- )   download a block (from an
 \        answered peer, of a plausible size); purpose: 0 the chain, 1 fast
 \        sync's H, 2 its H + 1.
+: dlt0 variable ;                                   \ when it started
 : dlstart ( k hash height size purpose -- )
-	dlfor !  dlsize !  dlh !  dlhash 20 lit ncpy  dlk !
+	dlfor !  dlsize !  dlh !  dlhash 20 lit ncpy  dlk !  pms dlt0 !
 	dlsize @ 0= 0=  dlsize @ 200001 lit u< and  dlk @ pp 8 lit + @ 2 lit = and if
 		dlsize @ 3FF lit + A lit rshift dlnc !
 		dlrcv dlnc @ nzero
@@ -565,7 +575,7 @@
 		bheight drop  bhdr @ 4 lit + dbfind 0<  over 0= 0= and if          \ an unknown parent
 			nip nip 1 lit -  dup pgm 7C lit + @ u< if drop pnext then  pq !
 		else
-			drop prelay acblock if
+			drop  pms acrly !  prelay  acrly @ pago acrly !  acblock if
 				pnext pq !
 				prl @ 0= if dbtip ?dup if                               \ our new best: announce it
 					dup pid 20 lit mcmp 0= if 20 lit + @ pid swap dlsize @ dlk @ pann else drop then
@@ -586,7 +596,7 @@
 : pdone ( -- )
 	0 lit dlon !
 	dlbuf pid hdrid  pid dlhash 20 lit mcmp 0= if
-		dlfor @ 0= if dlbuf dlsize @ pblock then
+		dlfor @ 0= if dlt0 @ pago acfet !  dlbuf dlsize @ pblock then
 		dlfor @ 1 lit = if dlbuf phb dlsize @ ncpy  dlsize @ phn ! then
 		dlfor @ 2 lit = if dlbuf pnb dlsize @ ncpy  dlsize @ pnn ! then
 	then

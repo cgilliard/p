@@ -53,7 +53,7 @@ mod wallet;
 mod wire;
 mod wots;
 
-use block::{Block, now_millis};
+use block::{Block, HEADER_LEN, now_millis};
 use chain::{AcceptOutcome, BlockReader, Chain};
 use discovery::Discovery;
 use net::Command;
@@ -293,6 +293,8 @@ struct Args {
     /// No seeds (unless `--seed`s are given), and mine without waiting to
     /// hear a peer: the first node of a new network.
     standalone: bool,
+    /// Skip proofs, and mine without them (`node::DebugBig`).
+    debug_unverified: bool,
 }
 
 /// The seeds a node starts from when no `--seed` is given: the public
@@ -307,11 +309,16 @@ const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]
          [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
          [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]
          [--full-sync] [--sync-depth BLOCKS] [--max-hosts N] [--probe-interval SECONDS]
-         [--max-per-ip N] [--standalone]
+         [--max-per-ip N] [--standalone] [--debug-disable-verification]
 
 Without --seed, the node starts from the public seeds; --standalone starts
 from none (the first node of a new network: it mines without waiting to hear
-a peer).";
+a peer).
+
+--debug-disable-verification: don't check blocks' proofs (everything else
+still is), and mine blocks without any -- so the CLI's debug-big-block can
+fabricate full-size blocks, to time what a node does with one. Only for a
+private network: no node that checks proofs takes these blocks.";
 
 fn parse_args() -> Args {
     let mut data_dir = None;
@@ -333,6 +340,7 @@ fn parse_args() -> Args {
         probe_interval_s: DEFAULT_PROBE_INTERVAL_S,
         max_per_ip: DEFAULT_MAX_PER_IP,
         standalone: false,
+        debug_unverified: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -367,6 +375,7 @@ fn parse_args() -> Args {
             }
             "--no-mine" => args.mine = false,
             "--standalone" => args.standalone = true,
+            "--debug-disable-verification" => args.debug_unverified = true,
             "--log-file" => args.log_file = Some(value().into()),
             "--log-level" => {
                 let v = value();
@@ -602,10 +611,14 @@ fn process_one(chain: &mut Chain, reader: &BlockReader, commands: &Sender<Comman
     let height = block.header.height;
     let prev_hash = block.header.prev_hash;
     let tip_before = reader.tip().expect("failed to read tip");
-    match chain.accept_block(block.clone()) {
+    let start = std::time::Instant::now();
+    let accepted = chain.accept_block(block.clone());
+    let applied_in = start.elapsed();
+    match accepted {
         Ok(AcceptOutcome::Applied) => {
             info!("received block #{height} from {from}");
             print_block(&block);
+            print_apply_time(&block, applied_in);
         }
         Ok(AcceptOutcome::Reorged { unwound, applied }) => {
             info!("received block #{height} from {from}: reorg, unwound {unwound}, applied {applied}");
@@ -729,13 +742,33 @@ fn print_block(block: &Block) {
     info!("  outputs:     {} in all", block.header.output_count);
     info!("  body_hash:   {}", hex(&block.header.body_hash));
     info!("  inputs:      {}", block.body.inputs.len());
-    for commitment in &block.body.inputs {
+    for commitment in block.body.inputs.iter().take(LISTED) {
         info!("    - {}", hex(commitment));
     }
+    if block.body.inputs.len() > LISTED {
+        info!("    ... and {} more", block.body.inputs.len() - LISTED);
+    }
     info!("  outputs:     {}", block.body.outputs.len());
-    for commitment in &block.body.outputs {
+    for commitment in block.body.outputs.iter().take(LISTED) {
         info!("    + {}", hex(commitment));
     }
+    if block.body.outputs.len() > LISTED {
+        info!("    ... and {} more", block.body.outputs.len() - LISTED);
+    }
+}
+
+/// The most of a block's inputs, and of its outputs, `print_block` lists.
+const LISTED: usize = 16;
+
+/// How long accepting `block` took -- its checks, proofs (unless skipped),
+/// and the state update, committed.
+fn print_apply_time(block: &Block, elapsed: std::time::Duration) {
+    info!(
+        "  applied in:  {elapsed:.2?} ({} bytes: {} inputs, {} outputs)",
+        HEADER_LEN + block.body.encoded_len(),
+        block.body.inputs.len(),
+        block.body.outputs.len()
+    );
 }
 
 /// Set up the log (see `log`): a file (rotated) and, with `--log-stdout`,
@@ -800,6 +833,10 @@ fn main() {
     });
     // Every block after genesis carries its parent's chain proof.
     chain.require_chain_proofs(chain_step::consensus_verifier());
+    if args.debug_unverified {
+        chain.skip_proof_checks();
+        warn!("--debug-disable-verification: blocks' proofs are not checked, and this node's blocks carry none");
+    }
     let fresh = {
         let rtxn = storage.read_txn().expect("failed to open read transaction");
         chain.height(&rtxn).expect("failed to read chain height").unwrap_or(0) == 0
@@ -866,6 +903,7 @@ fn main() {
     node.standalone = standalone;
     node.fast_sync = fast_sync;
     node.sync_events = Some(sync_events);
+    node.debug_unverified = args.debug_unverified;
     node.run();
     std::process::exit(0);
 }

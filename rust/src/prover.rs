@@ -302,8 +302,8 @@ impl Proof {
     }
 
     /// An empty stand-in proof, for tests about everything *but* proofs
-    /// (forks, retargeting, sync), whose chains skip proof checks.
-    #[cfg(test)]
+    /// (forks, retargeting, sync), whose chains skip proof checks -- and
+    /// for blocks mined with `--debug-disable-verification`.
     pub fn placeholder() -> Self {
         Proof::default()
     }

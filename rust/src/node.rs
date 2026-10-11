@@ -75,6 +75,10 @@ pub enum Request {
     SubmitFile { file: PathBuf },
     /// Summarize a transaction file.
     Inspect { file: PathBuf },
+    /// `--debug-disable-verification` only: fabricate a block of `count`
+    /// new outputs, then one spending them all and making `count` more
+    /// (`DebugBig`).
+    DebugBigBlock { count: usize },
     Quit,
 }
 
@@ -113,6 +117,35 @@ enum Miner {
         started: Instant,
         batches: u64,
     },
+}
+
+/// `debug-big-block`: what the next templates fabricate. Fan: `count`
+/// new outputs (bare commitments, random); then Spend: every one of them,
+/// and as many new ones -- a block as large as a full one, every input a
+/// real unspent output, so a node that skips proofs applies it as any
+/// other. Only on a chain no node verifies proofs on.
+pub enum DebugBig {
+    Idle,
+    Fan(usize),
+    Spend(Vec<[u8; 32]>),
+}
+
+/// `count` fresh commitments (each word below the field's prime, as
+/// consensus requires) and nonces, all random.
+fn fabricate(count: usize) -> Vec<([u8; 32], [u8; crate::recovery::NONCE_LEN])> {
+    (0..count)
+        .map(|_| {
+            let r = crate::random_key();
+            let mut c = [0u8; 32];
+            for (i, w) in r.chunks_exact(4).enumerate() {
+                let v = u32::from_le_bytes(w.try_into().unwrap()) % crate::poseidon2::P;
+                c[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            let mut nonce = [0u8; crate::recovery::NONCE_LEN];
+            nonce.copy_from_slice(&crate::random_key()[..crate::recovery::NONCE_LEN]);
+            (c, nonce)
+        })
+        .collect()
 }
 
 /// The largest share of a block template given to mempool transactions
@@ -158,6 +191,13 @@ pub struct Node {
     pub fast_sync: Option<crate::fastsync::FastSync>,
     /// Fast-sync events from the network.
     pub sync_events: Option<Receiver<crate::statesync::Event>>,
+    /// `--debug-disable-verification`: proofs aren't checked, and this
+    /// node's blocks carry none (nothing could prove a chain past a block
+    /// without one).
+    pub debug_unverified: bool,
+    debug_big: DebugBig,
+    /// What `debug_big` becomes once the template being mined is applied.
+    debug_next: Option<DebugBig>,
 }
 
 /// How often a recovering wallet checks whether the chain has caught up.
@@ -202,6 +242,9 @@ impl Node {
             next_recovery_check: Instant::now(),
             fast_sync: None,
             sync_events: None,
+            debug_unverified: false,
+            debug_big: DebugBig::Idle,
+            debug_next: None,
         }
     }
 
@@ -473,6 +516,7 @@ impl Node {
             Miner::Proving { reward, .. } | Miner::Mining { reward, .. } => reward,
             Miner::Idle => return,
         };
+        self.debug_next = None;
         if let Err(e) = self.wallet.forget(&reward) {
             error!("wallet: {e}");
         }
@@ -556,7 +600,7 @@ impl Node {
     /// the moment the tip moves, so it's done (or nearly) by the time the
     /// next block's own proof is. The tip and its job.
     fn prove_tip(&mut self) -> Option<([u8; 32], ChainProofSlot)> {
-        if !self.mining || self.recovering || self.fast_sync.is_some() {
+        if !self.mining || self.recovering || self.fast_sync.is_some() || self.debug_unverified {
             return None;
         }
         let tip = self.reader.tip().ok().flatten()?.1;
@@ -626,6 +670,10 @@ impl Node {
         reward_tx.add_output(reward).expect("fresh transaction never finalized");
         let count = txs.len();
         let transactions: Vec<Transaction> = std::iter::once(reward_tx).chain(txs).collect();
+        if self.debug_unverified {
+            self.start_debug_template(&transactions, reward.commitment());
+            return;
+        }
         let unproven = match self.chain.build_block(&transactions) {
             Ok(u) => u,
             Err(e) => {
@@ -673,14 +721,67 @@ impl Node {
         };
     }
 
+    /// `start_template` with `--debug-disable-verification`: no proving --
+    /// a placeholder proof, no chain proof -- and whatever `debug_big`
+    /// asks fabricated in.
+    fn start_debug_template(&mut self, transactions: &[Transaction], reward: [u8; 32]) {
+        let (spend, create) = match &self.debug_big {
+            DebugBig::Idle => (Vec::new(), Vec::new()),
+            DebugBig::Fan(count) => (Vec::new(), fabricate(*count)),
+            DebugBig::Spend(outputs) => (outputs.clone(), fabricate(outputs.len())),
+        };
+        let start = Instant::now();
+        let unproven = match self.chain.build_debug_block(transactions, &spend, &create) {
+            Ok(u) => u,
+            Err(e) => {
+                error!("failed to build a block template: {e}; the next one leaves out the mempool and anything fabricated");
+                let _ = self.wallet.forget(&reward);
+                self.skip_mempool = true;
+                self.debug_big = DebugBig::Idle;
+                return;
+            }
+        };
+        if !spend.is_empty() || !create.is_empty() {
+            info!(
+                "debug block template #{}: {} inputs, {} outputs, {} bytes -- built (the state applied, not committed) in {:.2?}",
+                unproven.height,
+                unproven.inputs.len(),
+                unproven.outputs.len(),
+                crate::block::HEADER_LEN + 20 + unproven.inputs.len() * 32 + unproven.outputs.len() * (32 + crate::recovery::NONCE_LEN),
+                start.elapsed()
+            );
+        }
+        self.debug_next = match &self.debug_big {
+            DebugBig::Idle => None,
+            DebugBig::Fan(_) => Some(DebugBig::Spend(create.iter().map(|(c, _)| *c).collect())),
+            DebugBig::Spend(_) => Some(DebugBig::Idle),
+        };
+        let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
+        self.miner = Miner::Mining {
+            block: unproven.finish(prover::Proof::placeholder()),
+            target,
+            min_timestamp,
+            reward,
+            started: Instant::now(),
+            batches: 0,
+        };
+    }
+
     fn mined(&mut self, block: Block, target: [u8; 32], elapsed: Duration, batches: u64) {
         // `pow::mine` counts nonces up from 0 in the nonce's first 8 bytes,
         // so the winning nonce says how many tries the last batch took.
         let last_batch = u64::from_le_bytes(block.header.nonce[..8].try_into().unwrap()) + 1;
         let hashes = batches * crate::MINE_BATCH + last_batch;
-        match self.chain.accept_block(block.clone()) {
+        let start = Instant::now();
+        let accepted = self.chain.accept_block(block.clone());
+        let applied_in = start.elapsed();
+        match accepted {
             Ok(AcceptOutcome::Applied) => {
+                if let Some(next) = self.debug_next.take() {
+                    self.debug_big = next;
+                }
                 crate::print_block(&block);
+                crate::print_apply_time(&block, applied_in);
                 crate::print_mining_stats(hashes, elapsed, &target);
                 if let Ok(hosts) = self.peer_table.all() {
                     let answering = hosts.iter().filter(|(_, record)| record.is_answering()).count();
@@ -931,6 +1032,18 @@ impl Node {
                     "{}\nThese 24 words are this wallet's backup: write them down, in order, and keep them\nsecret -- anyone who has them can spend everything in it.{reminder}",
                     crate::mnemonic::display(&words)
                 ))
+            }
+            Request::DebugBigBlock { count } => {
+                if !self.debug_unverified {
+                    return Err("only on a node run with --debug-disable-verification".into());
+                }
+                if !self.mining {
+                    return Err("mining is off (mine on)".into());
+                }
+                self.abandon_template();
+                self.debug_big = DebugBig::Fan(count);
+                info!("debug-big-block: next, a block of {count} new outputs; then one spending them all and making {count} more");
+                Ok(format!("mining a block of {count} new outputs, then one spending them all and making {count} more (see the log)"))
             }
             Request::Quit => Ok("bye".into()),
         }

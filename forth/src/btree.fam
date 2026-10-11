@@ -17,6 +17,8 @@
 \   btget ( key out -- found )
 \   btput ( key val -- )      insert, or replace the value
 \   btdel ( key -- found )
+\   btins ( key val -- new )  btput, only if the key isn't there
+\   bttake ( key out -- found )   btget, then btdel
 \   btseek ( key kout vout -- found )   the first entry with a key >= key
 \   btdrop ( -- )             empty the tree, freeing its pages
 \
@@ -37,30 +39,74 @@
 : btroot ( -- p )     btrta @ ;
 : btroot! ( p -- )    btrta !  pgmd ;
 
-\ mcmp ( a b n -- c )   compare n bytes: -1, 0 or 1.
-: mcr variable ;
+\ mcmp ( a b n -- c )   compare n bytes, unsigned: -1, 0 or 1 -- up to the
+\        first that differs: src/mcmp.S, assembled by tools/s2words.py.
 : mcmp ( a b n -- c )
-	0 lit mcr !
-	0 lit do
-		mcr @ 0= if
-			over i + c@ over i + c@
-			2dup u< if 2drop -1 lit mcr ! else u> if 1 lit mcr ! then then
-		then
-	loop
-	2drop mcr @
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+13018100 ,   \ addi sp,sp,8
+93030000 ,   \ addi t2,zero,0
+63080602 ,   \ beq a2,zero,44 <done>
+83420500 ,   \ lbu t0,0(a0)
+03C30500 ,   \ lbu t1,0(a1)
+639C6200 ,   \ bne t0,t1,38 <differ>
+13051500 ,   \ addi a0,a0,1
+93851500 ,   \ addi a1,a1,1
+1306F6FF ,   \ addi a2,a2,-1
+E31406FE ,   \ bne a2,zero,18 <next>
+6F000001 ,   \ jal zero,44 <done>
+93031000 ,   \ addi t2,zero,1
+63F46200 ,   \ bgeu t0,t1,44 <done>
+9303F0FF ,   \ addi t2,zero,-1
+23207100 ,   \ sw t2,0(sp)
 ;
 
-\ bmove ( src dst n -- )   copy n bytes; the ranges may overlap.
+\ bmove ( src dst n -- )   copy n bytes; the ranges may overlap: src/bmove.S,
+\        assembled by tools/s2words.py.
 : bmove ( src dst n -- )
-	dup 0= if drop 2drop else
-	2 lit pick 2 lit pick u< if                            \ dst above src: from the top
-		dup 0 lit do
-			2 lit pick over 1 lit - i - + c@  2 lit pick 2 lit pick 1 lit - i - + c!
-		loop
-	else
-		dup 0 lit do 2 lit pick i + c@ 2 lit pick i + c! loop
-	then
-	drop 2drop then
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+1301C100 ,   \ addi sp,sp,12
+630C0608 ,   \ beq a2,zero,a8 <done>
+3363B500 ,   \ or t1,a0,a1
+3363C300 ,   \ or t1,t1,a2
+13733300 ,   \ andi t1,t1,3
+6378B504 ,   \ bgeu a0,a1,70 <fwd>
+B303C500 ,   \ add t2,a0,a2
+63F47504 ,   \ bgeu a1,t2,70 <fwd>
+3305C500 ,   \ add a0,a0,a2
+B385C500 ,   \ add a1,a1,a2
+63100302 ,   \ bne t1,zero,54 <bback>
+1305C5FF ,   \ addi a0,a0,-4
+9385C5FF ,   \ addi a1,a1,-4
+83220500 ,   \ lw t0,0(a0)
+23A05500 ,   \ sw t0,0(a1)
+1306C6FF ,   \ addi a2,a2,-4
+E31606FE ,   \ bne a2,zero,38 <wback>
+6F008005 ,   \ jal zero,a8 <done>
+1305F5FF ,   \ addi a0,a0,-1
+9385F5FF ,   \ addi a1,a1,-1
+83420500 ,   \ lbu t0,0(a0)
+23805500 ,   \ sb t0,0(a1)
+1306F6FF ,   \ addi a2,a2,-1
+E31606FE ,   \ bne a2,zero,54 <bback>
+6F00C003 ,   \ jal zero,a8 <done>
+63100302 ,   \ bne t1,zero,90 <bfwd>
+83220500 ,   \ lw t0,0(a0)
+23A05500 ,   \ sw t0,0(a1)
+13054500 ,   \ addi a0,a0,4
+93854500 ,   \ addi a1,a1,4
+1306C6FF ,   \ addi a2,a2,-4
+E31606FE ,   \ bne a2,zero,74 <wfwd>
+6F00C001 ,   \ jal zero,a8 <done>
+83420500 ,   \ lbu t0,0(a0)
+23805500 ,   \ sb t0,0(a1)
+13051500 ,   \ addi a0,a0,1
+93851500 ,   \ addi a1,a1,1
+1306F6FF ,   \ addi a2,a2,-1
+E31606FE ,   \ bne a2,zero,90 <bfwd>
 ;
 
 : btn@ ( a -- n )    4 lit + @ ;
@@ -81,14 +127,57 @@
 \ btkey variable: the key being worked on.
 : btk variable ;
 
-\ btchild ( a -- j )   which child of inner node a the key goes down: the
-\        number of its keys <= the key.
-: btchild ( a -- j )
-	0 lit over btn@ 0 lit do
-		over i bik btk @ btks @ mcmp 1 lit < if 1 lit + then
-	loop
-	nip
+\ btbs ( key ks base stride n strict -- j )   a node's binary search:
+\        src/btbs.S, assembled by tools/s2words.py.
+: btbs ( key ks base stride n strict -- j )
+83270100 ,   \ lw a5,0(sp)
+03274100 ,   \ lw a4,4(sp)
+83268100 ,   \ lw a3,8(sp)
+0326C100 ,   \ lw a2,12(sp)
+83250101 ,   \ lw a1,16(sp)
+03254101 ,   \ lw a0,20(sp)
+13014101 ,   \ addi sp,sp,20
+130E0000 ,   \ addi t3,zero,0
+6376EE08 ,   \ bgeu t3,a4,ac <done>
+B30EEE00 ,   \ add t4,t3,a4
+93DE1E00 ,   \ srli t4,t4,0x1
+130F0600 ,   \ addi t5,a2,0
+93820E00 ,   \ addi t0,t4,0
+13830600 ,   \ addi t1,a3,0
+638E0200 ,   \ beq t0,zero,54 <cmp0>
+93F31200 ,   \ andi t2,t0,1
+63840300 ,   \ beq t2,zero,48 <mul2>
+330F6F00 ,   \ add t5,t5,t1
+13131300 ,   \ slli t1,t1,0x1
+93D21200 ,   \ srli t0,t0,0x1
+6FF09FFE ,   \ jal zero,38 <mul>
+93030000 ,   \ addi t2,zero,0
+93020F00 ,   \ addi t0,t5,0
+13030500 ,   \ addi t1,a0,0
+938F0500 ,   \ addi t6,a1,0
+63860F02 ,   \ beq t6,zero,90 <cmpd>
+03C80200 ,   \ lbu a6,0(t0)
+83480300 ,   \ lbu a7,0(t1)
+631A1801 ,   \ bne a6,a7,84 <cmpne>
+93821200 ,   \ addi t0,t0,1
+13031300 ,   \ addi t1,t1,1
+938FFFFF ,   \ addi t6,t6,-1
+6FF05FFE ,   \ jal zero,64 <cmp>
+93031000 ,   \ addi t2,zero,1
+63741801 ,   \ bgeu a6,a7,90 <cmpd>
+9303F0FF ,   \ addi t2,zero,-1
+63C60300 ,   \ blt t2,zero,9c <right>
+63980300 ,   \ bne t2,zero,a4 <left>
+63860700 ,   \ beq a5,zero,a4 <left>
+138E1E00 ,   \ addi t3,t4,1
+6FF01FF8 ,   \ jal zero,20 <loop>
+13870E00 ,   \ addi a4,t4,0
+6FF09FF7 ,   \ jal zero,20 <loop>
+2320C101 ,   \ sw t3,0(sp)
 ;
+\ btchild ( a -- j )   which child of inner node a the key goes down: the
+\        number of its keys <= the key (a binary search).
+: btchild ( a -- j )   btk @ btks @ rot dup 0 lit bik swap btn@ btps @ swap 1 lit btbs ;
 
 \ btdown ( -- leaf )   from the root to the key's leaf, recording the path
 \        (btd: the leaf's depth).  The root must exist.
@@ -108,16 +197,7 @@
 
 \ btpos ( a -- j )   the first entry of leaf a whose key is >= the key (n if
 \        none is).
-: btpr variable ;
-: btpos ( a -- j )
-	dup btn@ btpr !
-	dup btn@ ?dup if 0 lit do
-		btpr @ over btn@ = if
-			dup i ble btk @ btks @ mcmp -1 lit <> if i btpr ! then
-		then
-	loop then
-	drop btpr @
-;
+: btpos ( a -- j )   btk @ btks @ rot dup 8 lit + swap btn@ btes @ swap 0 lit btbs ;
 
 : bta variable ;   : btj variable ;   : btval variable ;   : btgo variable ;
 : btgf variable ;
@@ -195,6 +275,17 @@
 	btd @ btrn @ btupd
 ;
 
+\ btadd ( -- )   put the key (btk) and value (btval) at leaf bta's entry btj
+\        (btdown, btpos: not there yet).
+: btadd ( -- )
+	bta @ btj @ ble  bta @ btj @ 1 lit + ble  bta @ btn@ btj @ - btes @ * bmove
+	btk @ bta @ btj @ ble btks @ ncpy
+	btval @ bta @ btj @ ble btks @ + btvs @ ncpy
+	bta @ btn@ 1 lit + bta @ btn!
+	btd @ btpage pgdirty
+	bta @ btn@ btlm @ > if btsplitl then
+;
+
 : btput ( key val -- )
 	pgop  btval ! btk !
 	btroot 0= if pgnew dup btroot! pgget 1 lit swap ! then
@@ -202,14 +293,17 @@
 	bthit? if
 		btval @ bta @ btj @ ble btks @ + btvs @ ncpy
 		btd @ btpage pgdirty
-	else
-		bta @ btj @ ble  bta @ btj @ 1 lit + ble  bta @ btn@ btj @ - btes @ * bmove
-		btk @ bta @ btj @ ble btks @ ncpy
-		btval @ bta @ btj @ ble btks @ + btvs @ ncpy
-		bta @ btn@ 1 lit + bta @ btn!
-		btd @ btpage pgdirty
-		bta @ btn@ btlm @ > if btsplitl then
-	then
+	else btadd then
+;
+
+\ btins ( key val -- new )   btput, if the key isn't there yet (else nothing
+\        changes): whether it wasn't -- one descent where btget and btput
+\        take two.
+: btins ( key val -- new )
+	pgop  btval ! btk !
+	btroot 0= if pgnew dup btroot! pgget 1 lit swap ! then
+	btdown bta !  bta @ btpos btj !
+	bthit? if 0 lit else btadd -1 lit then
 ;
 
 \ ── Deleting ──
@@ -246,16 +340,31 @@
 ;
 
 : btdf variable ;
+\ btcut ( -- )   delete leaf bta's entry btj (btdown, btpos: the key's).
+: btcut ( -- )
+	bta @ btj @ 1 lit + ble  bta @ btj @ ble  bta @ btn@ btj @ - 1 lit - btes @ * bmove
+	bta @ btn@ 1 lit - bta @ btn!
+	btd @ btpage pgdirty
+	bta @ btn@ 0= if btrm btcolps then
+;
+
 : btdel ( key -- found )
 	pgop  btk !  0 lit btdf !
 	btroot if
 		btdown bta !  bta @ btpos btj !
+		bthit? if -1 lit btdf !  btcut then
+	then
+	btdf @
+;
+
+\ bttake ( key out -- found )   btget, then btdel: one descent, not two.
+: bttake ( key out -- found )
+	pgop  btgo ! btk !  0 lit btdf !
+	btroot if
+		btdown bta !  bta @ btpos btj !
 		bthit? if
-			-1 lit btdf !
-			bta @ btj @ 1 lit + ble  bta @ btj @ ble  bta @ btn@ btj @ - 1 lit - btes @ * bmove
-			bta @ btn@ 1 lit - bta @ btn!
-			btd @ btpage pgdirty
-			bta @ btn@ 0= if btrm btcolps then
+			bta @ btj @ ble btks @ + btgo @ btvs @ ncpy
+			-1 lit btdf !  btcut
 		then
 	then
 	btdf @
@@ -292,6 +401,37 @@
 		else 2drop then
 	then
 	btsf @
+;
+
+\ btfrom ( key -- )   start a scan at the first entry whose key is >= key.
+\ btnext ( kout vout -- found )   the scan's next entry, copied out; then
+\        the one after.  Entries are read straight off the leaf; past its
+\        last, the scan looks up the next key from the root again.  Nothing
+\        else may use the trees between the two (the leaf is the page
+\        cache's, kept through this operation).
+: btsa variable ;  : btsj variable ;
+: btnkv variable ;  : btnk ( -- a )  btnkv 100 lit lazy ;   \ the key to go on from
+: btfrom ( key -- )
+	pgop btk !  0 lit btsa !
+	btroot if
+		btdown dup btpos                                      ( a j )
+		over btn@ over = if 2drop btnxl 0 lit then
+		btsj ! btsa !
+	then
+;
+: btnext ( kout vout -- found )
+	btsa @ if
+		btsa @ btsj @ ble  dup 3 lit pick btks @ ncpy  btks @ + swap btvs @ ncpy  ( kout )
+		btsj @ 1 lit + btsj !
+		btsj @ btsa @ btn@ = if
+			btnk btks @ ncpy                                  \ past the leaf: from the next key
+			btks @ begin dup while
+				1 lit -  btnk over + dup c@ 1 lit + dup rot c!  FF lit and if drop 0 lit then
+			repeat drop
+			btnk btfrom
+		else drop then
+		-1 lit
+	else 2drop 0 lit then
 ;
 
 \ btfreep ( p -- )   free a node and every node below it.

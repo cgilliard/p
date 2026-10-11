@@ -30,7 +30,7 @@
 
 : pgbase ( -- sector )   110008 lit ;                 \ after the tip log (src/store.fam)
 : pgsz ( -- n )          1000 lit ;                    \ bytes a page
-: pgn ( -- n )           400 lit ;                     \ cache slots
+: pgn ( -- n )           800 lit ;                     \ cache slots: 8 MiB
 : pgjcap ( -- n )        80000 lit ;                   \ journal slots: 2^19
 : pgj0 ( -- p )          202 lit ;                     \ the first journal slot's page
 : pgd0 ( -- p )          80202 lit ;                   \ the first data page
@@ -153,13 +153,27 @@
 	0 lit swap pgcd pgc!
 ;
 
-\ pgvict ( -- s )   a slot to use: an empty one; else one not used by this
-\        operation, clean if possible (round robin), journaled if changed.
-\        Halts if every slot is in use by this operation.
-: pgvs variable ;
+\ pgvict ( -- s )   a slot to use: an empty one (slots fill in order, and
+\        empty only all at once: pgfill); else one not used by this
+\        operation -- of the next 64 (round robin), the first clean one, or
+\        else the first changed one, journaled -- else any such.  Halts if
+\        every slot is in use by this operation.
+: pgvs variable ;  : pgvd variable ;  : pgfill variable ;
 : pgvict ( -- s )
 	-1 lit pgvs !
-	pgn 0 lit do pgvs @ 0< if i pgcp pgc@ 0= if i pgvs ! then then loop
+	pgfill @ pgn u< if pgfill @ pgvs !  pgfill @ 1 lit + pgfill ! then
+	pgvs @ 0< if
+		-1 lit pgvd !
+		40 lit 0 lit do
+			pgvs @ 0< if
+				pgrr @ 1 lit + pgn 1 lit - and dup pgrr !
+				dup pgce pgc@ pgep @ <> if
+					dup pgcd pgc@ 0= if pgvs ! else pgvd @ 0< if pgvd ! else drop then then
+				else drop then
+			then
+		loop
+		pgvs @ 0< pgvd @ 0< 0= and if pgvd @ dup pgspill pgvs ! then
+	then
 	pgvs @ 0< if
 		pgn 0 lit do
 			pgvs @ 0< if
@@ -281,7 +295,7 @@
 ;
 
 \ pgreset ( -- )   forget the cache and the journal map (as at startup).
-: pgreset ( -- )   pgn 0 lit do 0 lit i pgcp pgc!  0 lit i pgcd pgc! loop  pgbh 800 lit zero  pgjclr ;
+: pgreset ( -- )   pgn 0 lit do 0 lit i pgcp pgc!  0 lit i pgcd pgc! loop  0 lit pgfill !  pgbh 800 lit zero  pgjclr ;
 
 \ pgabort ( -- )   drop every change since the last commit.
 : pgabort ( -- )   pgreset ;

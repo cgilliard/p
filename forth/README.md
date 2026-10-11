@@ -104,6 +104,43 @@ undo data are kept for 1,000 blocks). `src/snap.fam` is fast sync's state, as
 the Rust node does it: start at a recent block whose chain proof checks out,
 taking the state as of it in pieces each checked against its root on
 arrival -- and serve those pieces, as of any recent block, to others.
+
+A full block costs it about 17 s (a 2 MB main block's worth of commitments
+-- 22,000 inputs, 22,001 outputs -- plus a main block's proofs; 0.22 s for
+the Rust node). That's measured, not estimated: the Rust miner's
+`--debug-disable-verification` mines blocks without proofs (no node that
+checks them takes them: a private network only), and its `debug-big-block N`
+fabricates a block of N outputs and then one spending them all and making N
+more; this node, run with `scripts/node.sh --debug-disable-verification`
+seeded from it, checks everything but the proofs, and logs a big block's
+costs -- fetching it, the checks, keeping it, the state (its records, its
+tree), the commit. On this laptop the big block's state took over half an
+hour at first; now:
+
+| Block 1030 (1.76 MB) | |
+| --- | --- |
+| fetched, relayed | 0.7 s |
+| checked, proofs aside (the body hash: Poseidon2, 48 bytes a permutation) | 3.4 s |
+| the state's records (spends, appends, undo data) | 5.3 s |
+| the state's tree | 5.6 s |
+| kept, committed | 0.3 s |
+| the proofs (block, chain) and hashing their 331 KB, from the benches | 1.8 s |
+
+What it took: the tree's stored nodes updated once per block, level by
+level over the block's changes radix-sorted (`stflush`), not once per change
+(22,000 appends: some 2,900 node updates, not 814,000) -- and the lowest
+stored level hashed straight from its 16 positions (`st4`); B+tree nodes
+searched by binary search in assembly (`src/btbs.S`), with `mcmp`, `ncpy`,
+`nzero` and `bmove` in assembly too; range scans read along a leaf
+(`btfrom`/`btnext`) rather than from the root for each entry; a spend's
+lookups and deletes, and an append's duplicate check and insert, made one
+descent each (`bttake`, `btins`); a page cache of 8 MiB that finds a page to
+evict without scanning every slot; and the peer timers a yield runs reading
+the clock once, not for each of the table's 256 slots (each read a long
+division: they had cost more than the work they interrupted). The Rust node
+updates its tree once per block too (`StateTree::apply`). The rest is
+mostly Poseidon2 (some 43,000 permutations for the tree, 37,000 for the
+body hash).
 `src/net.fam` is UDP over virtio-net (ARP, IPv4, polled), and `src/peer.fam`
 the Rust node's network protocol over it: discovery with cookies, catching
 up block by block (following a peer onto another branch), fast sync, and

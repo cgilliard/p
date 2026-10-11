@@ -11,8 +11,51 @@
 
 \ ── Byte-string arithmetic (n >= 1 throughout) ──
 
-: nzero ( a n -- )      0 lit do 0 lit over i + c! loop drop ;
-: ncpy ( src dst n -- ) 0 lit do over i + c@ over i + c! loop 2drop ;
+\ nzero ( a n -- )   n zero bytes; ncpy ( src dst n -- )   copy n bytes
+\        forward (n may be 0 for either): src/nzero.S, src/ncpy.S, assembled
+\        by tools/s2words.py.
+: nzero ( a n -- )
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+13018100 ,   \ addi sp,sp,8
+630A0602 ,   \ beq a2,zero,40 <done>
+33E3C500 ,   \ or t1,a1,a2
+13733300 ,   \ andi t1,t1,3
+631C0300 ,   \ bne t1,zero,30 <bytes>
+23A00500 ,   \ sw zero,0(a1)
+93854500 ,   \ addi a1,a1,4
+1306C6FF ,   \ addi a2,a2,-4
+E31A06FE ,   \ bne a2,zero,1c <words>
+6F004001 ,   \ jal zero,40 <done>
+23800500 ,   \ sb zero,0(a1)
+93851500 ,   \ addi a1,a1,1
+1306F6FF ,   \ addi a2,a2,-1
+E31A06FE ,   \ bne a2,zero,30 <bytes>
+;
+: ncpy ( src dst n -- )
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+1301C100 ,   \ addi sp,sp,12
+63040604 ,   \ beq a2,zero,58 <done>
+3363B500 ,   \ or t1,a0,a1
+3363C300 ,   \ or t1,t1,a2
+13733300 ,   \ andi t1,t1,3
+63100302 ,   \ bne t1,zero,40 <bytes>
+83220500 ,   \ lw t0,0(a0)
+23A05500 ,   \ sw t0,0(a1)
+13054500 ,   \ addi a0,a0,4
+93854500 ,   \ addi a1,a1,4
+1306C6FF ,   \ addi a2,a2,-4
+E31606FE ,   \ bne a2,zero,24 <words>
+6F00C001 ,   \ jal zero,58 <done>
+83420500 ,   \ lbu t0,0(a0)
+23805500 ,   \ sb t0,0(a1)
+13051500 ,   \ addi a0,a0,1
+93851500 ,   \ addi a1,a1,1
+1306F6FF ,   \ addi a2,a2,-1
+E31606FE ,   \ bne a2,zero,40 <bytes>
+;
 \ nrev ( src dst n -- )   reversed (big-endian <-> little-endian).
 : nrev ( src dst n -- )
 	dup 0 lit do 2 lit pick i + c@  2 lit pick 2 lit pick 1 lit - i - + c! loop drop 2drop

@@ -160,7 +160,7 @@
 		tba @ tbn @ bvalid hcheck
 	then
 	\ The chain proof it carries: of the parent's tip.
-	hok @ if bcp @ bcl @ tpar @ chverify hcheck then
+	hok @ bnover @ 0= and if bcp @ bcl @ tpar @ chverify hcheck then
 	\ Its tip.
 	hok @ if
 		tbody

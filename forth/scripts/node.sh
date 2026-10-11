@@ -5,6 +5,7 @@
 #
 #   node.sh [--recover] [--passphrase] [--api-key]
 #           [--log-dest webui|console|both] [--log-max-entries N]
+#           [--debug-disable-verification]
 #
 #   --recover     restore the wallet from its 24 backup words, typed when the
 #                 node asks (on a disk without a wallet: a new data/disk.img)
@@ -17,6 +18,11 @@
 #   --log-max-entries N
 #                 the most log lines kept for the Log tab, the oldest dropped
 #                 as new ones come (default 10000; at most 1000000)
+#   --debug-disable-verification
+#                 don't check blocks' proofs (everything else is checked), to
+#                 time what a big block costs: only with a private network --
+#                 SEED a Rust miner run with --debug-disable-verification, on
+#                 a disk of its own (its chain is that network's)
 #
 # The first run makes a wallet and shows its backup words once.  Words and
 # passphrases go straight to the node over the console, never in settings or
@@ -56,8 +62,9 @@ WALLET=""
 APIKEY=""
 LOGDEST=""
 LOGMAX=""
+NOVERIFY=""
 usage() {
-	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N]" >&2
+	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N] [--debug-disable-verification]" >&2
 	exit 1
 }
 while [ $# -gt 0 ]; do
@@ -69,6 +76,7 @@ while [ $# -gt 0 ]; do
 		--log-dest) [ $# -ge 2 ] || usage; LOGDEST=$2; shift ;;
 		--log-max-entries=*) LOGMAX=${1#*=} ;;
 		--log-max-entries) [ $# -ge 2 ] || usage; LOGMAX=$2; shift ;;
+		--debug-disable-verification) NOVERIFY=1 ;;
 		*) usage ;;
 	esac
 	shift
@@ -109,10 +117,10 @@ echo "node.sh: the web wallet: http://127.0.0.1:$API/ (once the node is up)" >&2
 # timeout, network, and the seeds it would fetch the node from if the disk's
 # copy were bad), then the node's own (src/full_node.fam).
 settings() {
-	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s\004' \
+	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s%s\004' \
 		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
 		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}" "${PERIP:+ perip=$PERIP}" \
-		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}"
+		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}"
 }
 # QEMU's output goes through a pipe (| cat): QEMU makes its output
 # non-blocking, and on a terminal that would be the keyboard's too.

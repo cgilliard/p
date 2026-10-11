@@ -220,7 +220,7 @@
 			snpt @ 20 lit + qbe@ sntip 78 lit + t64!
 			snpt @ 28 lit + sntip 80 lit + 20 lit ncpy
 			bhdr @ snhdr BC lit ncpy
-			snpp @ snpl @ sntip chverify and
+			bnover @ if -1 lit else snpp @ snpl @ sntip chverify then and
 		then
 	else 0 lit then
 ;

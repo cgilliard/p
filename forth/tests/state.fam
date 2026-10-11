@@ -18,6 +18,17 @@
 : tspush ( k -- )   dup tsdata  tscm tsno rot 3E8 lit % 7 lit + stpush ;
 \ tsspend ( k -- ok )   spend output k.
 : tsspend ( k -- ok )   tsdata tscm stspend ;
+\ tsnodes ( -- n )   how many nodes are stored.
+: tsnn variable ;
+: tsnodes ( -- n )
+	0 lit tsnn !  stk 9 lit nzero
+	begin stnodes stk stq stv btseek while
+		tsnn @ 1 lit + tsnn !  stq stk 9 lit ncpy  stk 9 lit binc
+	repeat
+	tsnn @
+;
+: tsn1 variable ;
+
 \ tsok ( w0 .. w7 -- f )   whether the root is the 32 bytes whose words these are.
 : tsok ( w0 .. w7 -- f )
 	8 lit 0 lit do tsr 20 lit + 1C lit i 2 lit lshift - + ! loop
@@ -58,5 +69,23 @@ Test {
 		pgcommit assert
 		stopen assert
 		13B6AC40 lit 3121B98D lit 4F9AA1D5 lit 766256D7 lit 65D9E3A0 lit 1508C31B lit 71E73F52 lit 1BCA7856 lit tsok assert
+	}
+	state_batched {
+		\ The same pushes and spends, each block's nodes updated once
+		\ (stbeg .. stflush): the same roots, and the same nodes stored.
+		tsnodes tsn1 !
+		pgfmt assert  stopen assert  0 lit stuf !  0 lit stul !  0 lit stuk !
+		stbeg  28 lit 0 lit do i tspush loop  stflush
+		2636909C lit 35FD6CB2 lit 11A87120 lit 702500C1 lit 207C7A5F lit F51A603 lit 74E7B454 lit 3B0FA66B lit tsok assert
+		stbeg  3 lit tsspend assert  11 lit tsspend assert  27 lit tsspend assert  0 lit tsspend assert  stflush
+		13B6AC40 lit 3121B98D lit 4F9AA1D5 lit 766256D7 lit 65D9E3A0 lit 1508C31B lit 71E73F52 lit 1BCA7856 lit tsok assert
+		tsnodes tsn1 @ asrt_eq
+		stc@ 0 lit asrt_eq 28 lit asrt_eq
+	}
+	state_twin_refused {
+		\ A live output's commitment, appended again: refused, nothing changed.
+		5 lit tsdata  tscm tsno 7 lit stadd 0= assert
+		13B6AC40 lit 3121B98D lit 4F9AA1D5 lit 766256D7 lit 65D9E3A0 lit 1508C31B lit 71E73F52 lit 1BCA7856 lit tsok assert
+		stc@ 0 lit asrt_eq 28 lit asrt_eq
 	}
 }

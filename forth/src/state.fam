@@ -153,15 +153,14 @@
 \        a .. b-1, in order, at most limit of them, into stent.
 : stun ( alo ahi blo bhi limit -- n )
 	stlim ! sthk qbe! stk qbe!
-	stleaves  0 lit stn !
+	stleaves  0 lit stn !  stk btfrom
 	begin
 		stn @ stlim @ u< if
-			stk stq stv btseek if stq sthk 8 lit mcmp 0< else 0 lit then
+			stq stv btnext if stq sthk 8 lit mcmp 0< else 0 lit then
 		else 0 lit then
 	while
 		stq stn @ ste 8 lit ncpy  stv stn @ ste 8 lit + 34 lit ncpy
 		stn @ 1 lit + stn !
-		stq stk 8 lit ncpy  stk 8 lit binc
 	repeat
 	stn @
 ;
@@ -257,37 +256,181 @@
 : stRv variable ;  : stR ( -- a )  stRv 20 lit lazy ;
 : stVv variable ;  : stV ( -- a )  stVv 20 lit lazy ;
 
-\ stupd ( plo phi -- )   after a change at a position (its record, or the
-\        count): bring the stored nodes above it up to date -- each stored
-\        exactly if its subtree holds two or more unspent outputs.
-: stupd ( plo phi -- )
-	stph ! stpl !
-	stdep 1 lit + stfrom do
-		stpl @ stph @ i q>>  stih ! stil !
-		stil @ i 0 lit stf !  stih @ i 1 lit stf !  i stlohi
-		i 4 lit stf @ i 5 lit stf @ i 6 lit stf @ i 7 lit stf @ 2 lit stun 2 lit < if
-			stnodes  i stk c!  stil @ stih @ stk 1 lit + qbe!  stk btdel drop
-		else
-			i 1 lit -  stil @ stih @ 1 lit q<<  stL stget
-			i 1 lit -  stil @ stih @ 1 lit q<< swap 1 lit or swap  stR stget
-			stL stR i 1 lit - stV stnode
-			stnodes  i stk c!  stil @ stih @ stk 1 lit + qbe!  stk stV btput
-		then
-	loop
+\ st4 ( -- )   stlvl at the lowest stored level (stfrom: 16 positions), done
+\        directly: its outputs read once, their leaves hashed, and pairs
+\        combined up four levels -- where both halves are all empty, or all
+\        spent, the level's fixed hash instead (as sthash does).  Slot j's
+\        tag: 0 hashed (in st4b), 1 all empty, 2 all spent.
+: stlvn variable ;
+: st4bv variable ;  : st4b ( -- a )  st4bv 200 lit lazy ;     \ 16 hashes
+: st4tv variable ;  : st4t ( -- a )  st4tv 40 lit lazy ;      \ 16 tags
+: st4n variable ;  : st4k variable ;  : st4l variable ;
+: st4h ( j -- a )   5 lit lshift st4b + ;
+: st4g ( j -- a )   2 lit lshift st4t + ;
+\ st4v ( j -- a )   slot j's hash at level st4l, a fixed one if tagged so.
+: st4v ( j -- a )
+	dup st4g @ dup 0= if drop st4h else nip 1 lit = if st4l @ stemp else st4l @ stspt then then
+;
+: st4 ( -- )
+	stlvn @ 4 lit stf @ stlvn @ 5 lit stf @ stlvn @ 6 lit stf @ stlvn @ 7 lit stf @ 11 lit stun st4n !
+	st4n @ 2 lit < if
+		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk btdel drop
+	else
+		0 lit st4k !
+		10 lit 0 lit do                                      \ the leaves (the first position is a multiple of 16)
+			st4k @ st4n @ u< if
+				st4k @ ste qbe@  stlvn @ 5 lit stf @ =  swap stlvn @ 4 lit stf @ i + =  and
+			else 0 lit then
+			if
+				st4k @ ste dup 8 lit +  over 28 lit +  rot 38 lit + be32  i st4h stleaf
+				0 lit i st4g !  st4k @ 1 lit + st4k !
+			else
+				stlvn @ 4 lit stf @ i +  stlvn @ 5 lit stf @  stc@ du< if 2 lit else 1 lit then  i st4g !
+			then
+		loop
+		0 lit st4l !
+		4 lit 0 lit do                                       \ up to level 4
+			10 lit st4l @ 1 lit + rshift 0 lit do
+				i 1 lit lshift st4g @  i 1 lit lshift 1 lit + st4g @  over = over 0= 0= and if
+					i st4g !
+				else
+					drop  i 1 lit lshift st4v  i 1 lit lshift 1 lit + st4v  st4l @  i st4h stnode  0 lit i st4g !
+				then
+			loop
+			st4l @ 1 lit + st4l !
+		loop
+		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk 0 lit st4h btput
+	then
 ;
 
+\ stlvl ( -- )   the stored node (level stlvn, index stil/stih) brought up
+\        to date: kept exactly if its subtree holds two or more unspent
+\        outputs.  Its children must already be as they'll stay.
+: stlvl ( -- )
+	stil @ stlvn @ 0 lit stf !  stih @ stlvn @ 1 lit stf !  stlvn @ stlohi
+	stlvn @ stfrom = if st4 else
+	stlvn @ 4 lit stf @ stlvn @ 5 lit stf @ stlvn @ 6 lit stf @ stlvn @ 7 lit stf @ 2 lit stun 2 lit < if
+		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk btdel drop
+	else
+		stlvn @ 1 lit -  stil @ stih @ 1 lit q<<  stL stget
+		stlvn @ 1 lit -  stil @ stih @ 1 lit q<< swap 1 lit or swap  stR stget
+		stL stR stlvn @ 1 lit - stV stnode
+		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk stV btput
+	then then
+;
+
+\ ── A block's changes: the nodes over them updated once ──
+\ Between stbeg and stflush a change only notes its position (stupd); then
+\ stflush sorts them (a radix sort, 16 bits a pass) and goes up the levels,
+\ bringing each node over a change up to date once -- a level at a time, so
+\ its children already are.  The nodes come out as one update per change
+\ leaves them; a block of 22,000 appends updates some 2,900 nodes, not
+\ 814,000.
+
+: stcmax ( -- n )   1C000 lit ;                          \ more than a 2 MiB block makes
+: stcpv variable ;  : stcp ( -- a )  stcpv E0000 lit lazy ;   \ positions: lo, hi
+: stcqv variable ;  : stcq ( -- a )  stcqv E0000 lit lazy ;   \ the other buffer
+: stctv variable ;  : stct ( -- a )  stctv 40000 lit lazy ;   \ 65,536 counts
+: stcn variable ;  : stbat variable ;  : stcs variable ;
+: stsrc variable ;  : stdst variable ;  : stsh variable ;  : stdd variable ;
+: stacc variable ;  : stxl variable ;  : stxh variable ;
+
+\ stbeg ( -- )   start noting changes.
+: stbeg ( -- )   0 lit stcn !  -1 lit stbat ! ;
+
+\ stnote ( plo phi -- )   a change, noted.
+: stnote ( plo phi -- )
+	stcn @ stcmax u< 0= if "the state: too many changes in a block" lputs A lit lputc lfail then
+	stcn @ 3 lit lshift stcp +  tuck 4 lit + !  !  stcn @ 1 lit + stcn !
+;
+
+\ stdig ( a k -- d )   entry k's 16-bit digit at bit stsh (0, 16 or 32).
+: stdig ( a k -- d )
+	3 lit lshift +  stsh @ 20 lit = if 4 lit + @ else @ stsh @ rshift then  FFFF lit and
+;
+
+\ stpass ( -- )   a stable counting sort of stsrc into stdst by the digit --
+\        skipped if every digit is 0 (stdd: whether it was done).
+: stpass ( -- )
+	stct 10000 lit zero  0 lit stdd !
+	stcn @ 0 lit do
+		stsrc @ i stdig  dup if -1 lit stdd ! then  2 lit lshift stct + dup @ 1 lit + swap !
+	loop
+	stdd @ if
+		0 lit stacc !
+		10000 lit 0 lit do i 2 lit lshift stct + dup @ swap stacc @ swap !  stacc @ + stacc ! loop
+		stcn @ 0 lit do
+			stsrc @ i stdig 2 lit lshift stct +  dup @ dup 1 lit + rot !           ( slot )
+			3 lit lshift stdst @ +  stsrc @ i 3 lit lshift +                       ( to from )
+			dup @ 2 lit pick !  4 lit + @ swap 4 lit + !
+		loop
+	then
+;
+
+\ stsort ( -- )   the noted positions, ascending, at stcs.
+: stsort1 ( sh -- )
+	stsh !  stcs @ stsrc !  stcs @ stcp = if stcq else stcp then stdst !
+	stpass  stdd @ if stdst @ stcs ! then
+;
+: stsort ( -- )   stcp stcs !  0 lit stsort1  10 lit stsort1  20 lit stsort1 ;
+
+\ stshift ( n -- )   each (sorted) entry shifted right n bits, the repeats
+\        dropped.
+: stshift ( n -- )
+	stsh !  0 lit stdd !
+	stcn @ 0 lit do
+		stcs @ i 3 lit lshift + dup @ swap 4 lit + @ stsh @ q>>             ( lo hi )
+		stdd @ if 2dup stxh @ = swap stxl @ = and else 0 lit then
+		if 2drop else
+			2dup stxh ! stxl !
+			stcs @ stdd @ 3 lit lshift +  tuck 4 lit + !  !  stdd @ 1 lit + stdd !
+		then
+	loop
+	stdd @ stcn !
+;
+
+\ stflush ( -- )   stop noting; the nodes over the changes up to date.
+: stflush ( -- )
+	0 lit stbat !
+	stcn @ if
+		stsort  stfrom stshift
+		stdep 1 lit + stfrom do
+			i stlvn !
+			stcn @ 0 lit do stcs @ i 3 lit lshift + dup @ stil ! 4 lit + @ stih !  stlvl loop
+			stlvn @ stdep u< if 1 lit stshift then
+		loop
+	then
+;
+
+\ stupd ( plo phi -- )   after a change at a position (its record, or the
+\        count): the stored nodes above it up to date -- or, between stbeg
+\        and stflush, the position noted.
+: stupd ( plo phi -- )
+	stbat @ if stnote else
+		stph ! stpl !
+		stdep 1 lit + stfrom do
+			stpl @ stph @ i q>> stih ! stil !  i stlvn !  stlvl
+		loop
+	then
+;
+
+\ stadd ( comm nonce height -- new )   append an output -- unless its
+\        commitment is a live output's: then nothing changes.
 \ stpush ( comm nonce height -- )   append an output.
 : stht variable ;
-: stpush ( comm nonce height -- )
+: stadd ( comm nonce height -- new )
 	stht !
 	stv 20 lit + 10 lit ncpy
 	dup stv 20 lit ncpy
 	stht @ stv 30 lit + be!
-	stc@ stk qbe!  stleaves stk stv btput
-	stc@ stw qbe!  stindex stw btput
-	stc@ 2dup stph ! stpl !  q1+ stc!
-	stpl @ stph @ stupd
+	stc@ stw qbe!  stindex stw btins if
+		stc@ stk qbe!  stleaves stk stv btput
+		stc@ 2dup stph ! stpl !  q1+ stc!
+		stpl @ stph @ stupd
+		-1 lit
+	else 0 lit then
 ;
+: stpush ( comm nonce height -- )   stadd drop ;
 
 \ Undo data: a chain of pages, each 0 the next page, 4 how many entries, then
 \ entries of 60 bytes: a spent output's position and record.
@@ -308,15 +451,13 @@
 
 \ stspend ( comm -- ok )   spend the unspent output with this commitment.
 : stspend ( comm -- ok )
-	stindex dup stw btget if
+	stindex stw bttake if
 		stw stk 8 lit ncpy
-		stleaves stk stv btget drop
+		stleaves stk stv bttake drop
 		stk stv stuadd
-		stleaves stk btdel drop
-		stindex btdel drop
 		stk qbe@ stupd
 		-1 lit
-	else drop 0 lit then
+	else 0 lit then
 ;
 
 \ ── Blocks ──
@@ -327,23 +468,25 @@
 \        be unspent), append its outputs (none may be a live output's
 \        twin), and check the header's state root and output count.  Keeps
 \        the undo data under the block's hash; the meta page notes the block.
+: sttr variable ;  : sttn variable ;            \ ms: the records, the tree (stapply)
 : stapply ( hash -- ok )
 	stah !  -1 lit stok !  0 lit stuf !  0 lit stul !  0 lit stuk !
-	sttabs
+	sttabs  stbeg  hnow drop sttr !
 	bnin @ ?dup if 0 lit do
 		stok @ if bin @ i 5 lit lshift + stspend stok @ and stok ! then
 	loop then
 	stok @ if bnout @ ?dup if 0 lit do
 		stok @ if
-			stindex  bout @ i 5 lit lshift + stw btget if 0 lit stok ! else
-				bout @ i 5 lit lshift +  bnon @ i 4 lit lshift +  bheight drop  stpush
-			then
+			bout @ i 5 lit lshift +  bnon @ i 4 lit lshift +  bheight drop  stadd 0= if 0 lit stok ! then
 		then
 	loop then then
+	hnow drop dup sttr @ - sttr !  sttn !
+	stflush
 	stok @ if
 		stV stroot
 		bsroot stV 8 lit ceq  stc@ bhcnt rot = -rot = and and stok !
 	then
+	hnow drop sttn @ - sttn !
 	stok @ if
 		stundot stah @ stw btget 0= if stw 18 lit nzero then
 		stuf @ stw !  stuk @ stw 4 lit + !  bnout @ stw 8 lit + !  -1 lit stw 14 lit + !
@@ -363,7 +506,7 @@
 : stunapl ( hash -- ok )
 	sttabs
 	stundot dup stw btget if stw 14 lit + @ else 0 lit then 0= if drop 0 lit else
-		stw @ stuf !  stw 4 lit + @ stuk !  stw 8 lit + @ stum !
+		stw @ stuf !  stw 4 lit + @ stuk !  stw 8 lit + @ stum !  stbeg
 		\ Its outputs: the last stum positions.
 		stc@ stum @ 0 lit d-  2dup stc!  2dup stph ! stpl !     ( keep )
 		stum @ ?dup if 0 lit do
@@ -393,6 +536,7 @@
 			repeat
 			stpp @ pgget @  stpp @ pgfree  stpp !
 		repeat
+		stflush
 		stundot dup stw btget drop                              \ keep its delta; it's not applied
 		0 lit stw !  0 lit stw 4 lit + !  0 lit stw 8 lit + !  0 lit stw 14 lit + !
 		stw btput

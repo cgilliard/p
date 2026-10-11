@@ -1081,10 +1081,13 @@ impl Chain {
         Ok(chain)
     }
 
-    /// Stop verifying blocks' proofs -- for tests about forks, retargeting,
-    /// or sync, whose blocks carry placeholder proofs, since real ones take
-    /// seconds each to make. Doesn't exist outside tests.
-    #[cfg(test)]
+    /// Stop verifying blocks' proofs (block and chain proofs both) -- for
+    /// tests about forks, retargeting, or sync, whose blocks carry
+    /// placeholder proofs, since real ones take seconds each to make; and
+    /// for a node run with `--debug-disable-verification`, to time
+    /// everything else a block costs. Everything but the proofs is still
+    /// checked: proof of work, structure, the body hash, and the state the
+    /// body makes against the header's.
     pub fn skip_proof_checks(&mut self) {
         self.check_proofs = false;
     }
@@ -1566,23 +1569,28 @@ impl Chain {
             Some(chunks) => self.chunk_transitions(wtxn, body, height, chunks)?,
             None => Vec::new(),
         };
+        // The state's records, then its tree once for the whole block
+        // (`StateTree::apply`).
         let mut spent_inputs = Vec::with_capacity(body.inputs.len());
         for &commitment in &body.inputs {
             let position = self
                 .utxo
                 .get(wtxn, commitment)?
                 .ok_or(Error::UnresolvedInput(commitment))?;
-            self.state.spend(wtxn, position)?;
             self.utxo.remove(wtxn, commitment)?;
             spent_inputs.push((commitment, position));
         }
-        for (commitment, nonce) in body.outputs.iter().zip(&body.nonces) {
+        let base = self.state.count(wtxn)?;
+        let mut appended = Vec::with_capacity(body.outputs.len());
+        for (i, (commitment, nonce)) in body.outputs.iter().zip(&body.nonces).enumerate() {
             if self.utxo.get(wtxn, *commitment)?.is_some() {
                 return Err(Error::DuplicateOutput(*commitment));
             }
-            let position = self.state.push(wtxn, &(*commitment, *nonce, height))?;
-            self.utxo.insert(wtxn, *commitment, position)?;
+            self.utxo.insert(wtxn, *commitment, base + i as u64)?;
+            appended.push((*commitment, *nonce, height));
         }
+        let positions: Vec<u64> = spent_inputs.iter().map(|(_, p)| *p).collect();
+        self.state.apply(wtxn, &positions, &appended)?;
         let root = self.state.root(wtxn)?;
         if let Some(last) = transitions.last()
             && crate::poseidon2::digest_to_bytes(last.change.root_out) != root
@@ -1774,13 +1782,14 @@ impl Chain {
 
         // Reverse the inputs: every spent output goes back to live, at
         // exactly the position it occupied before.
+        let mut unspent = Vec::with_capacity(undo.spent_inputs.len());
         for (commitment, position) in &undo.spent_inputs {
             // Its nonce: the output index keeps spent outputs' records
             // (until the block that created them is itself unwound).
             let record = self
                 .output_record(wtxn, commitment)?
                 .ok_or(Error::Corrupt("a spent output's record is missing"))?;
-            self.state.unspend(wtxn, *position, &(*commitment, record.nonce, leaf_height(record.height)?))?;
+            unspent.push((*position, (*commitment, record.nonce, leaf_height(record.height)?)));
             self.utxo.insert(wtxn, *commitment, *position)?;
         }
         // Reverse the outputs: each one this block created disappears
@@ -1790,8 +1799,9 @@ impl Chain {
         }
         // Reverse the appends -- this block appended exactly
         // `body.outputs.len()` outputs, the last ones, and nothing else
-        // has been appended since (we're unwinding the tip).
-        self.state.truncate(wtxn, block.body.outputs.len() as u64)?;
+        // has been appended since (we're unwinding the tip) -- and the
+        // spends, the tree updated once (`StateTree::unapply`).
+        self.state.unapply(wtxn, block.body.outputs.len() as u64, &unspent)?;
 
         self.active_heights.delete(wtxn, &block.header.height.to_be_bytes())?;
 
@@ -2167,6 +2177,56 @@ impl Chain {
                 transitions,
                 reward,
                 heights,
+            },
+        })
+    }
+}
+
+impl Chain {
+    /// `build_block` for `--debug-disable-verification`: `transactions`,
+    /// plus bare commitments -- `spend` (unspent outputs, which must
+    /// exist) and `create` (new outputs, with their nonces) -- that no
+    /// transaction accounts for. Nothing can prove such a block: it's only
+    /// for nodes that skip proofs, to time a block of any size. The state
+    /// root and output count are the real ones, so those nodes apply it as
+    /// any other.
+    pub fn build_debug_block(&mut self, transactions: &[Transaction], spend: &[[u8; 32]], create: &[([u8; 32], [u8; NONCE_LEN])]) -> Result<UnprovenBlock> {
+        let mut body = BlockBody::from_transactions(transactions).map_err(Error::InvalidTransaction)?;
+        body.inputs.extend_from_slice(spend);
+        body.inputs.sort_unstable();
+        let mut outputs: Vec<_> = body.outputs.iter().copied().zip(body.nonces.iter().copied()).chain(create.iter().copied()).collect();
+        outputs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        (body.outputs, body.nonces) = outputs.into_iter().unzip();
+        if !body.is_canonically_ordered() {
+            return Err(Error::InvalidBlock);
+        }
+        if crate::block::HEADER_LEN + body.encoded_len() > crate::block::MAX_BLOCK_BYTES {
+            return Err(Error::BlockTooLarge);
+        }
+        let storage = self.storage.clone();
+        let mut wtxn = storage.write_txn()?;
+        let (prev_hash, height) = self.next_prev_hash_and_height(&wtxn)?;
+        let min_timestamp = self.tip_header(&wtxn)?.map_or(0, |parent| parent.timestamp + 1);
+        let target = self.current_target(&wtxn)?;
+        let reward = self.difficulty.schedule.reward(height).ok_or(Error::ChainEnded)?;
+        let (state_root, output_count, _, _) = self.resolve_and_apply(&mut wtxn, &body, height, None)?;
+        // Never committed, as in `build_block`.
+        Ok(UnprovenBlock {
+            prev_hash,
+            height,
+            target,
+            min_timestamp,
+            state_root,
+            output_count,
+            inputs: body.inputs,
+            outputs: body.outputs,
+            nonces: body.nonces,
+            aux_hash: [0; 32],
+            plan: crate::prover::BlockPlan {
+                chunks: Vec::new(),
+                transitions: Vec::new(),
+                reward,
+                heights: crate::block_air::Heights { block: leaf_height(height)?, created: Default::default() },
             },
         })
     }
@@ -3852,6 +3912,48 @@ mod tests {
         assert_eq!(block.header.timestamp, ahead + 1);
         assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
         chain.apply_block(&block).unwrap();
+    }
+
+    /// `build_debug_block` (`--debug-disable-verification`): a block of
+    /// bare new outputs, then one spending every one of them and making
+    /// as many more -- each applied by a chain skipping proofs, its state
+    /// what the header says. A commitment that isn't unspent can't be
+    /// spent.
+    #[test]
+    fn debug_blocks_fan_out_then_spend_it_all() {
+        let (_dir, _storage, mut chain) = open();
+        let made = |tag: u32| -> Vec<([u8; 32], [u8; NONCE_LEN])> {
+            (0..300u32)
+                .map(|i| {
+                    let mut c = [0u8; 32];
+                    c[..4].copy_from_slice(&(i + 1).to_le_bytes());
+                    c[4..8].copy_from_slice(&tag.to_le_bytes());
+                    (c, [i as u8; NONCE_LEN])
+                })
+                .collect()
+        };
+        let mine = |chain: &mut Chain, unproven: UnprovenBlock| {
+            let target = unproven.target;
+            let mut block = unproven.finish(prover::Proof::placeholder());
+            assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+            chain.apply_block(&block).unwrap();
+            block
+        };
+        let (_sk, pk) = keypair(1);
+        let fan = chain.build_debug_block(&[reward_transaction(&pk, 50)], &[], &made(5)).unwrap();
+        let fan = mine(&mut chain, fan);
+        assert_eq!((fan.body.inputs.len(), fan.body.outputs.len()), (0, 301));
+
+        let spend: Vec<[u8; 32]> = made(5).iter().map(|(c, _)| *c).collect();
+        let (_sk2, pk2) = keypair(2);
+        let big = chain.build_debug_block(&[reward_transaction(&pk2, 50)], &spend, &made(6)).unwrap();
+        let big = mine(&mut chain, big);
+        assert_eq!((big.body.inputs.len(), big.body.outputs.len()), (300, 301));
+        assert_eq!(big.header.output_count, fan.header.output_count + 301);
+        assert!(big.body.is_canonically_ordered());
+
+        // Spent now: not again.
+        assert!(matches!(chain.build_debug_block(&[], &spend[..1], &[]), Err(Error::UnresolvedInput(_))));
     }
 
     /// With a fixed genesis, no other block is ever accepted at height 0

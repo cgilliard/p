@@ -423,18 +423,79 @@ impl StateTree {
     /// subtree holds two or more unspent outputs.
     fn update(&self, wtxn: &mut heed::RwTxn, position: u64) -> Result<()> {
         for h in STORED_FROM..=DEPTH {
-            let index = position >> h;
-            let k = key(h, index);
-            let (lo, hi) = (index << h, (index + 1) << h);
-            if self.unspent_limited(wtxn, lo, hi, 2)?.len() >= 2 {
-                let left = self.get(wtxn, h - 1, 2 * index)?;
-                let right = self.get(wtxn, h - 1, 2 * index + 1)?;
-                self.nodes.put(wtxn, &k, &digest_to_bytes(node(h - 1, &left, &right)))?;
-            } else {
-                self.nodes.delete(wtxn, &k)?;
-            }
+            self.update_node(wtxn, h, position >> h)?;
         }
         Ok(())
+    }
+
+    /// Node `(h, index)` brought up to date, its children already being.
+    fn update_node(&self, wtxn: &mut heed::RwTxn, h: usize, index: u64) -> Result<()> {
+        let k = key(h, index);
+        let (lo, hi) = (index << h, (index + 1) << h);
+        if self.unspent_limited(wtxn, lo, hi, 2)?.len() >= 2 {
+            let left = self.get(wtxn, h - 1, 2 * index)?;
+            let right = self.get(wtxn, h - 1, 2 * index + 1)?;
+            self.nodes.put(wtxn, &k, &digest_to_bytes(node(h - 1, &left, &right)))?;
+        } else {
+            self.nodes.delete(wtxn, &k)?;
+        }
+        Ok(())
+    }
+
+    /// `update` for changes at every one of `changed` (any order, repeats
+    /// allowed) at once: each stored node over them brought up to date
+    /// once, a level at a time from the bottom, so its children already
+    /// are -- the same nodes as one `update` per change, with a block of
+    /// 22,000 appends updating some 2,900 nodes rather than 814,000.
+    fn update_many(&self, wtxn: &mut heed::RwTxn, mut changed: Vec<u64>) -> Result<()> {
+        changed.sort_unstable();
+        let mut nodes: Vec<u64> = changed.iter().map(|p| p >> STORED_FROM).collect();
+        nodes.dedup();
+        for h in STORED_FROM..=DEPTH {
+            for &index in &nodes {
+                self.update_node(wtxn, h, index)?;
+            }
+            for index in nodes.iter_mut() {
+                *index >>= 1;
+            }
+            nodes.dedup();
+        }
+        Ok(())
+    }
+
+    /// A block's changes at once: the outputs at `spent` spent, then
+    /// `appended` appended, and the stored nodes over them all updated once
+    /// (`update_many`). The first appended output's position.
+    pub fn apply(&self, wtxn: &mut heed::RwTxn, spent: &[u64], appended: &[LeafData]) -> Result<u64> {
+        let base = self.count(wtxn)?;
+        let end = base + appended.len() as u64;
+        if end > 1 << DEPTH {
+            return Err(Error::Full);
+        }
+        for position in spent {
+            self.leaves.delete(wtxn, &position.to_be_bytes())?;
+        }
+        for (position, data) in (base..end).zip(appended) {
+            self.put_leaf(wtxn, position, data)?;
+        }
+        self.set_count(wtxn, end)?;
+        self.update_many(wtxn, spent.iter().copied().chain(base..end).collect())?;
+        Ok(base)
+    }
+
+    /// Undo `apply`: the last `appended` outputs removed, and each of
+    /// `unspent` live again at its position.
+    pub fn unapply(&self, wtxn: &mut heed::RwTxn, appended: u64, unspent: &[(u64, LeafData)]) -> Result<()> {
+        let count = self.count(wtxn)?;
+        let keep = count.checked_sub(appended).ok_or(Error::Corrupt("truncating below zero"))?;
+        for position in keep..count {
+            self.leaves.delete(wtxn, &position.to_be_bytes())?;
+        }
+        self.set_count(wtxn, keep)?;
+        for (position, data) in unspent {
+            self.put_leaf(wtxn, *position, data)?;
+        }
+        self.update_many(wtxn, unspent.iter().map(|(p, _)| *p).chain(keep..count).collect())
     }
 
     fn set_count(&self, wtxn: &mut heed::RwTxn, count: u64) -> Result<()> {
@@ -719,6 +780,55 @@ mod tests {
     /// and paths match a tree rebuilt from scratch with every node
     /// computed, and exactly the nodes an import of the same state would
     /// store are stored.
+    /// `apply` and `unapply` -- a block's spends and appends with the tree
+    /// updated once -- leave exactly the root and the stored nodes that one
+    /// change at a time does, blocks applied and undone in turn.
+    #[test]
+    fn a_block_at_once_matches_one_change_at_a_time() {
+        let (_d, storage, tree) = open("at-once");
+        let (_d2, storage2, one) = open("one-at-a-time");
+        let mut wtxn = storage.write_txn().unwrap();
+        let mut w2 = storage2.write_txn().unwrap();
+        let mut seed = 777u64;
+        let mut random = move |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut next = 0u64;
+        let mut undo: Vec<(u64, Vec<(u64, LeafData)>)> = Vec::new();
+        for step in 0..60 {
+            if step % 4 == 3 {
+                let (appended, unspent) = undo.pop().unwrap();
+                tree.unapply(&mut wtxn, appended, &unspent).unwrap();
+                one.truncate(&mut w2, appended).unwrap();
+                for (p, d) in &unspent {
+                    one.unspend(&mut w2, *p, d).unwrap();
+                }
+            } else {
+                let live = tree.unspent_in(&wtxn, 0, u64::MAX).unwrap();
+                let spent: Vec<(u64, LeafData)> = live.iter().filter(|_| random(3) == 0).map(|&(p, c, n, h)| (p, (c, n, h))).collect();
+                let appended: Vec<LeafData> = (0..random(70)).map(|_| {
+                    next += 1;
+                    data(next)
+                }).collect();
+                let positions: Vec<u64> = spent.iter().map(|(p, _)| *p).collect();
+                tree.apply(&mut wtxn, &positions, &appended).unwrap();
+                for p in &positions {
+                    one.spend(&mut w2, *p).unwrap();
+                }
+                for d in &appended {
+                    one.push(&mut w2, d).unwrap();
+                }
+                undo.push((appended.len() as u64, spent));
+            }
+            assert_eq!(tree.root(&wtxn).unwrap(), one.root(&w2).unwrap(), "step {step}");
+            assert_eq!(tree.count(&wtxn).unwrap(), one.count(&w2).unwrap(), "step {step}");
+            let stored: Vec<(Vec<u8>, Vec<u8>)> = tree.nodes.iter(&wtxn).unwrap().map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())).unwrap()).collect();
+            let wanted: Vec<(Vec<u8>, Vec<u8>)> = one.nodes.iter(&w2).unwrap().map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())).unwrap()).collect();
+            assert_eq!(stored, wanted, "step {step}");
+        }
+    }
+
     #[test]
     fn stored_nodes_stay_exactly_those_needed() {
         let (_d, storage, tree) = open("random-ops");
