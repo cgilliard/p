@@ -197,7 +197,12 @@ for the session), shows the balance and the chain (live: the tip event),
 and pays and is paid with slate files: Send makes the file to give (a
 download, or its text to copy), Receive answers one, Finalize signs and
 sends; Activity lists payments (an unanswered one can be cancelled), Coins
-the outputs. It's served with headers that keep it to itself (its own
+the outputs; Bible reads the text the node holds -- served at `/bible` as it
+is (`data/akjv.txt.gz`) with `Content-Encoding: gzip`, so the browser
+inflates it and the node never needs to (cached for good once fetched,
+about 4 s over the node's TCP) -- by book and chapter, going to a reference
+as typed (`John 3:16`, `1 cor 13:4`, `ps 23`), and searching every verse as
+you type (the exact phrase first, then all the words apart). It's served with headers that keep it to itself (its own
 inline code only, connecting only back to the node, never framed, never
 cached). Its script was run under Node against a live node and a Rust dev
 miner -- unlocking (a wrong key refused), receiving a Rust S1 and the Rust

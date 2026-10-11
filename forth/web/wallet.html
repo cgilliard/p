@@ -68,6 +68,21 @@ ol.steps { margin: 6px 0 0; padding-left: 20px; color: var(--muted); font-size: 
 code { font-family: var(--mono); font-size: 12.5px; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
 .check { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--muted); }
 .check input { margin: 0; }
+.biblebar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.biblebar select { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; }
+.biblebar input { flex: 1 1 220px; }
+.biblebar button.secondary { margin-top: 0; padding: 8px 12px; }
+.scripture { font-family: Georgia, "Iowan Old Style", "Times New Roman", serif; font-size: 18px; line-height: 1.75; max-width: 700px; margin: 6px auto 0; }
+.scripture h2 { font-family: inherit; font-weight: 600; font-size: 24px; margin: 14px 0 10px; }
+.scripture p { margin: 0 0 12px; }
+.scripture sup { color: var(--muted); font-family: system-ui, sans-serif; font-size: 11px; margin: 0 3px 0 1px; }
+.scripture .here { background: var(--chip); border-radius: 4px; }
+mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: inherit; border-radius: 2px; }
+.hits { max-width: 700px; margin: 8px auto 0; }
+.hit { display: block; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line);
+  padding: 9px 4px; color: var(--ink); font: 15px/1.55 Georgia, "Times New Roman", serif; cursor: pointer; }
+.hit:hover { background: var(--chip); }
+.hit b { font-family: system-ui, sans-serif; font-size: 12.5px; color: var(--accent); margin-right: 6px; }
 </style>
 </head>
 <body>
@@ -96,6 +111,7 @@ code { font-family: var(--mono); font-size: 12.5px; background: var(--chip); pad
     <button role="tab" data-tab="finalize">Finalize</button>
     <button role="tab" data-tab="activity">Activity</button>
     <button role="tab" data-tab="coins">Coins</button>
+    <button role="tab" data-tab="bible">Bible</button>
   </nav>
 
   <section id="tab-send" class="card">
@@ -137,6 +153,18 @@ code { font-family: var(--mono); font-size: 12.5px; background: var(--chip); pad
       <thead><tr><th>Payment</th><th class="num">Amount</th><th class="num">Fee</th><th>State</th><th>Slate</th><th></th></tr></thead>
       <tbody id="slates"></tbody>
     </table></div>
+  </section>
+
+  <section id="tab-bible" class="card" hidden>
+    <div class="biblebar">
+      <select id="bbook" aria-label="Book"></select>
+      <select id="bchap" aria-label="Chapter"></select>
+      <button class="secondary" id="bprev" title="Previous chapter">‹</button>
+      <button class="secondary" id="bnext" title="Next chapter">›</button>
+      <input id="bsearch" type="text" placeholder="Search, or go to a verse: John 3:16" autocomplete="off" spellcheck="false">
+    </div>
+    <div id="bstatus" class="hint"></div>
+    <div id="bview" class="scripture"></div>
   </section>
 
   <section id="tab-coins" class="card" hidden>
@@ -376,11 +404,142 @@ $("finbtn").addEventListener("click", () => busy($("finbtn"), async () => {
   } catch (e) { showError(box, e); }
 }));
 
+// ── The Bible ──
+// The text the node holds (data/akjv.txt.gz), served gzip-encoded at /bible:
+// the browser inflates it.  "### Book" heads each book, "[c:v] text" each
+// verse; a verse beginning with ¶ begins a paragraph.  Loaded the first time
+// the tab is opened (about 1.3 MB; cached after).
+const BPOS = "tabernacle.bible";
+let bible = null, verses = null, bibleLoading = null, bpos = { b: 0, c: 0, v: 0 };
+try { const p = JSON.parse(localStorage.getItem(BPOS)); if (p && p.b >= 0) bpos = p; } catch (e) {}
+
+function loadBible() {
+  if (bibleLoading) return bibleLoading;
+  $("bstatus").textContent = "Loading the text…";
+  bibleLoading = (async () => {
+    const res = await fetch("/bible");
+    if (!res.ok) throw new Error("the node didn't serve the text (" + res.status + ")");
+    const text = await res.text();
+    bible = []; verses = [];
+    let book = null;
+    for (const line of text.split("\n")) {
+      if (line.startsWith("### ")) { book = { name: line.slice(4), chapters: [] }; bible.push(book); continue; }
+      const m = /^\[(\d+):(\d+)\] (.*)$/.exec(line);
+      if (!m || !book) continue;
+      const c = +m[1] - 1, v = +m[2] - 1;
+      (book.chapters[c] ||= [])[v] = m[3];
+      verses.push({ b: bible.length - 1, c, v, text: m[3], low: m[3].toLowerCase() });
+    }
+    $("bbook").replaceChildren(...bible.map((bk, i) => el("option", { value: i }, bk.name)));
+    $("bstatus").textContent = "";
+  })().catch((e) => { bibleLoading = null; $("bstatus").textContent = "Couldn't load the text: " + e.message; throw e; });
+  return bibleLoading;
+}
+
+const bname = (b) => bible[b].name;
+function showChapter(b, c, v) {
+  bpos = { b, c, v: v || 0 };
+  try { localStorage.setItem(BPOS, JSON.stringify(bpos)); } catch (e) {}
+  const bk = bible[b];
+  $("bbook").value = b;
+  $("bchap").replaceChildren(...bk.chapters.map((_, i) => el("option", { value: i }, "Chapter " + (i + 1))));
+  $("bchap").value = c;
+  const view = $("bview");
+  view.replaceChildren(el("h2", {}, `${bk.name} ${c + 1}`));
+  let para = el("p");
+  let target = null;
+  bk.chapters[c].forEach((text, i) => {
+    let t = text;
+    if (t.startsWith("¶")) { if (para.childNodes.length) view.append(para); para = el("p"); t = t.replace(/^¶\s*/, ""); }
+    const span = el("span", { id: "v" + (i + 1) }, el("sup", {}, String(i + 1)), t + " ");
+    if (v && i + 1 === v) { span.className = "here"; target = span; }
+    para.append(span);
+  });
+  view.append(para);
+  $("bprev").disabled = b === 0 && c === 0;
+  $("bnext").disabled = b === bible.length - 1 && c === bk.chapters.length - 1;
+  if (target) target.scrollIntoView({ block: "center" }); else $("tab-bible").scrollIntoView({ block: "start" });
+}
+function step(d) {
+  let { b, c } = bpos;
+  c += d;
+  if (c < 0) { if (b === 0) return; b--; c = bible[b].chapters.length - 1; }
+  if (c >= bible[b].chapters.length) { if (b === bible.length - 1) return; b++; c = 0; }
+  showChapter(b, c);
+}
+$("bbook").addEventListener("change", () => showChapter(+$("bbook").value, 0));
+$("bchap").addEventListener("change", () => showChapter(bpos.b, +$("bchap").value));
+$("bprev").addEventListener("click", () => step(-1));
+$("bnext").addEventListener("click", () => step(1));
+
+// A reference: a book (its name or the start of it; "1 John" for I John),
+// a chapter, and maybe a verse -- "ps 23", "1 cor 13:4", "song 2".
+function findRef(q) {
+  const m = /^\s*([123]|i{1,3})?\s*([a-z][a-z .]*?)\.?\s+(\d+)(?:\s*:\s*(\d+))?\s*$/i.exec(q);
+  if (!m) return null;
+  const num = m[1] ? { 1: "i", 2: "ii", 3: "iii" }[m[1]] || m[1].toLowerCase() : "";
+  const want = (num + m[2]).toLowerCase().replace(/[\s.]/g, "");
+  const norm = (n) => n.toLowerCase().replace(/\s/g, "");
+  const b = bible.findIndex((bk) => norm(bk.name) === want) >= 0
+    ? bible.findIndex((bk) => norm(bk.name) === want)
+    : bible.findIndex((bk) => norm(bk.name).startsWith(want));
+  if (b < 0) return null;
+  const c = +m[3] - 1, v = m[4] ? +m[4] : 0;
+  if (!bible[b].chapters[c] || (v && !bible[b].chapters[c][v - 1])) return null;
+  return { b, c, v };
+}
+
+// Words found, marked.
+function marked(text, words) {
+  const low = text.toLowerCase(), out = [];
+  let i = 0;
+  while (i < text.length) {
+    let best = -1, len = 0;
+    for (const w of words) { const j = low.indexOf(w, i); if (j >= 0 && (best < 0 || j < best)) { best = j; len = w.length; } }
+    if (best < 0) { out.push(text.slice(i)); break; }
+    if (best > i) out.push(text.slice(i, best));
+    out.push(el("mark", {}, text.slice(best, best + len)));
+    i = best + len;
+  }
+  return out;
+}
+
+const MAXHITS = 300;
+function search(q) {
+  const ref = findRef(q);
+  if (ref) { showChapter(ref.b, ref.c, ref.v); $("bstatus").textContent = ""; return; }
+  const phrase = q.trim().toLowerCase();
+  if (phrase.length < 3) { $("bstatus").textContent = phrase ? "Type at least 3 letters to search." : ""; showChapter(bpos.b, bpos.c); return; }
+  // Every word, anywhere in the verse ("quoted text" as one phrase).
+  const words = [...phrase.matchAll(/"([^"]+)"|(\S+)/g)].map((m) => (m[1] || m[2]).trim()).filter(Boolean);
+  // The whole phrase first, then the verses with all the words apart.
+  const whole = phrase.replace(/"/g, "").replace(/\s+/g, " ");
+  const found = verses.filter((x) => words.every((w) => x.low.includes(w)));
+  const hits = found.filter((x) => x.low.includes(whole)).concat(found.filter((x) => !x.low.includes(whole)));
+  $("bstatus").textContent = hits.length
+    ? `${hits.length.toLocaleString("en-US")} verse${hits.length === 1 ? "" : "s"}` + (hits.length > MAXHITS ? ` — the first ${MAXHITS} shown` : "")
+    : "Nothing found.";
+  $("bview").replaceChildren(el("div", { class: "hits" }, ...hits.slice(0, MAXHITS).map((x) =>
+    el("button", { class: "hit", onclick: () => { $("bsearch").value = ""; $("bstatus").textContent = ""; showChapter(x.b, x.c, x.v + 1); } },
+      el("b", {}, `${bname(x.b)} ${x.c + 1}:${x.v + 1}`), ...marked(x.text.replace(/^¶\s*/, ""), words)))));
+}
+let searchTimer = null;
+$("bsearch").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { if (bible) search($("bsearch").value); }, 200);
+});
+$("bsearch").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { clearTimeout(searchTimer); if (bible) search($("bsearch").value); } });
+
+async function openBible() {
+  try { await loadBible(); if (!$("bview").childNodes.length) showChapter(Math.min(bpos.b, bible.length - 1), bpos.c, bpos.v); } catch (e) {}
+}
+
 // ── Tabs ──
 for (const b of document.querySelectorAll("nav button")) {
   b.addEventListener("click", () => {
     for (const o of document.querySelectorAll("nav button")) o.setAttribute("aria-selected", o === b ? "true" : "false");
     for (const s of document.querySelectorAll("main > section")) s.hidden = s.id !== "tab-" + b.dataset.tab;
+    if (b.dataset.tab === "bible") openBible();
   });
 }
 

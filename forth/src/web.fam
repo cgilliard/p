@@ -11,7 +11,10 @@
 \ HTTP: one request a connection, answered and closed.  "/" is the web
 \ wallet (web/wallet.html, as src/page.fam), with headers that keep it to
 \ itself: its own inline code, connecting only back here, never framed by
-\ another page, never cached; anything else is 404.  A body larger than the
+\ another page, never cached; "/bible" the Bible text, as the node holds it
+\ (data/akjv.txt.gz, src/text.fam) and served gzip-encoded, so the browser
+\ inflates it (the node never needs to) -- it never changes: cached for
+\ good; anything else is 404.  A body larger than the
 \ room to queue it is fed as room frees up (each connection's pending
 \ bytes), then the close.
 \
@@ -167,6 +170,14 @@
 	jout jon @ twrite drop
 ;
 
+\ wbhead ( k -- )   the Bible text's response head.
+: wbhead ( k -- )
+	jout jon jto
+	"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Encoding: gzip\r\nContent-Length: " js  wtextn @ jdec
+	"\r\nCache-Control: public, max-age=31536000, immutable\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n" js
+	jout jon @ twrite drop
+;
+
 \ wserve ( k -- )   the request's headers are in.
 : wserve ( k -- )
 	dup "host:" whdr wlocal 0= if
@@ -174,9 +185,11 @@
 	else dup tread drop "GET /ws " 8 lit mcmp 0= if dup wupgrade
 	else dup tread drop "GET / " 6 lit mcmp 0=  over tread drop "GET /index.html " 10 lit mcmp 0= or if
 		dup wpage nip wphead  dup wpage wbody
+	else dup tread drop "GET /bible " B lit mcmp 0= if
+		dup wbhead  dup wtext @ wtextn @ wbody
 	else
 		dup "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" wstatus
-	then then then
+	then then then then
 	dup tread nip ttake
 ;
 
