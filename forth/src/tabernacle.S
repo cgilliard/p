@@ -635,31 +635,32 @@ rx_desc_done:
 # seeds, then the hosts they name (127.x becomes 10.0.2.2, this machine under
 # QEMU, as the node does for its seed), up to MAX_PEERS.  A HOSTS answer
 # (with our nonce, from the host asked) makes it a peer and carries its
-# cookie.  Then the image, in windows of WINDOW chunks: every tick, each pick
-# that has sent chunks is asked for the next window still missing, and the
-# rest every fourth tick.  The image comes from the network, not the seeds,
-# whenever anyone else has it.  Chunks are taken only from peers, only for
-# our hash, each once (the bitmap).  When all are in, the image is hashed:
-# a match boots it; a mismatch drops every peer that sent chunks and starts
-# over.  No progress for the timeout (discovery or chunks) halts 'N'.
+# cookie.  Then the image, from ONE peer at a time -- the source -- so a
+# peer serving a bad copy can only cost a try, never spoil a download from
+# good ones: every tick the source is asked for the next SRC_WINDOWS windows
+# of WINDOW chunks still missing.  Chunks are taken only from the source,
+# only for our hash, each once (the bitmap).  When all are in, the image is
+# hashed: a match boots it; a mismatch drops the source, forgets its chunks,
+# and starts over from the next.  A source that sends no new chunk for
+# STALL_TICKS is likewise dropped and replaced.  Once every peer with this
+# build has been tried (and discovery is over), it halts: no peer has a good
+# copy.  No progress for the timeout (discovery or chunks) halts 'N' too.
 #
-# Which peers: a HOSTS answer may end with a trailer about the answering host
+# Which peer: a HOSTS answer may end with a trailer about the answering host
 # -- flags (bit 0: serves its boot image) and the first 8 bytes of that
 # image's hash; a host whose trailer names our hash has this build.  Nothing
-# is asked for in the first DISC_WAIT (discovery fills the table), then up to
-# MAX_PICKS of the hosts with this build are picked at random (xorshift32,
-# seeded by the clock -- spreading load, not secrecy) and only they are
-# asked; a pick that sends nothing after 8 asks is dropped and another picked.
-# Seeds are never picked: they're asked (if they have this build) only once
-# SEED_WAIT has passed with no other peer sending any.
+# is asked for in the first DISC_WAIT (discovery fills the table), then the
+# source is one of the hosts with this build at random (xorshift32, seeded by
+# the clock -- spreading load, not secrecy), never a seed while another has
+# it untried: a seed only once SEED_WAIT has passed and no other is left.
 #
 # Peer table at s7 + PEERS, MAX_PEERS x 32 B:
 #     +0 ip (4 B, network order)  +4 port (2 B, network order)
 #     +6 state: 0 new, 1 asked for hosts, 2 a peer (cookie), 3 dropped
-#     +7 flags: bit 0 seed, bit 1 sent chunks, bit 2 has this build, bit 3
-#        picked; bits 4..7 GET_HOSTS asks
+#     +7 flags: bit 0 seed, bit 2 has this build; bits 4..7 GET_HOSTS asks
+#        (a source that failed is dropped: state 3)
 #     +8 cookie (8 B, as received)
-#     +16 GET_BINs asked with nothing back (1 B)
+#     +16 ticks since the source last sent a new chunk (1 B)
 #
 # Pinned registers:
 #     s0 = consumed RX used.idx       s1 = chunks received
@@ -677,7 +678,7 @@ rx_desc_done:
 	.equ CURSOR,                0x9FC8      # next chunk to ask for (4 B)
 	.equ LASTTICK,              0x9FC4      # mtime of the last tick (4 B)
 	.equ T_START,               0x9FC0      # mtime the fetch started (4 B)
-	.equ HAVE_NS,               0x9FBC      # a non-seed peer has sent chunks (4 B)
+	.equ SRC,                   0x9FBC      # the source: its peer table entry (0 none)
 	.equ TICKN,                 0x9FB8      # ticks so far (4 B)
 	.equ NONCE,                 0x9FB0      # our GET_HOSTS nonce (8 B)
 	.equ ADDRTMP,               0x9FA8      # a seed's address, as a host's (6 B)
@@ -686,7 +687,8 @@ rx_desc_done:
 	.equ TICK_TK,              2500000      # 250 ms a tick
 	.equ DISC_WAIT_TK,        20000000      # 2 s of discovery before asking for chunks
 	.equ SEED_WAIT_TK,        50000000      # 5 s before asking seeds for chunks
-	.equ MAX_PICKS,                 16      # peers fetched from at once
+	.equ STALL_TICKS,               20      # 5 s without a new chunk: the source dropped
+	.equ SRC_WINDOWS,                4      # windows asked of the source a tick
 	.equ PEER_SZ,                   32      # a peer table entry
 	.equ WINDOW,                    32      # chunks a GET_BIN
 	.equ PKT,                   0x8236      # the TX payload (frame + 42)
@@ -904,9 +906,10 @@ rx_chunk:
 	bltz    t0, rx_refill
 	CALL    find_src
 	beqz    a5, rx_refill
-	lbu     t0, 6(a5)
-	li      t1, 2
-	bne     t0, t1, rx_refill               # only peers (and not dropped)
+	li      t0, SRC
+	add     t0, s7, t0
+	lw      t0, 0(t0)
+	bne     t0, a5, rx_refill               # only the source's
 	addi    t0, a2, 60
 	addi    t1, gp, -32                     # our hash
 	li      t2, 32
@@ -940,24 +943,8 @@ rx_chunk:
 	bnez    t2, rx_refill
 	or      t6, t6, t1
 	sb      t6, 0(t3)
-	lbu     t0, 7(a5)                       # the peer has sent chunks
-	andi    t1, t0, 2
-	bnez    t1, 3f
-	ori     t0, t0, 2                       # its first: say so
-	sb      t0, 7(a5)
-	mv      a6, t4
-	LOAD_ADDRESS a0, msg_from
-	CALL    put_str
-	CALL    put_peer
-	mv      t4, a6
-	lbu     t0, 7(a5)
-3:	andi    t0, t0, 1
-	bnez    t0, 1f
-	li      t0, HAVE_NS
-	add     t0, s7, t0
-	li      t1, 1
-	sw      t1, 0(t0)
-1:	slli    t5, t4, 10
+	sb      zero, 16(a5)                    # sending: not stalled
+	slli    t5, t4, 10
 	add     t5, gp, t5                      # dst = gp + index * 1024
 	addi    a3, a2, 96
 	addi    a4, a1, -96
@@ -1058,13 +1045,8 @@ net_idle:
 	addi    t2, t2, 1
 	sw      t2, 0(t0)
 
-	# Seeds may be asked for chunks: no other peer has sent any, and
-	# SEED_WAIT has passed.  a6 = 1 if so.
+	# A seed may be the source once SEED_WAIT has passed: a6 = 1 if so.
 	li      a6, 0
-	li      t0, HAVE_NS
-	add     t0, s7, t0
-	lw      t0, 0(t0)
-	bnez    t0, 1f
 	li      t0, T_START
 	add     t0, s7, t0
 	lw      t0, 0(t0)
@@ -1072,20 +1054,6 @@ net_idle:
 	li      t2, SEED_WAIT_TK
 	bltu    t0, t2, 1f
 	li      a6, 1
-1:
-	# Discovery done (DISC_WAIT since the start)?  s6 = 1 if so; then top
-	# up the picks.
-	li      s6, 0
-	li      t0, MTIME_ADDR
-	lw      t1, 0(t0)
-	li      t0, T_START
-	add     t0, s7, t0
-	lw      t0, 0(t0)
-	sub     t0, t1, t0
-	li      t2, DISC_WAIT_TK
-	bltu    t0, t2, 1f
-	li      s6, 1
-	CALL    pick_peers
 1:
 	# Every eighth tick (2 s), how far the download has got.
 	li      t0, TICKN
@@ -1109,7 +1077,19 @@ net_idle:
 	LOAD_ADDRESS a0, msg_chunks
 	CALL    put_str
 2:
-	# Walk the table: discovery, then the image.
+	# Discovery done (DISC_WAIT since the start)?  Then the image, from the
+	# source.
+	li      t0, MTIME_ADDR
+	lw      t1, 0(t0)
+	li      t0, T_START
+	add     t0, s7, t0
+	lw      t0, 0(t0)
+	sub     t0, t1, t0
+	li      t2, DISC_WAIT_TK
+	bltu    t0, t2, 1f
+	CALL    fetch_tick
+1:
+	# Walk the table: discovery.
 	li      a5, PEERS
 	add     a5, s7, a5
 	li      t0, NPEERS
@@ -1121,8 +1101,6 @@ tick_peer:
 	beqz    t0, tp_ask                      # new: ask for hosts
 	li      t1, 1
 	beq     t0, t1, tp_asked
-	li      t1, 2
-	beq     t0, t1, tp_peer
 	j       tp_next
 tp_asked:
 	# Asked, no answer yet: again every fourth tick, four times in all (a
@@ -1148,37 +1126,6 @@ tp_ask:
 	addi    t0, t0, 0x10                    # one more ask
 	sb      t0, 7(a5)
 	CALL    send_get_hosts
-	j       tp_next
-tp_peer:
-	beqz    s6, tp_next                     # still discovering
-	lbu     t0, 7(a5)
-	andi    t1, t0, 4
-	beqz    t1, tp_next                     # doesn't have this build
-	andi    t1, t0, 8
-	bnez    t1, 1f                          # one of our picks
-	andi    t1, t0, 1
-	beqz    t1, tp_next                     # neither picked nor a seed
-	beqz    a6, tp_next                     # a seed: only as the last resort
-1:	andi    t1, t0, 2
-	bnez    t1, 2f                          # has sent chunks: every tick
-	li      t1, TICKN                       # else every fourth
-	add     t1, s7, t1
-	lw      t1, 0(t1)
-	andi    t1, t1, 3
-	bnez    t1, tp_next
-	lbu     t1, 16(a5)                      # one more ask with nothing back
-	addi    t1, t1, 1
-	sb      t1, 16(a5)
-	li      t2, 8
-	bltu    t1, t2, 2f
-	li      t1, 3                           # 8 of them: dropped (picked anew)
-	sb      t1, 6(a5)
-	andi    t0, t0, 0xF7
-	sb      t0, 7(a5)
-	j       tp_next
-2:	CALL    next_missing                    # a0 = the first chunk to ask for
-	bltz    a0, net_loop                    # nothing missing
-	CALL    send_get_bin
 tp_next:
 	addi    a5, a5, PEER_SZ
 	addi    a4, a4, -1
@@ -1219,37 +1166,14 @@ net_hash_cmp:
 
 net_hash_mismatch:
 	addi    sp, sp, 32
+	# The source's copy is bad: dropped, its chunks forgotten; the next.
 	LOAD_ADDRESS a0, msg_bad
 	CALL    put_str
-	# Drop every peer that sent chunks; forget the chunks; again.
-	li      a5, PEERS
-	add     a5, s7, a5
-	li      t0, NPEERS
+	li      t0, SRC
 	add     t0, s7, t0
-	lw      a4, 0(t0)
-1:	beqz    a4, 2f
-	lbu     t0, 7(a5)
-	andi    t1, t0, 2
-	beqz    t1, 3f
-	andi    t0, t0, 0xFD
-	sb      t0, 7(a5)
-	li      t0, 3
-	sb      t0, 6(a5)
-3:	addi    a5, a5, PEER_SZ
-	addi    a4, a4, -1
-	j       1b
-2:	li      t0, NB_BMAP
-	add     t0, s7, t0
-	li      t1, NB_BMAP_BYTES / 4
-1:	sw      zero, 0(t0)
-	addi    t0, t0, 4
-	addi    t1, t1, -1
-	bnez    t1, 1b
-	li      s1, 0
-	li      t0, HAVE_NS
-	add     t0, s7, t0
-	sw      zero, 0(t0)
-	CALL    progress
+	lw      a5, 0(t0)
+	CALL    put_peer
+	CALL    drop_source
 	j       net_loop
 halt_no_disk:
 panic:
@@ -1258,6 +1182,9 @@ panic:
 
 halt_no_net:
 	LOAD_ADDRESS a0, msg_nonet
+	j       halt_tail
+halt_no_good:
+	LOAD_ADDRESS a0, msg_nogood
 halt_tail:
 1:	lbu     t0, 0(a0)                       # (no CALL: a panic may be the RID stack)
 	beqz    t0, 2f
@@ -1727,62 +1654,137 @@ rand:
 	j       dispatch
 
 # ──────────────────────────────────────────────────────────────────────────────
-# pick_peers — top the picks up to MAX_PICKS: each, a random one of the
-#   peers with this build not yet picked (not seeds, not dropped) -- the
-#   first such from a random place in the table.  Trashes t0..t6, a0, a3.
+# fetch_tick — a tick of the download (after DISC_WAIT; a6 = 1 if a seed may
+#   be the source): no source, the next is picked (none left: halted); a
+#   source silent STALL_TICKS is dropped; else it's asked for SRC_WINDOWS
+#   windows.  Trashes t0..t6, a0, a1, a3, a5.
 # ──────────────────────────────────────────────────────────────────────────────
-pick_peers:
-	li      t5, 0                           # picks now
-	li      a3, PEERS
-	add     a3, s7, a3
+fetch_tick:
+	li      t0, SRC
+	add     t0, s7, t0
+	lw      a5, 0(t0)
+	bnez    a5, 1f
+	CALL    pick_source
+	beqz    a5, ft_done                     # none yet
+1:	lbu     t0, 16(a5)                      # one more tick without a new chunk
+	addi    t0, t0, 1
+	sb      t0, 16(a5)
+	li      t1, STALL_TICKS
+	bltu    t0, t1, 2f
+	LOAD_ADDRESS a0, msg_stall
+	CALL    put_str
+	CALL    put_peer
+	CALL    drop_source
+	j       ft_done
+2:	li      a3, SRC_WINDOWS
+3:	CALL    next_missing                    # a0 = the first chunk to ask for
+	bltz    a0, ft_done                     # nothing missing
+	CALL    send_get_bin
+	addi    a3, a3, -1
+	bnez    a3, 3b
+ft_done:
+	j       dispatch
+
+# ──────────────────────────────────────────────────────────────────────────────
+# pick_source — a5 = the new source, or 0: a random peer with this build, not
+#   a seed; else (a6 = 1) a random seed with it.  None, with a6 = 1 and no
+#   host still being asked for hosts: no peer has a good copy -- halted.
+#   Trashes t0..t6, a0, a3.
+# ──────────────────────────────────────────────────────────────────────────────
+pick_source:
+	li      a3, 0                           # not a seed
+	CALL    pick_one
+	bnez    a5, ps_got
+	beqz    a6, ps_done
+	li      a3, 1                           # a seed, then
+	CALL    pick_one
+	bnez    a5, ps_got
+	li      t1, PEERS                       # anyone still being discovered?
+	add     t1, s7, t1
 	li      t0, NPEERS
 	add     t0, s7, t0
 	lw      t4, 0(t0)
-1:	beqz    t4, 2f
-	lbu     t0, 6(a3)
-	li      t1, 2
-	bne     t0, t1, 3f
-	lbu     t0, 7(a3)
-	andi    t0, t0, 8
-	beqz    t0, 3f
-	addi    t5, t5, 1
-3:	addi    a3, a3, PEER_SZ
+1:	beqz    t4, halt_no_good                # no: every copy tried
+	lbu     t0, 6(t1)
+	li      t2, 2
+	bltu    t0, t2, ps_done                 # yes: wait for it
+	addi    t1, t1, PEER_SZ
 	addi    t4, t4, -1
 	j       1b
-2:	li      t0, MAX_PICKS
-	bgeu    t5, t0, pp_done
+ps_got:
+	li      t0, SRC
+	add     t0, s7, t0
+	sw      a5, 0(t0)
+	sb      zero, 16(a5)
+	LOAD_ADDRESS a0, msg_from
+	CALL    put_str
+	CALL    put_peer
+	CALL    progress                        # its time starts now
+ps_done:
+	j       dispatch
+
+# ──────────────────────────────────────────────────────────────────────────────
+# pick_one — a3 = 0 (not a seed) or 1 (a seed): a5 = a peer (state 2) with
+#   this build, that kind -- the first such from a random place in the
+#   table -- or 0.  Trashes t0..t6, a0.
+# ──────────────────────────────────────────────────────────────────────────────
+pick_one:
 	CALL    rand                            # a random place to start
+	li      a5, 0
 	li      t0, NPEERS
 	add     t0, s7, t0
 	lw      t4, 0(t0)
-	beqz    t4, pp_done
+	beqz    t4, po_done
 	andi    t6, a0, 31
 4:	bltu    t6, t4, 5f
 	sub     t6, t6, t4
 	j       4b
 5:	mv      t3, t4                          # entries to look at
-6:	beqz    t3, pp_done                     # none left to pick
+6:	beqz    t3, po_done                     # none
 	slli    t0, t6, 5                       # PEER_SZ
-	li      a3, PEERS
-	add     a3, s7, a3
-	add     a3, a3, t0
-	lbu     t0, 6(a3)
-	li      t1, 2
-	bne     t0, t1, 7f
-	lbu     t0, 7(a3)
-	andi    t1, t0, 13                      # picked, seed, or no build?
-	li      t2, 4
-	bne     t1, t2, 7f
-	ori     t0, t0, 8                       # picked
-	sb      t0, 7(a3)
-	addi    t5, t5, 1
-	j       2b
+	li      t1, PEERS
+	add     t1, s7, t1
+	add     t1, t1, t0
+	lbu     t0, 6(t1)
+	li      t2, 2
+	bne     t0, t2, 7f
+	lbu     t0, 7(t1)
+	andi    t0, t0, 5                       # has this build; a seed or not
+	ori     t2, a3, 4
+	bne     t0, t2, 7f
+	mv      a5, t1
+	j       po_done
 7:	addi    t6, t6, 1
 	bltu    t6, t4, 8f
 	li      t6, 0
 8:	addi    t3, t3, -1
 	j       6b
-pp_done:
+po_done:
+	j       dispatch
+
+# ──────────────────────────────────────────────────────────────────────────────
+# drop_source — the source failed: dropped (never asked again), its chunks
+#   forgotten, the download to start over from the next.  Trashes t0, t1, a5.
+# ──────────────────────────────────────────────────────────────────────────────
+drop_source:
+	li      t0, SRC
+	add     t0, s7, t0
+	lw      a5, 0(t0)
+	sw      zero, 0(t0)
+	li      t1, 3
+	sb      t1, 6(a5)
+	li      t0, NB_BMAP
+	add     t0, s7, t0
+	li      t1, NB_BMAP_BYTES / 4
+1:	sw      zero, 0(t0)
+	addi    t0, t0, 4
+	addi    t1, t1, -1
+	bnez    t1, 1b
+	li      s1, 0
+	li      t0, CURSOR
+	add     t0, s7, t0
+	sw      zero, 0(t0)
+	CALL    progress                        # the next gets its time
 	j       dispatch
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2120,7 +2122,9 @@ msg_tab:    .asciz "tabernacle: "
 msg_of:     .asciz " of "
 msg_chunks: .asciz " chunks\n"
 msg_got:    .asciz "tabernacle: got the node, and its hash checks out: booting it\n"
-msg_bad:    .asciz "tabernacle: what came does not match the hash of the node: again, without those peers\n"
+msg_bad:    .asciz "tabernacle: its copy does not match the hash of the node: trying another peer; dropped "
+msg_stall:  .asciz "tabernacle: no new chunks for 5 s: trying another peer; dropped "
+msg_nogood: .asciz "tabernacle: no peer has a good copy of this build of the node: giving up\n"
 msg_nodev:  .asciz "tabernacle: no disk or network device\n"
 msg_nonet:  .asciz "tabernacle: no progress fetching the node: giving up\n"
 	.balign 4, 0                            # zeros: nops can't pad odd bytes (no C)

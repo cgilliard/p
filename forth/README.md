@@ -398,13 +398,21 @@ those hosts in turn (up to 32 peers, each answer carrying a cookie). A
 `HOSTS` answer may end with a trailer about the answering host: whether it
 serves its boot image, and that image's hash (the first 8 bytes) -- a Forth
 node and `tools/server.py` send it; the Rust node accepts and ignores it.
-After 2 seconds of discovery, tabernacle picks up to 16 of the hosts with
-*this* build at random and asks only them for the image, in windows of 32
-chunks (a pick that sends nothing after 8 asks is replaced by another);
-the seeds only if no other peer has sent any within 5 seconds, so a new
-node costs its seeds a few small packets. Nodes hand out their hosts in a
-random order, so new nodes spread across the network. A hash mismatch drops
-every peer that sent chunks and starts over. `scripts/node.sh` gives
+After 2 seconds of discovery, tabernacle takes the whole image from ONE
+host at a time -- the source -- so a host serving a bad copy costs a try
+and can't spoil a download from good ones: a host with *this* build at
+random, never a seed while another has it untried (a seed only after 5
+seconds, once no other is left), so a new node costs its seeds a few small
+packets. The source is asked for 4 windows of 32 chunks every quarter
+second, and chunks are taken only from it. A hash mismatch, or 5 seconds
+without a new chunk, drops the source and its chunks, and the download
+starts over from the next; when every host with the build has been tried,
+tabernacle stops: no peer has a good copy. Nodes hand out their hosts in a
+random order, so new nodes spread across the network. (Against
+`tools/server.py` copies on this machine -- one serving a corrupted chunk,
+one stopping after 100 chunks, one good -- it dropped the bad and the
+stalled ones in turn and booted the good one's copy, 2,723 chunks in about
+5 s; with no good copy anywhere it gave up.) `scripts/node.sh` gives
 it the seeds as `BOOT` (default: `SEED`'s, as addresses: tabernacle has
 no DNS, so `node.sh` looks names up on the host); `scripts/makenode.sh` writes a
 new build to `data/disk.img` by hand. Under QEMU, with a Rust dev node as
