@@ -1,0 +1,72 @@
+\ tests/dns.fam — the seeds by name (src/dns.fam): names checked, the query
+\ built, answers taken (a CNAME skipped, the seeds made and unmade) or
+\ refused (another id) or failed (no such name).  After tests/net.fam (the
+\ network open: queries are built where datagrams are).
+
+: tzdv variable ;  : tzd ( -- a )  tzdv 100 lit lazy ;     \ an answer
+: tzdn variable ;
+\ tzrr ( type n -- a )   a record after the answer so far: the name (a
+\        pointer to the question's), type, class IN, a TTL, n bytes of data
+\        (returned: where they go).
+: tzt variable ;  : tzl variable ;
+: tzrr ( type n -- a )
+	tzl ! tzt !
+	tzd tzdn @ +  C00C lit over nb16!  tzt @ over 2 lit + nb16!  1 lit over 4 lit + nb16!
+	0 lit over 6 lit + nb16!  E10 lit over 8 lit + nb16!  tzl @ over A lit + nb16!
+	C lit +  tzdn @ C lit + tzl @ + tzdn !
+;
+\ tzans ( id rcode records -- )   the answer to name 0's query, handed to dnin.
+: tzans ( id rcode records -- )
+	dnqb tzd dnql @ ncpy  dnql @ tzdn !
+	tzd 6 lit + nb16!  8180 lit or tzd 2 lit + nb16!  tzd nb16!
+;
+: tzgo ( -- f )   tzd npay !  tzdn @ npn !  11 lit nproto !  35 lit nsport !  A000203 lit nsrc !  dnin ;
+\ tzseed? ( ip -- f )   a seed at port 3737.
+: tzseed? ( ip -- f )   E99 lit pfind dup 0< if drop 0 lit else pp 38 lit + @ 0= 0= then ;
+
+Test {
+	dns_names_checked {
+		0 lit dnn !
+		"seed1.example.org" 11 lit E99 lit 0 lit dnadd assert
+		"a..b" 4 lit E99 lit 0 lit dnadd 0= assert
+		"a.b." 4 lit E99 lit 0 lit dnadd 0= assert
+		"a b" 3 lit E99 lit 0 lit dnadd 0= assert
+		"ok" 2 lit 0 lit 0 lit dnadd 0= assert                            \ no port
+		dnn @ 1 lit asrt_eq
+		0 lit dne 30 lit + "seed1.example.org" 12 lit mcmp 0= assert     \ (and its zero)
+	}
+	dns_query_built {
+		1234 lit dnid !  0 lit dne dnq dup 23 lit asrt_eq dnql !  npkt dnqb dnql @ ncpy
+		dnqb nb16@ 1234 lit asrt_eq  dnqb 2 lit + nb16@ 100 lit asrt_eq  dnqb 4 lit + nb16@ 1 lit asrt_eq
+		dnqb C lit + c@ 5 lit asrt_eq  dnqb 12 lit + c@ 7 lit asrt_eq  dnqb 1A lit + c@ 3 lit asrt_eq
+		dnqb 1E lit + c@ 0 lit asrt_eq  dnqb 1F lit + nb16@ 1 lit asrt_eq  dnqb 21 lit + nb16@ 1 lit asrt_eq
+	}
+	dns_answer_taken {
+		A000203 lit dnsv !  0 lit gwset !
+		0 lit dnpk !  1234 lit 0 lit 3 lit tzans
+		5 lit 2 lit tzrr C00C lit swap nb16!                              \ a CNAME: skipped
+		1 lit 4 lit tzrr 9F36ACBE lit swap be!
+		1 lit 4 lit tzrr 7F000001 lit swap be!                            \ this machine
+		tzgo assert  dnpk @ -1 lit asrt_eq
+		0 lit dne 14 lit + @ 2 lit asrt_eq  0 lit dne 10 lit + @ assert
+		9F36ACBE lit tzseed? assert  A000202 lit tzseed? assert
+		\ the name moved off this machine: no longer a seed
+		0 lit dnpk !  1234 lit 0 lit 1 lit tzans  1 lit 4 lit tzrr 9F36ACBE lit swap be!
+		tzgo assert  0 lit dne 14 lit + @ 1 lit asrt_eq
+		9F36ACBE lit tzseed? assert  A000202 lit tzseed? 0= assert
+	}
+	dns_answer_refused {
+		\ another id: not taken, still waiting
+		0 lit dnpk !  4321 lit 0 lit 1 lit tzans  1 lit 4 lit tzrr 01020304 lit swap be!
+		tzgo assert  dnpk @ 0 lit asrt_eq  01020304 lit tzseed? 0= assert
+		\ from elsewhere: not the resolver's
+		1234 lit 0 lit 1 lit tzans  1 lit 4 lit tzrr 01020304 lit swap be!
+		tzd npay !  tzdn @ npn !  11 lit nproto !  35 lit nsport !  08080808 lit nsrc !
+		dnin 0= assert  dnpk @ 0 lit asrt_eq
+		\ no such name: failed, its address kept
+		1234 lit 3 lit 0 lit tzans
+		tzgo assert  dnpk @ -1 lit asrt_eq
+		0 lit dne 14 lit + @ 1 lit asrt_eq  9F36ACBE lit tzseed? assert
+		0 lit dnn !
+	}
+}

@@ -208,6 +208,18 @@ impl PeerTable {
         self.protected.extend(addrs);
     }
 
+    #[cfg(test)]
+    pub fn is_protected(&self, addr: SocketAddrV4) -> bool {
+        self.protected.contains(&addr)
+    }
+
+    /// No longer seeds: evicted and dropped as any host.
+    pub fn unprotect(&mut self, addrs: impl IntoIterator<Item = SocketAddrV4>) {
+        for addr in addrs {
+            self.protected.remove(&addr);
+        }
+    }
+
     /// Room for one more host in a full table, made by evicting the host
     /// silent longest among those not answering now -- never answered
     /// first, then the oldest last success -- if there is one (not

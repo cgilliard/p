@@ -101,6 +101,8 @@ pub enum Command {
     SyncState { at: [u8; 32], root: [u8; 32], count: u64 },
     /// Fast sync: abandon the state download.
     StopStateSync,
+    /// The seeds' addresses now (their names looked up again).
+    Seeds(Vec<SocketAddrV4>),
 }
 
 #[derive(Debug)]
@@ -240,6 +242,7 @@ impl<T: Transport> Node<T> {
                 self.statesync.stop();
                 Vec::new()
             }
+            Command::Seeds(seeds) => self.discovery.set_seeds(seeds, crate::block::now_millis())?,
         };
         self.send_all(out);
         Ok(())

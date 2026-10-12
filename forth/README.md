@@ -191,7 +191,23 @@ that stop answering -- in both nodes -- are kept and asked again every
 probe interval (a minute; hourly once silent over a day), not counted,
 shared or announced to until they answer, and removed only when they've
 never answered in 3 asks, or not in a week: a node back after longer
-reaches out itself. Seeds are never removed. At most 4 hosts share an IP
+reaches out itself. Seeds are never removed. The public seeds are given by
+name -- `tabernacle1.root.sx` and `tabernacle2.root.sx` -- so where they are
+can change without updating nodes. The Forth node has its own DNS client
+(`src/dns.fam`: A records over UDP, from its own port, an answer taken only
+from the resolver, with the query's random id and question). It asks
+`dns=A.B.C.D` / `DNS`, by default QEMU user networking's 10.0.2.3, which
+asks the host's resolver; on hardware, a public one such as 8.8.8.8. It
+looks the names up at the start -- 3 tries, 1.5 s apart, then the address
+after the name's `/`, if one is given (the defaults give none: no addresses
+are built in, so the seeds can move, and a DNS server must answer) -- and
+hourly after that (every minute while lookups fail). Each address a name
+has (up to 4) is a seed; one it stops having is an ordinary host from then
+on. The gateways, when taken from the seeds, follow them. The Rust node
+looks the same names up with the system's resolver (`--seed
+HOST:PORT[/IPV4]`), likewise at the start and hourly. A forged answer can
+only point a node at hosts that aren't the seeds, whose chain is checked
+like any other. At most 4 hosts share an IP
 address (Forth `perip=N` / `PERIP`, Rust `--max-per-ip`), so no address can
 be made a target for the whole network's probes; a new host at a full IP
 takes the place of the one there silent longest among those not answering.
@@ -389,7 +405,8 @@ the seeds only if no other peer has sent any within 5 seconds, so a new
 node costs its seeds a few small packets. Nodes hand out their hosts in a
 random order, so new nodes spread across the network. A hash mismatch drops
 every peer that sent chunks and starts over. `scripts/node.sh` gives
-it the seeds as `BOOT` (default: `SEED`); `scripts/makenode.sh` writes a
+it the seeds as `BOOT` (default: `SEED`'s, as addresses: tabernacle has
+no DNS, so `node.sh` looks names up on the host); `scripts/makenode.sh` writes a
 new build to `data/disk.img` by hand. Under QEMU, with a Rust dev node as
 the only seed and one Forth node holding the build, a new node on a blank
 disk booted in about 18 s, every chunk from the Forth node.

@@ -8,6 +8,12 @@
 \ booted by it), ended by EOT (0x04), separated by spaces:
 \   seed=A.B.C.D:PORT   a host to start from (any number; 127.x.x.x is the
 \                       host machine, reached through QEMU's gateway)
+\   seed=NAME:PORT, seed=NAME:PORT/A.B.C.D
+\                       one by name, looked up (src/dns.fam) when the node
+\                       starts and every hour; the address after / is the
+\                       one to use if the first lookups get no answer
+\   dns=A.B.C.D         the DNS server asked (10.0.2.3: QEMU user
+\                       networking's, which asks the host's)
 \   port=N              our UDP port (3737)
 \   depth=N             fast sync: start N blocks behind the best peer, on a
 \                       node with nothing past genesis (25; 0: never)
@@ -65,10 +71,28 @@
 	0 lit  begin fnc 30 lit - A lit u< while A lit * fnc 30 lit - + fn+ repeat
 ;
 
+\ fnip4 ( -- ip )   A.B.C.D
+: fnip4 ( -- ip )   fnnum  3 lit 0 lit do fn+ 8 lit lshift fnnum or loop ;
+
 \ fnip ( -- ip port )   A.B.C.D:PORT
-: fnip ( -- ip port )
-	fnnum  3 lit 0 lit do fn+ 8 lit lshift fnnum or loop
-	fn+ fnnum
+: fnip ( -- ip port )   fnip4 fn+ fnnum ;
+
+\ fnname? ( -- f )   the host at fnp is a name (not A.B.C.D).
+: fnnm variable ;
+: fnname? ( -- f )
+	0 lit fnnm !  fnp @
+	begin fncfg over + c@ dup 3A lit = over 21 lit u< or 0= while
+		dup 2E lit = swap 30 lit - A lit u< or 0= if -1 lit fnnm ! then  1 lit +
+	repeat 2drop fnnm @
+;
+
+\ fnseedn ( -- )   seed=NAME:PORT[/A.B.C.D]
+: fnseedn ( -- )
+	fncfg fnp @ +  0 lit  begin 2dup + c@ dup 3A lit = over 2F lit = or swap 21 lit u< or 0= while 1 lit + repeat
+	dup fnp @ + fnp !
+	fnc 3A lit = if fn+ fnnum else 0 lit then
+	fnc 2F lit = if fn+ fnip4 dup 18 lit rshift 7F lit = if drop A000202 lit then else 0 lit then
+	dnadd 0= if "node: a seed it can't use (seed=NAME:PORT, NAME:PORT/A.B.C.D or A.B.C.D:PORT)\n" lputs bye then
 ;
 
 : fnbad ( -- )   "node: a setting it doesn't know: " lputs  fncfg fnp @ + lputs  A lit lputc bye ;
@@ -80,7 +104,8 @@
 		fnc
 	while
 		"seed=" fnpre? if
-			fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then pseed
+			fnname? if fnseedn else fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then pseed then
+		else "dns=" fnpre? if fnip4 dnsv !
 		else "port=" fnpre? if fnnum nport !
 		else "depth=" fnpre? if fnnum pfdep !
 		else "net=dev" fnpre? if 1 lit bnet !
@@ -98,8 +123,8 @@
 		else "logmax=" fnpre? if fnnum F4240 lit pumin dup 0= if drop 1 lit then lgmax !
 		else "noverify" fnpre? if -1 lit bnover !
 		else "gateway" fnpre? if -1 lit gwserve !
-		else "usegw=" fnpre? if fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then gwuse
-		else fnbad then then then then then then then then then then then then then then then then then then then
+		else "usegw=" fnpre? if fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then gwuse  -1 lit gwset !
+		else fnbad then then then then then then then then then then then then then then then then then then then then
 	repeat
 ;
 
@@ -145,9 +170,9 @@
 \        transaction relay's and boot image's datagrams -- then the timers.
 : fnstep ( -- )
 	begin nrecv while
-		nproto @ 6 lit = if tin else txin 0= if pzin 0= if gwin 0= if imin 0= if pin then then then then then
+		nproto @ 6 lit = if tin else dnin 0= if txin 0= if pzin 0= if gwin 0= if imin 0= if pin then then then then then then
 	repeat
-	ptick txtick ttick wtick gwtick pztick
+	ptick txtick ttick wtick gwtick pztick dntick
 ;
 
 \ ── Time-sharing: the yield ──
@@ -241,7 +266,7 @@
 \ fnmain ( -- )
 : fnmain ( -- )
 	fnclean
-	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  E99 lit nport !
+	A00020F lit nadr !  A000202 lit ngw !  FFFFFF00 lit nmask !  E99 lit nport !  A000203 lit dnsv !
 	19 lit pfdep !  0 lit bnet !  2 lit lgdst !  -1 lit fnfs !  -1 lit fnpc !  -1 lit fnph !
 	fnread fnparse
 	wlshowk @ if fnkey then
@@ -268,6 +293,7 @@
 	wl? if "node: payment address: " lputs  fnaddr dup paaddr  over + 0 lit swap c!  lputs A lit lputc then
 	dbtip ?dup if "node: resuming at height " lputs 20 lit + @ fndec A lit lputc else "node: a new chain\n" lputs then
 	pstart 0= if "node: no network device" lputs A lit lputc lfail then
+	dnstart                                           \ the seeds given by name
 	ppn 0 lit do i pp 38 lit + @ if "node: seed " lputs i pp @ fnip. 3A lit lputc i pp 4 lit + @ fndec A lit lputc then loop
 	0 lit ppn 0 lit do i pp 8 lit + @ i pp 38 lit + @ 0= and if 1 lit + then loop
 	?dup if "node: hosts known from before: " lputs fndec A lit lputc then

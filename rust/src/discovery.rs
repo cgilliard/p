@@ -252,6 +252,27 @@ impl Discovery {
         Ok(out)
     }
 
+    /// The seeds are now these (their names looked up again): the new ones
+    /// protected, recorded and asked for hosts; the gone ones no longer
+    /// protected -- kept, or dropped, as any host.
+    pub fn set_seeds(&mut self, seeds: Vec<SocketAddrV4>, now_ms: u64) -> peers::Result<Vec<Outgoing>> {
+        let old = std::mem::replace(&mut self.config.seeds, seeds);
+        let gone: Vec<SocketAddrV4> = old.iter().filter(|a| !self.config.seeds.contains(a)).copied().collect();
+        self.table.unprotect(gone);
+        self.table.protect(self.config.seeds.iter().copied());
+        let mut out = Vec::new();
+        for seed in self.config.seeds.clone() {
+            if old.contains(&seed) || !peers::is_plausible(seed) || self.self_addrs.contains(&seed) {
+                continue;
+            }
+            self.add_candidate(seed)?;
+            if !self.pending.contains_key(&seed) {
+                out.push(self.request(seed, now_ms));
+            }
+        }
+        Ok(out)
+    }
+
     /// Housekeeping, to be called regularly: count every request that's
     /// timed out as a failure, then re-ask every known host that's due.
     pub fn tick(&mut self, now_ms: u64) -> peers::Result<Vec<Outgoing>> {
@@ -433,6 +454,19 @@ mod tests {
             nonce_sent_to(&out, seed);
             assert!(d.table().get(seed).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn new_seeds_are_asked_and_gone_ones_released() {
+        let (_dir, mut d) = discovery(config(vec![addr(1, 9000), addr(2, 9000)]));
+        d.start(0).unwrap();
+        let out = d.set_seeds(vec![addr(2, 9000), addr(3, 9000)], 10).unwrap();
+
+        assert_eq!(out.len(), 1); // only the new one: 2 was asked at the start
+        nonce_sent_to(&out, addr(3, 9000));
+        assert!(d.table().get(addr(3, 9000)).unwrap().is_some());
+        assert!(d.table().is_protected(addr(2, 9000)) && d.table().is_protected(addr(3, 9000)));
+        assert!(!d.table().is_protected(addr(1, 9000)));
     }
 
     #[test]

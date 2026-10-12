@@ -31,9 +31,14 @@
 # passphrases go straight to the node over the console, never in settings or
 # the environment; what you type isn't shown.
 #
-#   SEED   the hosts to start from, host:port, space-separated (default the
-#          two public seeds; 127.0.0.1 is this machine -- a Rust node here
-#          is 127.0.0.1:3739)
+#   SEED   the hosts to start from, space-separated: A.B.C.D:PORT, or by
+#          name, NAME:PORT -- looked up by the node when it starts and every
+#          hour -- or NAME:PORT/A.B.C.D, falling back on that address if the
+#          name gets no answer (default the two public seeds, by name only:
+#          a DNS server must answer;
+#          127.0.0.1 is this machine -- a Rust node here is 127.0.0.1:3739)
+#   DNS    the DNS server the node asks, A.B.C.D (default 10.0.2.3: QEMU's
+#          own, which asks this machine's -- whatever /etc/resolv.conf says)
 #   DEPTH  fast sync: start this many blocks behind the seed on a new chain
 #          (default 25: a few minutes of replay under QEMU; 0 syncs every block)
 #   PORT   our UDP port, forwarded from this machine (default 3737)
@@ -51,19 +56,33 @@
 #   BOOT   the seeds tabernacle starts from when the disk's copy isn't the
 #          build it expects: it finds peers through them and fetches the node
 #          from the peers holding it, the seeds only if no one else does
-#          (default SEED)
+#          (default SEED's, as addresses: names looked up here, on this
+#          machine -- tabernacle has no DNS of its own)
 #
 # To boot a new build from the disk without fetching it, run
 # scripts/makenode.sh after scripts/build.sh.  To start over: rm
 # data/disk.img -- which deletes the wallet too (restore it with --recover).
 set -e
 DISK=${DISK:-./data/disk.img}
-SEED=${SEED:-159.54.172.190:3737 146.235.230.124:3737}
+SEED=${SEED:-tabernacle1.root.sx:3737 tabernacle2.root.sx:3737}
 DEPTH=${DEPTH:-25}
 PORT=${PORT:-3737}
 NET=${NET:-dev}
 API=${API:-$((PORT + 1))}
-BOOT=${BOOT:-$SEED}
+# boot_of: SEED as A.B.C.D:PORT, for tabernacle.
+boot_of() {
+	for s in $SEED; do
+		hp=${s%%/*}; host=${hp%:*}; port=${hp##*:}
+		case $host in
+		*[!0-9.]*)
+			ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 { print $1 }')
+			[ -n "$ip" ] || case $s in */*) ip=${s#*/} ;; esac
+			[ -n "$ip" ] && printf '%s:%s ' "$ip" "$port" ;;
+		*) printf '%s ' "$hp" ;;
+		esac
+	done
+}
+BOOT=${BOOT:-$(boot_of | sed "s/ *$//")}
 WALLET=""
 APIKEY=""
 LOGDEST=""
@@ -129,10 +148,10 @@ echo "node.sh: the web wallet: http://127.0.0.1:$API/ (once the node is up)" >&2
 # timeout, network, and the seeds it would fetch the node from if the disk's
 # copy were bad), then the node's own (src/full_node.fam).
 settings() {
-	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s%s%s\004' \
+	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s%s%s%s\004' \
 		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
 		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}" "${PERIP:+ perip=$PERIP}" \
-		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${GATEWAY:+ gateway}"
+		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${GATEWAY:+ gateway}" "${DNS:+ dns=$DNS}"
 }
 # QEMU's output goes through a pipe (| cat): QEMU makes its output
 # non-blocking, and on a terminal that would be the keyboard's too.

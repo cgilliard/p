@@ -266,7 +266,7 @@ struct Args {
     /// `main`, or `dev` (light, insecure proofs for testing).
     network: network::Network,
     port: u16,
-    seeds: Vec<SocketAddrV4>,
+    seeds: Vec<SeedSpec>,
     mine: bool,
     /// Where to log (default: `tabernacle.log` in the data directory).
     log_file: Option<std::path::PathBuf>,
@@ -298,19 +298,137 @@ struct Args {
 }
 
 /// The seeds a node starts from when no `--seed` is given: the public
-/// seeds (Forth nodes, port 3737). `--standalone` starts from none.
-const DEFAULT_SEEDS: [&str; 2] = ["159.54.172.190:3737", "146.235.230.124:3737"];
+/// seeds (Forth nodes, port 3737), by name only -- no addresses built in,
+/// so they can move; DNS must answer. `--standalone` starts from none.
+const DEFAULT_SEEDS: [&str; 2] = ["tabernacle1.root.sx:3737", "tabernacle2.root.sx:3737"];
+
+/// How often seeds given by name are looked up again (an hour), so where
+/// the names point can change without updating nodes.
+const SEED_LOOKUP_INTERVAL_S: u64 = 3600;
+
+/// The most addresses taken from one seed's name.
+const SEED_ADDRS_PER_NAME: usize = 4;
+
+/// A seed as given: `HOST:PORT`, the host an IPv4 address or a name --
+/// looked up with the system's resolver when the node starts, and hourly
+/// -- optionally with an address to fall back on if the name gets no
+/// answer at the start (`HOST:PORT/IPV4`).
+#[derive(Clone, Debug)]
+struct SeedSpec {
+    host: String,
+    port: u16,
+    fallback: Option<std::net::Ipv4Addr>,
+}
+
+impl std::str::FromStr for SeedSpec {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let (host_port, fallback) = match s.split_once('/') {
+            Some((hp, ip)) => (hp, Some(ip.parse().map_err(|_| ())?)),
+            None => (s, None),
+        };
+        let (host, port) = host_port.rsplit_once(':').ok_or(())?;
+        let port: u16 = port.parse().map_err(|_| ())?;
+        if host.is_empty() || port == 0 {
+            return Err(());
+        }
+        Ok(SeedSpec { host: host.to_string(), port, fallback })
+    }
+}
+
+impl SeedSpec {
+    /// The seed's addresses now (IPv4 only), or `None` if its name got no
+    /// answer.
+    fn lookup(&self) -> Option<Vec<SocketAddrV4>> {
+        use std::net::ToSocketAddrs;
+        match (self.host.as_str(), self.port).to_socket_addrs() {
+            Ok(addrs) => {
+                let mut found: Vec<SocketAddrV4> = Vec::new();
+                for addr in addrs {
+                    if let std::net::SocketAddr::V4(v4) = addr
+                        && !found.contains(&v4)
+                        && found.len() < SEED_ADDRS_PER_NAME
+                    {
+                        found.push(v4);
+                    }
+                }
+                (!found.is_empty()).then_some(found)
+            }
+            Err(e) => {
+                warn!("Seed {}: no answer from DNS ({e}).", self.host);
+                None
+            }
+        }
+    }
+}
+
+/// Every seed's addresses, in order, without repeats.
+fn all_seed_addrs(each: &[Vec<SocketAddrV4>]) -> Vec<SocketAddrV4> {
+    let mut out = Vec::new();
+    for addr in each.iter().flatten() {
+        if !out.contains(addr) {
+            out.push(*addr);
+        }
+    }
+    out
+}
+
+/// The seeds' addresses at the start: each looked up, or its fallback.
+fn resolve_seeds(specs: &[SeedSpec]) -> Vec<Vec<SocketAddrV4>> {
+    specs
+        .iter()
+        .map(|spec| {
+            spec.lookup().unwrap_or_else(|| match spec.fallback {
+                Some(ip) => {
+                    warn!("Seed {}: falling back on {ip}.", spec.host);
+                    vec![SocketAddrV4::new(ip, spec.port)]
+                }
+                None => Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Seeds given by name: looked up again every hour, and the network told
+/// when their addresses change (a name that gets no answer keeps its
+/// addresses).
+fn spawn_seed_lookups(specs: Vec<SeedSpec>, mut each: Vec<Vec<SocketAddrV4>>, commands: Sender<Command>) {
+    if specs.iter().all(|s| s.host.parse::<std::net::Ipv4Addr>().is_ok()) {
+        return;
+    }
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(SEED_LOOKUP_INTERVAL_S));
+            let before = all_seed_addrs(&each);
+            for (spec, addrs) in specs.iter().zip(each.iter_mut()) {
+                if let Some(found) = spec.lookup() {
+                    if found != *addrs {
+                        let shown: Vec<String> = found.iter().map(|a| a.to_string()).collect();
+                        info!("Seed {} now points at {}.", spec.host, shown.join(", "));
+                    }
+                    *addrs = found;
+                }
+            }
+            let after = all_seed_addrs(&each);
+            if after != before && commands.send(Command::Seeds(after)).is_err() {
+                return; // the network has stopped
+            }
+        }
+    });
+}
 
 /// Fast sync's default `--sync-depth`: blocks replayed in full after the
 /// sync point, and how deep a fast-synced node can reorg at first.
 const DEFAULT_SYNC_DEPTH: u64 = 100;
 
-const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed IPV4:PORT]... [--no-mine]
+const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed HOST:PORT[/IPV4]]... [--no-mine]
          [--log-file PATH] [--log-level trace|debug|info|warn|error] [--log-stdout]
          [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]
          [--full-sync] [--sync-depth BLOCKS] [--max-hosts N] [--probe-interval SECONDS]
          [--max-per-ip N] [--standalone] [--debug-disable-verification]
 
+A seed's HOST is an IPv4 address or a name (looked up when the node starts
+and every hour); /IPV4 is the address to use if the name gets no answer.
 Without --seed, the node starts from the public seeds; --standalone starts
 from none (the first node of a new network: it mines without waiting to hear
 a peer).
@@ -369,7 +487,7 @@ fn parse_args() -> Args {
             "--seed" => {
                 let v = value();
                 args.seeds.push(v.parse().unwrap_or_else(|_| {
-                    eprintln!("invalid seed (expected IPV4:PORT): {v}\n{USAGE}");
+                    eprintln!("invalid seed (expected HOST:PORT or HOST:PORT/IPV4): {v}\n{USAGE}");
                     std::process::exit(2);
                 }));
             }
@@ -853,14 +971,17 @@ fn main() {
         }
     }
 
+    let seed_addrs = resolve_seeds(&args.seeds);
+    let seeds = all_seed_addrs(&seed_addrs);
     if args.seeds.is_empty() {
         info!("Listening on UDP port {} (standalone: no seeds).", args.port);
     } else {
-        let seeds: Vec<String> = args.seeds.iter().map(|s| s.to_string()).collect();
-        info!("Listening on UDP port {}, seeds: {}.", args.port, seeds.join(", "));
+        let shown: Vec<String> = seeds.iter().map(|s| s.to_string()).collect();
+        info!("Listening on UDP port {}, seeds: {}.", args.port, shown.join(", "));
     }
     let standalone = args.standalone;
-    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, args.seeds, args.max_hosts, args.max_per_ip, args.probe_interval_s);
+    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, seeds, args.max_hosts, args.max_per_ip, args.probe_interval_s);
+    spawn_seed_lookups(args.seeds.clone(), seed_addrs, commands.clone());
     let fast_sync = (fresh && !args.full_sync).then(|| fastsync::FastSync::new(args.sync_depth, &commands));
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
     let peer_table = PeerTable::open(&storage, args.max_hosts, args.max_per_ip).expect("failed to open peer table");
@@ -912,6 +1033,21 @@ fn main() {
 mod tests {
     use super::*;
     use crate::block::mine_block;
+
+    #[test]
+    fn seeds_are_given_by_address_or_name() {
+        let s: SeedSpec = "1.2.3.4:3737".parse().unwrap();
+        assert_eq!((s.host.as_str(), s.port, s.fallback), ("1.2.3.4", 3737, None));
+        let s: SeedSpec = "seed.example.org:3737/5.6.7.8".parse().unwrap();
+        assert_eq!((s.host.as_str(), s.port, s.fallback), ("seed.example.org", 3737, Some("5.6.7.8".parse().unwrap())));
+        for bad in ["seed.example.org", ":3737", "a:0", "a:3737/x", "a:99999"] {
+            assert!(bad.parse::<SeedSpec>().is_err(), "{bad}");
+        }
+        assert_eq!(SeedSpec { host: "1.2.3.4".into(), port: 9, fallback: None }.lookup(), Some(vec!["1.2.3.4:9".parse().unwrap()]));
+        for d in DEFAULT_SEEDS {
+            assert!(d.parse::<SeedSpec>().unwrap().host.parse::<std::net::Ipv4Addr>().is_err()); // names, no addresses
+        }
+    }
 
     fn hex32(bytes: &[u8; 32]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()

@@ -221,6 +221,7 @@
 
 : gwgv variable ;  : gwg ( k -- a )  4 lit lshift gwgv 40 lit lazy + ;   \ 0 ip 4 port 8 acked C last sent
 : gwgn variable ;  : gwmat variable ;  : gwmid variable ;
+: gwset variable ;                                     \ usegw= given (else the seeds: gwseeds)
 : gwuse ( ip port -- )   gwgn @ 4 lit u< if gwgn @ gwg 4 lit + !  gwgn @ gwg !  0 lit gwgn @ gwg 8 lit + !  gwgn @ 1 lit + gwgn ! else 2drop then ;
 
 \ gwseeds ( -- )   no gateways set: the seeds, then.

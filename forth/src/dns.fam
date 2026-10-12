@@ -1,0 +1,242 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/dns.fam — the seeds by name: a DNS client (RFC 1035), A records over
+\ UDP, asking one resolver (dns=A.B.C.D: QEMU user networking's own,
+\ 10.0.2.3, by default -- it asks the host's resolver, as any program on the
+\ host would; on hardware, a public one such as 8.8.8.8).
+\
+\ A seed given by name (seed=NAME:PORT, or NAME:PORT/A.B.C.D with an
+\ address to fall back on) is looked up when the node starts, then every
+\ hour (every minute while lookups fail), so where the names point can be
+\ changed without updating nodes.  Each address it has (up to 4) is a
+\ seed; one it no longer has stops being one (and is then kept, or
+\ dropped, as any host).  The gateways, when taken from the seeds (no
+\ usegw=), are taken again when the seeds change.
+\
+\ Queries go from the node's own UDP port; an answer counts only from the
+\ resolver's address and port 53, with the query's id (random) and
+\ question.  A forged answer could at most point the node at hosts that
+\ aren't seeds -- the chain they offer is checked as any other.
+\
+\   dnadd ( a n port ip -- f )   a seed by name (ip: the one to fall back
+\                                on, or 0): whether it's a name it can use
+\   dnstart ( -- )               look them up (up to 3 tries each, 1.5 s
+\                                apart), after pstart
+\   dnin ( -- f )                the datagram is the resolver's (handled)
+\   dntick ( -- )                lookups due
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: dnsv variable ;                                     \ the resolver (dns=)
+
+\ The names: up to 8, 0x80 bytes each: 0 its length  4 the port  8 the
+\ address to fall back on (0 none)  C when last asked  10 whether it's ever
+\ been answered  14 how many addresses  18 the addresses (4)  28 whether
+\ lookups are failing (said)  30 the name (lower case, up to 79 bytes, then
+\ zero).
+: dnev variable ;  : dne ( k -- a )  7 lit lshift dnev 400 lit lazy + ;
+: dnn variable ;
+
+: dnlow ( c -- c )   dup 41 lit - 1A lit u< if 20 lit or then ;
+
+\ dnok ( a n -- f )   a host name: labels of letters, digits, - and _, 1 to
+\        63 bytes each, between dots.  (n > 0.)
+: dnf variable ;  : dnll variable ;
+: dnok ( a n -- f )
+	-1 lit dnf !  0 lit dnll !
+	0 lit do
+		dup i + c@
+		dup 2E lit = if
+			drop dnll @ 0= if 0 lit dnf ! then  0 lit dnll !
+		else
+			dup 30 lit - A lit u<  over 20 lit or 61 lit - 1A lit u< or  over 2D lit = or  swap 5F lit = or if
+				dnll @ 1 lit + dup dnll !  3F lit u> if 0 lit dnf ! then
+			else 0 lit dnf ! then
+		then
+	loop drop
+	dnll @ 0= if 0 lit dnf ! then  dnf @
+;
+
+: dna variable ;  : dnl variable ;  : dnpt variable ;  : dnfb variable ;
+: dnadd ( a n port ip -- f )
+	dnfb ! dnpt ! dnl ! dna !
+	dnl @ 1 lit - 4F lit u< if dna @ dnl @ dnok else 0 lit then
+	dnn @ 8 lit u< and  dnpt @ 1 lit - FFFF lit u< and  dup if
+		dnn @ dne  dup 80 lit nzero
+		dnl @ over !  dnpt @ over 4 lit + !  dnfb @ over 8 lit + !
+		30 lit +  dnl @ 0 lit do dna @ i + c@ dnlow over i + c! loop drop
+		dnn @ 1 lit + dnn !
+	then
+;
+
+\ ── The query ──
+
+: dnid variable ;  : dnpk variable ;  : dnt0 variable ;   \ the one out: its id, name, when
+: dnqv variable ;  : dnqb ( -- a )  dnqv 80 lit lazy ;  : dnql variable ;   \ its bytes
+: dnlp variable ;  : dno variable ;  : dnc variable ;
+
+\ dnq ( e -- n )   the query for name e's A records, at npkt: n bytes.
+: dnq ( e -- n )
+	npkt  dnid @ over nb16!  100 lit over 2 lit + nb16!  1 lit over 4 lit + nb16!  6 lit + 6 lit nzero
+	npkt C lit + dup dnlp !  1 lit + dno !  0 lit dnc !
+	dup @ 0 lit do
+		dup 30 lit + i + c@ dup 2E lit = if
+			drop dnc @ dnlp @ c!  dno @ dnlp !  dno @ 1 lit + dno !  0 lit dnc !
+		else dno @ c!  dno @ 1 lit + dno !  dnc @ 1 lit + dnc ! then
+	loop drop
+	dnc @ dnlp @ c!  0 lit dno @ c!  1 lit dno @ 1 lit + nb16!  1 lit dno @ 3 lit + nb16!
+	dno @ 5 lit +  npkt -
+;
+
+\ dnask ( k -- )   ask the resolver for name k.
+: dnask ( k -- )
+	dup dnpk !  pnonce drop FFFF lit and dnid !
+	dup dne dnq dnql !  npkt dnqb dnql @ ncpy
+	dnsv @ 35 lit dnql @ nsend drop
+	pms dup dnt0 !  swap dne C lit + !
+;
+
+\ ── The answer ──
+
+: dnb variable ;  : dnm variable ;  : dnoff variable ;
+: dnnv variable ;  : dnnw ( i -- a )  2 lit lshift dnnv 10 lit lazy + ;  : dnnc variable ;
+
+\ dnskip ( -- )   dnoff past the name there (a pointer ends it).
+: dnskip ( -- )
+	begin
+		dnoff @ dnm @ u< if
+			dnb @ dnoff @ + c@
+			dup C0 lit and if drop dnoff @ 2 lit + dnoff ! 0 lit else
+			dup 0= if drop dnoff @ 1 lit + dnoff ! 0 lit else
+				1 lit + dnoff @ + dnoff ! -1 lit
+			then then
+		else 0 lit then
+	while repeat
+;
+
+\ dnqok ( -- f )   the answer's question is ours (case aside).
+: dnqok ( -- f )
+	-1 lit  dnql @ C lit - 0 lit do dnb @ C lit + i + c@ dnlow  dnqb C lit + i + c@ dnlow = and loop
+;
+
+\ dnrrs ( -- )   the answer's A records (up to 4) to dnnw / dnnc.
+: dnrrs ( -- )
+	0 lit dnnc !  dnql @ dnoff !
+	dnb @ 6 lit + nb16@ 20 lit pumin ?dup if 0 lit do
+		dnskip
+		dnoff @ A lit + dnm @ u> 0= if
+			dnb @ dnoff @ +
+			dup nb16@ 1 lit =  over 2 lit + nb16@ 1 lit = and  over 8 lit + nb16@ 4 lit = and
+			dnoff @ E lit + dnm @ u> 0= and  dnnc @ 4 lit u< and if
+				dup A lit + be32 dnnc @ dnnw !  dnnc @ 1 lit + dnnc !
+			then
+			8 lit + nb16@ A lit + dnoff @ + dnoff !
+		then
+	loop then
+;
+
+\ ── What the names point at ──
+
+: dnen variable ;  : dnchg variable ;
+
+\ dnhas ( ip a n -- f )   ip among the n addresses at a.
+: dnhas ( ip a n -- f )
+	0 lit swap ?dup if 0 lit do over i 2 lit lshift + @ 3 lit pick = or loop then nip nip
+;
+
+: dnsay ( -- )   "dns: " lputs dnen @ 30 lit + lputs ;
+
+\ dnput ( -- )   name dnpk's addresses are now dnnw's dnnc: seeds made of the
+\        new, and no longer of the gone.
+: dnput ( -- )
+	dnpk @ dne dnen !  0 lit dnchg !
+	dnnc @ ?dup if 0 lit do i dnnw dup @ 18 lit rshift 7F lit = if A000202 lit swap ! else drop then loop then
+	dnen @ 14 lit + @ ?dup if 0 lit do
+		dnen @ 18 lit + i 2 lit lshift + @
+		dup 0 lit dnnw dnnc @ dnhas if drop else
+			dup dnen @ 4 lit + @ pfind dup 0< if drop else pp 38 lit + 0 lit swap ! then
+			dnsay " no longer points at " lputs fnip. A lit lputc  -1 lit dnchg !
+		then
+	loop then
+	dnnc @ ?dup if 0 lit do
+		i dnnw @  dup dnen @ 18 lit + dnen @ 14 lit + @ dnhas if drop else
+			dnsay " points at " lputs fnip. A lit lputc  -1 lit dnchg !
+		then
+		i dnnw @ dnen @ 4 lit + @ pseed
+	loop then
+	0 lit dnnw dnen @ 18 lit + 10 lit ncpy  dnnc @ dnen @ 14 lit + !
+	dnchg @ gwset @ 0= and if 0 lit gwgn ! then           \ the gateways: the seeds again
+;
+
+\ dnfail ( -- )   no answer for name dnpk (its addresses are kept).
+: dnfail ( -- )
+	dnpk @ dne dnen !
+	dnen @ 28 lit + @ 0= if
+		dnsay " -- no answer from the DNS server " lputs dnsv @ fnip.
+		dnen @ 14 lit + @ if " (still using its addresses)" lputs then A lit lputc
+		-1 lit dnen @ 28 lit + !
+	then
+	-1 lit dnpk !
+;
+
+\ dnans ( -- )   the resolver's answer to the query out.
+: dnans ( -- )
+	npay @ dnb !  npn @ dnm !
+	dnm @ dnql @ u< 0=  dnb @ nb16@ dnid @ = and  dnb @ 2 lit + c@ 80 lit and 0= 0= and
+	dnb @ 4 lit + nb16@ 1 lit = and if
+		dnqok if
+			dnb @ 3 lit + c@ F lit and if 0 lit dnnc ! else dnrrs then
+			dnnc @ if
+				dnput  dnpk @ dne dnen !  -1 lit dnen @ 10 lit + !  0 lit dnen @ 28 lit + !
+				-1 lit dnpk !
+			else dnfail then
+		then
+	then
+;
+
+\ dnin ( -- f )
+: dnin ( -- f )
+	nproto @ 11 lit =  nsport @ 35 lit = and  nsrc @ dnsv @ = and
+	dup if dnpk @ 0< 0= if dnans then then
+;
+
+\ dntick ( -- )   the query out unanswered for 3 s: failed.  Else a name
+\        due: asked (hourly; a minute after a failure).
+: dntick ( -- )
+	dnn @ if
+		dnpk @ 0< if
+			dnn @ 0 lit do
+				dnpk @ 0< if
+					i dne dup 10 lit + @ over 28 lit + @ 0= and if 36EE80 lit else EA60 lit then
+					swap C lit + @ pago u< if i dnask then
+				then
+			loop
+		else dnt0 @ pago BB8 lit u> if dnfail then then
+	then
+;
+
+\ dnwait ( -- )   the answer, for up to 1.5 s (other datagrams dropped).
+: dnwait ( -- )
+	begin
+		nrecv if dnin drop then
+		dnpk @ 0<  dnt0 @ pago 5DC lit u> or
+	until
+	-1 lit dnpk !
+;
+
+\ dnstart ( -- )
+: dnstart ( -- )
+	-1 lit dnpk !
+	dnn @ ?dup if
+		"node: DNS server " lputs dnsv @ fnip. A lit lputc
+		0 lit do
+			3 lit 0 lit do j dne 10 lit + @ 0= if j dnask dnwait then loop
+			i dne dnen !
+			dnen @ 10 lit + @ 0= if
+				-1 lit dnen @ 28 lit + !
+				dnen @ 8 lit + @ ?dup if
+					dnsay " -- no answer from the DNS server; falling back on " lputs dup fnip. A lit lputc
+					0 lit dnnw !  1 lit dnnc !  i dnpk !  dnput  -1 lit dnpk !
+				else dnsay " -- no answer from the DNS server (DNS=A.B.C.D asks another, such as 8.8.8.8)" lputs A lit lputc then
+			then
+		loop
+	then
+;
