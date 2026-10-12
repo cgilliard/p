@@ -1,0 +1,955 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/chacha.fam — ChaCha20 and Poly1305, and the two as one AEAD (RFC 8439):
+\ the symmetric encryption of the payment network's sessions.
+\
+\   chacha ( key nonce ctr src dst n -- )   n bytes encrypted (or decrypted:
+\                               the same) with a 32-byte key and 12-byte
+\                               nonce, the block counter starting at ctr
+\   p1beg ( key -- )  p1abs ( a n -- )  p1end ( out -- )   Poly1305: a
+\                               one-time 32-byte key, the message (in any
+\                               pieces), the 16-byte tag
+\   aeseal ( key nonce aad an pt n ct -- )   the AEAD: n bytes encrypted to
+\                               ct, then the 16-byte tag over them and the aad
+\   aeopen ( key nonce aad an ct n pt -- ok )   whether ct's tag (at ct + n)
+\                               checks; if so, the n bytes decrypted to pt
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ chblk ( in out -- )   the block function: src/chacha.S (written by
+\        tools/chacha_s.py), assembled by tools/s2words.py.
+: chblk ( in out -- )
+130141FF ,   \ addi sp,sp,-12
+23208100 ,   \ sw s0,0(sp)
+23222101 ,   \ sw s2,4(sp)
+23244101 ,   \ sw s4,8(sp)
+03290101 ,   \ lw s2,16(sp)
+03250900 ,   \ lw a0,0(s2)
+83254900 ,   \ lw a1,4(s2)
+03268900 ,   \ lw a2,8(s2)
+8326C900 ,   \ lw a3,12(s2)
+03270901 ,   \ lw a4,16(s2)
+83274901 ,   \ lw a5,20(s2)
+03288901 ,   \ lw a6,24(s2)
+8328C901 ,   \ lw a7,28(s2)
+83220902 ,   \ lw t0,32(s2)
+03234902 ,   \ lw t1,36(s2)
+83238902 ,   \ lw t2,40(s2)
+032EC902 ,   \ lw t3,44(s2)
+832E0903 ,   \ lw t4,48(s2)
+032F4903 ,   \ lw t5,52(s2)
+832F8903 ,   \ lw t6,56(s2)
+0324C903 ,   \ lw s0,60(s2)
+1309A000 ,   \ addi s2,zero,10
+3305E500 ,   \ add a0,a0,a4
+B3CEAE00 ,   \ xor t4,t4,a0
+139A0E01 ,   \ slli s4,t4,0x10
+93DE0E01 ,   \ srli t4,t4,0x10
+B3EE4E01 ,   \ or t4,t4,s4
+B382D201 ,   \ add t0,t0,t4
+33475700 ,   \ xor a4,a4,t0
+131AC700 ,   \ slli s4,a4,0xc
+13574701 ,   \ srli a4,a4,0x14
+33674701 ,   \ or a4,a4,s4
+3305E500 ,   \ add a0,a0,a4
+B3CEAE00 ,   \ xor t4,t4,a0
+139A8E00 ,   \ slli s4,t4,0x8
+93DE8E01 ,   \ srli t4,t4,0x18
+B3EE4E01 ,   \ or t4,t4,s4
+B382D201 ,   \ add t0,t0,t4
+33475700 ,   \ xor a4,a4,t0
+131A7700 ,   \ slli s4,a4,0x7
+13579701 ,   \ srli a4,a4,0x19
+33674701 ,   \ or a4,a4,s4
+B385F500 ,   \ add a1,a1,a5
+334FBF00 ,   \ xor t5,t5,a1
+131A0F01 ,   \ slli s4,t5,0x10
+135F0F01 ,   \ srli t5,t5,0x10
+336F4F01 ,   \ or t5,t5,s4
+3303E301 ,   \ add t1,t1,t5
+B3C76700 ,   \ xor a5,a5,t1
+139AC700 ,   \ slli s4,a5,0xc
+93D74701 ,   \ srli a5,a5,0x14
+B3E74701 ,   \ or a5,a5,s4
+B385F500 ,   \ add a1,a1,a5
+334FBF00 ,   \ xor t5,t5,a1
+131A8F00 ,   \ slli s4,t5,0x8
+135F8F01 ,   \ srli t5,t5,0x18
+336F4F01 ,   \ or t5,t5,s4
+3303E301 ,   \ add t1,t1,t5
+B3C76700 ,   \ xor a5,a5,t1
+139A7700 ,   \ slli s4,a5,0x7
+93D79701 ,   \ srli a5,a5,0x19
+B3E74701 ,   \ or a5,a5,s4
+33060601 ,   \ add a2,a2,a6
+B3CFCF00 ,   \ xor t6,t6,a2
+139A0F01 ,   \ slli s4,t6,0x10
+93DF0F01 ,   \ srli t6,t6,0x10
+B3EF4F01 ,   \ or t6,t6,s4
+B383F301 ,   \ add t2,t2,t6
+33487800 ,   \ xor a6,a6,t2
+131AC800 ,   \ slli s4,a6,0xc
+13584801 ,   \ srli a6,a6,0x14
+33684801 ,   \ or a6,a6,s4
+33060601 ,   \ add a2,a2,a6
+B3CFCF00 ,   \ xor t6,t6,a2
+139A8F00 ,   \ slli s4,t6,0x8
+93DF8F01 ,   \ srli t6,t6,0x18
+B3EF4F01 ,   \ or t6,t6,s4
+B383F301 ,   \ add t2,t2,t6
+33487800 ,   \ xor a6,a6,t2
+131A7800 ,   \ slli s4,a6,0x7
+13589801 ,   \ srli a6,a6,0x19
+33684801 ,   \ or a6,a6,s4
+B3861601 ,   \ add a3,a3,a7
+3344D400 ,   \ xor s0,s0,a3
+131A0401 ,   \ slli s4,s0,0x10
+13540401 ,   \ srli s0,s0,0x10
+33644401 ,   \ or s0,s0,s4
+330E8E00 ,   \ add t3,t3,s0
+B3C8C801 ,   \ xor a7,a7,t3
+139AC800 ,   \ slli s4,a7,0xc
+93D84801 ,   \ srli a7,a7,0x14
+B3E84801 ,   \ or a7,a7,s4
+B3861601 ,   \ add a3,a3,a7
+3344D400 ,   \ xor s0,s0,a3
+131A8400 ,   \ slli s4,s0,0x8
+13548401 ,   \ srli s0,s0,0x18
+33644401 ,   \ or s0,s0,s4
+330E8E00 ,   \ add t3,t3,s0
+B3C8C801 ,   \ xor a7,a7,t3
+139A7800 ,   \ slli s4,a7,0x7
+93D89801 ,   \ srli a7,a7,0x19
+B3E84801 ,   \ or a7,a7,s4
+3305F500 ,   \ add a0,a0,a5
+3344A400 ,   \ xor s0,s0,a0
+131A0401 ,   \ slli s4,s0,0x10
+13540401 ,   \ srli s0,s0,0x10
+33644401 ,   \ or s0,s0,s4
+B3838300 ,   \ add t2,t2,s0
+B3C77700 ,   \ xor a5,a5,t2
+139AC700 ,   \ slli s4,a5,0xc
+93D74701 ,   \ srli a5,a5,0x14
+B3E74701 ,   \ or a5,a5,s4
+3305F500 ,   \ add a0,a0,a5
+3344A400 ,   \ xor s0,s0,a0
+131A8400 ,   \ slli s4,s0,0x8
+13548401 ,   \ srli s0,s0,0x18
+33644401 ,   \ or s0,s0,s4
+B3838300 ,   \ add t2,t2,s0
+B3C77700 ,   \ xor a5,a5,t2
+139A7700 ,   \ slli s4,a5,0x7
+93D79701 ,   \ srli a5,a5,0x19
+B3E74701 ,   \ or a5,a5,s4
+B3850501 ,   \ add a1,a1,a6
+B3CEBE00 ,   \ xor t4,t4,a1
+139A0E01 ,   \ slli s4,t4,0x10
+93DE0E01 ,   \ srli t4,t4,0x10
+B3EE4E01 ,   \ or t4,t4,s4
+330EDE01 ,   \ add t3,t3,t4
+3348C801 ,   \ xor a6,a6,t3
+131AC800 ,   \ slli s4,a6,0xc
+13584801 ,   \ srli a6,a6,0x14
+33684801 ,   \ or a6,a6,s4
+B3850501 ,   \ add a1,a1,a6
+B3CEBE00 ,   \ xor t4,t4,a1
+139A8E00 ,   \ slli s4,t4,0x8
+93DE8E01 ,   \ srli t4,t4,0x18
+B3EE4E01 ,   \ or t4,t4,s4
+330EDE01 ,   \ add t3,t3,t4
+3348C801 ,   \ xor a6,a6,t3
+131A7800 ,   \ slli s4,a6,0x7
+13589801 ,   \ srli a6,a6,0x19
+33684801 ,   \ or a6,a6,s4
+33061601 ,   \ add a2,a2,a7
+334FCF00 ,   \ xor t5,t5,a2
+131A0F01 ,   \ slli s4,t5,0x10
+135F0F01 ,   \ srli t5,t5,0x10
+336F4F01 ,   \ or t5,t5,s4
+B382E201 ,   \ add t0,t0,t5
+B3C85800 ,   \ xor a7,a7,t0
+139AC800 ,   \ slli s4,a7,0xc
+93D84801 ,   \ srli a7,a7,0x14
+B3E84801 ,   \ or a7,a7,s4
+33061601 ,   \ add a2,a2,a7
+334FCF00 ,   \ xor t5,t5,a2
+131A8F00 ,   \ slli s4,t5,0x8
+135F8F01 ,   \ srli t5,t5,0x18
+336F4F01 ,   \ or t5,t5,s4
+B382E201 ,   \ add t0,t0,t5
+B3C85800 ,   \ xor a7,a7,t0
+139A7800 ,   \ slli s4,a7,0x7
+93D89801 ,   \ srli a7,a7,0x19
+B3E84801 ,   \ or a7,a7,s4
+B386E600 ,   \ add a3,a3,a4
+B3CFDF00 ,   \ xor t6,t6,a3
+139A0F01 ,   \ slli s4,t6,0x10
+93DF0F01 ,   \ srli t6,t6,0x10
+B3EF4F01 ,   \ or t6,t6,s4
+3303F301 ,   \ add t1,t1,t6
+33476700 ,   \ xor a4,a4,t1
+131AC700 ,   \ slli s4,a4,0xc
+13574701 ,   \ srli a4,a4,0x14
+33674701 ,   \ or a4,a4,s4
+B386E600 ,   \ add a3,a3,a4
+B3CFDF00 ,   \ xor t6,t6,a3
+139A8F00 ,   \ slli s4,t6,0x8
+93DF8F01 ,   \ srli t6,t6,0x18
+B3EF4F01 ,   \ or t6,t6,s4
+3303F301 ,   \ add t1,t1,t6
+33476700 ,   \ xor a4,a4,t1
+131A7700 ,   \ slli s4,a4,0x7
+13579701 ,   \ srli a4,a4,0x19
+33674701 ,   \ or a4,a4,s4
+1309F9FF ,   \ addi s2,s2,-1
+63040900 ,   \ beq s2,zero,2e4 <out>
+6FF09FD7 ,   \ jal zero,58 <round>
+232E81FE ,   \ sw s0,-4(sp)
+03290101 ,   \ lw s2,16(sp)
+032AC100 ,   \ lw s4,12(sp)
+03240900 ,   \ lw s0,0(s2)
+33058500 ,   \ add a0,a0,s0
+2320AA00 ,   \ sw a0,0(s4)
+03244900 ,   \ lw s0,4(s2)
+B3858500 ,   \ add a1,a1,s0
+2322BA00 ,   \ sw a1,4(s4)
+03248900 ,   \ lw s0,8(s2)
+33068600 ,   \ add a2,a2,s0
+2324CA00 ,   \ sw a2,8(s4)
+0324C900 ,   \ lw s0,12(s2)
+B3868600 ,   \ add a3,a3,s0
+2326DA00 ,   \ sw a3,12(s4)
+03240901 ,   \ lw s0,16(s2)
+33078700 ,   \ add a4,a4,s0
+2328EA00 ,   \ sw a4,16(s4)
+03244901 ,   \ lw s0,20(s2)
+B3878700 ,   \ add a5,a5,s0
+232AFA00 ,   \ sw a5,20(s4)
+03248901 ,   \ lw s0,24(s2)
+33088800 ,   \ add a6,a6,s0
+232C0A01 ,   \ sw a6,24(s4)
+0324C901 ,   \ lw s0,28(s2)
+B3888800 ,   \ add a7,a7,s0
+232E1A01 ,   \ sw a7,28(s4)
+03240902 ,   \ lw s0,32(s2)
+B3828200 ,   \ add t0,t0,s0
+23205A02 ,   \ sw t0,32(s4)
+03244902 ,   \ lw s0,36(s2)
+33038300 ,   \ add t1,t1,s0
+23226A02 ,   \ sw t1,36(s4)
+03248902 ,   \ lw s0,40(s2)
+B3838300 ,   \ add t2,t2,s0
+23247A02 ,   \ sw t2,40(s4)
+0324C902 ,   \ lw s0,44(s2)
+330E8E00 ,   \ add t3,t3,s0
+2326CA03 ,   \ sw t3,44(s4)
+03240903 ,   \ lw s0,48(s2)
+B38E8E00 ,   \ add t4,t4,s0
+2328DA03 ,   \ sw t4,48(s4)
+03244903 ,   \ lw s0,52(s2)
+330F8F00 ,   \ add t5,t5,s0
+232AEA03 ,   \ sw t5,52(s4)
+03248903 ,   \ lw s0,56(s2)
+B38F8F00 ,   \ add t6,t6,s0
+232CFA03 ,   \ sw t6,56(s4)
+0324C1FF ,   \ lw s0,-4(sp)
+0325C903 ,   \ lw a0,60(s2)
+3304A400 ,   \ add s0,s0,a0
+232E8A02 ,   \ sw s0,60(s4)
+03240100 ,   \ lw s0,0(sp)
+03294100 ,   \ lw s2,4(sp)
+032A8100 ,   \ lw s4,8(sp)
+13014101 ,   \ addi sp,sp,20
+;
+
+: chsv variable ;  : chs ( -- a )  chsv 40 lit lazy ;      \ the state
+: chkv variable ;  : chk ( -- a )  chkv 40 lit lazy ;      \ a block of keystream
+: chn variable ;  : chsr variable ;  : chds variable ;  : chm variable ;
+
+\ chx ( src dst n -- )   n bytes of src xored with the keystream block, to dst.
+: chx ( src dst n -- )
+	?dup if 0 lit do  over i + c@ chk i + c@ xor  over i + c!  loop then 2drop
+;
+
+: chacha ( key nonce ctr src dst n -- )
+	chn ! chds ! chsr !
+	chs 30 lit + !  chs 34 lit + C lit ncpy  chs 10 lit + 20 lit ncpy
+	61707865 lit chs !  3320646E lit chs 4 lit + !  79622D32 lit chs 8 lit + !  6B206574 lit chs C lit + !
+	begin chn @ while
+		chs chk chblk
+		chn @ 40 lit pumin chm !
+		chsr @ chds @ chm @ chx
+		chsr @ chm @ + chsr !  chds @ chm @ + chds !  chn @ chm @ - chn !
+		chs 30 lit + dup @ 1 lit + swap !
+	repeat
+;
+
+\ ── Poly1305 ──
+\ After poly1305-donna (32-bit): the accumulator h and the key's r as five
+\ 26-bit limbs; a block at a time in assembly.
+
+\ p1blk ( h r m hibit -- )   one block: src/poly.S (written by
+\        tools/poly_s.py), assembled by tools/s2words.py.
+: p1blk ( h r m hibit -- )
+83260100 ,   \ lw a3,0(sp)
+03264100 ,   \ lw a2,4(sp)
+83258100 ,   \ lw a1,8(sp)
+0325C100 ,   \ lw a0,12(sp)
+13010101 ,   \ addi sp,sp,16
+83220500 ,   \ lw t0,0(a0)
+03234500 ,   \ lw t1,4(a0)
+83238500 ,   \ lw t2,8(a0)
+032EC500 ,   \ lw t3,12(a0)
+832E0501 ,   \ lw t4,16(a0)
+03470600 ,   \ lbu a4,0(a2)
+034F1600 ,   \ lbu t5,1(a2)
+131F8F00 ,   \ slli t5,t5,0x8
+3367E701 ,   \ or a4,a4,t5
+034F2600 ,   \ lbu t5,2(a2)
+131F0F01 ,   \ slli t5,t5,0x10
+3367E701 ,   \ or a4,a4,t5
+034F3600 ,   \ lbu t5,3(a2)
+131F8F01 ,   \ slli t5,t5,0x18
+3367E701 ,   \ or a4,a4,t5
+83474600 ,   \ lbu a5,4(a2)
+034F5600 ,   \ lbu t5,5(a2)
+131F8F00 ,   \ slli t5,t5,0x8
+B3E7E701 ,   \ or a5,a5,t5
+034F6600 ,   \ lbu t5,6(a2)
+131F0F01 ,   \ slli t5,t5,0x10
+B3E7E701 ,   \ or a5,a5,t5
+034F7600 ,   \ lbu t5,7(a2)
+131F8F01 ,   \ slli t5,t5,0x18
+B3E7E701 ,   \ or a5,a5,t5
+03488600 ,   \ lbu a6,8(a2)
+034F9600 ,   \ lbu t5,9(a2)
+131F8F00 ,   \ slli t5,t5,0x8
+3368E801 ,   \ or a6,a6,t5
+034FA600 ,   \ lbu t5,10(a2)
+131F0F01 ,   \ slli t5,t5,0x10
+3368E801 ,   \ or a6,a6,t5
+034FB600 ,   \ lbu t5,11(a2)
+131F8F01 ,   \ slli t5,t5,0x18
+3368E801 ,   \ or a6,a6,t5
+8348C600 ,   \ lbu a7,12(a2)
+034FD600 ,   \ lbu t5,13(a2)
+131F8F00 ,   \ slli t5,t5,0x8
+B3E8E801 ,   \ or a7,a7,t5
+034FE600 ,   \ lbu t5,14(a2)
+131F0F01 ,   \ slli t5,t5,0x10
+B3E8E801 ,   \ or a7,a7,t5
+034FF600 ,   \ lbu t5,15(a2)
+131F8F01 ,   \ slli t5,t5,0x18
+B3E8E801 ,   \ or a7,a7,t5
+B70F0004 ,   \ lui t6,0x4000
+938FFFFF ,   \ addi t6,t6,-1 # 3ffffff <__global_pointer$+0x3ffdf63>
+337FF701 ,   \ and t5,a4,t6
+B382E201 ,   \ add t0,t0,t5
+135FA701 ,   \ srli t5,a4,0x1a
+13976700 ,   \ slli a4,a5,0x6
+336FEF00 ,   \ or t5,t5,a4
+337FFF01 ,   \ and t5,t5,t6
+3303E301 ,   \ add t1,t1,t5
+13DF4701 ,   \ srli t5,a5,0x14
+9317C800 ,   \ slli a5,a6,0xc
+336FFF00 ,   \ or t5,t5,a5
+337FFF01 ,   \ and t5,t5,t6
+B383E301 ,   \ add t2,t2,t5
+135FE800 ,   \ srli t5,a6,0xe
+13982801 ,   \ slli a6,a7,0x12
+336F0F01 ,   \ or t5,t5,a6
+337FFF01 ,   \ and t5,t5,t6
+330EEE01 ,   \ add t3,t3,t5
+13DF8800 ,   \ srli t5,a7,0x8
+336FDF00 ,   \ or t5,t5,a3
+B38EEE01 ,   \ add t4,t4,t5
+13070000 ,   \ addi a4,zero,0
+93070000 ,   \ addi a5,zero,0
+83A60500 ,   \ lw a3,0(a1)
+13880200 ,   \ addi a6,t0,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,150 <__BSS_END__-0x174c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,138 <__BSS_END__-0x1764>
+83A60502 ,   \ lw a3,32(a1)
+13080300 ,   \ addi a6,t1,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,190 <__BSS_END__-0x170c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,178 <__BSS_END__-0x1724>
+83A6C501 ,   \ lw a3,28(a1)
+13880300 ,   \ addi a6,t2,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,1d0 <__BSS_END__-0x16cc>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,1b8 <__BSS_END__-0x16e4>
+83A68501 ,   \ lw a3,24(a1)
+13080E00 ,   \ addi a6,t3,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,210 <__BSS_END__-0x168c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,1f8 <__BSS_END__-0x16a4>
+83A64501 ,   \ lw a3,20(a1)
+13880E00 ,   \ addi a6,t4,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,250 <__BSS_END__-0x164c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,238 <__BSS_END__-0x1664>
+232CE1FE ,   \ sw a4,-8(sp)
+232EF1FE ,   \ sw a5,-4(sp)
+13070000 ,   \ addi a4,zero,0
+93070000 ,   \ addi a5,zero,0
+83A64500 ,   \ lw a3,4(a1)
+13880200 ,   \ addi a6,t0,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,2a0 <__BSS_END__-0x15fc>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,288 <__BSS_END__-0x1614>
+83A60500 ,   \ lw a3,0(a1)
+13080300 ,   \ addi a6,t1,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,2e0 <__BSS_END__-0x15bc>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,2c8 <__BSS_END__-0x15d4>
+83A60502 ,   \ lw a3,32(a1)
+13880300 ,   \ addi a6,t2,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,320 <__BSS_END__-0x157c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,308 <__BSS_END__-0x1594>
+83A6C501 ,   \ lw a3,28(a1)
+13080E00 ,   \ addi a6,t3,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,360 <__BSS_END__-0x153c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,348 <__BSS_END__-0x1554>
+83A68501 ,   \ lw a3,24(a1)
+13880E00 ,   \ addi a6,t4,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,3a0 <__BSS_END__-0x14fc>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,388 <__BSS_END__-0x1514>
+2328E1FE ,   \ sw a4,-16(sp)
+232AF1FE ,   \ sw a5,-12(sp)
+13070000 ,   \ addi a4,zero,0
+93070000 ,   \ addi a5,zero,0
+83A68500 ,   \ lw a3,8(a1)
+13880200 ,   \ addi a6,t0,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,3f0 <__BSS_END__-0x14ac>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,3d8 <__BSS_END__-0x14c4>
+83A64500 ,   \ lw a3,4(a1)
+13080300 ,   \ addi a6,t1,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,430 <__BSS_END__-0x146c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,418 <__BSS_END__-0x1484>
+83A60500 ,   \ lw a3,0(a1)
+13880300 ,   \ addi a6,t2,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,470 <__BSS_END__-0x142c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,458 <__BSS_END__-0x1444>
+83A60502 ,   \ lw a3,32(a1)
+13080E00 ,   \ addi a6,t3,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,4b0 <__BSS_END__-0x13ec>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,498 <__BSS_END__-0x1404>
+83A6C501 ,   \ lw a3,28(a1)
+13880E00 ,   \ addi a6,t4,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,4f0 <__BSS_END__-0x13ac>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,4d8 <__BSS_END__-0x13c4>
+2324E1FE ,   \ sw a4,-24(sp)
+2326F1FE ,   \ sw a5,-20(sp)
+13070000 ,   \ addi a4,zero,0
+93070000 ,   \ addi a5,zero,0
+83A6C500 ,   \ lw a3,12(a1)
+13880200 ,   \ addi a6,t0,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,540 <__BSS_END__-0x135c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,528 <__BSS_END__-0x1374>
+83A68500 ,   \ lw a3,8(a1)
+13080300 ,   \ addi a6,t1,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,580 <__BSS_END__-0x131c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,568 <__BSS_END__-0x1334>
+83A64500 ,   \ lw a3,4(a1)
+13880300 ,   \ addi a6,t2,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,5c0 <__BSS_END__-0x12dc>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,5a8 <__BSS_END__-0x12f4>
+83A60500 ,   \ lw a3,0(a1)
+13080E00 ,   \ addi a6,t3,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,600 <__BSS_END__-0x129c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,5e8 <__BSS_END__-0x12b4>
+83A60502 ,   \ lw a3,32(a1)
+13880E00 ,   \ addi a6,t4,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,640 <__BSS_END__-0x125c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,628 <__BSS_END__-0x1274>
+2320E1FE ,   \ sw a4,-32(sp)
+2322F1FE ,   \ sw a5,-28(sp)
+13070000 ,   \ addi a4,zero,0
+93070000 ,   \ addi a5,zero,0
+83A60501 ,   \ lw a3,16(a1)
+13880200 ,   \ addi a6,t0,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,690 <__BSS_END__-0x120c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,678 <__BSS_END__-0x1224>
+83A6C500 ,   \ lw a3,12(a1)
+13080300 ,   \ addi a6,t1,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,6d0 <__BSS_END__-0x11cc>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,6b8 <__BSS_END__-0x11e4>
+83A68500 ,   \ lw a3,8(a1)
+13880300 ,   \ addi a6,t2,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,710 <__BSS_END__-0x118c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,6f8 <__BSS_END__-0x11a4>
+83A64500 ,   \ lw a3,4(a1)
+13080E00 ,   \ addi a6,t3,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,750 <__BSS_END__-0x114c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,738 <__BSS_END__-0x1164>
+83A60500 ,   \ lw a3,0(a1)
+13880E00 ,   \ addi a6,t4,0
+93880600 ,   \ addi a7,a3,0
+130F0000 ,   \ addi t5,zero,0
+937F1800 ,   \ andi t6,a6,1
+638A0F00 ,   \ beq t6,zero,790 <__BSS_END__-0x110c>
+33071701 ,   \ add a4,a4,a7
+B33F1701 ,   \ sltu t6,a4,a7
+B387E701 ,   \ add a5,a5,t5
+B387F701 ,   \ add a5,a5,t6
+131F1F00 ,   \ slli t5,t5,0x1
+93DFF801 ,   \ srli t6,a7,0x1f
+336FFF01 ,   \ or t5,t5,t6
+93981800 ,   \ slli a7,a7,0x1
+13581800 ,   \ srli a6,a6,0x1
+E31A08FC ,   \ bne a6,zero,778 <__BSS_END__-0x1124>
+232CE1FC ,   \ sw a4,-40(sp)
+232EF1FC ,   \ sw a5,-36(sp)
+B70F0004 ,   \ lui t6,0x4000
+938FFFFF ,   \ addi t6,t6,-1 # 3ffffff <__global_pointer$+0x3ffdf63>
+13080000 ,   \ addi a6,zero,0
+032781FF ,   \ lw a4,-8(sp)
+8327C1FF ,   \ lw a5,-4(sp)
+33070701 ,   \ add a4,a4,a6
+333F0701 ,   \ sltu t5,a4,a6
+B387E701 ,   \ add a5,a5,t5
+B372F701 ,   \ and t0,a4,t6
+1358A701 ,   \ srli a6,a4,0x1a
+93976700 ,   \ slli a5,a5,0x6
+3368F800 ,   \ or a6,a6,a5
+032701FF ,   \ lw a4,-16(sp)
+832741FF ,   \ lw a5,-12(sp)
+33070701 ,   \ add a4,a4,a6
+333F0701 ,   \ sltu t5,a4,a6
+B387E701 ,   \ add a5,a5,t5
+3373F701 ,   \ and t1,a4,t6
+1358A701 ,   \ srli a6,a4,0x1a
+93976700 ,   \ slli a5,a5,0x6
+3368F800 ,   \ or a6,a6,a5
+032781FE ,   \ lw a4,-24(sp)
+8327C1FE ,   \ lw a5,-20(sp)
+33070701 ,   \ add a4,a4,a6
+333F0701 ,   \ sltu t5,a4,a6
+B387E701 ,   \ add a5,a5,t5
+B373F701 ,   \ and t2,a4,t6
+1358A701 ,   \ srli a6,a4,0x1a
+93976700 ,   \ slli a5,a5,0x6
+3368F800 ,   \ or a6,a6,a5
+032701FE ,   \ lw a4,-32(sp)
+832741FE ,   \ lw a5,-28(sp)
+33070701 ,   \ add a4,a4,a6
+333F0701 ,   \ sltu t5,a4,a6
+B387E701 ,   \ add a5,a5,t5
+337EF701 ,   \ and t3,a4,t6
+1358A701 ,   \ srli a6,a4,0x1a
+93976700 ,   \ slli a5,a5,0x6
+3368F800 ,   \ or a6,a6,a5
+032781FD ,   \ lw a4,-40(sp)
+8327C1FD ,   \ lw a5,-36(sp)
+33070701 ,   \ add a4,a4,a6
+333F0701 ,   \ sltu t5,a4,a6
+B387E701 ,   \ add a5,a5,t5
+B37EF701 ,   \ and t4,a4,t6
+1358A701 ,   \ srli a6,a4,0x1a
+93976700 ,   \ slli a5,a5,0x6
+3368F800 ,   \ or a6,a6,a5
+131F2800 ,   \ slli t5,a6,0x2
+3308E801 ,   \ add a6,a6,t5
+B3820201 ,   \ add t0,t0,a6
+13D8A201 ,   \ srli a6,t0,0x1a
+B3F2F201 ,   \ and t0,t0,t6
+33030301 ,   \ add t1,t1,a6
+23205500 ,   \ sw t0,0(a0)
+23226500 ,   \ sw t1,4(a0)
+23247500 ,   \ sw t2,8(a0)
+2326C501 ,   \ sw t3,12(a0)
+2328D501 ,   \ sw t4,16(a0)
+;
+
+: p1hv variable ;  : p1h ( -- a )  p1hv 14 lit lazy ;      \ h: five limbs
+: p1rv variable ;  : p1r ( -- a )  p1rv 24 lit lazy ;      \ r0..r4, then 5r1..5r4
+: p1sv variable ;  : p1s ( -- a )  p1sv 10 lit lazy ;      \ s: the key's second half
+: p1bv variable ;  : p1b ( -- a )  p1bv 10 lit lazy ;      \ a block being filled
+: p1bn variable ;  : p1w variable ;
+
+: p1le ( a -- w )   dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or ;
+: p1c! ( w k -- )   2 lit lshift p1r + ! ;                    \ r cell k
+
+\ p1beg ( key -- )   r (clamped) and s from the one-time key; h = 0.
+: p1beg ( key -- )
+	p1h 5 lit zero  0 lit p1bn !
+	dup 10 lit + p1s 10 lit ncpy
+	dup p1le 3FFFFFF lit and 0 lit p1c!
+	dup p1le 1A lit rshift  over 4 lit + p1le 6 lit lshift or  3FFFF03 lit and 1 lit p1c!
+	dup 4 lit + p1le 14 lit rshift  over 8 lit + p1le C lit lshift or  3FFC0FF lit and 2 lit p1c!
+	dup 8 lit + p1le E lit rshift  over C lit + p1le 12 lit lshift or  3F03FFF lit and 3 lit p1c!
+	C lit + p1le 8 lit rshift FFFFF lit and 4 lit p1c!
+	5 lit 1 lit do i 2 lit lshift p1r + @ dup 2 lit lshift +  i 4 lit + p1c! loop
+;
+
+\ p1abs ( a n -- )   the message's next bytes: whole blocks straight from it,
+\        the rest through p1b.
+: p1abs ( a n -- )
+	begin dup while
+		p1bn @ 0= over F lit u> and if
+			over p1h p1r rot 1000000 lit p1blk  swap 10 lit + swap 10 lit -
+		else
+			over c@ p1b p1bn @ + c!  p1bn @ 1 lit + p1bn !  swap 1 lit + swap 1 lit -
+			p1bn @ 10 lit = if p1h p1r p1b 1000000 lit p1blk  0 lit p1bn ! then
+		then
+	repeat 2drop
+;
+
+\ p1end ( out -- )   the last block (padded: a 1, then zeros), h fully
+\        reduced mod 2^130 - 5, plus s mod 2^128: the tag.
+: p1g ( k -- a )   2 lit lshift p1h + ;
+: p1g2v variable ;  : p1g2 ( k -- a )  2 lit lshift p1g2v 14 lit lazy + ;
+: p1tv variable ;  : p1t ( k -- a )  2 lit lshift p1tv 10 lit lazy + ;
+: p1add ( n k -- )   p1g dup @ rot + swap ! ;
+: p1st ( w a -- )   2dup c!  over 8 lit rshift over 1 lit + c!  over 10 lit rshift over 2 lit + c!  swap 18 lit rshift swap 3 lit + c! ;
+: p1c variable ;
+: p1end ( out -- )
+	p1bn @ if
+		1 lit p1b p1bn @ + c!
+		p1bn @ 1 lit + dup 10 lit u< if p1b over + 10 lit rot - nzero else drop then
+		p1h p1r p1b 0 lit p1blk
+	then
+	\ the carries through: h1 .. h4, h4 into h0 (times 5), h0 into h1
+	4 lit 1 lit do i p1g @ 1A lit rshift i 1 lit + p1add  i p1g @ 3FFFFFF lit and i p1g ! loop
+	4 lit p1g @ 1A lit rshift dup 2 lit lshift + 0 lit p1add  4 lit p1g @ 3FFFFFF lit and 4 lit p1g !
+	0 lit p1g @ 1A lit rshift 1 lit p1add  0 lit p1g @ 3FFFFFF lit and 0 lit p1g !
+	\ g = h + 5 - 2^130: h if that's negative, else g
+	0 lit p1g @ 5 lit +  dup 3FFFFFF lit and 0 lit p1g2 !  1A lit rshift
+	4 lit 1 lit do i p1g @ + dup 3FFFFFF lit and i p1g2 !  1A lit rshift loop
+	4 lit p1g @ + 4000000 lit -  dup 4 lit p1g2 !
+	1F lit rshift 1 lit -  p1w !                                     \ all ones: take g
+	5 lit 0 lit do  i p1g2 @ p1w @ and  i p1g @ p1w @ invert and  or  i p1g ! loop
+	\ as 128 bits
+	0 lit p1g @  1 lit p1g @ 1A lit lshift or  0 lit p1t !
+	1 lit p1g @ 6 lit rshift  2 lit p1g @ 14 lit lshift or  1 lit p1t !
+	2 lit p1g @ C lit rshift  3 lit p1g @ E lit lshift or  2 lit p1t !
+	3 lit p1g @ 12 lit rshift  4 lit p1g @ 8 lit lshift or  3 lit p1t !
+	\ plus s, the carry rippling up (out of the top: dropped)
+	0 lit p1c !
+	4 lit 0 lit do
+		i p1t @ p1w !
+		p1s i 2 lit lshift + p1le p1w @ +  dup p1w @ u<              ( out sum1 c1 )
+		swap p1c @ +  dup p1c @ u<                                     ( out c1 sum c2 )
+		rot or 1 lit and p1c !                                         ( out sum )
+		over i 2 lit lshift + p1st
+	loop
+	drop
+;
+
+\ ── The AEAD (RFC 8439, 2.8) ──
+\ The Poly1305 key: the key stream's first 32 bytes (block 0); the message
+\ from block 1; the tag over the aad and the ciphertext, each padded to 16
+\ bytes, then their lengths (8 bytes each, little-endian).
+
+: aekv variable ;  : aek ( -- a )  aekv 40 lit lazy ;      \ the one-time key; lengths
+: aez ( n -- )   F lit and ?dup if 10 lit swap - aek 30 lit + dup 10 lit nzero swap p1abs then ;
+: aelen ( an n -- )   aek 30 lit + 10 lit nzero  aek 38 lit + p1st  aek 30 lit + p1st  aek 30 lit + 10 lit p1abs ;
+: aekey variable ;  : aenon variable ;  : aea variable ;  : aean variable ;
+: aec variable ;  : aen variable ;  : aept variable ;
+: aetv variable ;  : aet ( -- a )  aetv 10 lit lazy ;      \ a tag computed
+
+\ aetag ( out -- )   the tag of the aad (aea, aean) and ciphertext (aec,
+\        aen), under aekey and aenon, at out.
+: aetag ( out -- )
+	aek 20 lit nzero  aekey @ aenon @ 0 lit aek aek 20 lit chacha       \ block 0: the one-time key
+	aek p1beg
+	aea @ aean @ p1abs  aean @ aez
+	aec @ aen @ p1abs  aen @ aez
+	aean @ aen @ aelen
+	p1end
+;
+
+: aeseal ( key nonce aad an pt n ct -- )
+	aec ! aen ! aept ! aean ! aea ! aenon ! aekey !
+	aekey @ aenon @ 1 lit aept @ aec @ aen @ chacha
+	aec @ aen @ + aetag
+;
+
+\ aeopen: the tag compared whole (every byte, whatever differs first).
+: aeopen ( key nonce aad an ct n pt -- ok )
+	aept ! aen ! aec ! aean ! aea ! aenon ! aekey !
+	aet aetag
+	0 lit  10 lit 0 lit do aet i + c@ aec @ aen @ + i + c@ xor or loop  0=
+	dup if aekey @ aenon @ 1 lit aec @ aept @ aen @ chacha then
+;

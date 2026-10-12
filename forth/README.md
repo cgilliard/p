@@ -286,6 +286,65 @@ miner -- unlocking (a wrong key refused), receiving a Rust S1 and the Rust
 CLI finalizing the S2 downloaded, sending (the Rust CLI answering the S1)
 and finalizing the answer -- both payments mined.
 
+The payment network's cryptography (person-to-person payments: slates
+between wallets, through gateways -- the seed nodes by default -- and later
+onion routing) is post-quantum like the rest: Kyber-512 (ML-KEM-512, FIPS
+203: `src/kyber.fam`) to agree a session's key, Dilithium2 (ML-DSA-44, FIPS
+204: `src/dilithium.fam`) to sign the gateways' records, ChaCha20-Poly1305
+(RFC 8439: `src/chacha.fam`) to encrypt, and Keccak (FIPS 202:
+`src/keccak.fam`; SHA3-256/512, SHAKE128/256) under both. The hot loops are
+RV32I assembly, written by `tools/keccak_s.py`, `tools/chacha_s.py` and
+`tools/poly_s.py` (and `src/dimul.S`, Dilithium's 46-bit product mod q);
+the rest is Forth. Under QEMU: Kyber's key pair 97 ms, encapsulation 99 ms,
+decapsulation 152 ms; Dilithium's key pair 103 ms, a signature 0.9 s, a
+check 116 ms. A wallet's payment address (`src/address.fam`) comes from its seed, so its
+backup words (and passphrase) give the same address anywhere: Kyber's (d, z)
+= SHAKE256("tabernacle-kyber-v1" ‖ seed ‖ index, 64), Dilithium's ξ =
+SHAKE256("tabernacle-dilithium-v1" ‖ seed ‖ index, 32), the index a
+little-endian u32 (0, for now); the address is SHA3-256 of the two public
+keys, in Bech32m (BIP 350) -- `tab1…` on the main network, `tabdev1…` on dev,
+a version symbol first -- 63 characters. The node logs it at the start;
+`status` returns it, the web wallet shows it (Receive), `tools/wallet
+address` prints it. Gateways (`src/gateway.fam`) find a payment address: a wallet registers a
+record with them -- its two public keys, a sequence (the time) and an expiry
+(6 hours), signed with Dilithium -- every hour, and a gateway keeps each
+address's newest (B+tree 10, the record in two pages) with the ip:port it
+came from (so a wallet behind NAT is found where its NAT shows it). A sender
+asks for an address and checks what comes back itself: the keys hash to
+the address, the signature holds, it hasn't expired -- a lying gateway can
+only misroute. Records (4.6 KB) go in parts of 1 KB, new packet types the
+Rust node ignores; a gateway answers only an asker quoting the cookie it
+issued that address (no amplification), and takes a registration from an IP
+at most every 10 s, 10,000 in all. A node serves as one with `node.sh
+--gateway` (the seeds); a wallet uses `usegw=` settings, or the seeds.
+`tools/wallet lookup ADDRESS` (the API's `lookup`) asks; `status` says how
+many gateways hold our record. Tried with three nodes under QEMU: two
+wallets registered with a gateway and found each other.
+
+Paying an address (`src/pay.fam`; `tools/wallet pay ADDRESS AMOUNT`, the
+API's `pay` and `payment`, the web wallet's Send) is one round trip, end to
+end, relayed by the gateways (RELAY in, DELIVER out, to where the address
+was heard; they read nothing, and pass at most 256 KB a second an IP). PAY1:
+a one-time Kyber key pair, a key encapsulated to the receiver's Kyber key,
+and a ChaCha20-Poly1305 box with the sender's address and S1. The receiver
+answers by itself: PAY2, a key encapsulated to the one-time key, a box with
+S2 (or why not); the sender finalizes, and the transaction goes out. The
+boxes' keys are SHAKE256 of the secrets and a hash of the exchange, so S2 is
+forward secret (the one-time key is gone); a PAY1 sent again gets the same
+PAY2, not a second slate, and a receiver answers a new one at most every
+2 s. A wallet keeps its way open with a KEEP to each gateway every 20 s.
+Failed or unanswered (a minute), the payment's slate is cancelled and its
+coins are free again. Tried under QEMU on a private dev chain with real
+proofs: a Rust miner, a Forth gateway, two Forth wallets -- the first funded
+by the Rust wallet, then paying the second by address, and the second paying
+back from the web wallet, every payment mined.
+
+`tests/crypto.fam` checks each against Python's hashlib and
+`cryptography` (RFC 8439's vectors among them) and the FIPS 203/204
+reference implementations (kyber-py, dilithium-py): keys, ciphertexts and
+signatures byte for byte, implicit rejection, and every check the standards
+ask for.
+
 `src/txrelay.fam` is the mempool, and relays everyone's transactions as the
 Rust node does (`TX_INV`, `GET_TX`, `TX_CHUNK`, `GET_TX_INV`): an announced
 transaction is fetched, must hash to its id, and is accepted -- and relayed

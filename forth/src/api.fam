@@ -15,7 +15,19 @@
 \ is answered on a connection until it has.  Then:
 \   status                  height, best_peer (-1: none), fast_sync (its
 \                           phase; 0: none), peers, network, wallet ("none",
-\                           "open", "restoring"), passphrase, next_key
+\                           "open", "restoring"), passphrase, next_key,
+\                           address (the payment address: src/address.fam),
+\                           gateways (how many hold our record)
+\   pay address amount [fee]   pay a payment address (src/pay.fam): {}
+\                           (follow it with payment)
+\   payment                 the payment's progress: {state: "none",
+\                           "finding", "sending", "paid" (txid) or "failed"
+\                           (error)}
+\   lookup address          a payment address's record, from the gateways:
+\                           {status: "looking"} until it's in, then
+\                           {status: "found", ip, port, expires_in (s)} or
+\                           {status: "not found"}; a different address
+\                           starts a new lookup
 \   balance                 spendable, immature, pending, locked, held,
 \                           held_until, height
 \   outputs                 [ {commitment, key, amount, status, origin,
@@ -378,6 +390,7 @@
 	6 lit = if "held" else "unknown" then then then then then then then
 ;
 
+: jadv variable ;  : jaddr ( -- a )  jadv 80 lit lazy ;     \ the payment address
 : jstatus ( -- )
 	wastatus  -1 lit jhead jobj
 	"height" jkey wares be32 jdec
@@ -388,6 +401,8 @@
 	"wallet" jkey wl? 0= if "\"none\"" else wlflags 2 lit and if "\"restoring\"" else "\"open\"" then then js
 	"passphrase" jkey wl? if wlflags 1 lit and else 0 lit then if "true" else "false" then js
 	"next_key" jkey wares C lit + be32 jdec
+	"address" jkey wl? if jaddr dup paaddr jstr else "null" js then
+	"gateways" jkey 0 lit gwgn @ ?dup if 0 lit do i gwg 8 lit + @ if 1 lit + then loop then jdec
 	jdone jdone
 ;
 
@@ -508,6 +523,44 @@
 	5D lit jc jdone jdone
 ;
 
+: jlav variable ;  : jla ( -- a )  jlav 20 lit lazy ;
+\ jlookup ( -- )   lookup: started, or its result.
+: jlookup ( -- )
+	"address" jget 1 lit = if jla pahash else 2drop 0 lit then
+	0= if "address: a payment address (tab1..., tabdev1... on dev)" jerr else
+		jla gwla 20 lit mcmp 0= gwlst @ and 0= if jla gwlook then
+		-1 lit jhead jobj "status" jkey
+		gwlst @ 1 lit = if "\"looking\"" js else
+		gwlst @ 3 lit = if "\"not found\"" js else
+			"\"found\"" js  "ip" jkey 22 lit jc gwip @ 18 lit rshift jdec 2E lit jc gwip @ 10 lit rshift FF lit and jdec 2E lit jc
+			gwip @ 8 lit rshift FF lit and jdec 2E lit jc gwip @ FF lit and jdec 22 lit jc
+			"port" jkey gwport @ jdec
+			"expires_in" jkey gwrec 10 lit + qbe@ gwnow d- drop 3E8 lit / jdec
+		then then
+		jdone jdone
+	then
+;
+
+\ jpay ( -- )   pay: the address, amount and fee checked, the payment begun.
+: jpay ( -- )
+	"address" jget 1 lit = if jla pahash else 2drop 0 lit then
+	0= if "address: a payment address (tab1..., tabdev1... on dev)" jerr else
+	"amount" jget if jpamt else 2drop 0 lit 0 lit 0 lit then  jsok ! jsah ! jsal !
+	"fee" jget if jpamt jsok @ and jsok ! jsfh ! jsfl ! else 2drop 186A0 lit jsfl ! 0 lit jsfh ! then
+	jsok @ 0= if "amount and fee: coins, as decimal strings (\"1.5\")" jerr else
+	jla jsal @ jsah @ jsfl @ jsfh @ pzpay if -1 lit jhead "{}" js jdone else "a payment is under way" jerr then
+	then then
+;
+
+\ jpaymt ( -- )   payment: where it's got to.
+: jpaymt ( -- )
+	-1 lit jhead jobj "state" jkey
+	pzst @ dup 0= if drop "\"none\"" js else dup 1 lit = if drop "\"finding\"" js else
+	dup 2 lit = if drop "\"sending\"" js else 3 lit = if "\"paid\"" js  "txid" jkey pztxid 20 lit jqhex
+	else "\"failed\"" js  "error" jkey pzwhy @ ?dup 0= if "failed" then dup strlen jstr then then then then
+	jdone jdone
+;
+
 \ jauth ( -- ok )   {"cmd":"auth","key":..}: the API key, compared in full.
 : jauth ( -- ok )
 	"key" jget 1 lit = over 40 lit = and wl? and if
@@ -528,6 +581,9 @@
 		else jau @ 0= if 2drop "authenticate first: {\"cmd\":\"auth\",\"key\":\"...\"}" jerr else
 		2dup "status" jis if 2drop jstatus else
 		2dup "log" jis if 2drop jlog else
+		2dup "lookup" jis if 2drop jlookup else
+		2dup "pay" jis if 2drop jpay else
+		2dup "payment" jis if 2drop jpaymt else
 		wl? 0= if 2drop "no wallet" jerr else
 		wlflags 2 lit and if 2drop "the wallet is being restored (once the node has caught up)" jerr else
 		2dup "balance" jis if 2drop jbalance else
@@ -538,7 +594,7 @@
 		2dup "cancel" jis if 2drop jcancel else
 		2dup "slates" jis if 2drop jslates else
 		2drop "unknown command" jerr
-		then then then then then then then then then then then then then
+		then then then then then then then then then then then then then then then then
 	else 2drop "not a request: {\"id\":..,\"cmd\":\"...\"}" jerr then
 	jau @
 ;

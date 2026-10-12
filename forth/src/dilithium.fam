@@ -1,0 +1,483 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/dilithium.fam — Dilithium2: ML-DSA-44 of FIPS 204 (called Dilithium
+\ here): the signatures on the payment network's records.  q = 8380417,
+\ n = 256, k = l = 4, eta = 2, tau = 39, gamma1 = 2^17, gamma2 = (q-1)/88,
+\ omega = 80, d = 13; an empty context string.  Keys from a 32-byte seed;
+\ signing from 32 bytes of randomness (hedged; the caller's, so it's
+\ testable -- zeros for the deterministic variant).
+\
+\   dikeys ( xi pk sk -- )            pk: 1,312 bytes, sk: 2,560
+\   disign ( sk m n rnd sig -- )      sig: 2,420 bytes
+\   diverify ( pk m n sig -- ok )
+\ Polynomials are 256 cells, coefficients in [0, q): -x is q - x.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: diq ( -- q )   7FE001 lit ;
+
+\ dimul ( a b -- a b mod q ): src/dimul.S, assembled by tools/s2words.py.
+: dimul ( a b -- c )
+83250100 ,   \ lw a1,0(sp)
+03254100 ,   \ lw a0,4(sp)
+13014100 ,   \ addi sp,sp,4
+13060000 ,   \ addi a2,zero,0
+93060000 ,   \ addi a3,zero,0
+93070500 ,   \ addi a5,a0,0
+13070000 ,   \ addi a4,zero,0
+638A0502 ,   \ beq a1,zero,50 <red>
+93F21500 ,   \ andi t0,a1,1
+638A0200 ,   \ beq t0,zero,38 <red-0x18>
+3306F600 ,   \ add a2,a2,a5
+B332F600 ,   \ sltu t0,a2,a5
+B386E600 ,   \ add a3,a3,a4
+B3865600 ,   \ add a3,a3,t0
+13171700 ,   \ slli a4,a4,0x1
+93D2F701 ,   \ srli t0,a5,0x1f
+33675700 ,   \ or a4,a4,t0
+93971700 ,   \ slli a5,a5,0x1
+93D51500 ,   \ srli a1,a1,0x1
+E39A05FC ,   \ bne a1,zero,20 <red-0x30>
+93527601 ,   \ srli t0,a2,0x17
+13939600 ,   \ slli t1,a3,0x9
+B3E26200 ,   \ or t0,t0,t1
+37038000 ,   \ lui t1,0x800
+1303F3FF ,   \ addi t1,t1,-1 # 7fffff <__global_pointer$+0x7fe73b>
+B3736600 ,   \ and t2,a2,t1
+13DEA200 ,   \ srli t3,t0,0xa
+93FEF23F ,   \ andi t4,t0,1023
+131FDE00 ,   \ slli t5,t3,0xd
+B383E301 ,   \ add t2,t2,t5
+139FDE00 ,   \ slli t5,t4,0xd
+B383E301 ,   \ add t2,t2,t5
+B383C341 ,   \ sub t2,t2,t3
+B3835340 ,   \ sub t2,t2,t0
+37CFFF00 ,   \ lui t5,0xffc
+130F2F00 ,   \ addi t5,t5,2 # ffc002 <__global_pointer$+0xffa73e>
+B383E301 ,   \ add t2,t2,t5
+13DE7301 ,   \ srli t3,t2,0x17
+B3F36300 ,   \ and t2,t2,t1
+931EDE00 ,   \ slli t4,t3,0xd
+B383D301 ,   \ add t2,t2,t4
+B383C341 ,   \ sub t2,t2,t3
+37EF7F00 ,   \ lui t5,0x7fe
+130F1F00 ,   \ addi t5,t5,1 # 7fe001 <__global_pointer$+0x7fc73d>
+63E4E301 ,   \ bltu t2,t5,b8 <red+0x68>
+B383E341 ,   \ sub t2,t2,t5
+63E4E301 ,   \ bltu t2,t5,c0 <red+0x70>
+B383E341 ,   \ sub t2,t2,t5
+23207100 ,   \ sw t2,0(sp)
+;
+: diadd ( a b -- c )   + dup diq u< 0= if diq - then ;
+: disub ( a b -- c )   - diq + dup diq u< 0= if diq - then ;
+\ dimodq ( n -- c )   a small signed integer (|n| < q) mod q.
+: dimodq ( n -- c )   dup 0< if diq + then ;
+\ dicen ( c -- n )   c as a signed integer, in -(q-1)/2 .. (q-1)/2.
+: dicen ( c -- n )   dup 3FF000 lit u> if diq - then ;
+: diabs ( n -- u )   dup 0< if 0 lit swap - then ;
+
+\ zeta^brv8(i) mod q (zeta = 1753): the NTT's twiddles, made once.
+: dizv variable ;
+: dizeta ( -- a )
+	dizv @ 0= if
+		400 lit alloc dizv !
+		1 lit dizv @ 0 lit + !  495E02 lit dizv @ 4 lit + !  397567 lit dizv @ 8 lit + !  396569 lit dizv @ C lit + !
+		4F062B lit dizv @ 10 lit + !  53DF73 lit dizv @ 14 lit + !  4FE033 lit dizv @ 18 lit + !  4F066B lit dizv @ 1C lit + !
+		76B1AE lit dizv @ 20 lit + !  360DD5 lit dizv @ 24 lit + !  28EDB0 lit dizv @ 28 lit + !  207FE4 lit dizv @ 2C lit + !
+		397283 lit dizv @ 30 lit + !  70894A lit dizv @ 34 lit + !  88192 lit dizv @ 38 lit + !  6D3DC8 lit dizv @ 3C lit + !
+		4C7294 lit dizv @ 40 lit + !  41E0B4 lit dizv @ 44 lit + !  28A3D2 lit dizv @ 48 lit + !  66528A lit dizv @ 4C lit + !
+		4A18A7 lit dizv @ 50 lit + !  794034 lit dizv @ 54 lit + !  A52EE lit dizv @ 58 lit + !  6B7D81 lit dizv @ 5C lit + !
+		4E9F1D lit dizv @ 60 lit + !  1A2877 lit dizv @ 64 lit + !  2571DF lit dizv @ 68 lit + !  1649EE lit dizv @ 6C lit + !
+		7611BD lit dizv @ 70 lit + !  492BB7 lit dizv @ 74 lit + !  2AF697 lit dizv @ 78 lit + !  22D8D5 lit dizv @ 7C lit + !
+		36F72A lit dizv @ 80 lit + !  30911E lit dizv @ 84 lit + !  29D13F lit dizv @ 88 lit + !  492673 lit dizv @ 8C lit + !
+		50685F lit dizv @ 90 lit + !  2010A2 lit dizv @ 94 lit + !  3887F7 lit dizv @ 98 lit + !  11B2C3 lit dizv @ 9C lit + !
+		603A4 lit dizv @ A0 lit + !  E2BED lit dizv @ A4 lit + !  10B72C lit dizv @ A8 lit + !  4A5F35 lit dizv @ AC lit + !
+		1F9D15 lit dizv @ B0 lit + !  428CD4 lit dizv @ B4 lit + !  3177F4 lit dizv @ B8 lit + !  20E612 lit dizv @ BC lit + !
+		341C1D lit dizv @ C0 lit + !  1AD873 lit dizv @ C4 lit + !  736681 lit dizv @ C8 lit + !  49553F lit dizv @ CC lit + !
+		3952F6 lit dizv @ D0 lit + !  62564A lit dizv @ D4 lit + !  65AD05 lit dizv @ D8 lit + !  439A1C lit dizv @ DC lit + !
+		53AA5F lit dizv @ E0 lit + !  30B622 lit dizv @ E4 lit + !  87F38 lit dizv @ E8 lit + !  3B0E6D lit dizv @ EC lit + !
+		2C83DA lit dizv @ F0 lit + !  1C496E lit dizv @ F4 lit + !  330E2B lit dizv @ F8 lit + !  1C5B70 lit dizv @ FC lit + !
+		2EE3F1 lit dizv @ 100 lit + !  137EB9 lit dizv @ 104 lit + !  57A930 lit dizv @ 108 lit + !  3AC6EF lit dizv @ 10C lit + !
+		3FD54C lit dizv @ 110 lit + !  4EB2EA lit dizv @ 114 lit + !  503EE1 lit dizv @ 118 lit + !  7BB175 lit dizv @ 11C lit + !
+		2648B4 lit dizv @ 120 lit + !  1EF256 lit dizv @ 124 lit + !  1D90A2 lit dizv @ 128 lit + !  45A6D4 lit dizv @ 12C lit + !
+		2AE59B lit dizv @ 130 lit + !  52589C lit dizv @ 134 lit + !  6EF1F5 lit dizv @ 138 lit + !  3F7288 lit dizv @ 13C lit + !
+		175102 lit dizv @ 140 lit + !  75D59 lit dizv @ 144 lit + !  1187BA lit dizv @ 148 lit + !  52ACA9 lit dizv @ 14C lit + !
+		773E9E lit dizv @ 150 lit + !  296D8 lit dizv @ 154 lit + !  2592EC lit dizv @ 158 lit + !  4CFF12 lit dizv @ 15C lit + !
+		404CE8 lit dizv @ 160 lit + !  4AA582 lit dizv @ 164 lit + !  1E54E6 lit dizv @ 168 lit + !  4F16C1 lit dizv @ 16C lit + !
+		1A7E79 lit dizv @ 170 lit + !  3978F lit dizv @ 174 lit + !  4E4817 lit dizv @ 178 lit + !  31B859 lit dizv @ 17C lit + !
+		5884CC lit dizv @ 180 lit + !  1B4827 lit dizv @ 184 lit + !  5B63D0 lit dizv @ 188 lit + !  5D787A lit dizv @ 18C lit + !
+		35225E lit dizv @ 190 lit + !  400C7E lit dizv @ 194 lit + !  6C09D1 lit dizv @ 198 lit + !  5BD532 lit dizv @ 19C lit + !
+		6BC4D3 lit dizv @ 1A0 lit + !  258ECB lit dizv @ 1A4 lit + !  2E534C lit dizv @ 1A8 lit + !  97A6C lit dizv @ 1AC lit + !
+		3B8820 lit dizv @ 1B0 lit + !  6D285C lit dizv @ 1B4 lit + !  2CA4F8 lit dizv @ 1B8 lit + !  337CAA lit dizv @ 1BC lit + !
+		14B2A0 lit dizv @ 1C0 lit + !  558536 lit dizv @ 1C4 lit + !  28F186 lit dizv @ 1C8 lit + !  55795D lit dizv @ 1CC lit + !
+		4AF670 lit dizv @ 1D0 lit + !  234A86 lit dizv @ 1D4 lit + !  75E826 lit dizv @ 1D8 lit + !  78DE66 lit dizv @ 1DC lit + !
+		5528C lit dizv @ 1E0 lit + !  7ADF59 lit dizv @ 1E4 lit + !  F6E17 lit dizv @ 1E8 lit + !  5BF3DA lit dizv @ 1EC lit + !
+		459B7E lit dizv @ 1F0 lit + !  628B34 lit dizv @ 1F4 lit + !  5DBECB lit dizv @ 1F8 lit + !  1A9E7B lit dizv @ 1FC lit + !
+		6D9 lit dizv @ 200 lit + !  6257C5 lit dizv @ 204 lit + !  574B3C lit dizv @ 208 lit + !  69A8EF lit dizv @ 20C lit + !
+		289838 lit dizv @ 210 lit + !  64B5FE lit dizv @ 214 lit + !  7EF8F5 lit dizv @ 218 lit + !  2A4E78 lit dizv @ 21C lit + !
+		120A23 lit dizv @ 220 lit + !  154A8 lit dizv @ 224 lit + !  9B7FF lit dizv @ 228 lit + !  435E87 lit dizv @ 22C lit + !
+		437FF8 lit dizv @ 230 lit + !  5CD5B4 lit dizv @ 234 lit + !  4DC04E lit dizv @ 238 lit + !  4728AF lit dizv @ 23C lit + !
+		7F735D lit dizv @ 240 lit + !  C8D0D lit dizv @ 244 lit + !  F66D5 lit dizv @ 248 lit + !  5A6D80 lit dizv @ 24C lit + !
+		61AB98 lit dizv @ 250 lit + !  185D96 lit dizv @ 254 lit + !  437F31 lit dizv @ 258 lit + !  468298 lit dizv @ 25C lit + !
+		662960 lit dizv @ 260 lit + !  4BD579 lit dizv @ 264 lit + !  28DE06 lit dizv @ 268 lit + !  465D8D lit dizv @ 26C lit + !
+		49B0E3 lit dizv @ 270 lit + !  9B434 lit dizv @ 274 lit + !  7C0DB3 lit dizv @ 278 lit + !  5A68B0 lit dizv @ 27C lit + !
+		409BA9 lit dizv @ 280 lit + !  64D3D5 lit dizv @ 284 lit + !  21762A lit dizv @ 288 lit + !  658591 lit dizv @ 28C lit + !
+		246E39 lit dizv @ 290 lit + !  48C39B lit dizv @ 294 lit + !  7BC759 lit dizv @ 298 lit + !  4F5859 lit dizv @ 29C lit + !
+		392DB2 lit dizv @ 2A0 lit + !  230923 lit dizv @ 2A4 lit + !  12EB67 lit dizv @ 2A8 lit + !  454DF2 lit dizv @ 2AC lit + !
+		30C31C lit dizv @ 2B0 lit + !  285424 lit dizv @ 2B4 lit + !  13232E lit dizv @ 2B8 lit + !  7FAF80 lit dizv @ 2BC lit + !
+		2DBFCB lit dizv @ 2C0 lit + !  22A0B lit dizv @ 2C4 lit + !  7E832C lit dizv @ 2C8 lit + !  26587A lit dizv @ 2CC lit + !
+		6B3375 lit dizv @ 2D0 lit + !  95B76 lit dizv @ 2D4 lit + !  6BE1CC lit dizv @ 2D8 lit + !  5E061E lit dizv @ 2DC lit + !
+		78E00D lit dizv @ 2E0 lit + !  628C37 lit dizv @ 2E4 lit + !  3DA604 lit dizv @ 2E8 lit + !  4AE53C lit dizv @ 2EC lit + !
+		1F1D68 lit dizv @ 2F0 lit + !  6330BB lit dizv @ 2F4 lit + !  7361B8 lit dizv @ 2F8 lit + !  5EA06C lit dizv @ 2FC lit + !
+		671AC7 lit dizv @ 300 lit + !  201FC6 lit dizv @ 304 lit + !  5BA4FF lit dizv @ 308 lit + !  60D772 lit dizv @ 30C lit + !
+		8F201 lit dizv @ 310 lit + !  6DE024 lit dizv @ 314 lit + !  80E6D lit dizv @ 318 lit + !  56038E lit dizv @ 31C lit + !
+		695688 lit dizv @ 320 lit + !  1E6D3E lit dizv @ 324 lit + !  2603BD lit dizv @ 328 lit + !  6A9DFA lit dizv @ 32C lit + !
+		7C017 lit dizv @ 330 lit + !  6DBFD4 lit dizv @ 334 lit + !  74D0BD lit dizv @ 338 lit + !  63E1E3 lit dizv @ 33C lit + !
+		519573 lit dizv @ 340 lit + !  7AB60D lit dizv @ 344 lit + !  2867BA lit dizv @ 348 lit + !  2DECD4 lit dizv @ 34C lit + !
+		58018C lit dizv @ 350 lit + !  3F4CF5 lit dizv @ 354 lit + !  B7009 lit dizv @ 358 lit + !  427E23 lit dizv @ 35C lit + !
+		3CBD37 lit dizv @ 360 lit + !  273333 lit dizv @ 364 lit + !  673957 lit dizv @ 368 lit + !  1A4B5D lit dizv @ 36C lit + !
+		196926 lit dizv @ 370 lit + !  1EF206 lit dizv @ 374 lit + !  11C14E lit dizv @ 378 lit + !  4C76C8 lit dizv @ 37C lit + !
+		3CF42F lit dizv @ 380 lit + !  7FB19A lit dizv @ 384 lit + !  6AF66C lit dizv @ 388 lit + !  2E1669 lit dizv @ 38C lit + !
+		3352D6 lit dizv @ 390 lit + !  34760 lit dizv @ 394 lit + !  85260 lit dizv @ 398 lit + !  741E78 lit dizv @ 39C lit + !
+		2F6316 lit dizv @ 3A0 lit + !  6F0A11 lit dizv @ 3A4 lit + !  7C0F1 lit dizv @ 3A8 lit + !  776D0B lit dizv @ 3AC lit + !
+		D1FF0 lit dizv @ 3B0 lit + !  345824 lit dizv @ 3B4 lit + !  223D4 lit dizv @ 3B8 lit + !  68C559 lit dizv @ 3BC lit + !
+		5E8885 lit dizv @ 3C0 lit + !  2FAA32 lit dizv @ 3C4 lit + !  23FC65 lit dizv @ 3C8 lit + !  5E6942 lit dizv @ 3CC lit + !
+		51E0ED lit dizv @ 3D0 lit + !  65ADB3 lit dizv @ 3D4 lit + !  2CA5E6 lit dizv @ 3D8 lit + !  79E1FE lit dizv @ 3DC lit + !
+		7B4064 lit dizv @ 3E0 lit + !  35E1DD lit dizv @ 3E4 lit + !  433AAC lit dizv @ 3E8 lit + !  464ADE lit dizv @ 3EC lit + !
+		1CFE14 lit dizv @ 3F0 lit + !  73F1CE lit dizv @ 3F4 lit + !  10170E lit dizv @ 3F8 lit + !  74B6D7 lit dizv @ 3FC lit + !
+	then
+	dizv @
+;
+
+\ ── The polynomials: a pool of 64 ──
+: dipv variable ;  : dip ( k -- f )   A lit lshift dipv 10000 lit lazy + ;
+: dic@ ( f i -- x )   2 lit lshift + @ ;
+: dic! ( x f i -- )   2 lit lshift + ! ;
+: dizero ( f -- )   100 lit zero ;
+: dicopy ( f g -- )   100 lit cpy ;
+
+: dif variable ;  : dig variable ;  : dih variable ;  : dil variable ;  : dis variable ;  : dim variable ;  : dizt variable ;  : dit variable ;
+
+\ dintt ( f -- )   in place (FIPS 204, Algorithm 41).
+: dintt ( f -- )
+	dif !  0 lit dim !  80 lit dil !
+	begin dil @ while
+		0 lit dis !
+		begin dis @ 100 lit u< while
+			dim @ 1 lit + dim !  dizeta dim @ dic@ dizt !
+			dis @ dil @ + dis @ do
+				dif @ i dil @ + dic@ dizt @ dimul dit !
+				dif @ i dic@ dit @ disub  dif @ i dil @ + dic!
+				dif @ i dic@ dit @ diadd  dif @ i dic!
+			loop
+			dis @ dil @ 1 lit lshift + dis !
+		repeat
+		dil @ 1 lit rshift dil !
+	repeat
+;
+
+\ diintt ( f -- )   in place (Algorithm 42), times 256^-1 (8347681).
+: diintt ( f -- )
+	dif !  100 lit dim !  1 lit dil !
+	begin dil @ 100 lit u< while
+		0 lit dis !
+		begin dis @ 100 lit u< while
+			dim @ 1 lit - dim !  diq dizeta dim @ dic@ - dizt !
+			dis @ dil @ + dis @ do
+				dif @ i dic@ dit !
+				dit @ dif @ i dil @ + dic@ diadd  dif @ i dic!
+				dit @ dif @ i dil @ + dic@ disub dizt @ dimul  dif @ i dil @ + dic!
+			loop
+			dis @ dil @ 1 lit lshift + dis !
+		repeat
+		dil @ 1 lit lshift dil !
+	repeat
+	100 lit 0 lit do dif @ i dic@ 7F6021 lit dimul dif @ i dic! loop
+;
+
+\ dimacc ( f g h -- )   h += f g, pointwise (NTT domain).
+: dimacc ( f g h -- )
+	dih ! dig ! dif !
+	100 lit 0 lit do dif @ i dic@ dig @ i dic@ dimul  dih @ i dic@ diadd  dih @ i dic! loop
+;
+\ dipmul ( f g h -- )   h = f g, pointwise.
+: dipmul ( f g h -- )   dup dizero dimacc ;
+: diaddp ( f g -- )   100 lit 0 lit do over i dic@ over i dic@ diadd over i dic! loop 2drop ;     \ g += f
+: disubp ( f g -- )   100 lit 0 lit do dup i dic@ 2 lit pick i dic@ disub over i dic! loop 2drop ;   \ g -= f
+
+\ ── Sampling (Algorithms 29 to 34) ──
+
+: dibv variable ;  : dib ( -- a )  dibv 280 lit lazy ;      \ bytes squeezed
+: dij variable ;
+
+\ direj ( rho s r f -- )   A[r][s]: RejNTTPoly of SHAKE128(rho s r).
+: direj ( rho s r f -- )
+	dif !  dib 1 lit + c!  dib c!
+	A8 lit 1F lit kbeg  20 lit kabs  dib 2 lit kabs  kend
+	0 lit dij !
+	begin dij @ 100 lit u< while
+		dib 3 lit ksqz
+		dib c@  dib 1 lit + c@ 8 lit lshift or  dib 2 lit + c@ 7F lit and 10 lit lshift or
+		dup diq u< if dif @ dij @ dic!  dij @ 1 lit + dij ! else drop then
+	repeat
+;
+
+\ dibnd ( rho' r f -- )   RejBoundedPoly (eta 2) of SHAKE256(rho' r), r as two
+\        bytes: half-bytes below 15 give 2 - (b mod 5).
+: dihalf ( b -- )
+	dup F lit u< dij @ 100 lit u< and if 2 lit swap 5 lit % - dimodq dif @ dij @ dic!  dij @ 1 lit + dij ! else drop then
+;
+: dibnd ( rho' r f -- )
+	dif !  dup dib c!  8 lit rshift dib 1 lit + c!
+	88 lit 1F lit kbeg  40 lit kabs  dib 2 lit kabs  kend
+	0 lit dij !
+	begin dij @ 100 lit u< while
+		dib 1 lit ksqz  dib c@ dup F lit and dihalf  4 lit rshift dihalf
+	repeat
+;
+
+\ dipack ( f bits out -- )   coefficients of `bits` bits, little-endian bit
+\ diunpk ( in bits f -- )    order, 256 of them -- and back.
+: dibt variable ;  : dio variable ;  : diac variable ;  : din variable ;
+: dipack ( f bits out -- )
+	dio ! dibt ! dif !  0 lit diac !  0 lit din !
+	100 lit 0 lit do
+		dif @ i dic@ din @ lshift diac @ or diac !  din @ dibt @ + din !
+		begin din @ 7 lit u> while
+			diac @ dio @ c!  dio @ 1 lit + dio !  diac @ 8 lit rshift diac !  din @ 8 lit - din !
+		repeat
+	loop
+;
+: diunpk ( in bits f -- )
+	dif ! dibt ! dio !  0 lit diac !  0 lit din !
+	100 lit 0 lit do
+		begin din @ dibt @ u< while
+			dio @ c@ din @ lshift diac @ or diac !  dio @ 1 lit + dio !  din @ 8 lit + din !
+		repeat
+		diac @  1 lit dibt @ lshift 1 lit - and  dif @ i dic!
+		diac @ dibt @ rshift diac !  din @ dibt @ - din !
+	loop
+;
+\ dioff ( f c -- )   each coefficient x to c - x (mod q): the packings' offsets.
+: dioff ( f c -- )   swap dif ! 100 lit 0 lit do dup dif @ i dic@ disub dif @ i dic! loop drop ;
+
+\ dimask ( rho'' n f -- )   ExpandMask's polynomial: 18-bit values of
+\        SHAKE256(rho'' n), as gamma1 - x.
+: dimask ( rho'' n f -- )
+	dif !  dup dib c!  8 lit rshift dib 1 lit + c!
+	88 lit 1F lit kbeg  40 lit kabs  dib 2 lit kabs  kend  dib 240 lit ksqz
+	dib 12 lit dif @ diunpk  dif @ 20000 lit dioff
+;
+
+\ diball ( ct f -- )   SampleInBall: tau = 39 coefficients of +-1, from
+\        SHAKE256(c~): 8 bytes of signs, then the places.
+: disgl variable ;  : disgh variable ;
+: diball ( ct f -- )
+	dif !  88 lit 1F lit kbeg  20 lit kabs  kend
+	dif @ dizero
+	dib 8 lit ksqz  dib dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or disgl !
+	dib 4 lit + dup c@ over 1 lit + c@ 8 lit lshift or over 2 lit + c@ 10 lit lshift or swap 3 lit + c@ 18 lit lshift or disgh !
+	100 lit D9 lit do
+		begin dib 1 lit ksqz dib c@ i u> while repeat
+		dif @ dib c@ dic@  dif @ i dic!
+		disgl @ 1 lit and if diq 1 lit - else 1 lit then  dif @ dib c@ dic!
+		disgl @ 1 lit rshift  disgh @ 1F lit lshift or disgl !  disgh @ 1 lit rshift disgh !
+	loop
+;
+
+\ ── Rounding (Algorithms 35 to 40) ──
+
+\ dip2r ( r -- r1 r0 )   Power2Round, d = 13: r0 = r mod+- 2^13 (signed).
+: dip2r ( r -- r1 r0 )   dup 1FFF lit and dup 1000 lit u> if 2000 lit - then  tuck - D lit rshift swap ;
+
+\ didec ( r -- r1 r0 )   Decompose, alpha = 2 gamma2 = 190464: r0 signed.
+: dialf ( -- a )   2E800 lit ;
+: didec ( r -- r1 r0 )
+	dup dialf % dup 17400 lit u> if dialf - then                     ( r r0 )
+	2dup - diq 1 lit - = if nip 1 lit - 0 lit swap else tuck - dialf / swap then
+;
+: dihigh ( r -- r1 )   didec drop ;
+\ dihint ( z r -- h )   MakeHint: whether r's high bits change when z is added.
+: dihint ( z r -- h )   tuck diadd dihigh swap dihigh <> 1 lit and ;
+\ diuse ( h r -- r1 )   UseHint, m = 44.
+: diuse ( h r -- r1 )
+	didec rot if 0 lit > if 1 lit + dup 2C lit = if drop 0 lit then else dup 0= if drop 2B lit else 1 lit - then then else drop then
+;
+\ dinorm ( f b -- bad )   whether any coefficient's |x| is b or more.
+: dinorm ( f b -- bad )
+	swap dif !  0 lit swap  100 lit 0 lit do dif @ i dic@ dicen diabs over u< 0= rot or swap loop drop
+;
+
+\ ── Keys, signing, verifying (Algorithms 6, 7, 8) ──
+\ The pool: A[r][s] 4r + s (0..15), s1 16..19, s2 20..23, t (then t1)
+\ 24..27, t0 28..31, y 32..35, w 36..39, z 40..43, c 44, a scratch 45,
+\ h 48..51, cs2 52..55, ct0 56..59, y's NTT 60..63.
+
+: dirv variable ;  : diseed ( -- a )  dirv 80 lit lazy ;    \ rho, rho', K
+: dimuv variable ;  : dimu ( -- a )  dimuv 40 lit lazy ;   \ mu
+: dir2v variable ;  : dirho2 ( -- a )  dir2v 40 lit lazy ; \ rho''
+: dictv variable ;  : dict ( -- a )  dictv 20 lit lazy ;   \ c~
+: diwv variable ;  : diw1 ( -- a )  diwv 300 lit lazy ;    \ w1, encoded
+: dipk variable ;  : disk variable ;  : disig variable ;
+
+\ dimat ( rho -- )   ExpandA.
+: dimat ( rho -- )   4 lit 0 lit do 4 lit 0 lit do dup i j  j 4 lit * i + dip direj loop loop drop ;
+
+\ dimv ( v0 out0 -- )   out = invNTT(A v) for the NTT vector at pool v0.
+: dimv ( v0 out0 -- )
+	4 lit 0 lit do
+		dup i + dip dizero
+		4 lit 0 lit do  j 4 lit * i + dip  2 lit pick i + dip  2 lit pick j + dip dimacc  loop
+		dup i + dip diintt
+	loop 2drop
+;
+
+\ dih64 ( a n out -- )   H: SHAKE256, 64 bytes.
+: dih64 ( a n out -- )   40 lit shake256 ;
+
+\ dihpack ( out -- )   HintBitPack of h (pool 48..51): the places of the
+\        ones, then each polynomial's running count (omega + k bytes).
+\ dihunpk ( in -- ok )   HintBitUnpack, into h: refused if malformed.
+: dix variable ;  : dio2 variable ;
+: dihpack ( out -- )
+	dio2 !  dio2 @ 54 lit nzero  0 lit dix !
+	4 lit 0 lit do
+		100 lit 0 lit do
+			j 30 lit + dip i dic@ if i dio2 @ dix @ + c!  dix @ 1 lit + dix ! then
+		loop
+		dix @ dio2 @ 50 lit + i + c!
+	loop
+;
+: diok variable ;  : difirst variable ;
+: dihunpk ( in -- ok )
+	dio2 !  0 lit dix !  -1 lit diok !
+	4 lit 0 lit do
+		i 30 lit + dip dizero
+		dio2 @ 50 lit + i + c@  dup dix @ u<  over 50 lit u> or if 0 lit diok ! then
+		dix @ difirst !
+		begin dix @ over u< diok @ and while
+			dix @ difirst @ u>  if dio2 @ dix @ + 1 lit - c@  dio2 @ dix @ + c@ u< 0= if 0 lit diok ! then then
+			1 lit  i 30 lit + dip  dio2 @ dix @ + c@ dic!
+			dix @ 1 lit + dix !
+		repeat drop
+	loop
+	diok @ if dix @ 50 lit u< if 50 lit dix @ do dio2 @ i + c@ if 0 lit diok ! then loop then then   \ the rest: zeros
+	diok @
+;
+
+\ diw1 encoding: each polynomial's 256 high bits, 6 bits each (192 bytes).
+: diw1e ( p0 -- )   4 lit 0 lit do dup i + dip 6 lit diw1 i C0 lit * + dipack loop drop ;
+
+\ dikeys ( xi pk sk -- )   KeyGen (Algorithm 6).
+: dikeys ( xi pk sk -- )
+	disk ! dipk !
+	diw1 20 lit ncpy  4 lit diw1 20 lit + c!  4 lit diw1 21 lit + c!
+	diw1 22 lit diseed 80 lit shake256                                  \ (rho, rho', K) = H(xi k l, 128)
+	diseed dimat
+	4 lit 0 lit do diseed 20 lit + i i 10 lit + dip dibnd loop          \ s1
+	4 lit 0 lit do diseed 20 lit + i 4 lit + i 14 lit + dip dibnd loop  \ s2
+	4 lit 0 lit do i 10 lit + dip i 3C lit + dip dicopy  i 3C lit + dip dintt loop
+	3C lit 18 lit dimv                                                  \ t = invNTT(A NTT(s1)) + s2
+	4 lit 0 lit do
+		i 14 lit + dip i 18 lit + dip diaddp
+		100 lit 0 lit do                                                \ (t1, t0) = Power2Round(t)
+			j 18 lit + dip i dic@ dip2r dimodq  j 1C lit + dip i dic!  j 18 lit + dip i dic!
+		loop
+	loop
+	diseed dipk @ 20 lit ncpy
+	4 lit 0 lit do i 18 lit + dip A lit dipk @ 20 lit + i 140 lit * + dipack loop
+	diseed disk @ 20 lit ncpy  diseed 60 lit + disk @ 20 lit + 20 lit ncpy
+	dipk @ 520 lit disk @ 40 lit + dih64                                \ tr = H(pk, 64)
+	4 lit 0 lit do
+		i 10 lit + dip 2 lit dioff  i 10 lit + dip 3 lit disk @ 80 lit + i 60 lit * + dipack
+		i 14 lit + dip 2 lit dioff  i 14 lit + dip 3 lit disk @ 200 lit + i 60 lit * + dipack
+		i 1C lit + dip 1000 lit dioff  i 1C lit + dip D lit disk @ 380 lit + i 1A0 lit * + dipack
+	loop
+;
+
+\ dimsg ( tr m n -- )   mu = H(tr M', 64), M' = 0 0 m (no context).
+: dizz variable ;
+: dimsg ( tr m n -- )
+	88 lit 1F lit kbeg  rot 40 lit kabs  0 lit dizz !  dizz 2 lit kabs  kabs  kend  dimu 40 lit ksqz
+;
+
+\ disign ( sk m n rnd sig -- )   Sign (Algorithms 2 and 7).
+: dikap variable ;  : dirnd variable ;  : dibad variable ;  : dihn variable ;
+: disign ( sk m n rnd sig -- )
+	disig ! dirnd ! rot disk !
+	disk @ 40 lit + -rot dimsg
+	4 lit 0 lit do                                                      \ s1, s2, t0: unpacked, NTT
+		disk @ 80 lit + i 60 lit * + 3 lit i 10 lit + dip diunpk  i 10 lit + dip 2 lit dioff  i 10 lit + dip dintt
+		disk @ 200 lit + i 60 lit * + 3 lit i 14 lit + dip diunpk  i 14 lit + dip 2 lit dioff  i 14 lit + dip dintt
+		disk @ 380 lit + i 1A0 lit * + D lit i 1C lit + dip diunpk  i 1C lit + dip 1000 lit dioff  i 1C lit + dip dintt
+	loop
+	disk @ dimat
+	88 lit 1F lit kbeg  disk @ 20 lit + 20 lit kabs  dirnd @ 20 lit kabs  dimu 40 lit kabs  kend  dirho2 40 lit ksqz
+	0 lit dikap !
+	begin
+		4 lit 0 lit do dirho2 dikap @ i + i 20 lit + dip dimask  i 20 lit + dip i 3C lit + dip dicopy  i 3C lit + dip dintt loop
+		dikap @ 4 lit + dikap !
+		3C lit 24 lit dimv                                              \ w
+		4 lit 0 lit do 100 lit 0 lit do j 24 lit + dip i dic@ dihigh  j 2C lit + dip i dic! loop loop
+		2C lit diw1e                                                     \ c~ = H(mu w1Encode(w1), 32)
+		88 lit 1F lit kbeg  dimu 40 lit kabs  diw1 300 lit kabs  kend  dict 20 lit ksqz
+		dict 2C lit dip diball  2C lit dip dintt
+		0 lit dibad !
+		4 lit 0 lit do                                                  \ z = y + c s1; cs2; ct0
+			2C lit dip i 10 lit + dip i 28 lit + dip dipmul  i 28 lit + dip diintt  i 20 lit + dip i 28 lit + dip diaddp
+			2C lit dip i 14 lit + dip i 34 lit + dip dipmul  i 34 lit + dip diintt
+			2C lit dip i 1C lit + dip i 38 lit + dip dipmul  i 38 lit + dip diintt
+			i 28 lit + dip 20000 lit 4E lit - dinorm dibad @ or dibad !
+			i 38 lit + dip 17400 lit dinorm dibad @ or dibad !
+			100 lit 0 lit do                                            \ r0 = LowBits(w - cs2)
+				j 24 lit + dip i dic@  j 34 lit + dip i dic@ disub  didec nip diabs 17400 lit 4E lit - u< 0= dibad @ or dibad !
+			loop
+		loop
+		dibad @ 0= if
+			0 lit dihn !
+			4 lit 0 lit do 100 lit 0 lit do                             \ h = MakeHint(-ct0, w - cs2 + ct0)
+				diq j 38 lit + dip i dic@ - dup diq = if drop 0 lit then
+				j 24 lit + dip i dic@ j 34 lit + dip i dic@ disub j 38 lit + dip i dic@ diadd
+				dihint dup j 30 lit + dip i dic!  dihn @ + dihn !
+			loop loop
+			dihn @ 50 lit u> dibad !
+		then
+		dibad @ 0=
+	until
+	dict disig @ 20 lit ncpy
+	4 lit 0 lit do i 28 lit + dip 20000 lit dioff  i 28 lit + dip 12 lit disig @ 20 lit + i 240 lit * + dipack loop
+	disig @ 920 lit + dihpack
+;
+
+\ diverify ( pk m n sig -- ok )   Verify (Algorithms 3 and 8).
+: diverify ( pk m n sig -- ok )
+	disig ! rot dipk !
+	dipk @ 520 lit dimu dih64  dimu -rot dimsg                          \ tr, then mu
+	disig @ 920 lit + dihunpk dup if
+		0 lit dibad !
+		4 lit 0 lit do
+			disig @ 20 lit + i 240 lit * + 12 lit i 28 lit + dip diunpk  i 28 lit + dip 20000 lit dioff
+			i 28 lit + dip 20000 lit 4E lit - dinorm dibad @ or dibad !
+			dipk @ 20 lit + i 140 lit * + A lit i 18 lit + dip diunpk
+		loop
+		dibad @ 0= and
+	then
+	dup if
+		dipk @ dimat
+		disig @ 2C lit dip diball  2C lit dip dintt
+		4 lit 0 lit do
+			i 28 lit + dip dintt
+			100 lit 0 lit do j 18 lit + dip i dic@ D lit lshift  j 18 lit + dip i dic! loop    \ t1 2^d
+			i 18 lit + dip dintt
+		loop
+		4 lit 0 lit do                                                  \ w' = invNTT(A z - c t1 2^d)
+			i 24 lit + dip dizero
+			4 lit 0 lit do  j 4 lit * i + dip  i 28 lit + dip  j 24 lit + dip dimacc  loop
+			2C lit dip  i 18 lit + dip  2D lit dip dipmul
+			2D lit dip  i 24 lit + dip disubp
+			i 24 lit + dip diintt
+			100 lit 0 lit do  j 30 lit + dip i dic@  j 24 lit + dip i dic@ diuse  j 34 lit + dip i dic!  loop
+		loop
+		34 lit diw1e
+		88 lit 1F lit kbeg  dimu 40 lit kabs  diw1 300 lit kabs  kend  dict 20 lit ksqz
+		dict disig @ 20 lit mcmp 0= and
+	then
+;

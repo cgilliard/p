@@ -1,0 +1,355 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/kyber.fam — Kyber-512: ML-KEM-512 of FIPS 203 (called Kyber here): the
+\ key exchange of the payment network's sessions.  q = 3329, n = 256, k = 2,
+\ eta1 = 3, eta2 = 2, du = 10, dv = 4.  A key pair from 64 bytes of seed (d,
+\ z); encapsulation from 32 random bytes (m) -- the caller's randomness, so
+\ it's testable (FIPS 203's "internal" functions).
+\
+\   kykeys ( seed ek dk -- )          ek: 800 bytes, dk: 1,632
+\   kyencap ( ek m key ct -- ok )     a shared key (32 bytes) and its
+\                                     ciphertext (768); ok: the ek checks out
+\   kydecap ( dk ct key -- ok )       the key from a ciphertext; ok: dk checks
+\                                     out (an altered ciphertext yields a key
+\                                     no one else has: implicit rejection)
+\ Polynomials are 256 cells, coefficients in [0, q).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: kyq ( -- q )   D01 lit ;
+: kymod ( x -- x mod q )   kyq % ;
+
+\ zeta^brv7(i) mod q: the NTT's twiddles
+: kyzv variable ;
+: kyz ( -- a )
+	kyzv @ 0= if
+		200 lit alloc kyzv !
+		1 lit kyzv @ 0 lit + !  6C1 lit kyzv @ 4 lit + !  A14 lit kyzv @ 8 lit + !  CD9 lit kyzv @ C lit + !
+		A52 lit kyzv @ 10 lit + !  276 lit kyzv @ 14 lit + !  769 lit kyzv @ 18 lit + !  350 lit kyzv @ 1C lit + !
+		426 lit kyzv @ 20 lit + !  77F lit kyzv @ 24 lit + !  C1 lit kyzv @ 28 lit + !  31D lit kyzv @ 2C lit + !
+		AE2 lit kyzv @ 30 lit + !  CBC lit kyzv @ 34 lit + !  239 lit kyzv @ 38 lit + !  6D2 lit kyzv @ 3C lit + !
+		128 lit kyzv @ 40 lit + !  98F lit kyzv @ 44 lit + !  53B lit kyzv @ 48 lit + !  5C4 lit kyzv @ 4C lit + !
+		BE6 lit kyzv @ 50 lit + !  38 lit kyzv @ 54 lit + !  8C0 lit kyzv @ 58 lit + !  535 lit kyzv @ 5C lit + !
+		592 lit kyzv @ 60 lit + !  82E lit kyzv @ 64 lit + !  217 lit kyzv @ 68 lit + !  B42 lit kyzv @ 6C lit + !
+		959 lit kyzv @ 70 lit + !  B3F lit kyzv @ 74 lit + !  7B6 lit kyzv @ 78 lit + !  335 lit kyzv @ 7C lit + !
+		121 lit kyzv @ 80 lit + !  14B lit kyzv @ 84 lit + !  CB5 lit kyzv @ 88 lit + !  6DC lit kyzv @ 8C lit + !
+		4AD lit kyzv @ 90 lit + !  900 lit kyzv @ 94 lit + !  8E5 lit kyzv @ 98 lit + !  807 lit kyzv @ 9C lit + !
+		28A lit kyzv @ A0 lit + !  7B9 lit kyzv @ A4 lit + !  9D1 lit kyzv @ A8 lit + !  278 lit kyzv @ AC lit + !
+		B31 lit kyzv @ B0 lit + !  21 lit kyzv @ B4 lit + !  528 lit kyzv @ B8 lit + !  77B lit kyzv @ BC lit + !
+		90F lit kyzv @ C0 lit + !  59B lit kyzv @ C4 lit + !  327 lit kyzv @ C8 lit + !  1C4 lit kyzv @ CC lit + !
+		59E lit kyzv @ D0 lit + !  B34 lit kyzv @ D4 lit + !  5FE lit kyzv @ D8 lit + !  962 lit kyzv @ DC lit + !
+		A57 lit kyzv @ E0 lit + !  A39 lit kyzv @ E4 lit + !  5C9 lit kyzv @ E8 lit + !  288 lit kyzv @ EC lit + !
+		9AA lit kyzv @ F0 lit + !  C26 lit kyzv @ F4 lit + !  4CB lit kyzv @ F8 lit + !  38E lit kyzv @ FC lit + !
+		11 lit kyzv @ 100 lit + !  AC9 lit kyzv @ 104 lit + !  247 lit kyzv @ 108 lit + !  A59 lit kyzv @ 10C lit + !
+		665 lit kyzv @ 110 lit + !  2D3 lit kyzv @ 114 lit + !  8F0 lit kyzv @ 118 lit + !  44C lit kyzv @ 11C lit + !
+		581 lit kyzv @ 120 lit + !  A66 lit kyzv @ 124 lit + !  CD1 lit kyzv @ 128 lit + !  E9 lit kyzv @ 12C lit + !
+		2F4 lit kyzv @ 130 lit + !  86C lit kyzv @ 134 lit + !  BC7 lit kyzv @ 138 lit + !  BEA lit kyzv @ 13C lit + !
+		6A7 lit kyzv @ 140 lit + !  673 lit kyzv @ 144 lit + !  AE5 lit kyzv @ 148 lit + !  6FD lit kyzv @ 14C lit + !
+		737 lit kyzv @ 150 lit + !  3B8 lit kyzv @ 154 lit + !  5B5 lit kyzv @ 158 lit + !  A7F lit kyzv @ 15C lit + !
+		3AB lit kyzv @ 160 lit + !  904 lit kyzv @ 164 lit + !  985 lit kyzv @ 168 lit + !  954 lit kyzv @ 16C lit + !
+		2DD lit kyzv @ 170 lit + !  921 lit kyzv @ 174 lit + !  10C lit kyzv @ 178 lit + !  281 lit kyzv @ 17C lit + !
+		630 lit kyzv @ 180 lit + !  8FA lit kyzv @ 184 lit + !  7F5 lit kyzv @ 188 lit + !  C94 lit kyzv @ 18C lit + !
+		177 lit kyzv @ 190 lit + !  9F5 lit kyzv @ 194 lit + !  82A lit kyzv @ 198 lit + !  66D lit kyzv @ 19C lit + !
+		427 lit kyzv @ 1A0 lit + !  13F lit kyzv @ 1A4 lit + !  AD5 lit kyzv @ 1A8 lit + !  2F5 lit kyzv @ 1AC lit + !
+		833 lit kyzv @ 1B0 lit + !  231 lit kyzv @ 1B4 lit + !  9A2 lit kyzv @ 1B8 lit + !  A22 lit kyzv @ 1BC lit + !
+		AF4 lit kyzv @ 1C0 lit + !  444 lit kyzv @ 1C4 lit + !  193 lit kyzv @ 1C8 lit + !  402 lit kyzv @ 1CC lit + !
+		477 lit kyzv @ 1D0 lit + !  866 lit kyzv @ 1D4 lit + !  AD7 lit kyzv @ 1D8 lit + !  376 lit kyzv @ 1DC lit + !
+		6BA lit kyzv @ 1E0 lit + !  4BC lit kyzv @ 1E4 lit + !  752 lit kyzv @ 1E8 lit + !  405 lit kyzv @ 1EC lit + !
+		83E lit kyzv @ 1F0 lit + !  B77 lit kyzv @ 1F4 lit + !  375 lit kyzv @ 1F8 lit + !  86A lit kyzv @ 1FC lit + !
+	then
+	kyzv @
+;
+
+\ zeta^(2 brv7(i) + 1) mod q: the base-case products' gammas
+: kygv variable ;
+: kyg ( -- a )
+	kygv @ 0= if
+		200 lit alloc kygv !
+		11 lit kygv @ 0 lit + !  CF0 lit kygv @ 4 lit + !  AC9 lit kygv @ 8 lit + !  238 lit kygv @ C lit + !
+		247 lit kygv @ 10 lit + !  ABA lit kygv @ 14 lit + !  A59 lit kygv @ 18 lit + !  2A8 lit kygv @ 1C lit + !
+		665 lit kygv @ 20 lit + !  69C lit kygv @ 24 lit + !  2D3 lit kygv @ 28 lit + !  A2E lit kygv @ 2C lit + !
+		8F0 lit kygv @ 30 lit + !  411 lit kygv @ 34 lit + !  44C lit kygv @ 38 lit + !  8B5 lit kygv @ 3C lit + !
+		581 lit kygv @ 40 lit + !  780 lit kygv @ 44 lit + !  A66 lit kygv @ 48 lit + !  29B lit kygv @ 4C lit + !
+		CD1 lit kygv @ 50 lit + !  30 lit kygv @ 54 lit + !  E9 lit kygv @ 58 lit + !  C18 lit kygv @ 5C lit + !
+		2F4 lit kygv @ 60 lit + !  A0D lit kygv @ 64 lit + !  86C lit kygv @ 68 lit + !  495 lit kygv @ 6C lit + !
+		BC7 lit kygv @ 70 lit + !  13A lit kygv @ 74 lit + !  BEA lit kygv @ 78 lit + !  117 lit kygv @ 7C lit + !
+		6A7 lit kygv @ 80 lit + !  65A lit kygv @ 84 lit + !  673 lit kygv @ 88 lit + !  68E lit kygv @ 8C lit + !
+		AE5 lit kygv @ 90 lit + !  21C lit kygv @ 94 lit + !  6FD lit kygv @ 98 lit + !  604 lit kygv @ 9C lit + !
+		737 lit kygv @ A0 lit + !  5CA lit kygv @ A4 lit + !  3B8 lit kygv @ A8 lit + !  949 lit kygv @ AC lit + !
+		5B5 lit kygv @ B0 lit + !  74C lit kygv @ B4 lit + !  A7F lit kygv @ B8 lit + !  282 lit kygv @ BC lit + !
+		3AB lit kygv @ C0 lit + !  956 lit kygv @ C4 lit + !  904 lit kygv @ C8 lit + !  3FD lit kygv @ CC lit + !
+		985 lit kygv @ D0 lit + !  37C lit kygv @ D4 lit + !  954 lit kygv @ D8 lit + !  3AD lit kygv @ DC lit + !
+		2DD lit kygv @ E0 lit + !  A24 lit kygv @ E4 lit + !  921 lit kygv @ E8 lit + !  3E0 lit kygv @ EC lit + !
+		10C lit kygv @ F0 lit + !  BF5 lit kygv @ F4 lit + !  281 lit kygv @ F8 lit + !  A80 lit kygv @ FC lit + !
+		630 lit kygv @ 100 lit + !  6D1 lit kygv @ 104 lit + !  8FA lit kygv @ 108 lit + !  407 lit kygv @ 10C lit + !
+		7F5 lit kygv @ 110 lit + !  50C lit kygv @ 114 lit + !  C94 lit kygv @ 118 lit + !  6D lit kygv @ 11C lit + !
+		177 lit kygv @ 120 lit + !  B8A lit kygv @ 124 lit + !  9F5 lit kygv @ 128 lit + !  30C lit kygv @ 12C lit + !
+		82A lit kygv @ 130 lit + !  4D7 lit kygv @ 134 lit + !  66D lit kygv @ 138 lit + !  694 lit kygv @ 13C lit + !
+		427 lit kygv @ 140 lit + !  8DA lit kygv @ 144 lit + !  13F lit kygv @ 148 lit + !  BC2 lit kygv @ 14C lit + !
+		AD5 lit kygv @ 150 lit + !  22C lit kygv @ 154 lit + !  2F5 lit kygv @ 158 lit + !  A0C lit kygv @ 15C lit + !
+		833 lit kygv @ 160 lit + !  4CE lit kygv @ 164 lit + !  231 lit kygv @ 168 lit + !  AD0 lit kygv @ 16C lit + !
+		9A2 lit kygv @ 170 lit + !  35F lit kygv @ 174 lit + !  A22 lit kygv @ 178 lit + !  2DF lit kygv @ 17C lit + !
+		AF4 lit kygv @ 180 lit + !  20D lit kygv @ 184 lit + !  444 lit kygv @ 188 lit + !  8BD lit kygv @ 18C lit + !
+		193 lit kygv @ 190 lit + !  B6E lit kygv @ 194 lit + !  402 lit kygv @ 198 lit + !  8FF lit kygv @ 19C lit + !
+		477 lit kygv @ 1A0 lit + !  88A lit kygv @ 1A4 lit + !  866 lit kygv @ 1A8 lit + !  49B lit kygv @ 1AC lit + !
+		AD7 lit kygv @ 1B0 lit + !  22A lit kygv @ 1B4 lit + !  376 lit kygv @ 1B8 lit + !  98B lit kygv @ 1BC lit + !
+		6BA lit kygv @ 1C0 lit + !  647 lit kygv @ 1C4 lit + !  4BC lit kygv @ 1C8 lit + !  845 lit kygv @ 1CC lit + !
+		752 lit kygv @ 1D0 lit + !  5AF lit kygv @ 1D4 lit + !  405 lit kygv @ 1D8 lit + !  8FC lit kygv @ 1DC lit + !
+		83E lit kygv @ 1E0 lit + !  4C3 lit kygv @ 1E4 lit + !  B77 lit kygv @ 1E8 lit + !  18A lit kygv @ 1EC lit + !
+		375 lit kygv @ 1F0 lit + !  98C lit kygv @ 1F4 lit + !  86A lit kygv @ 1F8 lit + !  497 lit kygv @ 1FC lit + !
+	then
+	kygv @
+;
+
+\ ── The polynomials: a pool of 16 ──
+: kypv variable ;  : kyp ( k -- f )   A lit lshift kypv 4000 lit lazy + ;
+: kyc@ ( f i -- x )   2 lit lshift + @ ;
+: kyc! ( x f i -- )   2 lit lshift + ! ;
+
+\ kyntt ( f -- )   in place (FIPS 203, Algorithm 9).
+: kyf variable ;  : kyi variable ;  : kyl variable ;  : kyst variable ;  : kyt variable ;  : kyzt variable ;
+: kyntt ( f -- )
+	kyf !  1 lit kyi !  80 lit kyl !
+	begin kyl @ 1 lit u> while
+		0 lit kyst !
+		begin kyst @ 100 lit u< while
+			kyz kyi @ kyc@ kyzt !  kyi @ 1 lit + kyi !
+			kyst @ kyl @ + kyst @ do
+				kyf @ i kyl @ + kyc@ kyzt @ * kymod kyt !
+				kyf @ i kyc@ kyt @ - kyq + kymod  kyf @ i kyl @ + kyc!
+				kyf @ i kyc@ kyt @ + kymod  kyf @ i kyc!
+			loop
+			kyst @ kyl @ 1 lit lshift + kyst !
+		repeat
+		kyl @ 1 lit rshift kyl !
+	repeat
+;
+
+\ kyintt ( f -- )   in place (Algorithm 10), times 128^-1 (3303).
+: kyintt ( f -- )
+	kyf !  7F lit kyi !  2 lit kyl !
+	begin kyl @ 81 lit u< while
+		0 lit kyst !
+		begin kyst @ 100 lit u< while
+			kyz kyi @ kyc@ kyzt !  kyi @ 1 lit - kyi !
+			kyst @ kyl @ + kyst @ do
+				kyf @ i kyc@ kyt !
+				kyt @ kyf @ i kyl @ + kyc@ + kymod  kyf @ i kyc!
+				kyf @ i kyl @ + kyc@ kyt @ - kyq + kyzt @ * kymod  kyf @ i kyl @ + kyc!
+			loop
+			kyst @ kyl @ 1 lit lshift + kyst !
+		repeat
+		kyl @ 1 lit lshift kyl !
+	repeat
+	100 lit 0 lit do kyf @ i kyc@ CE7 lit * kymod kyf @ i kyc! loop
+;
+
+\ kymacc ( f g h -- )   h += f g, in the NTT domain (Algorithms 11, 12).
+: kyh variable ;  : kyg2 variable ;  : kya0 variable ;  : kya1 variable ;  : kyb0 variable ;  : kyb1 variable ;
+: kymacc ( f g h -- )
+	kyh ! kyg2 ! kyf !
+	80 lit 0 lit do
+		kyf @ i 2 lit * kyc@ kya0 !  kyf @ i 2 lit * 1 lit + kyc@ kya1 !
+		kyg2 @ i 2 lit * kyc@ kyb0 !  kyg2 @ i 2 lit * 1 lit + kyc@ kyb1 !
+		kya0 @ kyb0 @ * kymod  kya1 @ kyb1 @ * kymod kyg i kyc@ * kymod +
+		kyh @ i 2 lit * kyc@ + kymod  kyh @ i 2 lit * kyc!
+		kya0 @ kyb1 @ * kya1 @ kyb0 @ * + kymod
+		kyh @ i 2 lit * 1 lit + kyc@ + kymod  kyh @ i 2 lit * 1 lit + kyc!
+	loop
+;
+
+: kyzero ( f -- )   100 lit zero ;
+: kyadd ( f g -- )   100 lit 0 lit do over i kyc@ over i kyc@ + kymod over i kyc! loop 2drop ;     \ g += f
+: kysub ( f g -- )   100 lit 0 lit do dup i kyc@ 2 lit pick i kyc@ - kyq + kymod over i kyc! loop 2drop ;   \ g -= f
+
+\ ── Sampling ──
+
+\ kysntt ( rho j i f -- )   Â[i][j]: SampleNTT (Algorithm 7) of SHAKE128(rho j i).
+: kys3v variable ;  : kys3 ( -- a )  kys3v 4 lit lazy ;  : kyj variable ;
+: kysntt ( rho j i f -- )
+	kyf !  kys3 1 lit + c!  kys3 c!
+	A8 lit 1F lit kbeg  20 lit kabs  kys3 2 lit kabs  kend
+	0 lit kyj !
+	begin kyj @ 100 lit u< while
+		kys3 3 lit ksqz
+		kys3 c@  kys3 1 lit + c@ F lit and 8 lit lshift or                        ( d1 )
+		kys3 1 lit + c@ 4 lit rshift  kys3 2 lit + c@ 4 lit lshift or            ( d1 d2 )
+		swap dup kyq u< if kyf @ kyj @ kyc!  kyj @ 1 lit + kyj ! else drop then
+		dup kyq u< kyj @ 100 lit u< and if kyf @ kyj @ kyc!  kyj @ 1 lit + kyj ! else drop then
+	repeat
+;
+
+\ kycbd ( seed n eta f -- )   SamplePolyCBD_eta (Algorithm 8) of
+\        PRF_eta(seed, n) = SHAKE256(seed n), 64 eta bytes.
+: kyeta variable ;  : kybv variable ;  : kyb ( -- a )  kybv C0 lit lazy ;
+: kybit ( k -- b )   dup 3 lit rshift kyb + c@ swap 7 lit and rshift 1 lit and ;
+: kycbd ( seed n eta f -- )
+	kyf ! kyeta !  kys3 c!
+	88 lit 1F lit kbeg  20 lit kabs  kys3 1 lit kabs  kend  kyb kyeta @ 40 lit * ksqz
+	100 lit 0 lit do
+		0 lit  kyeta @ 0 lit do  j kyeta @ 2 lit * * i + kybit +  loop
+		0 lit  kyeta @ 0 lit do  j kyeta @ 2 lit * * kyeta @ + i + kybit +  loop
+		- kyq + kymod  kyf @ i kyc!
+	loop
+;
+
+\ ── Encoding (Algorithms 5, 6) and compression (4.7) ──
+
+\ kyenc ( f d out -- )   ByteEncode_d: 256 coefficients of d bits, little-
+\        endian bit order: 32 d bytes.
+: kyd variable ;  : kyo variable ;  : kyac variable ;  : kyn variable ;
+: kyenc ( f d out -- )
+	kyo ! kyd ! kyf !  0 lit kyac !  0 lit kyn !
+	100 lit 0 lit do
+		kyf @ i kyc@ kyn @ lshift kyac @ or kyac !  kyn @ kyd @ + kyn !
+		begin kyn @ 7 lit u> while
+			kyac @ kyo @ c!  kyo @ 1 lit + kyo !  kyac @ 8 lit rshift kyac !  kyn @ 8 lit - kyn !
+		repeat
+	loop
+;
+
+\ kydec ( in d f -- )   ByteDecode_d: the inverse; for d = 12, mod q.
+: kydec ( in d f -- )
+	kyf ! kyd ! kyo !  0 lit kyac !  0 lit kyn !
+	100 lit 0 lit do
+		begin kyn @ kyd @ u< while
+			kyo @ c@ kyn @ lshift kyac @ or kyac !  kyo @ 1 lit + kyo !  kyn @ 8 lit + kyn !
+		repeat
+		kyac @  1 lit kyd @ lshift 1 lit - and  kyd @ C lit = if kymod then  kyf @ i kyc!
+		kyac @ kyd @ rshift kyac !  kyn @ kyd @ - kyn !
+	loop
+;
+
+\ kycmp ( f d -- )   Compress_d, in place: round(2^d x / q) mod 2^d.
+\ kydcm ( f d -- )   Decompress_d, in place: round(q y / 2^d).
+: kycmp ( f d -- )
+	kyd ! kyf !
+	100 lit 0 lit do kyf @ i kyc@ kyd @ lshift 680 lit + kyq /  1 lit kyd @ lshift 1 lit - and  kyf @ i kyc! loop
+;
+: kydcm ( f d -- )
+	kyd ! kyf !
+	100 lit 0 lit do kyf @ i kyc@ kyq *  1 lit kyd @ 1 lit - lshift +  kyd @ rshift  kyf @ i kyc! loop
+;
+
+\ ── K-PKE (Algorithms 13, 14, 15) ──
+\ The pool: Â[i][j] 2i + j, s or y 4 5, e or e1 6 7, t 8 9, e2 10, u 11 12,
+\ v 13, mu 14, a sum 15.
+
+: kyrsv variable ;  : kyrs ( -- a )  kyrsv 40 lit lazy ;   \ rho, then sigma (or K, r)
+: kyinv variable ;  : kyin ( -- a )  kyinv 340 lit lazy ;  \ a hash's input
+
+\ kymat ( rho -- )   Â from rho.
+: kymat ( rho -- )
+	2 lit 0 lit do 2 lit 0 lit do  dup i j  j 2 lit * i + kyp kysntt  loop loop drop
+;
+
+\ kynoise ( seed n eta p -- )   two polynomials, pool p and p + 1, from
+\        PRF(seed, n) and PRF(seed, n + 1).
+: kyns variable ;  : kynn variable ;  : kyne variable ;  : kynp variable ;
+: kynoise ( seed n eta p -- )
+	kynp ! kyne ! kynn ! kyns !
+	kyns @ kynn @ kyne @ kynp @ kyp kycbd
+	kyns @ kynn @ 1 lit + kyne @ kynp @ 1 lit + kyp kycbd
+;
+
+\ kypkg ( d ek dkp -- )   K-PKE.KeyGen: ek (800 bytes), the secret (768).
+: kyek variable ;  : kydk variable ;
+: kypkg ( d ek dkp -- )
+	kydk ! kyek !
+	kyin 20 lit ncpy  2 lit kyin 20 lit + c!  kyin 21 lit kyrs sha3512    \ (rho, sigma) = G(d k)
+	kyrs kymat
+	kyrs 20 lit + 0 lit 3 lit 4 lit kynoise                               \ s
+	kyrs 20 lit + 2 lit 3 lit 6 lit kynoise                               \ e
+	4 lit kyp kyntt  5 lit kyp kyntt  6 lit kyp kyntt  7 lit kyp kyntt
+	2 lit 0 lit do                                                        \ t = Â s + e
+		i 8 lit + kyp kyzero
+		2 lit 0 lit do  j 2 lit * i + kyp  i 4 lit + kyp  j 8 lit + kyp kymacc  loop
+		i 6 lit + kyp  i 8 lit + kyp kyadd
+		i 8 lit + kyp C lit  kyek @ i 180 lit * + kyenc
+		i 4 lit + kyp C lit  kydk @ i 180 lit * + kyenc
+	loop
+	kyrs kyek @ 300 lit + 20 lit ncpy
+;
+
+\ kypenc ( ek m r ct -- )   K-PKE.Encrypt.
+: kym variable ;  : kyr variable ;  : kyct variable ;
+: kypenc ( ek m r ct -- )
+	kyct ! kyr ! kym ! kyek !
+	2 lit 0 lit do kyek @ i 180 lit * + C lit i 8 lit + kyp kydec loop    \ t
+	kyek @ 300 lit + kymat
+	kyr @ 0 lit 3 lit 4 lit kynoise                                       \ y
+	kyr @ 2 lit 2 lit 6 lit kynoise                                       \ e1
+	kyr @ 4 lit 2 lit A lit kyp kycbd                                     \ e2
+	4 lit kyp kyntt  5 lit kyp kyntt
+	2 lit 0 lit do                                                        \ u = NTT^-1(Â^T y) + e1
+		i B lit + kyp kyzero
+		2 lit 0 lit do  i 2 lit * j + kyp  i 4 lit + kyp  j B lit + kyp kymacc  loop
+		i B lit + kyp kyintt  i 6 lit + kyp  i B lit + kyp kyadd
+		i B lit + kyp A lit kycmp  i B lit + kyp A lit  kyct @ i 140 lit * + kyenc
+	loop
+	kym @ 1 lit E lit kyp kydec  E lit kyp 1 lit kydcm                    \ mu
+	D lit kyp kyzero                                                      \ v = NTT^-1(t^T y) + e2 + mu
+	2 lit 0 lit do  i 8 lit + kyp  i 4 lit + kyp  D lit kyp kymacc  loop
+	D lit kyp kyintt  A lit kyp D lit kyp kyadd  E lit kyp D lit kyp kyadd
+	D lit kyp 4 lit kycmp  D lit kyp 4 lit  kyct @ 280 lit + kyenc
+;
+
+\ kypdec ( dkp ct m -- )   K-PKE.Decrypt.
+: kypdec ( dkp ct m -- )
+	kym ! kyct ! kydk !
+	2 lit 0 lit do
+		kyct @ i 140 lit * + A lit i B lit + kyp kydec  i B lit + kyp A lit kydcm
+		kydk @ i 180 lit * + C lit i 4 lit + kyp kydec
+		i B lit + kyp kyntt
+	loop
+	kyct @ 280 lit + 4 lit D lit kyp kydec  D lit kyp 4 lit kydcm
+	F lit kyp kyzero
+	2 lit 0 lit do  i 4 lit + kyp  i B lit + kyp  F lit kyp kymacc  loop
+	F lit kyp kyintt  F lit kyp D lit kyp kysub                           \ w = v - NTT^-1(s^T u)
+	D lit kyp 1 lit kycmp  D lit kyp 1 lit kym @ kyenc
+;
+
+\ ── The KEM (Algorithms 16, 17, 18) ──
+
+: kykeys ( seed ek dk -- )
+	kydk ! kyek !
+	dup kyek @ kydk @ kypkg
+	kyek @ kydk @ 300 lit + 320 lit ncpy                                  \ dk = dk_pke || ek || H(ek) || z
+	kyek @ 320 lit kydk @ 620 lit + sha3256
+	20 lit + kydk @ 640 lit + 20 lit ncpy
+;
+
+\ kyekok ( ek -- ok )   the modulus check: t encodes back to the same bytes.
+: kyctv variable ;  : kyct2 ( -- a )  kyctv 300 lit lazy ;
+: kyekok ( ek -- ok )
+	-1 lit swap
+	2 lit 0 lit do
+		dup i 180 lit * + C lit F lit kyp kydec  F lit kyp C lit kyct2 kyenc
+		dup i 180 lit * + kyct2 180 lit mcmp 0= rot and swap
+	loop drop
+;
+
+: kykey variable ;
+: kyencap ( ek m key ct -- ok )
+	kyct ! kykey ! kym ! kyek !
+	kyek @ kyekok dup if
+		kym @ kyin 20 lit ncpy  kyek @ 320 lit kyin 20 lit + sha3256  kyin 40 lit kyrs sha3512    \ (K, r) = G(m H(ek))
+		kyrs kykey @ 20 lit ncpy
+		kyek @ kym @ kyrs 20 lit + kyct @ kypenc
+	then
+;
+
+\ kydecap: dk's hash check, then m' and a re-encryption; K' if it matches
+\ the ciphertext, else J(z c) -- chosen by a mask, not a branch.
+: kymv variable ;  : kym2 ( -- a )  kymv 20 lit lazy ;
+: kyw variable ;  : kyc0 variable ;  : kyd0 variable ;
+: kydecap ( dk ct key -- ok )
+	kykey ! dup kyc0 ! kyct ! dup kyd0 ! kydk !
+	kydk @ 300 lit + 320 lit kyrs sha3256  kyrs kydk @ 620 lit + 20 lit mcmp 0=  dup if
+		kydk @ kyct @ kym2 kypdec
+		kym2 kyin 20 lit ncpy  kydk @ 620 lit + kyin 20 lit + 20 lit ncpy  kyin 40 lit kyrs sha3512
+		kydk @ 640 lit + kyin 20 lit ncpy  kyct @ kyin 20 lit + 300 lit ncpy             \ Kbar = J(z c)
+		kyin 320 lit kykey @ 20 lit shake256
+		kyd0 @ 300 lit + kym2 kyrs 20 lit + kyct2 kypenc                                 \ c'
+		kyct2 kyc0 @ 300 lit mcmp 0= kyw !                                                \ all ones: c' = c
+		20 lit 0 lit do  kyrs i + c@ kyw @ and  kykey @ i + c@ kyw @ invert and  or  kykey @ i + c!  loop
+	then
+;

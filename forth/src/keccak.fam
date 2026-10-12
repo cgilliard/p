@@ -1,0 +1,921 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/keccak.fam — Keccak (FIPS 202): the permutation Keccak-f[1600], and the
+\ sponge over it -- SHA3-256, SHA3-512, SHAKE128, SHAKE256 -- what Kyber
+\ and Dilithium hash and sample with (src/kyber.fam, src/dilithium.fam).
+\
+\   kperm ( st -- )             the permutation, on 200 bytes
+\   kbeg ( rate pad -- )        start a sponge (rate in bytes; pad 6: SHA3,
+\                               1F: SHAKE)
+\   kabs ( a n -- )             absorb n bytes
+\   kend ( -- )                 pad: from here, squeeze
+\   ksqz ( out n -- )           squeeze n bytes (any number of times)
+\   sha3256 sha3512 ( a n out -- )   a digest of n bytes, at out
+\   shake128 shake256 ( a n out m -- )   m bytes of output
+\ One sponge at a time (kst): a caller that needs two keeps one's output.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ kf1600 ( st rc scratch -- )   the 24 rounds: src/keccak.S (written by
+\        tools/keccak_s.py), assembled by tools/s2words.py.
+: kf1600 ( st rc scratch -- )
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+1301C100 ,   \ addi sp,sp,12
+93068001 ,   \ addi a3,zero,24
+83220500 ,   \ lw t0,0(a0)
+03234500 ,   \ lw t1,4(a0)
+83238502 ,   \ lw t2,40(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C502 ,   \ lw t2,44(a0)
+33437300 ,   \ xor t1,t1,t2
+83230505 ,   \ lw t2,80(a0)
+B3C27200 ,   \ xor t0,t0,t2
+83234505 ,   \ lw t2,84(a0)
+33437300 ,   \ xor t1,t1,t2
+83238507 ,   \ lw t2,120(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C507 ,   \ lw t2,124(a0)
+33437300 ,   \ xor t1,t1,t2
+8323050A ,   \ lw t2,160(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323450A ,   \ lw t2,164(a0)
+33437300 ,   \ xor t1,t1,t2
+2324560C ,   \ sw t0,200(a2)
+2326660C ,   \ sw t1,204(a2)
+83228500 ,   \ lw t0,8(a0)
+0323C500 ,   \ lw t1,12(a0)
+83230503 ,   \ lw t2,48(a0)
+B3C27200 ,   \ xor t0,t0,t2
+83234503 ,   \ lw t2,52(a0)
+33437300 ,   \ xor t1,t1,t2
+83238505 ,   \ lw t2,88(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C505 ,   \ lw t2,92(a0)
+33437300 ,   \ xor t1,t1,t2
+83230508 ,   \ lw t2,128(a0)
+B3C27200 ,   \ xor t0,t0,t2
+83234508 ,   \ lw t2,132(a0)
+33437300 ,   \ xor t1,t1,t2
+8323850A ,   \ lw t2,168(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C50A ,   \ lw t2,172(a0)
+33437300 ,   \ xor t1,t1,t2
+2328560C ,   \ sw t0,208(a2)
+232A660C ,   \ sw t1,212(a2)
+83220501 ,   \ lw t0,16(a0)
+03234501 ,   \ lw t1,20(a0)
+83238503 ,   \ lw t2,56(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C503 ,   \ lw t2,60(a0)
+33437300 ,   \ xor t1,t1,t2
+83230506 ,   \ lw t2,96(a0)
+B3C27200 ,   \ xor t0,t0,t2
+83234506 ,   \ lw t2,100(a0)
+33437300 ,   \ xor t1,t1,t2
+83238508 ,   \ lw t2,136(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C508 ,   \ lw t2,140(a0)
+33437300 ,   \ xor t1,t1,t2
+8323050B ,   \ lw t2,176(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323450B ,   \ lw t2,180(a0)
+33437300 ,   \ xor t1,t1,t2
+232C560C ,   \ sw t0,216(a2)
+232E660C ,   \ sw t1,220(a2)
+83228501 ,   \ lw t0,24(a0)
+0323C501 ,   \ lw t1,28(a0)
+83230504 ,   \ lw t2,64(a0)
+B3C27200 ,   \ xor t0,t0,t2
+83234504 ,   \ lw t2,68(a0)
+33437300 ,   \ xor t1,t1,t2
+83238506 ,   \ lw t2,104(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C506 ,   \ lw t2,108(a0)
+33437300 ,   \ xor t1,t1,t2
+83230509 ,   \ lw t2,144(a0)
+B3C27200 ,   \ xor t0,t0,t2
+83234509 ,   \ lw t2,148(a0)
+33437300 ,   \ xor t1,t1,t2
+8323850B ,   \ lw t2,184(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C50B ,   \ lw t2,188(a0)
+33437300 ,   \ xor t1,t1,t2
+2320560E ,   \ sw t0,224(a2)
+2322660E ,   \ sw t1,228(a2)
+83220502 ,   \ lw t0,32(a0)
+03234502 ,   \ lw t1,36(a0)
+83238504 ,   \ lw t2,72(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C504 ,   \ lw t2,76(a0)
+33437300 ,   \ xor t1,t1,t2
+83230507 ,   \ lw t2,112(a0)
+B3C27200 ,   \ xor t0,t0,t2
+83234507 ,   \ lw t2,116(a0)
+33437300 ,   \ xor t1,t1,t2
+83238509 ,   \ lw t2,152(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323C509 ,   \ lw t2,156(a0)
+33437300 ,   \ xor t1,t1,t2
+8323050C ,   \ lw t2,192(a0)
+B3C27200 ,   \ xor t0,t0,t2
+8323450C ,   \ lw t2,196(a0)
+33437300 ,   \ xor t1,t1,t2
+2324560E ,   \ sw t0,232(a2)
+2326660E ,   \ sw t1,236(a2)
+8322060D ,   \ lw t0,208(a2)
+0323460D ,   \ lw t1,212(a2)
+93931200 ,   \ slli t2,t0,0x1
+9358F301 ,   \ srli a7,t1,0x1f
+B3E31301 ,   \ or t2,t2,a7
+131E1300 ,   \ slli t3,t1,0x1
+93D8F201 ,   \ srli a7,t0,0x1f
+336E1E01 ,   \ or t3,t3,a7
+032F860E ,   \ lw t5,232(a2)
+832FC60E ,   \ lw t6,236(a2)
+B3C3E301 ,   \ xor t2,t2,t5
+334EFE01 ,   \ xor t3,t3,t6
+832E0500 ,   \ lw t4,0(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2320D501 ,   \ sw t4,0(a0)
+832E4500 ,   \ lw t4,4(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2322D501 ,   \ sw t4,4(a0)
+832E8502 ,   \ lw t4,40(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2324D503 ,   \ sw t4,40(a0)
+832EC502 ,   \ lw t4,44(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2326D503 ,   \ sw t4,44(a0)
+832E0505 ,   \ lw t4,80(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2328D505 ,   \ sw t4,80(a0)
+832E4505 ,   \ lw t4,84(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232AD505 ,   \ sw t4,84(a0)
+832E8507 ,   \ lw t4,120(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+232CD507 ,   \ sw t4,120(a0)
+832EC507 ,   \ lw t4,124(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232ED507 ,   \ sw t4,124(a0)
+832E050A ,   \ lw t4,160(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2320D50B ,   \ sw t4,160(a0)
+832E450A ,   \ lw t4,164(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2322D50B ,   \ sw t4,164(a0)
+8322860D ,   \ lw t0,216(a2)
+0323C60D ,   \ lw t1,220(a2)
+93931200 ,   \ slli t2,t0,0x1
+9358F301 ,   \ srli a7,t1,0x1f
+B3E31301 ,   \ or t2,t2,a7
+131E1300 ,   \ slli t3,t1,0x1
+93D8F201 ,   \ srli a7,t0,0x1f
+336E1E01 ,   \ or t3,t3,a7
+032F860C ,   \ lw t5,200(a2)
+832FC60C ,   \ lw t6,204(a2)
+B3C3E301 ,   \ xor t2,t2,t5
+334EFE01 ,   \ xor t3,t3,t6
+832E8500 ,   \ lw t4,8(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2324D501 ,   \ sw t4,8(a0)
+832EC500 ,   \ lw t4,12(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2326D501 ,   \ sw t4,12(a0)
+832E0503 ,   \ lw t4,48(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2328D503 ,   \ sw t4,48(a0)
+832E4503 ,   \ lw t4,52(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232AD503 ,   \ sw t4,52(a0)
+832E8505 ,   \ lw t4,88(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+232CD505 ,   \ sw t4,88(a0)
+832EC505 ,   \ lw t4,92(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232ED505 ,   \ sw t4,92(a0)
+832E0508 ,   \ lw t4,128(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2320D509 ,   \ sw t4,128(a0)
+832E4508 ,   \ lw t4,132(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2322D509 ,   \ sw t4,132(a0)
+832E850A ,   \ lw t4,168(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2324D50B ,   \ sw t4,168(a0)
+832EC50A ,   \ lw t4,172(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2326D50B ,   \ sw t4,172(a0)
+8322060E ,   \ lw t0,224(a2)
+0323460E ,   \ lw t1,228(a2)
+93931200 ,   \ slli t2,t0,0x1
+9358F301 ,   \ srli a7,t1,0x1f
+B3E31301 ,   \ or t2,t2,a7
+131E1300 ,   \ slli t3,t1,0x1
+93D8F201 ,   \ srli a7,t0,0x1f
+336E1E01 ,   \ or t3,t3,a7
+032F060D ,   \ lw t5,208(a2)
+832F460D ,   \ lw t6,212(a2)
+B3C3E301 ,   \ xor t2,t2,t5
+334EFE01 ,   \ xor t3,t3,t6
+832E0501 ,   \ lw t4,16(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2328D501 ,   \ sw t4,16(a0)
+832E4501 ,   \ lw t4,20(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232AD501 ,   \ sw t4,20(a0)
+832E8503 ,   \ lw t4,56(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+232CD503 ,   \ sw t4,56(a0)
+832EC503 ,   \ lw t4,60(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232ED503 ,   \ sw t4,60(a0)
+832E0506 ,   \ lw t4,96(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2320D507 ,   \ sw t4,96(a0)
+832E4506 ,   \ lw t4,100(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2322D507 ,   \ sw t4,100(a0)
+832E8508 ,   \ lw t4,136(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2324D509 ,   \ sw t4,136(a0)
+832EC508 ,   \ lw t4,140(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2326D509 ,   \ sw t4,140(a0)
+832E050B ,   \ lw t4,176(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2328D50B ,   \ sw t4,176(a0)
+832E450B ,   \ lw t4,180(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232AD50B ,   \ sw t4,180(a0)
+8322860E ,   \ lw t0,232(a2)
+0323C60E ,   \ lw t1,236(a2)
+93931200 ,   \ slli t2,t0,0x1
+9358F301 ,   \ srli a7,t1,0x1f
+B3E31301 ,   \ or t2,t2,a7
+131E1300 ,   \ slli t3,t1,0x1
+93D8F201 ,   \ srli a7,t0,0x1f
+336E1E01 ,   \ or t3,t3,a7
+032F860D ,   \ lw t5,216(a2)
+832FC60D ,   \ lw t6,220(a2)
+B3C3E301 ,   \ xor t2,t2,t5
+334EFE01 ,   \ xor t3,t3,t6
+832E8501 ,   \ lw t4,24(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+232CD501 ,   \ sw t4,24(a0)
+832EC501 ,   \ lw t4,28(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232ED501 ,   \ sw t4,28(a0)
+832E0504 ,   \ lw t4,64(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2320D505 ,   \ sw t4,64(a0)
+832E4504 ,   \ lw t4,68(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2322D505 ,   \ sw t4,68(a0)
+832E8506 ,   \ lw t4,104(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2324D507 ,   \ sw t4,104(a0)
+832EC506 ,   \ lw t4,108(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2326D507 ,   \ sw t4,108(a0)
+832E0509 ,   \ lw t4,144(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2328D509 ,   \ sw t4,144(a0)
+832E4509 ,   \ lw t4,148(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232AD509 ,   \ sw t4,148(a0)
+832E850B ,   \ lw t4,184(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+232CD50B ,   \ sw t4,184(a0)
+832EC50B ,   \ lw t4,188(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232ED50B ,   \ sw t4,188(a0)
+8322860C ,   \ lw t0,200(a2)
+0323C60C ,   \ lw t1,204(a2)
+93931200 ,   \ slli t2,t0,0x1
+9358F301 ,   \ srli a7,t1,0x1f
+B3E31301 ,   \ or t2,t2,a7
+131E1300 ,   \ slli t3,t1,0x1
+93D8F201 ,   \ srli a7,t0,0x1f
+336E1E01 ,   \ or t3,t3,a7
+032F060E ,   \ lw t5,224(a2)
+832F460E ,   \ lw t6,228(a2)
+B3C3E301 ,   \ xor t2,t2,t5
+334EFE01 ,   \ xor t3,t3,t6
+832E0502 ,   \ lw t4,32(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2320D503 ,   \ sw t4,32(a0)
+832E4502 ,   \ lw t4,36(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2322D503 ,   \ sw t4,36(a0)
+832E8504 ,   \ lw t4,72(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2324D505 ,   \ sw t4,72(a0)
+832EC504 ,   \ lw t4,76(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2326D505 ,   \ sw t4,76(a0)
+832E0507 ,   \ lw t4,112(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2328D507 ,   \ sw t4,112(a0)
+832E4507 ,   \ lw t4,116(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232AD507 ,   \ sw t4,116(a0)
+832E8509 ,   \ lw t4,152(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+232CD509 ,   \ sw t4,152(a0)
+832EC509 ,   \ lw t4,156(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+232ED509 ,   \ sw t4,156(a0)
+832E050C ,   \ lw t4,192(a0)
+B3CE7E00 ,   \ xor t4,t4,t2
+2320D50D ,   \ sw t4,192(a0)
+832E450C ,   \ lw t4,196(a0)
+B3CECE01 ,   \ xor t4,t4,t3
+2322D50D ,   \ sw t4,196(a0)
+83220500 ,   \ lw t0,0(a0)
+03234500 ,   \ lw t1,4(a0)
+93830200 ,   \ addi t2,t0,0
+130E0300 ,   \ addi t3,t1,0
+23207600 ,   \ sw t2,0(a2)
+2322C601 ,   \ sw t3,4(a2)
+83228502 ,   \ lw t0,40(a0)
+0323C502 ,   \ lw t1,44(a0)
+93134300 ,   \ slli t2,t1,0x4
+93D8C201 ,   \ srli a7,t0,0x1c
+B3E31301 ,   \ or t2,t2,a7
+139E4200 ,   \ slli t3,t0,0x4
+9358C301 ,   \ srli a7,t1,0x1c
+336E1E01 ,   \ or t3,t3,a7
+23207608 ,   \ sw t2,128(a2)
+2322C609 ,   \ sw t3,132(a2)
+83220505 ,   \ lw t0,80(a0)
+03234505 ,   \ lw t1,84(a0)
+93933200 ,   \ slli t2,t0,0x3
+9358D301 ,   \ srli a7,t1,0x1d
+B3E31301 ,   \ or t2,t2,a7
+131E3300 ,   \ slli t3,t1,0x3
+93D8D201 ,   \ srli a7,t0,0x1d
+336E1E01 ,   \ or t3,t3,a7
+232C7602 ,   \ sw t2,56(a2)
+232EC603 ,   \ sw t3,60(a2)
+83228507 ,   \ lw t0,120(a0)
+0323C507 ,   \ lw t1,124(a0)
+93139300 ,   \ slli t2,t1,0x9
+93D87201 ,   \ srli a7,t0,0x17
+B3E31301 ,   \ or t2,t2,a7
+139E9200 ,   \ slli t3,t0,0x9
+93587301 ,   \ srli a7,t1,0x17
+336E1E01 ,   \ or t3,t3,a7
+232C760A ,   \ sw t2,184(a2)
+232EC60B ,   \ sw t3,188(a2)
+8322050A ,   \ lw t0,160(a0)
+0323450A ,   \ lw t1,164(a0)
+93932201 ,   \ slli t2,t0,0x12
+9358E300 ,   \ srli a7,t1,0xe
+B3E31301 ,   \ or t2,t2,a7
+131E2301 ,   \ slli t3,t1,0x12
+93D8E200 ,   \ srli a7,t0,0xe
+336E1E01 ,   \ or t3,t3,a7
+23287606 ,   \ sw t2,112(a2)
+232AC607 ,   \ sw t3,116(a2)
+83228500 ,   \ lw t0,8(a0)
+0323C500 ,   \ lw t1,12(a0)
+93931200 ,   \ slli t2,t0,0x1
+9358F301 ,   \ srli a7,t1,0x1f
+B3E31301 ,   \ or t2,t2,a7
+131E1300 ,   \ slli t3,t1,0x1
+93D8F201 ,   \ srli a7,t0,0x1f
+336E1E01 ,   \ or t3,t3,a7
+23287604 ,   \ sw t2,80(a2)
+232AC605 ,   \ sw t3,84(a2)
+83220503 ,   \ lw t0,48(a0)
+03234503 ,   \ lw t1,52(a0)
+9313C300 ,   \ slli t2,t1,0xc
+93D84201 ,   \ srli a7,t0,0x14
+B3E31301 ,   \ or t2,t2,a7
+139EC200 ,   \ slli t3,t0,0xc
+93584301 ,   \ srli a7,t1,0x14
+336E1E01 ,   \ or t3,t3,a7
+23247600 ,   \ sw t2,8(a2)
+2326C601 ,   \ sw t3,12(a2)
+83228505 ,   \ lw t0,88(a0)
+0323C505 ,   \ lw t1,92(a0)
+9393A200 ,   \ slli t2,t0,0xa
+93586301 ,   \ srli a7,t1,0x16
+B3E31301 ,   \ or t2,t2,a7
+131EA300 ,   \ slli t3,t1,0xa
+93D86201 ,   \ srli a7,t0,0x16
+336E1E01 ,   \ or t3,t3,a7
+23247608 ,   \ sw t2,136(a2)
+2326C609 ,   \ sw t3,140(a2)
+83220508 ,   \ lw t0,128(a0)
+03234508 ,   \ lw t1,132(a0)
+9313D300 ,   \ slli t2,t1,0xd
+93D83201 ,   \ srli a7,t0,0x13
+B3E31301 ,   \ or t2,t2,a7
+139ED200 ,   \ slli t3,t0,0xd
+93583301 ,   \ srli a7,t1,0x13
+336E1E01 ,   \ or t3,t3,a7
+23207604 ,   \ sw t2,64(a2)
+2322C605 ,   \ sw t3,68(a2)
+8322850A ,   \ lw t0,168(a0)
+0323C50A ,   \ lw t1,172(a0)
+93932200 ,   \ slli t2,t0,0x2
+9358E301 ,   \ srli a7,t1,0x1e
+B3E31301 ,   \ or t2,t2,a7
+131E2300 ,   \ slli t3,t1,0x2
+93D8E201 ,   \ srli a7,t0,0x1e
+336E1E01 ,   \ or t3,t3,a7
+2320760C ,   \ sw t2,192(a2)
+2322C60D ,   \ sw t3,196(a2)
+83220501 ,   \ lw t0,16(a0)
+03234501 ,   \ lw t1,20(a0)
+9313E301 ,   \ slli t2,t1,0x1e
+93D82200 ,   \ srli a7,t0,0x2
+B3E31301 ,   \ or t2,t2,a7
+139EE201 ,   \ slli t3,t0,0x1e
+93582300 ,   \ srli a7,t1,0x2
+336E1E01 ,   \ or t3,t3,a7
+2320760A ,   \ sw t2,160(a2)
+2322C60B ,   \ sw t3,164(a2)
+83228503 ,   \ lw t0,56(a0)
+0323C503 ,   \ lw t1,60(a0)
+93936200 ,   \ slli t2,t0,0x6
+9358A301 ,   \ srli a7,t1,0x1a
+B3E31301 ,   \ or t2,t2,a7
+131E6300 ,   \ slli t3,t1,0x6
+93D8A201 ,   \ srli a7,t0,0x1a
+336E1E01 ,   \ or t3,t3,a7
+232C7604 ,   \ sw t2,88(a2)
+232EC605 ,   \ sw t3,92(a2)
+83220506 ,   \ lw t0,96(a0)
+03234506 ,   \ lw t1,100(a0)
+9313B300 ,   \ slli t2,t1,0xb
+93D85201 ,   \ srli a7,t0,0x15
+B3E31301 ,   \ or t2,t2,a7
+139EB200 ,   \ slli t3,t0,0xb
+93585301 ,   \ srli a7,t1,0x15
+336E1E01 ,   \ or t3,t3,a7
+23287600 ,   \ sw t2,16(a2)
+232AC601 ,   \ sw t3,20(a2)
+83228508 ,   \ lw t0,136(a0)
+0323C508 ,   \ lw t1,140(a0)
+9393F200 ,   \ slli t2,t0,0xf
+93581301 ,   \ srli a7,t1,0x11
+B3E31301 ,   \ or t2,t2,a7
+131EF300 ,   \ slli t3,t1,0xf
+93D81201 ,   \ srli a7,t0,0x11
+336E1E01 ,   \ or t3,t3,a7
+23287608 ,   \ sw t2,144(a2)
+232AC609 ,   \ sw t3,148(a2)
+8322050B ,   \ lw t0,176(a0)
+0323450B ,   \ lw t1,180(a0)
+9313D301 ,   \ slli t2,t1,0x1d
+93D83200 ,   \ srli a7,t0,0x3
+B3E31301 ,   \ or t2,t2,a7
+139ED201 ,   \ slli t3,t0,0x1d
+93583300 ,   \ srli a7,t1,0x3
+336E1E01 ,   \ or t3,t3,a7
+23247604 ,   \ sw t2,72(a2)
+2326C605 ,   \ sw t3,76(a2)
+83228501 ,   \ lw t0,24(a0)
+0323C501 ,   \ lw t1,28(a0)
+9393C201 ,   \ slli t2,t0,0x1c
+93584300 ,   \ srli a7,t1,0x4
+B3E31301 ,   \ or t2,t2,a7
+131EC301 ,   \ slli t3,t1,0x1c
+93D84200 ,   \ srli a7,t0,0x4
+336E1E01 ,   \ or t3,t3,a7
+23247602 ,   \ sw t2,40(a2)
+2326C603 ,   \ sw t3,44(a2)
+83220504 ,   \ lw t0,64(a0)
+03234504 ,   \ lw t1,68(a0)
+93137301 ,   \ slli t2,t1,0x17
+93D89200 ,   \ srli a7,t0,0x9
+B3E31301 ,   \ or t2,t2,a7
+139E7201 ,   \ slli t3,t0,0x17
+93589300 ,   \ srli a7,t1,0x9
+336E1E01 ,   \ or t3,t3,a7
+2324760A ,   \ sw t2,168(a2)
+2326C60B ,   \ sw t3,172(a2)
+83228506 ,   \ lw t0,104(a0)
+0323C506 ,   \ lw t1,108(a0)
+93939201 ,   \ slli t2,t0,0x19
+93587300 ,   \ srli a7,t1,0x7
+B3E31301 ,   \ or t2,t2,a7
+131E9301 ,   \ slli t3,t1,0x19
+93D87200 ,   \ srli a7,t0,0x7
+336E1E01 ,   \ or t3,t3,a7
+23207606 ,   \ sw t2,96(a2)
+2322C607 ,   \ sw t3,100(a2)
+83220509 ,   \ lw t0,144(a0)
+03234509 ,   \ lw t1,148(a0)
+93935201 ,   \ slli t2,t0,0x15
+9358B300 ,   \ srli a7,t1,0xb
+B3E31301 ,   \ or t2,t2,a7
+131E5301 ,   \ slli t3,t1,0x15
+93D8B200 ,   \ srli a7,t0,0xb
+336E1E01 ,   \ or t3,t3,a7
+232C7600 ,   \ sw t2,24(a2)
+232EC601 ,   \ sw t3,28(a2)
+8322850B ,   \ lw t0,184(a0)
+0323C50B ,   \ lw t1,188(a0)
+93138301 ,   \ slli t2,t1,0x18
+93D88200 ,   \ srli a7,t0,0x8
+B3E31301 ,   \ or t2,t2,a7
+139E8201 ,   \ slli t3,t0,0x18
+93588300 ,   \ srli a7,t1,0x8
+336E1E01 ,   \ or t3,t3,a7
+232C7608 ,   \ sw t2,152(a2)
+232EC609 ,   \ sw t3,156(a2)
+83220502 ,   \ lw t0,32(a0)
+03234502 ,   \ lw t1,36(a0)
+9393B201 ,   \ slli t2,t0,0x1b
+93585300 ,   \ srli a7,t1,0x5
+B3E31301 ,   \ or t2,t2,a7
+131EB301 ,   \ slli t3,t1,0x1b
+93D85200 ,   \ srli a7,t0,0x5
+336E1E01 ,   \ or t3,t3,a7
+232C7606 ,   \ sw t2,120(a2)
+232EC607 ,   \ sw t3,124(a2)
+83228504 ,   \ lw t0,72(a0)
+0323C504 ,   \ lw t1,76(a0)
+93934201 ,   \ slli t2,t0,0x14
+9358C300 ,   \ srli a7,t1,0xc
+B3E31301 ,   \ or t2,t2,a7
+131E4301 ,   \ slli t3,t1,0x14
+93D8C200 ,   \ srli a7,t0,0xc
+336E1E01 ,   \ or t3,t3,a7
+23287602 ,   \ sw t2,48(a2)
+232AC603 ,   \ sw t3,52(a2)
+83220507 ,   \ lw t0,112(a0)
+03234507 ,   \ lw t1,116(a0)
+93137300 ,   \ slli t2,t1,0x7
+93D89201 ,   \ srli a7,t0,0x19
+B3E31301 ,   \ or t2,t2,a7
+139E7200 ,   \ slli t3,t0,0x7
+93589301 ,   \ srli a7,t1,0x19
+336E1E01 ,   \ or t3,t3,a7
+2328760A ,   \ sw t2,176(a2)
+232AC60B ,   \ sw t3,180(a2)
+83228509 ,   \ lw t0,152(a0)
+0323C509 ,   \ lw t1,156(a0)
+93938200 ,   \ slli t2,t0,0x8
+93588301 ,   \ srli a7,t1,0x18
+B3E31301 ,   \ or t2,t2,a7
+131E8300 ,   \ slli t3,t1,0x8
+93D88201 ,   \ srli a7,t0,0x18
+336E1E01 ,   \ or t3,t3,a7
+23247606 ,   \ sw t2,104(a2)
+2326C607 ,   \ sw t3,108(a2)
+8322050C ,   \ lw t0,192(a0)
+0323450C ,   \ lw t1,196(a0)
+9393E200 ,   \ slli t2,t0,0xe
+93582301 ,   \ srli a7,t1,0x12
+B3E31301 ,   \ or t2,t2,a7
+131EE300 ,   \ slli t3,t1,0xe
+93D82201 ,   \ srli a7,t0,0x12
+336E1E01 ,   \ or t3,t3,a7
+23207602 ,   \ sw t2,32(a2)
+2322C603 ,   \ sw t3,36(a2)
+83220600 ,   \ lw t0,0(a2)
+03234600 ,   \ lw t1,4(a2)
+83238600 ,   \ lw t2,8(a2)
+032EC600 ,   \ lw t3,12(a2)
+832E0601 ,   \ lw t4,16(a2)
+032F4601 ,   \ lw t5,20(a2)
+832F8601 ,   \ lw t6,24(a2)
+0327C601 ,   \ lw a4,28(a2)
+83270602 ,   \ lw a5,32(a2)
+03284602 ,   \ lw a6,36(a2)
+93C8F3FF ,   \ xori a7,t2,-1
+B3F8D801 ,   \ and a7,a7,t4
+B3C85800 ,   \ xor a7,a7,t0
+23201501 ,   \ sw a7,0(a0)
+9348FEFF ,   \ xori a7,t3,-1
+B3F8E801 ,   \ and a7,a7,t5
+B3C86800 ,   \ xor a7,a7,t1
+23221501 ,   \ sw a7,4(a0)
+93C8FEFF ,   \ xori a7,t4,-1
+B3F8F801 ,   \ and a7,a7,t6
+B3C87800 ,   \ xor a7,a7,t2
+23241501 ,   \ sw a7,8(a0)
+9348FFFF ,   \ xori a7,t5,-1
+B3F8E800 ,   \ and a7,a7,a4
+B3C8C801 ,   \ xor a7,a7,t3
+23261501 ,   \ sw a7,12(a0)
+93C8FFFF ,   \ xori a7,t6,-1
+B3F8F800 ,   \ and a7,a7,a5
+B3C8D801 ,   \ xor a7,a7,t4
+23281501 ,   \ sw a7,16(a0)
+9348F7FF ,   \ xori a7,a4,-1
+B3F80801 ,   \ and a7,a7,a6
+B3C8E801 ,   \ xor a7,a7,t5
+232A1501 ,   \ sw a7,20(a0)
+93C8F7FF ,   \ xori a7,a5,-1
+B3F85800 ,   \ and a7,a7,t0
+B3C8F801 ,   \ xor a7,a7,t6
+232C1501 ,   \ sw a7,24(a0)
+9348F8FF ,   \ xori a7,a6,-1
+B3F86800 ,   \ and a7,a7,t1
+B3C8E800 ,   \ xor a7,a7,a4
+232E1501 ,   \ sw a7,28(a0)
+93C8F2FF ,   \ xori a7,t0,-1
+B3F87800 ,   \ and a7,a7,t2
+B3C8F800 ,   \ xor a7,a7,a5
+23201503 ,   \ sw a7,32(a0)
+9348F3FF ,   \ xori a7,t1,-1
+B3F8C801 ,   \ and a7,a7,t3
+B3C80801 ,   \ xor a7,a7,a6
+23221503 ,   \ sw a7,36(a0)
+83228602 ,   \ lw t0,40(a2)
+0323C602 ,   \ lw t1,44(a2)
+83230603 ,   \ lw t2,48(a2)
+032E4603 ,   \ lw t3,52(a2)
+832E8603 ,   \ lw t4,56(a2)
+032FC603 ,   \ lw t5,60(a2)
+832F0604 ,   \ lw t6,64(a2)
+03274604 ,   \ lw a4,68(a2)
+83278604 ,   \ lw a5,72(a2)
+0328C604 ,   \ lw a6,76(a2)
+93C8F3FF ,   \ xori a7,t2,-1
+B3F8D801 ,   \ and a7,a7,t4
+B3C85800 ,   \ xor a7,a7,t0
+23241503 ,   \ sw a7,40(a0)
+9348FEFF ,   \ xori a7,t3,-1
+B3F8E801 ,   \ and a7,a7,t5
+B3C86800 ,   \ xor a7,a7,t1
+23261503 ,   \ sw a7,44(a0)
+93C8FEFF ,   \ xori a7,t4,-1
+B3F8F801 ,   \ and a7,a7,t6
+B3C87800 ,   \ xor a7,a7,t2
+23281503 ,   \ sw a7,48(a0)
+9348FFFF ,   \ xori a7,t5,-1
+B3F8E800 ,   \ and a7,a7,a4
+B3C8C801 ,   \ xor a7,a7,t3
+232A1503 ,   \ sw a7,52(a0)
+93C8FFFF ,   \ xori a7,t6,-1
+B3F8F800 ,   \ and a7,a7,a5
+B3C8D801 ,   \ xor a7,a7,t4
+232C1503 ,   \ sw a7,56(a0)
+9348F7FF ,   \ xori a7,a4,-1
+B3F80801 ,   \ and a7,a7,a6
+B3C8E801 ,   \ xor a7,a7,t5
+232E1503 ,   \ sw a7,60(a0)
+93C8F7FF ,   \ xori a7,a5,-1
+B3F85800 ,   \ and a7,a7,t0
+B3C8F801 ,   \ xor a7,a7,t6
+23201505 ,   \ sw a7,64(a0)
+9348F8FF ,   \ xori a7,a6,-1
+B3F86800 ,   \ and a7,a7,t1
+B3C8E800 ,   \ xor a7,a7,a4
+23221505 ,   \ sw a7,68(a0)
+93C8F2FF ,   \ xori a7,t0,-1
+B3F87800 ,   \ and a7,a7,t2
+B3C8F800 ,   \ xor a7,a7,a5
+23241505 ,   \ sw a7,72(a0)
+9348F3FF ,   \ xori a7,t1,-1
+B3F8C801 ,   \ and a7,a7,t3
+B3C80801 ,   \ xor a7,a7,a6
+23261505 ,   \ sw a7,76(a0)
+83220605 ,   \ lw t0,80(a2)
+03234605 ,   \ lw t1,84(a2)
+83238605 ,   \ lw t2,88(a2)
+032EC605 ,   \ lw t3,92(a2)
+832E0606 ,   \ lw t4,96(a2)
+032F4606 ,   \ lw t5,100(a2)
+832F8606 ,   \ lw t6,104(a2)
+0327C606 ,   \ lw a4,108(a2)
+83270607 ,   \ lw a5,112(a2)
+03284607 ,   \ lw a6,116(a2)
+93C8F3FF ,   \ xori a7,t2,-1
+B3F8D801 ,   \ and a7,a7,t4
+B3C85800 ,   \ xor a7,a7,t0
+23281505 ,   \ sw a7,80(a0)
+9348FEFF ,   \ xori a7,t3,-1
+B3F8E801 ,   \ and a7,a7,t5
+B3C86800 ,   \ xor a7,a7,t1
+232A1505 ,   \ sw a7,84(a0)
+93C8FEFF ,   \ xori a7,t4,-1
+B3F8F801 ,   \ and a7,a7,t6
+B3C87800 ,   \ xor a7,a7,t2
+232C1505 ,   \ sw a7,88(a0)
+9348FFFF ,   \ xori a7,t5,-1
+B3F8E800 ,   \ and a7,a7,a4
+B3C8C801 ,   \ xor a7,a7,t3
+232E1505 ,   \ sw a7,92(a0)
+93C8FFFF ,   \ xori a7,t6,-1
+B3F8F800 ,   \ and a7,a7,a5
+B3C8D801 ,   \ xor a7,a7,t4
+23201507 ,   \ sw a7,96(a0)
+9348F7FF ,   \ xori a7,a4,-1
+B3F80801 ,   \ and a7,a7,a6
+B3C8E801 ,   \ xor a7,a7,t5
+23221507 ,   \ sw a7,100(a0)
+93C8F7FF ,   \ xori a7,a5,-1
+B3F85800 ,   \ and a7,a7,t0
+B3C8F801 ,   \ xor a7,a7,t6
+23241507 ,   \ sw a7,104(a0)
+9348F8FF ,   \ xori a7,a6,-1
+B3F86800 ,   \ and a7,a7,t1
+B3C8E800 ,   \ xor a7,a7,a4
+23261507 ,   \ sw a7,108(a0)
+93C8F2FF ,   \ xori a7,t0,-1
+B3F87800 ,   \ and a7,a7,t2
+B3C8F800 ,   \ xor a7,a7,a5
+23281507 ,   \ sw a7,112(a0)
+9348F3FF ,   \ xori a7,t1,-1
+B3F8C801 ,   \ and a7,a7,t3
+B3C80801 ,   \ xor a7,a7,a6
+232A1507 ,   \ sw a7,116(a0)
+83228607 ,   \ lw t0,120(a2)
+0323C607 ,   \ lw t1,124(a2)
+83230608 ,   \ lw t2,128(a2)
+032E4608 ,   \ lw t3,132(a2)
+832E8608 ,   \ lw t4,136(a2)
+032FC608 ,   \ lw t5,140(a2)
+832F0609 ,   \ lw t6,144(a2)
+03274609 ,   \ lw a4,148(a2)
+83278609 ,   \ lw a5,152(a2)
+0328C609 ,   \ lw a6,156(a2)
+93C8F3FF ,   \ xori a7,t2,-1
+B3F8D801 ,   \ and a7,a7,t4
+B3C85800 ,   \ xor a7,a7,t0
+232C1507 ,   \ sw a7,120(a0)
+9348FEFF ,   \ xori a7,t3,-1
+B3F8E801 ,   \ and a7,a7,t5
+B3C86800 ,   \ xor a7,a7,t1
+232E1507 ,   \ sw a7,124(a0)
+93C8FEFF ,   \ xori a7,t4,-1
+B3F8F801 ,   \ and a7,a7,t6
+B3C87800 ,   \ xor a7,a7,t2
+23201509 ,   \ sw a7,128(a0)
+9348FFFF ,   \ xori a7,t5,-1
+B3F8E800 ,   \ and a7,a7,a4
+B3C8C801 ,   \ xor a7,a7,t3
+23221509 ,   \ sw a7,132(a0)
+93C8FFFF ,   \ xori a7,t6,-1
+B3F8F800 ,   \ and a7,a7,a5
+B3C8D801 ,   \ xor a7,a7,t4
+23241509 ,   \ sw a7,136(a0)
+9348F7FF ,   \ xori a7,a4,-1
+B3F80801 ,   \ and a7,a7,a6
+B3C8E801 ,   \ xor a7,a7,t5
+23261509 ,   \ sw a7,140(a0)
+93C8F7FF ,   \ xori a7,a5,-1
+B3F85800 ,   \ and a7,a7,t0
+B3C8F801 ,   \ xor a7,a7,t6
+23281509 ,   \ sw a7,144(a0)
+9348F8FF ,   \ xori a7,a6,-1
+B3F86800 ,   \ and a7,a7,t1
+B3C8E800 ,   \ xor a7,a7,a4
+232A1509 ,   \ sw a7,148(a0)
+93C8F2FF ,   \ xori a7,t0,-1
+B3F87800 ,   \ and a7,a7,t2
+B3C8F800 ,   \ xor a7,a7,a5
+232C1509 ,   \ sw a7,152(a0)
+9348F3FF ,   \ xori a7,t1,-1
+B3F8C801 ,   \ and a7,a7,t3
+B3C80801 ,   \ xor a7,a7,a6
+232E1509 ,   \ sw a7,156(a0)
+8322060A ,   \ lw t0,160(a2)
+0323460A ,   \ lw t1,164(a2)
+8323860A ,   \ lw t2,168(a2)
+032EC60A ,   \ lw t3,172(a2)
+832E060B ,   \ lw t4,176(a2)
+032F460B ,   \ lw t5,180(a2)
+832F860B ,   \ lw t6,184(a2)
+0327C60B ,   \ lw a4,188(a2)
+8327060C ,   \ lw a5,192(a2)
+0328460C ,   \ lw a6,196(a2)
+93C8F3FF ,   \ xori a7,t2,-1
+B3F8D801 ,   \ and a7,a7,t4
+B3C85800 ,   \ xor a7,a7,t0
+2320150B ,   \ sw a7,160(a0)
+9348FEFF ,   \ xori a7,t3,-1
+B3F8E801 ,   \ and a7,a7,t5
+B3C86800 ,   \ xor a7,a7,t1
+2322150B ,   \ sw a7,164(a0)
+93C8FEFF ,   \ xori a7,t4,-1
+B3F8F801 ,   \ and a7,a7,t6
+B3C87800 ,   \ xor a7,a7,t2
+2324150B ,   \ sw a7,168(a0)
+9348FFFF ,   \ xori a7,t5,-1
+B3F8E800 ,   \ and a7,a7,a4
+B3C8C801 ,   \ xor a7,a7,t3
+2326150B ,   \ sw a7,172(a0)
+93C8FFFF ,   \ xori a7,t6,-1
+B3F8F800 ,   \ and a7,a7,a5
+B3C8D801 ,   \ xor a7,a7,t4
+2328150B ,   \ sw a7,176(a0)
+9348F7FF ,   \ xori a7,a4,-1
+B3F80801 ,   \ and a7,a7,a6
+B3C8E801 ,   \ xor a7,a7,t5
+232A150B ,   \ sw a7,180(a0)
+93C8F7FF ,   \ xori a7,a5,-1
+B3F85800 ,   \ and a7,a7,t0
+B3C8F801 ,   \ xor a7,a7,t6
+232C150B ,   \ sw a7,184(a0)
+9348F8FF ,   \ xori a7,a6,-1
+B3F86800 ,   \ and a7,a7,t1
+B3C8E800 ,   \ xor a7,a7,a4
+232E150B ,   \ sw a7,188(a0)
+93C8F2FF ,   \ xori a7,t0,-1
+B3F87800 ,   \ and a7,a7,t2
+B3C8F800 ,   \ xor a7,a7,a5
+2320150D ,   \ sw a7,192(a0)
+9348F3FF ,   \ xori a7,t1,-1
+B3F8C801 ,   \ and a7,a7,t3
+B3C80801 ,   \ xor a7,a7,a6
+2322150D ,   \ sw a7,196(a0)
+83A20500 ,   \ lw t0,0(a1)
+03A34500 ,   \ lw t1,4(a1)
+83230500 ,   \ lw t2,0(a0)
+B3C35300 ,   \ xor t2,t2,t0
+23207500 ,   \ sw t2,0(a0)
+83234500 ,   \ lw t2,4(a0)
+B3C36300 ,   \ xor t2,t2,t1
+23227500 ,   \ sw t2,4(a0)
+93858500 ,   \ addi a1,a1,8
+9386F6FF ,   \ addi a3,a3,-1
+63840600 ,   \ beq a3,zero,cdc <done>
+6FF0CFB3 ,   \ jal zero,14 <round>
+;
+
+\ The round constants (24 lanes), made once.
+: krcv variable ;
+: krc ( -- a )
+	krcv @ 0= if
+		C0 lit alloc krcv !
+	1 lit krcv @ 0 lit + !  0 lit krcv @ 4 lit + !
+	8082 lit krcv @ 8 lit + !  0 lit krcv @ C lit + !
+	808A lit krcv @ 10 lit + !  80000000 lit krcv @ 14 lit + !
+	80008000 lit krcv @ 18 lit + !  80000000 lit krcv @ 1C lit + !
+	808B lit krcv @ 20 lit + !  0 lit krcv @ 24 lit + !
+	80000001 lit krcv @ 28 lit + !  0 lit krcv @ 2C lit + !
+	80008081 lit krcv @ 30 lit + !  80000000 lit krcv @ 34 lit + !
+	8009 lit krcv @ 38 lit + !  80000000 lit krcv @ 3C lit + !
+	8A lit krcv @ 40 lit + !  0 lit krcv @ 44 lit + !
+	88 lit krcv @ 48 lit + !  0 lit krcv @ 4C lit + !
+	80008009 lit krcv @ 50 lit + !  0 lit krcv @ 54 lit + !
+	8000000A lit krcv @ 58 lit + !  0 lit krcv @ 5C lit + !
+	8000808B lit krcv @ 60 lit + !  0 lit krcv @ 64 lit + !
+	8B lit krcv @ 68 lit + !  80000000 lit krcv @ 6C lit + !
+	8089 lit krcv @ 70 lit + !  80000000 lit krcv @ 74 lit + !
+	8003 lit krcv @ 78 lit + !  80000000 lit krcv @ 7C lit + !
+	8002 lit krcv @ 80 lit + !  80000000 lit krcv @ 84 lit + !
+	80 lit krcv @ 88 lit + !  80000000 lit krcv @ 8C lit + !
+	800A lit krcv @ 90 lit + !  0 lit krcv @ 94 lit + !
+	8000000A lit krcv @ 98 lit + !  80000000 lit krcv @ 9C lit + !
+	80008081 lit krcv @ A0 lit + !  80000000 lit krcv @ A4 lit + !
+	8080 lit krcv @ A8 lit + !  80000000 lit krcv @ AC lit + !
+	80000001 lit krcv @ B0 lit + !  0 lit krcv @ B4 lit + !
+	80008008 lit krcv @ B8 lit + !  80000000 lit krcv @ BC lit + !
+	then
+	krcv @
+;
+: kscrv variable ;  : kscr ( -- a )  kscrv F0 lit lazy ;
+
+: kperm ( st -- )   krc kscr kf1600 ;
+
+\ ── The sponge ──
+
+: kstv variable ;  : kst ( -- a )  kstv C8 lit lazy ;
+: krate variable ;  : kpos variable ;  : kpad variable ;
+
+: kbeg ( rate pad -- )   kpad ! krate !  0 lit kpos !  kst C8 lit nzero ;
+
+\ kabs ( a n -- )   each byte xored into the rate; a full rate, permuted.
+: kabs ( a n -- )
+	?dup if 0 lit do
+		dup i + c@  kst kpos @ + dup c@ rot xor swap c!
+		kpos @ 1 lit + dup kpos !  krate @ = if kst kperm 0 lit kpos ! then
+	loop then drop
+;
+
+\ kend ( -- )   the padding (pad byte, then 0x80 at the rate's end), and the
+\        first permutation of the squeeze.
+: kend ( -- )
+	kst kpos @ + dup c@ kpad @ xor swap c!
+	kst krate @ + 1 lit - dup c@ 80 lit xor swap c!
+	kst kperm  0 lit kpos !
+;
+
+\ ksqz ( out n -- )   n bytes of output, a rate's worth at a time.
+: kso variable ;  : ksn variable ;  : ksk variable ;
+: ksqz ( out n -- )
+	ksn ! kso !
+	begin ksn @ while
+		krate @ kpos @ -  ksn @ over u< if drop ksn @ then ksk !
+		kst kpos @ +  kso @  ksk @ ncpy
+		kso @ ksk @ + kso !  ksn @ ksk @ - ksn !  kpos @ ksk @ + kpos !
+		kpos @ krate @ = if kst kperm 0 lit kpos ! then
+	repeat
+;
+
+: kout variable ;
+: sha3256 ( a n out -- )   kout !  88 lit 6 lit kbeg kabs kend  kout @ 20 lit ksqz ;
+: sha3512 ( a n out -- )   kout !  48 lit 6 lit kbeg kabs kend  kout @ 40 lit ksqz ;
+: kom variable ;
+: shake128 ( a n out m -- )   kom ! kout !  A8 lit 1F lit kbeg kabs kend  kout @ kom @ ksqz ;
+: shake256 ( a n out m -- )   kom ! kout !  88 lit 1F lit kbeg kabs kend  kout @ kom @ ksqz ;

@@ -1,0 +1,146 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/address.fam — the wallet's payment address: where others send it slates,
+\ through the gateways.  Its keys come from the wallet's seed (so the backup
+\ words, and passphrase, give the same address in any wallet):
+\   Kyber-512's (d, z) = SHAKE256("tabernacle-kyber-v1" ‖ seed ‖ index, 64)
+\   Dilithium2's xi    = SHAKE256("tabernacle-dilithium-v1" ‖ seed ‖ index, 32)
+\ the index a little-endian u32 (0: one address a wallet, for now).  The
+\ address is SHA3-256(Kyber's public key ‖ Dilithium's), written in Bech32m
+\ (BIP 350): the network ("tab" main, "tabdev" dev), "1", a version (1),
+\ the 32 bytes, a checksum -- 63 characters on the main network.
+\
+\   pakeys ( -- )          the keys, made from the seed (once; the wallet open)
+\   paaddr ( out -- n )    the address, as text
+\   pahash ( a n out -- ok )   an address's 32 bytes, if it's valid text for
+\                          this network
+\ ──────────────────────────────────────────────────────────────────────────────
+
+\ ── Bech32m (BIP 350) ──
+
+: bmset ( -- s )   "qpzry9x8gf2tvdw0s3jn54khce6mua7l" ;
+: bmc variable ;
+\ bmpoly ( v -- )   one 5-bit value into the checksum (bmc).
+: bmpoly ( v -- )
+	bmc @ 19 lit rshift  bmc @ 1FFFFFF lit and 5 lit lshift rot xor bmc !
+	dup 1 lit and if bmc @ 3B6A57B2 lit xor bmc ! then
+	dup 2 lit and if bmc @ 26508E6D lit xor bmc ! then
+	dup 4 lit and if bmc @ 1EA119FA lit xor bmc ! then
+	dup 8 lit and if bmc @ 3D4233DD lit xor bmc ! then
+	10 lit and if bmc @ 2A1462B3 lit xor bmc ! then
+;
+\ bmhrp ( s -- )   the prefix, expanded: each character's high bits, 0, the low.
+: bmhrp ( s -- )
+	dup strlen 0 lit do dup i + c@ 5 lit rshift bmpoly loop
+	0 lit bmpoly
+	dup strlen 0 lit do dup i + c@ 1F lit and bmpoly loop drop
+;
+: bmconst ( -- k )   2BC830A3 lit ;
+
+\ bm5 ( a n out -- m )   n bytes as 5-bit values (big-endian bits), padded.
+: bmacc variable ;  : bmbits variable ;  : bmo variable ;  : bmm variable ;
+: bm5 ( a n out -- m )
+	bmo !  0 lit bmacc !  0 lit bmbits !  0 lit bmm !
+	0 lit do
+		bmacc @ 8 lit lshift over i + c@ or bmacc !  bmbits @ 8 lit + bmbits !
+		begin bmbits @ 4 lit u> while
+			bmbits @ 5 lit - bmbits !  bmacc @ bmbits @ rshift 1F lit and  bmo @ bmm @ + c!  bmm @ 1 lit + bmm !
+		repeat
+	loop drop
+	bmbits @ if bmacc @ 5 lit bmbits @ - lshift 1F lit and  bmo @ bmm @ + c!  bmm @ 1 lit + bmm ! then
+	bmm @
+;
+
+\ bmenc ( hrp d m out -- n )   hrp "1" the m 5-bit values, then the checksum.
+: bmd variable ;  : bmn variable ;
+: bmenc ( hrp d m out -- n )
+	bmo ! bmm ! bmd !  1 lit bmc !
+	dup bmhrp  dup strlen bmn !  bmo @ bmn @ ncpy
+	31 lit bmo @ bmn @ + c!  bmn @ 1 lit + bmn !
+	bmm @ 0 lit do bmd @ i + c@ dup bmpoly  bmset + c@ bmo @ bmn @ + c!  bmn @ 1 lit + bmn ! loop
+	6 lit 0 lit do 0 lit bmpoly loop  bmc @ bmconst xor bmc !
+	6 lit 0 lit do bmc @ 5 lit i - 5 lit * rshift 1F lit and bmset + c@ bmo @ bmn @ + c!  bmn @ 1 lit + bmn ! loop
+	bmn @
+;
+
+\ bmdec ( hrp a n d -- m | -1 )   a Bech32m string's 5-bit values (not the
+\        checksum) at d: -1 unless it has the prefix (any case, not mixed),
+\        a valid checksum and only Bech32 characters.
+: bmval ( c -- v | -1 )
+	dup 41 lit u< 0= over 5B lit u< and if 20 lit or then                  \ upper case: as lower
+	-1 lit swap  20 lit 0 lit do dup bmset i + c@ = if nip i swap then loop drop
+;
+: bmup variable ;  : bmlo variable ;  : bmok variable ;  : bma variable ;  : bmh variable ;
+: bmdec ( hrp a n d -- m )
+	bmd ! bmn ! bma ! bmh !  -1 lit bmok !  0 lit bmup !  0 lit bmlo !
+	bmn @ 0 lit do bma @ i + c@ dup 41 lit u< 0= over 5B lit u< and if -1 lit bmup ! then 60 lit u> if -1 lit bmlo ! then loop
+	bmup @ bmlo @ and if 0 lit bmok ! then
+	bmn @ bmh @ strlen 7 lit + u< if 0 lit bmok ! then
+	bmok @ if
+		bmh @ strlen 0 lit do bma @ i + c@ 20 lit or bmh @ i + c@ <> if 0 lit bmok ! then loop
+		bma @ bmh @ strlen + c@ 31 lit <> if 0 lit bmok ! then
+	then
+	bmok @ if
+		1 lit bmc !  bmh @ bmhrp
+		bmn @ bmh @ strlen 1 lit + do
+			bma @ i + c@ bmval dup 0< if drop 0 lit bmok ! else dup bmpoly  bmd @ i bmh @ strlen - 1 lit - + c! then
+		loop
+		bmc @ bmconst <> if 0 lit bmok ! then
+	then
+	bmok @ if bmn @ bmh @ strlen - 1 lit - 6 lit - else -1 lit then
+;
+
+\ bm8 ( d m out -- n ok )   5-bit values back to bytes: ok if the padding is
+\        under 5 bits and zero.
+: bm8 ( d m out -- n ok )
+	bmo !  0 lit bmacc !  0 lit bmbits !  0 lit bmm !
+	0 lit do
+		bmacc @ 5 lit lshift over i + c@ or bmacc !  bmbits @ 5 lit + bmbits !
+		bmbits @ 7 lit u> if
+			bmbits @ 8 lit - bmbits !  bmacc @ bmbits @ rshift FF lit and  bmo @ bmm @ + c!  bmm @ 1 lit + bmm !
+		then
+	loop drop
+	bmm @  bmbits @ 5 lit u<  bmacc @ 1 lit bmbits @ lshift 1 lit - and 0= and
+;
+
+\ ── The keys and the address ──
+
+: paekv variable ;  : paek ( -- a )  paekv 320 lit lazy ;   \ Kyber's public key
+: padkv variable ;  : padk ( -- a )  padkv 660 lit lazy ;   \ its secret key
+: papkv variable ;  : papk ( -- a )  papkv 520 lit lazy ;   \ Dilithium's public key
+: paskv variable ;  : pask ( -- a )  paskv A00 lit lazy ;   \ its secret key
+: paidv variable ;  : paid ( -- a )  paidv 20 lit lazy ;    \ the address's 32 bytes
+: paok variable ;   \ the keys are made
+: pabv variable ;  : pab ( -- a )  pabv 60 lit lazy ;      \ a seed being made
+
+\ pader ( s n out m -- )   SHAKE256(s ‖ the seed ‖ 0 as a u32, m bytes).
+: pam variable ;  : pao variable ;
+: pader ( s n out m -- )
+	pam ! pao !  88 lit 1F lit kbeg kabs  wlseed 20 lit kabs  pab 4 lit nzero  pab 4 lit kabs  kend  pao @ pam @ ksqz
+;
+
+: pakeys ( -- )
+	paok @ 0= if
+		"tabernacle-kyber-v1" 13 lit pab 40 lit pader  pab paek padk kykeys
+		"tabernacle-dilithium-v1" 17 lit pab 20 lit pader  pab papk pask dikeys
+		88 lit 6 lit kbeg  paek 320 lit kabs  papk 520 lit kabs  kend  paid 20 lit ksqz
+		-1 lit paok !
+	then
+;
+
+: pahrp ( -- s )   bnet @ if "tabdev" else "tab" then ;
+: padv variable ;  : pad5 ( -- a )  padv 80 lit lazy ;      \ 5-bit values
+
+\ paaddr ( out -- n )   the address: version 1, then the 32 bytes.
+: paout variable ;
+: paaddr ( out -- n )
+	paout !  pakeys  1 lit pad5 c!  pahrp pad5  paid 20 lit pad5 1 lit + bm5 1 lit +  paout @ bmenc
+;
+
+\ pahash ( a n out -- ok )   an address's 32 bytes (at out), if it's valid
+\        text, for this network, version 1.
+: pahash ( a n out -- ok )
+	paout !  pahrp -rot pad5 bmdec
+	dup 0< if drop 0 lit else
+		pad5 c@ 1 lit = if pad5 1 lit + swap 1 lit - paout @ bm8 swap 20 lit = and else drop 0 lit then
+	then
+;

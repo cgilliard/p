@@ -1,0 +1,177 @@
+\ tests/crypto.fam — test-only: Keccak's hashes (src/keccak.fam) against
+\ Python's hashlib (FIPS 202): message k's bytes are (13i + 7) mod 256, at
+\ lengths across each rate's edge.
+
+: tcmv variable ;  : tcm ( -- a )  tcmv 400 lit lazy ;     \ a message
+: tkysv variable ;  : tkys ( -- a )  tkysv 40 lit lazy ;
+: tkymv variable ;  : tkym ( -- a )  tkymv 20 lit lazy ;
+: tkekv variable ;  : tkek ( -- a )  tkekv 320 lit lazy ;
+: tkdkv variable ;  : tkdk ( -- a )  tkdkv 660 lit lazy ;
+: tkctv variable ;  : tkct ( -- a )  tkctv 300 lit lazy ;
+: tkkv variable ;  : tkk ( -- a )  tkkv 20 lit lazy ;
+: tkk2v variable ;  : tkk2 ( -- a )  tkk2v 20 lit lazy ;
+: tdpkv variable ;  : tdpk ( -- a )  tdpkv 520 lit lazy ;
+: tdskv variable ;  : tdsk ( -- a )  tdskv A00 lit lazy ;
+: tdsigv variable ;  : tdsig ( -- a )  tdsigv 980 lit lazy ;
+: tcov variable ;  : tco ( -- a )  tcov 200 lit lazy ;     \ an output
+\ tcmsg ( n -- a n )   the message of n bytes.
+: tcmsg ( n -- a n )   dup if dup 0 lit do i D lit * 7 lit + tcm i + c! loop then tcm swap ;
+
+Test {
+	sha3_256_vectors {
+		0 lit tcmsg tco sha3256  tco 20 lit "A7FFC6F8BF1ED76651C14756A061D662F580FF4DE43B49FA82D80A4B80F8434A" twhex assert
+		1 lit tcmsg tco sha3256  tco 20 lit "5223F7670B3B9BA04F57D477478AE77A58190D89F21DA0B0BE774735E23F9C96" twhex assert
+		3 lit tcmsg tco sha3256  tco 20 lit "BD197359AD16BE8EF2D8735ACBAE57F8545251349053346C937071BAF79AD50F" twhex assert
+		87 lit tcmsg tco sha3256  tco 20 lit "4CC550C9D5296A1373A78A98CA618F509B9BF1931950C483E09F0A9F15DBA093" twhex assert
+		88 lit tcmsg tco sha3256  tco 20 lit "75BA71B2E38674F1C3ED12FCEBFBDBBC83681F91EBF3CD326CC53F76E319AB92" twhex assert
+		89 lit tcmsg tco sha3256  tco 20 lit "54DB36547A5800224149D15F0D21EB6799245F2685F225F10CEF8D5F6B0936B5" twhex assert
+		12C lit tcmsg tco sha3256  tco 20 lit "320865FEEE70928CF11F5CCCB4D45B50567C760002968C91ECC2D3C2AD44ECC5" twhex assert
+	}
+	sha3_512_vectors {
+		0 lit tcmsg tco sha3512  tco 40 lit "A69F73CCA23A9AC5C8B567DC185A756E97C982164FE25859E0D1DCC1475C80A615B2123AF1F5F94C11E3E9402C3AC558F500199D95B6D3E301758586281DCD26" twhex assert
+		47 lit tcmsg tco sha3512  tco 40 lit "601ABF7C5B2D007DA728C7D9FC7EA3EC48D7768A8096FC346171611FC8591881572BB5FBA8526301BFFECF020DDB39FD7ADDBEA99D7A7D5B9E9BC6BB1AC6157C" twhex assert
+		48 lit tcmsg tco sha3512  tco 40 lit "A899D2A1300F42FF2D81F9A855CF3A885056DB63B32B1FD26E4E647F3C297F0099D57FD8C411409353C82EDF6C709D0171C364D10B0BCC2F4159D66AE96C20C7" twhex assert
+		49 lit tcmsg tco sha3512  tco 40 lit "275CADB59B02048FE416700E39F8BCF8AEE621C483381A9CFAB5675B9790BA415EB9330BA4AF426C7D8D2310472575437D5F0D9207760CBCC31C08E358BC7561" twhex assert
+		12C lit tcmsg tco sha3512  tco 40 lit "B0B820A0D4A5ECEA4FE65852329292C58E80C630E7CF235E2EB90CC439F7A8380D04C8E2C24461AA7C7C6A36F9F90D4705F82B661194817537771888E4A67973" twhex assert
+	}
+	shake_vectors {
+		0 lit tcmsg tco 20 lit shake128  tco 20 lit "7F9C2BA4E88F827D616045507605853ED73B8093F6EFBC88EB1A6EACFA66EF26" twhex assert
+		A7 lit tcmsg tco 20 lit shake128  tco 20 lit "10D74E38FA638413B01BE4294D87406E81E520F0DF799C984C8B1C2D3CAF8A45" twhex assert
+		A8 lit tcmsg tco 20 lit shake128  tco 20 lit "9B14A44A55E8E77E913A7FE24B54D70B42673B92E06487ABD1E009A50A96DDF9" twhex assert
+		A9 lit tcmsg tco 20 lit shake128  tco 20 lit "039F02A25FB688999885C0AA908D4E4374E406ECEDEB1038AC6C9765EB2DAFC7" twhex assert
+		0 lit tcmsg tco 20 lit shake256  tco 20 lit "46B9DD2B0BA88D13233B3FEB743EEB243FCD52EA62B81B82B50C27646ED5762F" twhex assert
+		87 lit tcmsg tco 20 lit shake256  tco 20 lit "704E04707207FF2DCD53B4501DB0052406F89D0399E2464808A62376574C56B2" twhex assert
+		88 lit tcmsg tco 20 lit shake256  tco 20 lit "F3235707D7230CB99D7BA88FF6AEEBBFF25BFE6E58586F09EA94C316CF86CB09" twhex assert
+		89 lit tcmsg tco 20 lit shake256  tco 20 lit "B67B79ACF69C41DC5FB1E4638A88550EE9C27AB1F2B6DC48E3CA9DEF6E6FC971" twhex assert
+		5 lit tcmsg tco 190 lit shake128  tco 150 lit + 20 lit "5B367C8C3BF059F0095CA3890AC48E90399826920C213211647907BEB1C005E2" twhex assert   \ a third block of output
+		5 lit tcmsg tco 190 lit shake256  tco 170 lit + 20 lit "72031815ED4BBEF4E85AC9B57C7AA6827E9C1D5DC5128F0524D3648684A67684" twhex assert
+	}
+	shake_in_pieces {
+		\ absorbed in pieces, squeezed in pieces: the same bytes
+		A8 lit 1F lit kbeg  12C lit tcmsg drop 7 lit kabs  12C lit tcmsg drop 7 lit + 125 lit kabs  kend
+		tco 3 lit ksqz  tco 3 lit + A5 lit ksqz  tco A8 lit + 48 lit ksqz
+		tco 20 lit "61766D3F337D1521F544DA3975F1B5E7BACD6D70FC7B48360DC22EDA56ABAFDB" twhex assert  tco A0 lit + 20 lit "43AFE2C43A3294C015971C8CB678942B865305FECBF6A0840B0CD01B460AE61C" twhex assert
+	}
+	chacha20_rfc8439 {
+		\ RFC 8439, 2.4.2: key 00..1F, nonce 00 00 00 00 00 00 00 4A 00 00 00 00, counter 1
+		20 lit 0 lit do i tcm 200 lit + i + c! loop
+		tcm 220 lit + C lit nzero  4A lit tcm 227 lit + c!
+		"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it." tcm 240 lit + 72 lit ncpy
+		tcm 200 lit +  tcm 220 lit +  1 lit  tcm 240 lit +  tco 72 lit chacha
+		tco 72 lit "6E2E359A2568F98041BA0728DD0D6981E97E7AEC1D4360C20A27AFCCFD9FAE0BF91B65C5524733AB8F593DABCD62B3571639D624E65152AB8F530C359F0861D807CA0DBF500D6A6156A38E088A22B65E52BC514D16CCF806818CE91AB77937365AF90BBF74A35BE6B40B8EEDF2785E42874D" twhex assert
+		\ and back
+		tcm 200 lit +  tcm 220 lit +  1 lit  tco tco 72 lit chacha
+		tco tcm 240 lit + 72 lit mcmp 0= assert
+	}
+	chacha20_lengths {
+		\ the key 0x2A.., nonce 0x01..: lengths across the 64-byte blocks, counter 7
+		20 lit 0 lit do 2A lit tcm 300 lit + i + c! loop  C lit 0 lit do 1 lit tcm 320 lit + i + c! loop
+		tcm 300 lit + tcm 320 lit + 7 lit 0 lit tcmsg drop tco 0 lit chacha
+		tcm 300 lit + tcm 320 lit + 7 lit 1 lit tcmsg drop tco 1 lit chacha  tco 1 lit "B4" twhex assert  tco 0 lit + 1 lit "B4" twhex assert
+		tcm 300 lit + tcm 320 lit + 7 lit 3F lit tcmsg drop tco 3F lit chacha  tco 20 lit "B4CF3753495109568E40D5B9BCC513CEC62E2F8A45E2CD23CCD7D7FBBFC60E92" twhex assert  tco 1F lit + 20 lit "9251B6B264951160E64FEF8C1C76281512328536F8B6A14B54403ABBEB36C17D" twhex assert
+		tcm 300 lit + tcm 320 lit + 7 lit 40 lit tcmsg drop tco 40 lit chacha  tco 20 lit "B4CF3753495109568E40D5B9BCC513CEC62E2F8A45E2CD23CCD7D7FBBFC60E92" twhex assert  tco 20 lit + 20 lit "51B6B264951160E64FEF8C1C76281512328536F8B6A14B54403ABBEB36C17D91" twhex assert
+		tcm 300 lit + tcm 320 lit + 7 lit 41 lit tcmsg drop tco 41 lit chacha  tco 20 lit "B4CF3753495109568E40D5B9BCC513CEC62E2F8A45E2CD23CCD7D7FBBFC60E92" twhex assert  tco 21 lit + 20 lit "B6B264951160E64FEF8C1C76281512328536F8B6A14B54403ABBEB36C17D915A" twhex assert
+		tcm 300 lit + tcm 320 lit + 7 lit 96 lit tcmsg drop tco 96 lit chacha  tco 20 lit "B4CF3753495109568E40D5B9BCC513CEC62E2F8A45E2CD23CCD7D7FBBFC60E92" twhex assert  tco 76 lit + 20 lit "18C9E7810029AFFFC3EE0935D2EB192E7BB3BF3C453C69D84BEE290422CF6D5D" twhex assert
+	}
+	poly1305_vectors {
+		\ RFC 8439, 2.5.2
+		"85D6BE7857556D337F4452FE42D506A80103808AFB0DB2FD4ABFF6AF4149F51B" tcm 200 lit + 20 lit twput
+		"43727970746F6772617068696320466F72756D2052657365617263682047726F7570" tcm 240 lit + 22 lit twput
+		tcm 200 lit + p1beg  tcm 240 lit + 22 lit p1abs  tco p1end  tco 10 lit "A8061DC1305136C6C22B8BAF0C0127A9" twhex assert
+		"03203D5A7794B1CEEB0825425F7C99B6D3F00D2A4764819EBBD8F5122F4C6986" tcm 200 lit + 20 lit twput
+		tcm 200 lit + p1beg  0 lit tcmsg p1abs  tco p1end  tco 10 lit "D3F00D2A4764819EBBD8F5122F4C6986" twhex assert
+		tcm 200 lit + p1beg  1 lit tcmsg p1abs  tco p1end  tco 10 lit "EDD3D9AE7DE7F0B622FF0147B50E184E" twhex assert
+		tcm 200 lit + p1beg  F lit tcmsg p1abs  tco p1end  tco 10 lit "C1F8428540D8F8B1134F447DFEAB7CF9" twhex assert
+		tcm 200 lit + p1beg  10 lit tcmsg p1abs  tco p1end  tco 10 lit "73DE1B75C49AC28433730DCDBEAA3663" twhex assert
+		tcm 200 lit + p1beg  11 lit tcmsg p1abs  tco p1end  tco 10 lit "6364E9EAADEA4FFCD978DAE59D286079" twhex assert
+		tcm 200 lit + p1beg  40 lit tcmsg p1abs  tco p1end  tco 10 lit "69AB82B0AFCF57BD0164FAE22BF65A46" twhex assert
+		tcm 200 lit + p1beg  FA lit tcmsg p1abs  tco p1end  tco 10 lit "70ECF5D3B817550607F4A25073FF43A2" twhex assert
+		\ every byte 0xFF: the carries at their limits
+		"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" tcm 200 lit + 20 lit twput
+		"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" tcm 240 lit + 64 lit twput
+		"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" tcm 2A4 lit + 64 lit twput
+		tcm 200 lit + p1beg  tcm 240 lit + C8 lit p1abs  tco p1end  tco 10 lit "38E84B52575A58BCDB84AE0860F4417D" twhex assert
+		tcm 200 lit + p1beg  tcm 240 lit + 3 lit p1abs  tcm 243 lit + 20 lit p1abs  tcm 263 lit + A5 lit p1abs  tco p1end  tco 10 lit "38E84B52575A58BCDB84AE0860F4417D" twhex assert
+	}
+	aead_vectors {
+		\ RFC 8439, 2.8.2
+		"808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9F" tcm 200 lit + 20 lit twput
+		"070000004041424344454647" tcm 220 lit + C lit twput
+		"50515253C0C1C2C3C4C5C6C7" tcm 230 lit + C lit twput
+		"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it." tcm 240 lit + 72 lit ncpy
+		tcm 200 lit + tcm 220 lit + tcm 230 lit + C lit  tcm 240 lit + 72 lit tco aeseal
+		tco 72 lit "D31A8D34648E60DB7B86AFBC53EF7EC2A4ADED51296E08FEA9E2B5A736EE62D63DBEA45E8CA9671282FAFB69DA92728B1A71DE0A9E060B2905D6A5B67ECD3B3692DDBD7F2D778B8C9803AEE328091B58FAB324E4FAD675945585808B4831D7BC3FF4DEF08E4B7A9DE576D26586CEC64B6116" twhex assert  tco 72 lit + 10 lit "1AE10B594F09E26A7E902ECBD0600691" twhex assert
+		\ opened: the text back
+		tcm 200 lit + tcm 220 lit + tcm 230 lit + C lit  tco 72 lit tcm 300 lit + aeopen assert  tcm 300 lit + tcm 240 lit + 72 lit mcmp 0= assert
+		\ a bit flipped in the ciphertext, the tag, or the aad: refused
+		tco 5 lit + dup c@ 1 lit xor swap c!  tcm 200 lit + tcm 220 lit + tcm 230 lit + C lit  tco 72 lit tcm 300 lit + aeopen 0= assert  tco 5 lit + dup c@ 1 lit xor swap c!
+		tco 7A lit + dup c@ 80 lit xor swap c!  tcm 200 lit + tcm 220 lit + tcm 230 lit + C lit  tco 72 lit tcm 300 lit + aeopen 0= assert  tco 7A lit + dup c@ 80 lit xor swap c!
+		tcm 230 lit + dup c@ 1 lit xor swap c!  tcm 200 lit + tcm 220 lit + tcm 230 lit + C lit  tco 72 lit tcm 300 lit + aeopen 0= assert  tcm 230 lit + dup c@ 1 lit xor swap c!
+		tcm 200 lit + tcm 220 lit + tcm 230 lit + C lit  tco 72 lit tcm 300 lit + aeopen assert
+		0 lit tcmsg 2drop    tcm 200 lit + tcm 220 lit + tcm 0 lit  tcm 300 lit + 0 lit tco aeseal  tco 10 lit "A0784D7A4716F3FEB4F64E7F4B39BF04" twhex assert
+		1 lit tcmsg 2drop  "01060B10151A1F24292E33383D42474C" tcm 300 lit + 10 lit twput  tcm 200 lit + tcm 220 lit + tcm 1 lit  tcm 300 lit + 10 lit tco aeseal  tco 20 lit "9E7DE24D14E75F9E3CCCBCC30BC34DE28517E25DB0ED1AC79951747F83734A8C" twhex assert
+		11 lit tcmsg 2drop  "01060B10151A1F24292E33383D42474C51565B60656A6F74797E83888D92979CA1" tcm 300 lit + 21 lit twput  tcm 200 lit + tcm 220 lit + tcm 11 lit  tcm 300 lit + 21 lit tco aeseal  tco 31 lit "9E7DE24D14E75F9E3CCCBCC30BC34DE29096D35F6C6B01AAA4F4530FD8109439EFB172FFA08E25812BA1D1ABF018342134" twhex assert
+		0 lit tcmsg 2drop  "01060B10151A1F24292E33383D42474C51565B60656A6F74797E83888D92979CA1A6ABB0B5BABFC4C9CED3D8DDE2E7ECF1F6FB00050A0F14191E23282D32373C41" tcm 300 lit + 41 lit twput  tcm 200 lit + tcm 220 lit + tcm 0 lit  tcm 300 lit + 41 lit tco aeseal  tco 51 lit "9E7DE24D14E75F9E3CCCBCC30BC34DE29096D35F6C6B01AAA4F4530FD8109439EF3860881934E1EF711461D72739B50484F2496EBB63625B79BAA6E73C8A2C65BDEF1A9A11CA0FB29D46356EDE245FFF87" twhex assert
+	}
+	kyber_vectors {
+		\ the Python reference (FIPS 203): (d, z) = 00..3F, m = 40..5F
+		40 lit 0 lit do i tkys i + c! loop  20 lit 0 lit do i 40 lit + tkym i + c! loop
+		tkys tkek tkdk kykeys
+		tkek 320 lit tco sha3256  tco 20 lit "82F101FF648063B376E2BB6C5B7455F655A50C2FEADADE150EFA0E0E6F365AEA" twhex assert
+		tkdk 660 lit tco sha3256  tco 20 lit "0BD3F5DF01098AC9C29D687C7F1BD0588A5573FEEEF8F1E3B4573FA7F6AB57C8" twhex assert
+		tkek tkym tkk tkct kyencap assert
+		tkk 20 lit "14CACE3E48771B316676AFAD2CFCFE8488DAAA4FAD954E57236CAA3F24A42CF7" twhex assert
+		tkct 300 lit tco sha3256  tco 20 lit "E3FDDDB90255869185C07CDF1C1880B2EFE08B6F04DA4997B693C0DEA61503BD" twhex assert
+		tkdk tkct tkk2 kydecap assert  tkk2 tkk 20 lit mcmp 0= assert
+		\ a bit flipped in the ciphertext: implicit rejection, J(z c')
+		tkct 64 lit + dup c@ 1 lit xor swap c!
+		tkdk tkct tkk2 kydecap assert  tkk2 20 lit "FE51F20A3572EBA22AC4770BFAADDFE530A44931A298954F5CC11638ADAFD880" twhex assert
+		tkct 64 lit + dup c@ 1 lit xor swap c!
+		\ a coefficient of t out of range: the encapsulation key refused
+		tkek c@  FF lit tkek c!  tkek 1 lit + c@ dup F lit or tkek 1 lit + c!
+		tkek tkym tkk tkct kyencap 0= assert
+		tkek 1 lit + c!  tkek c!
+		\ the decapsulation key's copy of ek altered: refused (its hash)
+		tkdk 310 lit + dup c@ 1 lit xor swap c!  tkdk tkct tkk2 kydecap 0= assert
+	}
+	dilithium_vectors {
+		\ the Python reference (FIPS 204): xi = 00..1F, rnd = 55.., the message
+		20 lit 0 lit do i tkys i + c! loop  20 lit 0 lit do 55 lit tkym i + c! loop
+		tkys tdpk tdsk dikeys
+		tdpk 520 lit tco sha3256  tco 20 lit "373C7BF2CAC5BD2A6C35933BAB0FA1C951F22247E1333383FCB618822080373F" twhex assert
+		tdsk A00 lit tco sha3256  tco 20 lit "DA0665A6D807669D06AEB7010507AA6BD4640641055462E38E37344A274F36A6" twhex assert
+		tdsk "tabernacle gateway record" 19 lit tkym tdsig disign
+		tdsig 974 lit tco sha3256  tco 20 lit "74759FA84C1C3FA9D97DCB80D521FB43BF61F4E1A6D418A0912E01DE1B8A4AAB" twhex assert
+		tdpk "tabernacle gateway record" 19 lit tdsig diverify assert
+		\ another message, or a byte of the signature changed: refused
+		tdpk "tabernacle gateway record" 18 lit tdsig diverify 0= assert
+		tdsig 300 lit + dup c@ 1 lit xor swap c!  tdpk "tabernacle gateway record" 19 lit tdsig diverify 0= assert
+		tdsig 300 lit + dup c@ 1 lit xor swap c!
+		tdsig 970 lit + dup c@ 1 lit xor swap c!  tdpk "tabernacle gateway record" 19 lit tdsig diverify 0= assert   \ the hints
+	}
+	bech32m_vectors {
+		\ BIP 350's: encoding, and decoding (any case; plain Bech32 and a typo refused)
+		20 lit 0 lit do 1F lit i - tcm i + c! loop
+		"abcdef" tcm 20 lit tco bmenc  tco swap "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx" dup strlen rot over = assert mcmp 0= assert
+		"abcdef" "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx" dup strlen tcm bmdec 20 lit asrt_eq
+		tcm c@ 1F lit asrt_eq  tcm 1F lit + c@ 0 lit asrt_eq
+		"a" "A1LQFN3A" 8 lit tcm bmdec 0 lit asrt_eq
+		"a" "a12uel5l" 8 lit tcm bmdec -1 lit asrt_eq                          \ Bech32, not Bech32m
+		"a" "A1lqfn3a" 8 lit tcm bmdec -1 lit asrt_eq                          \ mixed case
+		"a" "a1lqfn3q" 8 lit tcm bmdec -1 lit asrt_eq                          \ a typo
+	}
+	payment_address {
+		\ keys from the wallet seed, as Python derives them with the FIPS 203/204
+		\ references and BIP 350's Bech32m
+		20 lit 0 lit do i 7 lit * 3 lit + wlseed i + c! loop  0 lit paok !  0 lit bnet !
+		tco paaddr 3F lit asrt_eq  tco "tab1pkhvp0fxyfk83hqun029g4lxpz7cgu0gyr3c2m4srenpuhll9wetqesz5jx" 3F lit mcmp 0= assert
+		paid 20 lit "B5D817A4C44D8F1B83937A8A8AFCC117B08E3D041C70ADD603CCC3CBFFE57656" twhex assert
+		"tab1pkhvp0fxyfk83hqun029g4lxpz7cgu0gyr3c2m4srenpuhll9wetqesz5jx" 3F lit tcm pahash assert  tcm paid 20 lit mcmp 0= assert
+		"TAB1PKHVP0FXYFK83HQUN029G4LXPZ7CGU0GYR3C2M4SRENPUHLL9WETQESZ5JX" 3F lit tcm pahash assert                      \ upper case too
+		"tab1pkhvp0fxyfk83hquq029g4lxpz7cgu0gyr3c2m4srenpuhll9wetqesz5jx" 3F lit tcm pahash 0= assert                            \ a typo
+		1 lit bnet !                                                           \ the dev network's prefix
+		"tab1pkhvp0fxyfk83hqun029g4lxpz7cgu0gyr3c2m4srenpuhll9wetqesz5jx" 3F lit tcm pahash 0= assert
+		tco paaddr 42 lit asrt_eq  tco "tabdev1pkhvp0fxyfk83hqun029g4lxpz7cgu0gyr3c2m4srenpuhll9wetqnm9l87" 42 lit mcmp 0= assert
+		0 lit bnet !
+	}
+}

@@ -5,6 +5,11 @@ Usage: tools/wallet [--node HOST:PORT] [--key-file FILE] COMMAND [ARGS]
 
 Commands:
   status                    the node: its tip, peers, fast sync, the wallet
+  address                   the wallet's payment address
+  pay ADDRESS AMOUNT [FEE]  pay a payment address, through the gateways: the
+                            node sends the slate and finalizes the answer
+  lookup ADDRESS            a payment address's record, from the gateways:
+                            where its wallet is reached
   balance                   the wallet's coins, by status
   outputs                   each output the wallet owns
   send AMOUNT [FEE] [FILE]  start a payment: writes slate S1 for the receiver
@@ -40,6 +45,7 @@ import os
 import socket
 import struct
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_KEY_FILE = os.path.join(HERE, "..", "data", "wallet.key")
@@ -194,6 +200,53 @@ def show_status(node):
     state = {"open": "ready", "restoring": "being restored (it finds its outputs once the node has caught up)", "none": "none yet"}[s["wallet"]]
     print(f"wallet:       {state}{', with a passphrase' if s.get('passphrase') else ''}")
     print(f"next key:     {s['next_key']}")
+    if s.get("address"):
+        print(f"address:      {s['address']}")
+
+
+def do_pay(node, args):
+    if len(args) not in (2, 3):
+        raise Failure("usage: pay ADDRESS AMOUNT [FEE]")
+    call = {"address": args[0], "amount": check_amount(args[1])}
+    if len(args) == 3:
+        call["fee"] = check_amount(args[2])
+    node.call("pay", **call)
+    said = None
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        p = node.call("payment")
+        if p["state"] != said and p["state"] in ("finding", "sending"):
+            print({"finding": "finding the address...", "sending": "sent; waiting for their wallet to answer..."}[p["state"]])
+            said = p["state"]
+        if p["state"] == "paid":
+            print(f"paid: transaction {p['txid']} sent to the network")
+            return
+        if p["state"] == "failed":
+            raise Failure("the payment failed: " + p["error"])
+        time.sleep(1)
+    raise Failure("no result after two minutes (see the node's log)")
+
+
+def do_lookup(node, args):
+    if len(args) != 1:
+        raise Failure("usage: lookup ADDRESS")
+    deadline = time.time() + 30
+    while True:
+        r = node.call("lookup", address=args[0])
+        if r["status"] != "looking" or time.time() > deadline:
+            break
+        time.sleep(1)
+    if r["status"] == "found":
+        print(f"found: reached at {r['ip']}:{r['port']}, its record good for {r['expires_in'] // 60} more minutes")
+    else:
+        print(r["status"])
+
+
+def show_address(node):
+    s = node.call("status")
+    if not s.get("address"):
+        raise Failure("there's no wallet on this node yet")
+    print(s["address"])
 
 
 def units(text):
@@ -304,7 +357,7 @@ def main():
     parser = argparse.ArgumentParser(description="Talk to the Forth node's wallet.")
     parser.add_argument("--node", default="127.0.0.1:3738", help="the wallet API's address (127.0.0.1:3738)")
     parser.add_argument("--key-file", default=DEFAULT_KEY_FILE, help="where the API key is kept (data/wallet.key)")
-    parser.add_argument("command", choices=["status", "balance", "outputs", "send", "receive", "finalize", "cancel", "slates", "key"])
+    parser.add_argument("command", choices=["status", "address", "balance", "outputs", "send", "receive", "finalize", "cancel", "slates", "lookup", "pay", "key"])
     parser.add_argument("args", nargs="*")
     args = parser.parse_args()
     host, _, port = args.node.rpartition(":")
@@ -314,10 +367,10 @@ def main():
             return 0
         key = read_key(args.key_file) or ask_key(args.key_file)
         node = Node(host or "127.0.0.1", int(port), key)
-        if args.command in ("status", "balance", "outputs"):
-            {"status": show_status, "balance": show_balance, "outputs": show_outputs}[args.command](node)
+        if args.command in ("status", "address", "balance", "outputs"):
+            {"status": show_status, "address": show_address, "balance": show_balance, "outputs": show_outputs}[args.command](node)
         else:
-            {"send": do_send, "receive": do_receive, "finalize": do_finalize, "cancel": do_cancel, "slates": do_slates}[args.command](node, args.args)
+            {"send": do_send, "receive": do_receive, "finalize": do_finalize, "cancel": do_cancel, "slates": do_slates, "lookup": do_lookup, "pay": do_pay}[args.command](node, args.args)
     except Failure as e:
         print(f"wallet: {e}", file=sys.stderr)
         return 1

@@ -83,6 +83,9 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
   padding: 9px 4px; color: var(--ink); font: 15px/1.55 Georgia, "Times New Roman", serif; cursor: pointer; }
 .hit:hover { background: var(--chip); }
 .hit b { font-family: system-ui, sans-serif; font-size: 12.5px; color: var(--accent); margin-right: 6px; }
+.addrrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.addrrow code { font-size: 13px; overflow-wrap: anywhere; flex: 1 1 260px; padding: 6px 8px; }
+.addrrow button.secondary { margin-top: 0; padding: 6px 12px; }
 .logbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .logbar input[type=text] { flex: 1 1 220px; }
 .logbar .check { margin-top: 0; }
@@ -125,11 +128,13 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
   </nav>
 
   <section id="tab-send" class="card">
+    <label for="payto">Pay to address <span class="hint">(optional: leave it empty to make a payment file)</span></label>
+    <input id="payto" type="text" placeholder="tab1…" autocomplete="off" spellcheck="false">
     <div class="row">
       <div><label for="amount">Amount</label><input id="amount" type="text" inputmode="decimal" placeholder="1.5" autocomplete="off"></div>
       <div><label for="fee">Fee</label><input id="fee" type="text" inputmode="decimal" value="0.0001" autocomplete="off"></div>
     </div>
-    <button class="primary" id="sendbtn">Create payment file</button>
+    <button class="primary" id="sendbtn">Pay, or create the payment file</button>
     <ol class="steps">
       <li>Give the payment file to the person you're paying.</li>
       <li>They answer it and send a file back.</li>
@@ -139,7 +144,10 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
   </section>
 
   <section id="tab-receive" class="card" hidden>
-    <p class="hint" style="margin-top:0">Answer a payment file someone gave you. Then give your answer back to them; they finalize it.</p>
+    <label>Your payment address</label>
+    <div class="addrrow"><code id="payaddr">–</code><button class="secondary" id="copyaddr">Copy</button></div>
+    <p class="hint">Others will pay this address through the network's gateways. Until that's running, payments go as files, below.</p>
+    <p class="hint">Answer a payment file someone gave you. Then give your answer back to them; they finalize it.</p>
     <label for="recvfile">Payment file (<code>.s1.slate</code>)</label>
     <input id="recvfile" type="file" accept=".slate,text/plain">
     <label for="recvtext">…or paste its text</label>
@@ -297,6 +305,7 @@ async function refresh() {
       return;
     }
     note.hidden = true;
+    $("payaddr").textContent = s.address || "–";
     const b = await call("balance");
     $("spendable").textContent = coins(b.spendable);
     $("immature").textContent = coins(b.immature);
@@ -396,7 +405,22 @@ const AMOUNT = /^\d+(\.\d{1,9})?$/;
 $("sendbtn").addEventListener("click", () => busy($("sendbtn"), async () => {
   const amount = $("amount").value.trim(), fee = $("fee").value.trim() || "0.0001", box = $("sendout");
   if (!AMOUNT.test(amount) || !AMOUNT.test(fee)) { showError(box, new Error("Amounts are coins, like 1.5 (at most 9 decimals).")); return; }
+  const to = $("payto").value.trim();
   try {
+    if (to) {
+      await call("pay", { address: to, amount, fee });
+      box.replaceChildren(el("div", { class: "hint" }, "Finding the address…"));
+      const said = { finding: "Finding the address…", sending: "Sent: waiting for their wallet to answer…" };
+      for (let i = 0; i < 120; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const p = await call("payment");
+        if (p.state === "paid") { box.replaceChildren(el("div", { class: "ok" }, `Paid ${coins(amount)}: the transaction is on its way to the network.`), el("div", { class: "hint" }, "Transaction " + p.txid)); break; }
+        if (p.state === "failed") { showError(box, new Error("The payment failed: " + p.error)); break; }
+        box.replaceChildren(el("div", { class: "hint" }, said[p.state] || "…"));
+      }
+      refresh();
+      return;
+    }
     const r = await call("send", { amount, fee });
     slateResult(box, `Payment file for ${coins(amount)}`, r, "Give this file to the person you're paying. When they send their answer back, finalize it.");
     refresh();
@@ -554,6 +578,12 @@ $("bsearch").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { cle
 async function openBible() {
   try { await loadBible(); if (!$("bview").childNodes.length) showChapter(Math.min(bpos.b, bible.length - 1), bpos.c, bpos.v); } catch (e) {}
 }
+
+$("copyaddr").addEventListener("click", async () => {
+  const a = $("payaddr").textContent;
+  if (!a.startsWith("tab")) return;
+  try { await navigator.clipboard.writeText(a); $("copyaddr").textContent = "Copied"; setTimeout(() => { $("copyaddr").textContent = "Copy"; }, 1500); } catch (e) {}
+});
 
 // ── The node's log ──
 // Lines come numbered (seq) from the node's disk: the last 200 when the tab

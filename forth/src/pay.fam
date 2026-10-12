@@ -1,0 +1,264 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/pay.fam — paying a payment address: the slates exchanged end to end,
+\ encrypted, through the gateways (src/gateway.fam relays; it reads nothing).
+\
+\ One round trip.  PAY1, sender to receiver: a one-time Kyber key pair is
+\ made; the receiver's Kyber key (from its record) gets a key encapsulated
+\ (k1); the box holds the sender's own address and S1.  PAY2, back: the
+\ receiver answers S1 (S2), and encapsulates a second key (k2) to the one-time
+\ key; its box holds a status and S2.  The sender finalizes, and the
+\ transaction goes to the network.  The one-time key is thrown away, so S2 is
+\ forward secret; PAY1 rests on the receiver's key (as Noise's NK).
+\
+\   PAY1: 0 "PAY1"  4 sid (8)  C ct1 (0x300)  30C the one-time key (0x320)
+\         62C the box: our address (32), S1 -- then its tag (16)
+\   PAY2: 0 "PAY2"  4 sid  C ct2 (0x300)  30C the box: status (0 answered,
+\         else a reason, as text), S2 -- then its tag
+\   th = SHA3-256(bytes 4 .. 62C of PAY1)
+\   K1 = SHAKE256("tabernacle-pay1-v1" ‖ k1 ‖ th, 32)
+\   K2 = SHAKE256("tabernacle-pay2-v1" ‖ k1 ‖ k2 ‖ th ‖ ct2, 32)
+\ Each box: ChaCha20-Poly1305 under its key (used once: the nonce zeros), the
+\ message's first 12 bytes as associated data.
+\
+\ A message goes in parts: id (4), part, parts, up to 0x3E0 bytes -- each
+\ RELAYed by every gateway the sender uses, DELIVERed by the one that keeps
+\ the receiver.  Up to 40 parts (S1 of a dozen or more inputs).
+\
+\   pzpay ( addr alo ahi flo fhi -- ok )   start paying (one at a time)
+\   pzst ( -- a )        0 none, 1 finding the address, 2 sending, 3 paid
+\                        (pztxid), 4 failed (pzwhy)
+\   pzin ( -- f )        a DELIVER: handled
+\   pztick ( -- )
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: pzmax ( -- n )   A000 lit ;                              \ a message, at most
+: pzmv variable ;  : pzm ( -- a )  pzmv A000 lit lazy ;     \ one being sent
+: pzpv variable ;  : pzpt ( -- a )  pzpv A000 lit lazy ;    \ a box's contents
+: pzst variable ;  : pzwhy variable ;
+: pzkv variable ;  : pzk ( -- a )  pzkv 100 lit lazy ;     \ 0 k1, 20 k2, 40 th, 60 the key, 80 a nonce (zeros), A0 random
+: pzekv variable ;  : pzek ( -- a )  pzekv 320 lit lazy ;  \ the one-time key pair
+: pzdkv variable ;  : pzdk ( -- a )  pzdkv 660 lit lazy ;
+: pzsdv variable ;  : pzsid ( -- a )  pzsdv 8 lit lazy ;   \ our payment's session
+: pzdsv variable ;  : pzdest ( -- a )  pzdsv 20 lit lazy ; \ its address
+: pzslv variable ;  : pzslid ( -- a )  pzslv 10 lit lazy ; \ its slate's id
+: pztxv variable ;  : pztxid ( -- a )  pztxv 20 lit lazy ;
+: pzal variable ;  : pzah variable ;  : pzfl variable ;  : pzfh variable ;
+: pzn variable ;  : pzmid variable ;  : pzt variable ;  : pztry variable ;  : pzslm variable ;
+
+: pzrand ( a n -- )   2dup rnget if 2drop else nzero then ;
+
+\ pzkey ( tag n extra en -- )   the key at pzk + 60: SHAKE256(tag ‖ k1 ‖
+\        [k2] ‖ th ‖ extra), k2 if en is 0x300 (PAY2's).
+: pzex variable ;  : pzen variable ;
+: pzkey ( tag n extra en -- )
+	pzen ! pzex !
+	88 lit 1F lit kbeg  kabs  pzk 20 lit kabs
+	pzen @ if pzk 20 lit + 20 lit kabs then
+	pzk 40 lit + 20 lit kabs
+	pzen @ if pzex @ pzen @ kabs then
+	kend  pzk 60 lit + 20 lit ksqz
+;
+: pzk1 ( -- )   "tabernacle-pay1-v1" 12 lit 0 lit 0 lit pzkey ;
+: pzk2 ( ct2 -- )   "tabernacle-pay2-v1" 12 lit rot 300 lit pzkey ;
+: pzth ( msg -- )   4 lit + 628 lit pzk 40 lit + sha3256 ;
+: pzz ( -- a )   pzk 80 lit + dup C lit nzero ;            \ the nonce: zeros
+
+\ ── Parts ──
+
+\ pzsend ( msg n dest -- )   the message, RELAYed for dest by each of our
+\        gateways (those that have answered us), every part.
+: pzsm variable ;  : pzsn variable ;  : pzsd variable ;  : pzsp variable ;  : pzsk variable ;  : pzsl variable ;
+: pzsend ( msg n dest -- )
+	pzsd ! pzsn ! pzsm !
+	pzsn @ 3DF lit + 3E0 lit / pzsp !
+	gwgn @ ?dup if 0 lit do
+		i gwpeer dup 0< if drop else pzsk !
+			pzsp @ 0 lit do
+				14 lit phdr  pzsk @ pp C lit + @ pzsk @ pp 10 lit + @ 2 lit pick qbe!
+				pzsd @ over 8 lit + 20 lit ncpy  28 lit +
+				pzmid @ over be!  i over 4 lit + c!  pzsp @ over 5 lit + c!  6 lit +
+				pzsn @ i 3E0 lit * - 3E0 lit pumin pzsl !
+				pzsm @ i 3E0 lit * + swap pzsl @ ncpy
+				pzsk @ 34 lit pzsl @ + psendk
+			loop
+		then
+	loop then
+;
+
+\ Reassembly: 2 slots: 0 the id, 4 parts, 8 parts had (bits, two cells),
+\ 10 when begun, then the bytes (from 0x20).
+: pzrv variable ;  : pzr ( k -- a )  A020 lit * pzrv 14040 lit lazy + ;
+: pzra variable ;  : pzid variable ;  : pzpi variable ;  : pzpc variable ;
+\ pzmask ( n -- lo hi )   n bits set (n <= 64).
+: pzmask ( n -- lo hi )
+	dup 20 lit u< if 1 lit swap lshift 1 lit - 0 lit else 20 lit - dup 20 lit u< if -1 lit swap 1 lit swap lshift 1 lit - else drop -1 lit -1 lit then then
+;
+\ pzpart ( -- msg n | 0 )   a DELIVERed part: into its slot; the message,
+\        whole.
+: pzpart ( -- msg n | 0 )
+	pbd @ be32 pzid !  pbd @ 4 lit + c@ pzpi !  pbd @ 5 lit + c@ pzpc !
+	pzpi @ pzpc @ u<  pzpc @ 29 lit u< and  pbn @ 6 lit u> and  pbn @ 6 lit - 3E1 lit u< and 0= if 0 lit else
+		0 lit pzra !                                                         \ (an address: above 2^31, so not "negative")
+		2 lit 0 lit do i pzr @ pzid @ =  i pzr 4 lit + @ 0= 0= and if i pzr pzra ! then loop
+		pzra @ 0= if                                                         \ a new message: in the older slot
+			0 lit pzr 10 lit + @  1 lit pzr 10 lit + @ - 0< if 0 lit else 1 lit then pzr pzra !
+			pzra @ 8 lit zero
+			pzid @ pzra @ !  pzpc @ pzra @ 4 lit + !  pms pzra @ 10 lit + !
+		then
+		pbd @ 6 lit +  pzra @ 20 lit + pzpi @ 3E0 lit * +  pbn @ 6 lit - ncpy
+		pzpi @ 20 lit u< if 1 lit pzpi @ lshift pzra @ 8 lit + dup @ rot or swap !
+		else 1 lit pzpi @ 20 lit - lshift pzra @ C lit + dup @ rot or swap ! then
+		pzpi @ 1 lit + pzpc @ = if pzpi @ 3E0 lit * pbn @ 6 lit - + pzra @ 14 lit + ! then
+		pzra @ 4 lit + @ pzmask  pzra @ C lit + @ =  swap pzra @ 8 lit + @ = and  pzra @ 14 lit + @ 0= 0= and if
+			0 lit pzra @ 4 lit + !  pzra @ 20 lit +  pzra @ 14 lit + @                 \ whole; the slot free
+		else 0 lit then
+	then
+;
+
+\ ── Receiving: PAY1 -> PAY2 ──
+\ The last answer is kept: a PAY1 sent again (its PAY2 lost) is answered
+\ the same, not received twice.
+
+: pzlsv variable ;  : pzlsid ( -- a )  pzlsv 8 lit lazy ;   \ the last PAY1 answered
+: pzldv variable ;  : pzldst ( -- a )  pzldv 20 lit lazy ;  \ its sender
+: pzlav variable ;  : pzlast ( -- a )  pzlav A000 lit lazy ; \ the PAY2
+: pzln variable ;
+: pzwhv variable ;  : pzwho ( -- a )  pzwhv 80 lit lazy ;   \ an address, as text
+
+\ pzlog ( s addr -- )   a line: the text, then the address (32 bytes) as text.
+: pzn5 variable ;
+: pzlog ( s addr -- )
+	1 lit pad5 c!  20 lit pad5 1 lit + bm5 1 lit + pzn5 !
+	pahrp pad5 pzn5 @ pzwho bmenc  pzwho + 0 lit swap c!
+	lputs pzwho lputs A lit lputc
+;
+
+\ pzregd ( -- f )   some gateway holds our record (so an answer can reach us).
+: pzregd ( -- f )   0 lit gwgn @ ?dup if 0 lit do i gwg 8 lit + @ or loop then ;
+
+: pzmsg variable ;  : pzok variable ;  : pzl variable ;  : pzlat variable ;
+
+\ pzpay1 ( msg n -- )   a PAY1: opened, S1 answered (or refused), PAY2 back
+\        -- a new one at most every 2 s (each makes a slate's record).
+: pzpay1 ( msg n -- )
+	pzn ! pzmsg !
+	pzn @ 6A5 lit u< 0=  wl? and if                                     \ 0x62C + 32 + 0x29 + 16 at least
+		pzmsg @ 4 lit + pzlsid 8 lit mcmp 0= pzln @ and if                 \ answered already: again
+			pzk A0 lit + 4 lit pzrand  pzk A0 lit + be32 pzmid !
+			pzlast pzln @ pzldst pzsend
+		else pzlat @ pago 7D0 lit u> if                                     \ a new one at most every 2 s
+			pms pzlat !  pakeys
+			padk pzmsg @ C lit + pzk kydecap drop                          \ k1 (a wrong one: the box won't open)
+			pzmsg @ pzth  pzk1
+			pzk 60 lit + pzz pzmsg @ C lit  pzmsg @ 62C lit +  pzn @ 63C lit -  pzpt aeopen if
+				pzpt pzldst 20 lit ncpy
+				pzpt 20 lit +  pzn @ 65C lit -  wsrecv pzok !                \ S2, at wsb
+				50415932 lit pzm be!  pzmsg @ 4 lit + pzm 4 lit + 8 lit ncpy
+				pzk A0 lit + 20 lit pzrand
+				pzmsg @ 30C lit +  pzk A0 lit +  pzk 20 lit +  pzm C lit +  kyencap if     \ k2
+					pzm C lit + pzk2
+					pzok @ if 0 lit pzpt c!  wsb pzpt 1 lit + wsn @ ncpy  wsn @ 1 lit + pzl !
+					else 1 lit pzpt c!  wserr @ ?dup 0= if "refused" then dup strlen 40 lit pumin dup 1 lit + pzl !  pzpt 1 lit + swap ncpy then
+					pzk 60 lit + pzz pzm C lit  pzpt pzl @  pzm 30C lit + aeseal
+					pzl @ 31C lit + pzln !
+					pzm pzlast pzln @ ncpy  pzmsg @ 4 lit + pzlsid 8 lit ncpy
+					pzk A0 lit + 4 lit pzrand  pzk A0 lit + be32 pzmid !
+					pzlast pzln @ pzldst pzsend
+					pzok @ if "payment: received one, answered: from " else "payment: refused one: from " then pzldst pzlog
+				then
+			else "payment: a message that doesn't open: dropped\n" lputs then
+		then then
+	then
+;
+
+\ ── Paying ──
+
+\ pzfail ( s -- )   the payment failed (why); its slate cancelled, the coins
+\        free again.
+: pzfail ( s -- )
+	pzwhy !  4 lit pzst !
+	pzslm @ if pzslid wscancel drop  0 lit pzslm ! then
+	"payment: failed: " lputs pzwhy @ lputs A lit lputc
+;
+
+: pzwbv variable ;  : pzwb ( -- a )  pzwbv 48 lit lazy ;     \ the receiver's reason
+
+\ pzpay2 ( msg n -- )   a PAY2 for our payment: opened, S2 finalized, the
+\        transaction to the network.
+: pzpay2 ( msg n -- )
+	pzn ! pzmsg !
+	pzst @ 2 lit =  pzmsg @ 4 lit + pzsid 8 lit mcmp 0= and  pzn @ 31D lit u< 0= and if
+		pzdk pzmsg @ C lit + pzk 20 lit + kydecap drop                    \ k2
+		pzmsg @ C lit + pzk2
+		pzk 60 lit + pzz pzmsg @ C lit  pzmsg @ 30C lit +  pzn @ 31C lit -  pzpt aeopen if
+			pzpt c@ if
+				pzwb 48 lit nzero  "the receiver refused it: " pzwb 19 lit ncpy  pzpt 1 lit + pzwb 19 lit + pzn @ 31D lit - 2E lit pumin ncpy
+				pzwb pzfail
+			else
+				pzpt 1 lit +  pzn @ 31D lit -  wsfin if
+					0 lit pzslm !  trsoon  wtid pztxid 20 lit ncpy  3 lit pzst !
+					"payment: paid, the transaction sent: to " pzdest pzlog
+				else wserr @ ?dup 0= if "the answer didn't finalize" then pzfail then
+			then
+		then
+	then
+;
+
+\ pzpay ( addr alo ahi flo fhi -- ok )   start paying addr (its 32 bytes):
+\        the amount and fee in units.
+: pzpay ( addr alo ahi flo fhi -- ok )
+	pzst @ 1 lit = pzst @ 2 lit = or if 2drop 2drop drop 0 lit else
+		pzfh ! pzfl ! pzah ! pzal !  pzdest 20 lit ncpy
+		0 lit pzslm !  0 lit pzwhy !  pztxid 20 lit nzero
+		pzdest gwlook  1 lit pzst !  pms pzt !  -1 lit
+	then
+;
+
+\ pzbuild ( -- )   the address found: S1, the one-time key, PAY1, sent.
+: pzbuild ( -- )
+	pzal @ pzah @ pzfl @ pzfh @ wssend 0= if wserr @ ?dup 0= if "couldn't make the slate" then pzfail else
+		-1 lit pzslm !  wsb 7 lit + pzslid 10 lit ncpy
+		50415931 lit pzm be!
+		pzsid 8 lit pzrand  pzsid pzm 4 lit + 8 lit ncpy
+		pzk A0 lit + 40 lit pzrand  pzk A0 lit + pzek pzdk kykeys            \ the one-time key pair
+		pzk A0 lit + 20 lit pzrand
+		gwrec 18 lit +  pzk A0 lit +  pzk  pzm C lit +  kyencap 0= if "the receiver's key is refused" pzfail else
+			pzek pzm 30C lit + 320 lit ncpy
+			pzm pzth  pzk1
+			paid pzpt 20 lit ncpy  wsb pzpt 20 lit + wsn @ ncpy
+			pzk 60 lit + pzz pzm C lit  pzpt wsn @ 20 lit +  pzm 62C lit + aeseal
+			wsn @ 65C lit + pzl !
+			pzk A0 lit + 4 lit pzrand  pzk A0 lit + be32 pzmid !
+			pzm pzl @ pzdest pzsend  pms pzt !  1 lit pztry !  2 lit pzst !
+		then
+	then
+;
+
+: pztick ( -- )
+	pzst @ 1 lit = if
+		gwlst @ 3 lit = if "the address isn't registered with our gateways" pzfail else
+		gwfound gwla pzdest 20 lit mcmp 0= and pzregd and if pzbuild else
+		pzt @ pago EA60 lit u> if "timed out finding the address (or registering ours)" pzfail then
+		then then
+	then
+	pzst @ 2 lit = if pzt @ pago 1388 lit u> if
+		pztry @ C lit u< if pzm pzl @ pzdest pzsend  pms pzt !  pztry @ 1 lit + pztry !       \ for a minute
+		else "no answer from the receiver" pzfail then
+	then then
+;
+
+\ pzin ( -- f )   DELIVER (from one of our gateways): a part; a whole PAY1 or
+\        PAY2, handled.
+: pzgw? ( -- f )   0 lit gwgn @ ?dup if 0 lit do i gwg @ nsrc @ = i gwg 4 lit + @ nsport @ = and or loop then ;
+: pzin ( -- f )
+	pok? if npay @ 5 lit + c@ 15 lit = else 0 lit then
+	dup if
+		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+		pzgw? if
+			pzpart ?dup if
+				over be32 50415931 lit = if pzpay1 else
+				over be32 50415932 lit = if pzpay2 else 2drop then then
+			then
+		then
+	then
+;

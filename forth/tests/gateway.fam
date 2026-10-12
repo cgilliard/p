@@ -1,0 +1,57 @@
+\ tests/gateway.fam — the payment gateways (src/gateway.fam): records made,
+\ checked and refused; a gateway's directory keeping the newest.
+
+: tzgv variable ;  : tzg ( -- a )  tzgv 1200 lit lazy ;     \ a record kept aside
+: tzpv variable ;  : tzp ( -- a )  tzpv 500 lit lazy ;     \ a part's body
+\ tzput ( id k parts n -- msg n | 0 )   part k of a message: n bytes, each
+\        its part number, then reassembled.
+: tzn variable ;
+: tzput ( id k parts n -- msg n | 0 )
+	tzn !  tzp 5 lit + c!  dup tzp 4 lit + c!
+	tzp 6 lit + tzn @ 0 lit do over over i + c! loop 2drop  tzp be!
+	tzp pbd !  tzn @ 6 lit + pbn !  pzpart
+;
+: tzgvv variable ;  : tzval ( -- a )  tzgvv 20 lit lazy ;
+
+Test {
+	gateway_record {
+		20 lit 0 lit do i 7 lit * 3 lit + wlseed i + c! loop  0 lit paok !  0 lit bnet !
+		gwmake
+		gwmy gwcheck assert  gwh paid 20 lit mcmp 0= assert                \ its address: ours
+		gwmy tzg gwlen ncpy
+		\ a key's byte, the sequence, or the network changed: refused
+		tzg 20 lit + dup c@ 1 lit xor swap c!  tzg gwcheck 0= assert  tzg 20 lit + dup c@ 1 lit xor swap c!
+		tzg F lit + dup c@ 1 lit xor swap c!  tzg gwcheck 0= assert  tzg F lit + dup c@ 1 lit xor swap c!
+		1 lit bnet !  tzg gwcheck 0= assert  0 lit bnet !
+		tzg gwcheck assert
+	}
+	gateway_directory {
+		\ kept; the same again: not newer; a newer one: kept in its place
+		A000202 lit nsrc !  4D2 lit nsport !
+		pgop gwcnt @ tzval !                                                  \ the count before
+		tzg gwkeep 0 lit asrt_eq
+		tzg gwkeep 2 lit asrt_eq
+		pgop gwcnt @ tzval @ 1 lit + asrt_eq
+		gwmake  gwmy gwkeep 0 lit asrt_eq                                     \ a later sequence
+		pgop gwcnt @ tzval @ 1 lit + asrt_eq                                  \ the same address: one entry
+		gwdir paid gwv btget assert
+		gwv 8 lit + qbe@ gwmy 10 lit + qbe@ rot = -rot = and assert           \ its expiry
+		gwv 10 lit + @ A000202 lit asrt_eq  gwv 14 lit + @ 4D2 lit asrt_eq  \ where it was heard
+		gwv 18 lit + @ pgget gwmy 1000 lit mcmp 0= assert                    \ its bytes
+		gwv 1C lit + @ pgget gwmy 1000 lit + gwlen 1000 lit - mcmp 0= assert
+		tzg gwkeep 2 lit asrt_eq                                               \ the older one: refused
+	}
+	payment_parts {
+		\ 3 parts, out of order, one twice: whole once all are in, in order
+		7 lit 2 lit 3 lit 10 lit tzput 0 lit asrt_eq
+		7 lit 0 lit 3 lit 3E0 lit tzput 0 lit asrt_eq
+		7 lit 0 lit 3 lit 3E0 lit tzput 0 lit asrt_eq
+		7 lit 1 lit 3 lit 3E0 lit tzput  7D0 lit asrt_eq                      \ 2 x 0x3E0 + 0x10
+		dup c@ 0 lit asrt_eq  dup 3E0 lit + c@ 1 lit asrt_eq  dup 7C0 lit + c@ 2 lit asrt_eq  7CF lit + c@ 2 lit asrt_eq
+		\ 33 parts: the second mask word
+		21 lit 0 lit do 9 lit i 21 lit 3E0 lit tzput i 20 lit = if 7FE0 lit asrt_eq drop else 0 lit asrt_eq then loop
+		\ a part number past the parts, or too many parts: refused
+		5 lit 3 lit 3 lit 10 lit tzput 0 lit asrt_eq
+		5 lit 0 lit 29 lit 10 lit tzput 0 lit asrt_eq
+	}
+}
