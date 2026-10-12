@@ -97,13 +97,13 @@ reruns the main tests and these timings.
 What it needs: memory, a fixed 64 MiB heap in QEMU's default 128 MiB --
 whatever the chain's size, its state being on the disk (the page cache is
 12 MiB of it; running out stops the node, saying so) -- about 120 MiB of the
-host's. And disk: `scripts/node.sh` makes `data/disk.img` 64 GiB, sparse (it
+host's. And disk: `scripts/node.sh` makes `data/disk.img` 128 GiB, sparse (it
 takes only what's written). The first 2.5 GiB are the boot image, the tip
 log and the commit journal's room; the rest is the chain's -- its state (some
 500 MB for a million outputs, the groups' subtrees included) and every block
 whole. The node says at the start how much room is left, warns once under
 64 MiB, and stops, every commit before intact, rather than write past the
-end. A disk made smaller grows with the node stopped: `truncate -s 64G
+end. A disk made smaller grows with the node stopped: `truncate -s 128G
 data/disk.img`.
 
 `src/state.fam` keeps the chain's state -- the unspent outputs, the index

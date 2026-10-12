@@ -235,11 +235,11 @@
 : pgwarn variable ;
 : pgroom ( p -- p )
 	dup pgcap u< 0= if
-		"node: the disk is full: no room for the chain to grow (make the image larger, with the node stopped: truncate -s 64G data/disk.img)" lputs A lit lputc lfail
+		"node: the disk is full: no room for the chain to grow (make the image larger, with the node stopped: truncate -s +64G data/disk.img)" lputs A lit lputc lfail
 	then
 	pgwarn @ 0=  pgcap 2 lit pick - 4000 lit u< and if
 		-1 lit pgwarn !
-		"node: the disk is nearly full (under 64 MiB left for the chain; to make it larger, with the node stopped: truncate -s 64G data/disk.img)" lputs A lit lputc
+		"node: the disk is nearly full (under 64 MiB left for the chain; to make it larger, with the node stopped: truncate -s +64G data/disk.img)" lputs A lit lputc
 	then
 ;
 
