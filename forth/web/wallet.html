@@ -4,16 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tabernacle Wallet</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 104 104'%3E%3Cstyle%3Ecircle%7Bfill:%23133975%7Dpath%7Bstroke:%23ffffff%7D@media(prefers-color-scheme:dark)%7Bcircle%7Bfill:%238db4f0%7Dpath%7Bstroke:%230a1526%7D%7D%3C/style%3E%3Ccircle cx='52' cy='52' r='52'/%3E%3Cpath d='M52 14 V92 M28 40 H76' stroke-width='16' fill='none'/%3E%3C/svg%3E">
 <style>
 :root {
-  --bg: #f6f4ef; --panel: #ffffff; --ink: #1d1b16; --muted: #6b665a; --line: #e2ddd1;
-  --accent: #7a5a1e; --accent-ink: #ffffff; --good: #2f6b3a; --bad: #9b2c2c; --chip: #efe9da;
+  --bg: #f5f8fd; --panel: #ffffff; --ink: #121a2a; --muted: #4d5d78; --line: #c5d5ee;
+  --accent: #133975; --accent-ink: #ffffff; --good: #2f6b3a; --bad: #9b2c2c; --chip: #dbe7f8;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #15140f; --panel: #1f1d17; --ink: #ece7da; --muted: #a39c8a; --line: #34312a;
-    --accent: #d2a75a; --accent-ink: #1b1a14; --good: #7cc48a; --bad: #e08b8b; --chip: #2b2820;
+    --bg: #0a1526; --panel: #11203a; --ink: #e4ecf8; --muted: #9db1cf; --line: #24395c;
+    --accent: #8db4f0; --accent-ink: #0a1526; --good: #7cc48a; --bad: #e08b8b; --chip: #1a2c4b;
   }
 }
 * { box-sizing: border-box; }
@@ -22,6 +23,15 @@ body { margin: 0; background: var(--bg); color: var(--ink);
 header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
 header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand .mark { width: 30px; height: 30px; flex: none; }
+.brand .mark circle { fill: var(--accent); }
+.brand .mark path { stroke: var(--panel); stroke-width: 10; fill: none; }
+.brand .word { height: 19px; width: 121px; }
+.brand .word path { fill: var(--ink); }
+.brand.big { flex-direction: column; gap: 12px; margin: 4px 0 18px; }
+.brand.big .mark { width: 60px; height: 60px; }
+.brand.big .word { height: 26px; width: 166px; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--chip); color: var(--muted); }
 .chip.dev { color: var(--accent); }
 #chain { margin-left: auto; font-size: 13px; color: var(--muted); }
@@ -40,8 +50,10 @@ nav button { background: none; border: 0; padding: 8px 12px; border-radius: 8px;
 nav button[aria-selected="true"] { background: var(--panel); color: var(--ink); border: 1px solid var(--line); }
 section[hidden] { display: none; }
 label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
-input[type=text], textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
+input[type=text], textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--accent); border-radius: 8px;
   background: var(--bg); color: var(--ink); font: inherit; }
+input[type=text]:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+:root { accent-color: var(--accent); }
 textarea { font-family: var(--mono); font-size: 12px; min-height: 110px; resize: vertical; }
 .row { display: flex; gap: 12px; flex-wrap: wrap; } .row > div { flex: 1 1 180px; }
 button.primary, button.secondary { font: inherit; border-radius: 8px; padding: 9px 16px; cursor: pointer; margin-top: 14px; }
@@ -69,7 +81,7 @@ code { font-family: var(--mono); font-size: 12.5px; background: var(--chip); pad
 .check { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--muted); }
 .check input { margin: 0; }
 .biblebar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-.biblebar select { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; }
+.biblebar select { padding: 8px 10px; border: 1px solid var(--accent); border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; }
 .biblebar input { flex: 1 1 220px; }
 .biblebar button.secondary { margin-top: 0; padding: 8px 12px; }
 .scripture { font-family: Georgia, "Iowan Old Style", "Times New Roman", serif; font-size: 18px; line-height: 1.75; max-width: 700px; margin: 6px auto 0; }
@@ -102,7 +114,8 @@ h3.sub { font-size: 15px; font-weight: 650; margin: 22px 0 4px; padding-top: 14p
 </head>
 <body>
 <header>
-  <h1>Tabernacle Wallet</h1>
+  <!-- The logo: the cross in a circle, and "Tabernacle" in Josefin Sans SemiBold as outlines (SIL Open Font License) -->
+  <h1 class="brand" aria-label="Tabernacle Wallet"><svg class="mark" viewBox="0 0 104 104" aria-hidden="true"><circle cx="52" cy="52" r="52"></circle><path d="M52 18 V88 M32 40 H72"></path></svg><svg class="word" viewBox="48 -780 5057 792" aria-hidden="true"><path d="M48 -728H535V-616H347V0H231V-616H48Z M837 11Q778 11 730 -14Q681 -39 653 -88Q625 -138 625 -211Q625 -283 654 -334Q684 -386 732 -414Q781 -442 838 -442Q899 -442 936 -418Q974 -393 995 -361L989 -345L1000 -423H1103V0H991V-103L1002 -76Q999 -70 986 -57Q974 -43 953 -27Q932 -11 903 0Q875 11 837 11ZM868 -81Q899 -81 924 -92Q949 -103 966 -123Q983 -143 991 -171V-263Q983 -289 965 -309Q947 -328 921 -339Q896 -350 865 -350Q830 -350 802 -333Q773 -316 755 -286Q738 -256 738 -217Q738 -179 756 -148Q774 -117 804 -99Q834 -81 868 -81Z M1524 11Q1467 11 1426 -11Q1385 -34 1358 -69L1369 -98V0H1257V-780H1368V-336L1367 -375Q1392 -405 1437 -423Q1482 -442 1538 -442Q1595 -442 1641 -415Q1688 -388 1716 -339Q1743 -289 1743 -219Q1743 -148 1713 -96Q1683 -44 1632 -17Q1582 11 1524 11ZM1500 -84Q1536 -84 1566 -102Q1595 -119 1613 -150Q1630 -181 1630 -220Q1630 -258 1612 -288Q1595 -318 1566 -336Q1536 -354 1500 -354Q1468 -354 1442 -342Q1415 -331 1396 -312Q1378 -292 1369 -265V-172Q1379 -146 1397 -126Q1415 -106 1441 -95Q1467 -84 1500 -84Z M2064 11Q1989 11 1936 -18Q1883 -47 1855 -98Q1827 -149 1827 -215Q1827 -278 1859 -330Q1891 -381 1945 -411Q2000 -442 2066 -442Q2153 -442 2209 -391Q2266 -341 2285 -249L1944 -134L1918 -197L2185 -292L2161 -279Q2151 -309 2126 -331Q2101 -354 2057 -354Q2022 -354 1995 -337Q1968 -320 1952 -290Q1937 -261 1937 -221Q1937 -179 1954 -149Q1971 -118 2000 -101Q2029 -85 2066 -85Q2092 -85 2116 -94Q2139 -103 2161 -118L2212 -35Q2179 -14 2139 -2Q2100 11 2064 11Z M2496 -423 2506 -303 2502 -320Q2519 -358 2551 -385Q2582 -412 2616 -427Q2649 -442 2670 -442L2665 -330Q2617 -334 2581 -313Q2546 -292 2526 -256Q2506 -221 2506 -182V0H2395V-423Z M2886 -423 2895 -332 2892 -344Q2913 -388 2957 -414Q3001 -441 3061 -441Q3121 -441 3160 -406Q3199 -371 3200 -314V0H3088V-274Q3087 -306 3070 -326Q3053 -345 3016 -346Q2982 -346 2955 -325Q2928 -305 2912 -269Q2897 -234 2897 -188V0H2785V-423Z M3531 11Q3472 11 3424 -14Q3375 -39 3347 -88Q3319 -138 3319 -211Q3319 -283 3348 -334Q3378 -386 3426 -414Q3475 -442 3532 -442Q3593 -442 3630 -418Q3668 -393 3689 -361L3683 -345L3694 -423H3797V0H3685V-103L3696 -76Q3693 -70 3680 -57Q3668 -43 3647 -27Q3626 -11 3597 0Q3569 11 3531 11ZM3562 -81Q3593 -81 3618 -92Q3643 -103 3660 -123Q3677 -143 3685 -171V-263Q3677 -289 3659 -309Q3641 -328 3615 -339Q3590 -350 3559 -350Q3524 -350 3496 -333Q3467 -316 3449 -286Q3432 -256 3432 -217Q3432 -179 3450 -148Q3468 -117 3498 -99Q3528 -81 3562 -81Z M4301 -39Q4273 -16 4232 -3Q4192 11 4151 11Q4081 11 4028 -16Q3975 -44 3945 -93Q3916 -143 3916 -212Q3916 -281 3947 -331Q3979 -381 4030 -407Q4082 -434 4139 -434Q4193 -434 4234 -419Q4275 -405 4304 -380L4249 -307Q4233 -320 4208 -331Q4182 -343 4149 -343Q4116 -343 4088 -326Q4060 -309 4044 -279Q4028 -250 4028 -212Q4028 -176 4045 -146Q4062 -116 4092 -98Q4121 -81 4160 -81Q4186 -81 4207 -88Q4228 -96 4245 -109Z M4416 -780H4528V0H4416Z M4884 11Q4809 11 4756 -18Q4703 -47 4675 -98Q4647 -149 4647 -215Q4647 -278 4679 -330Q4711 -381 4765 -411Q4820 -442 4886 -442Q4973 -442 5029 -391Q5086 -341 5105 -249L4764 -134L4738 -197L5005 -292L4981 -279Q4971 -309 4946 -331Q4921 -354 4877 -354Q4842 -354 4815 -337Q4788 -320 4772 -290Q4757 -261 4757 -221Q4757 -179 4774 -149Q4791 -118 4820 -101Q4849 -85 4886 -85Q4912 -85 4936 -94Q4959 -103 4981 -118L5032 -35Q4999 -14 4959 -2Q4920 11 4884 11Z"></path></svg></h1>
   <span id="net" class="chip">…</span>
   <span id="chain"><span id="conn" class="dot"></span><span id="chaintext">connecting…</span></span>
 </header>
@@ -218,6 +231,7 @@ h3.sub { font-size: 15px; font-weight: 650; margin: 22px 0 4px; padding-top: 14p
 
 <div id="keydlg" hidden>
   <form class="card" id="keyform">
+    <div class="brand big" aria-hidden="true"><svg class="mark" viewBox="0 0 104 104" aria-hidden="true"><circle cx="52" cy="52" r="52"></circle><path d="M52 18 V88 M32 40 H72"></path></svg><svg class="word" viewBox="48 -780 5057 792" aria-hidden="true"><path d="M48 -728H535V-616H347V0H231V-616H48Z M837 11Q778 11 730 -14Q681 -39 653 -88Q625 -138 625 -211Q625 -283 654 -334Q684 -386 732 -414Q781 -442 838 -442Q899 -442 936 -418Q974 -393 995 -361L989 -345L1000 -423H1103V0H991V-103L1002 -76Q999 -70 986 -57Q974 -43 953 -27Q932 -11 903 0Q875 11 837 11ZM868 -81Q899 -81 924 -92Q949 -103 966 -123Q983 -143 991 -171V-263Q983 -289 965 -309Q947 -328 921 -339Q896 -350 865 -350Q830 -350 802 -333Q773 -316 755 -286Q738 -256 738 -217Q738 -179 756 -148Q774 -117 804 -99Q834 -81 868 -81Z M1524 11Q1467 11 1426 -11Q1385 -34 1358 -69L1369 -98V0H1257V-780H1368V-336L1367 -375Q1392 -405 1437 -423Q1482 -442 1538 -442Q1595 -442 1641 -415Q1688 -388 1716 -339Q1743 -289 1743 -219Q1743 -148 1713 -96Q1683 -44 1632 -17Q1582 11 1524 11ZM1500 -84Q1536 -84 1566 -102Q1595 -119 1613 -150Q1630 -181 1630 -220Q1630 -258 1612 -288Q1595 -318 1566 -336Q1536 -354 1500 -354Q1468 -354 1442 -342Q1415 -331 1396 -312Q1378 -292 1369 -265V-172Q1379 -146 1397 -126Q1415 -106 1441 -95Q1467 -84 1500 -84Z M2064 11Q1989 11 1936 -18Q1883 -47 1855 -98Q1827 -149 1827 -215Q1827 -278 1859 -330Q1891 -381 1945 -411Q2000 -442 2066 -442Q2153 -442 2209 -391Q2266 -341 2285 -249L1944 -134L1918 -197L2185 -292L2161 -279Q2151 -309 2126 -331Q2101 -354 2057 -354Q2022 -354 1995 -337Q1968 -320 1952 -290Q1937 -261 1937 -221Q1937 -179 1954 -149Q1971 -118 2000 -101Q2029 -85 2066 -85Q2092 -85 2116 -94Q2139 -103 2161 -118L2212 -35Q2179 -14 2139 -2Q2100 11 2064 11Z M2496 -423 2506 -303 2502 -320Q2519 -358 2551 -385Q2582 -412 2616 -427Q2649 -442 2670 -442L2665 -330Q2617 -334 2581 -313Q2546 -292 2526 -256Q2506 -221 2506 -182V0H2395V-423Z M2886 -423 2895 -332 2892 -344Q2913 -388 2957 -414Q3001 -441 3061 -441Q3121 -441 3160 -406Q3199 -371 3200 -314V0H3088V-274Q3087 -306 3070 -326Q3053 -345 3016 -346Q2982 -346 2955 -325Q2928 -305 2912 -269Q2897 -234 2897 -188V0H2785V-423Z M3531 11Q3472 11 3424 -14Q3375 -39 3347 -88Q3319 -138 3319 -211Q3319 -283 3348 -334Q3378 -386 3426 -414Q3475 -442 3532 -442Q3593 -442 3630 -418Q3668 -393 3689 -361L3683 -345L3694 -423H3797V0H3685V-103L3696 -76Q3693 -70 3680 -57Q3668 -43 3647 -27Q3626 -11 3597 0Q3569 11 3531 11ZM3562 -81Q3593 -81 3618 -92Q3643 -103 3660 -123Q3677 -143 3685 -171V-263Q3677 -289 3659 -309Q3641 -328 3615 -339Q3590 -350 3559 -350Q3524 -350 3496 -333Q3467 -316 3449 -286Q3432 -256 3432 -217Q3432 -179 3450 -148Q3468 -117 3498 -99Q3528 -81 3562 -81Z M4301 -39Q4273 -16 4232 -3Q4192 11 4151 11Q4081 11 4028 -16Q3975 -44 3945 -93Q3916 -143 3916 -212Q3916 -281 3947 -331Q3979 -381 4030 -407Q4082 -434 4139 -434Q4193 -434 4234 -419Q4275 -405 4304 -380L4249 -307Q4233 -320 4208 -331Q4182 -343 4149 -343Q4116 -343 4088 -326Q4060 -309 4044 -279Q4028 -250 4028 -212Q4028 -176 4045 -146Q4062 -116 4092 -98Q4121 -81 4160 -81Q4186 -81 4207 -88Q4228 -96 4245 -109Z M4416 -780H4528V0H4416Z M4884 11Q4809 11 4756 -18Q4703 -47 4675 -98Q4647 -149 4647 -215Q4647 -278 4679 -330Q4711 -381 4765 -411Q4820 -442 4886 -442Q4973 -442 5029 -391Q5086 -341 5105 -249L4764 -134L4738 -197L5005 -292L4981 -279Q4971 -309 4946 -331Q4921 -354 4877 -354Q4842 -354 4815 -337Q4788 -320 4772 -290Q4757 -261 4757 -221Q4757 -179 4774 -149Q4791 -118 4820 -101Q4849 -85 4886 -85Q4912 -85 4936 -94Q4959 -103 4981 -118L5032 -35Q4999 -14 4959 -2Q4920 11 4884 11Z"></path></svg></div>
     <h2>Unlock the wallet</h2>
     <p class="hint">Enter the wallet's API key. The node shows it when the wallet is made; to see it again, run <code>./scripts/node.sh --api-key</code>.</p>
     <label for="keyin">API key</label>
