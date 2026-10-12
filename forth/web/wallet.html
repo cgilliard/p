@@ -83,6 +83,9 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
   padding: 9px 4px; color: var(--ink); font: 15px/1.55 Georgia, "Times New Roman", serif; cursor: pointer; }
 .hit:hover { background: var(--chip); }
 .hit b { font-family: system-ui, sans-serif; font-size: 12.5px; color: var(--accent); margin-right: 6px; }
+.addrbox { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.addrbox .label { margin-bottom: 4px; }
+h3.sub { font-size: 15px; font-weight: 650; margin: 22px 0 4px; padding-top: 14px; border-top: 1px solid var(--line); }
 .addrrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
 .addrrow code { font-size: 13px; overflow-wrap: anywhere; flex: 1 1 260px; padding: 6px 8px; }
 .addrrow button.secondary { margin-top: 0; padding: 6px 12px; }
@@ -115,38 +118,49 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
       <span id="heldwrap" hidden>Held <b id="held">–</b></span>
     </div>
     <div id="walletnote" class="hint" hidden></div>
+    <div class="addrbox">
+      <div class="label">Tabernacle Address</div>
+      <div class="addrrow"><code id="payaddr">–</code><button class="secondary" id="copyaddr">Copy</button></div>
+    </div>
   </div>
 
   <nav role="tablist">
-    <button role="tab" data-tab="send" aria-selected="true">Send</button>
-    <button role="tab" data-tab="receive">Receive</button>
-    <button role="tab" data-tab="finalize">Finalize</button>
+    <button role="tab" data-tab="home" aria-selected="true">Home</button>
+    <button role="tab" data-tab="slates">Slates</button>
     <button role="tab" data-tab="activity">Activity</button>
     <button role="tab" data-tab="coins">Coins</button>
     <button role="tab" data-tab="bible">Bible</button>
     <button role="tab" data-tab="log">Log</button>
   </nav>
 
-  <section id="tab-send" class="card">
-    <label for="payto">Pay to address <span class="hint">(optional: leave it empty to make a payment file)</span></label>
+  <section id="tab-home" class="card">
+    <label for="payto">Address to send to</label>
     <input id="payto" type="text" placeholder="tab1…" autocomplete="off" spellcheck="false">
     <div class="row">
       <div><label for="amount">Amount</label><input id="amount" type="text" inputmode="decimal" placeholder="1.5" autocomplete="off"></div>
       <div><label for="fee">Fee</label><input id="fee" type="text" inputmode="decimal" value="0.0001" autocomplete="off"></div>
     </div>
-    <button class="primary" id="sendbtn">Pay, or create the payment file</button>
+    <button class="primary" id="paybtn">Send</button>
+    <div id="payout"></div>
+  </section>
+
+  <section id="tab-slates" class="card" hidden>
+    <p class="hint" style="margin-top:0">Payments by file, without an address: you make a payment file, the person you're paying answers it, and you finalize their answer.</p>
+
+    <h3 class="sub">Make a payment file</h3>
+    <div class="row">
+      <div><label for="samount">Amount</label><input id="samount" type="text" inputmode="decimal" placeholder="1.5" autocomplete="off"></div>
+      <div><label for="sfee">Fee</label><input id="sfee" type="text" inputmode="decimal" value="0.0001" autocomplete="off"></div>
+    </div>
+    <button class="primary" id="sendbtn">Create payment file</button>
     <ol class="steps">
       <li>Give the payment file to the person you're paying.</li>
       <li>They answer it and send a file back.</li>
-      <li>Finalize that file here: the payment is signed and sent.</li>
+      <li>Finalize that file below: the payment is signed and sent.</li>
     </ol>
     <div id="sendout"></div>
-  </section>
 
-  <section id="tab-receive" class="card" hidden>
-    <label>Your payment address</label>
-    <div class="addrrow"><code id="payaddr">–</code><button class="secondary" id="copyaddr">Copy</button></div>
-    <p class="hint">Others will pay this address through the network's gateways. Until that's running, payments go as files, below.</p>
+    <h3 class="sub">Answer a payment file</h3>
     <p class="hint">Answer a payment file someone gave you. Then give your answer back to them; they finalize it.</p>
     <label for="recvfile">Payment file (<code>.s1.slate</code>)</label>
     <input id="recvfile" type="file" accept=".slate,text/plain">
@@ -154,10 +168,9 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
     <textarea id="recvtext" placeholder="-----BEGIN TABERNACLE SLATE-----"></textarea>
     <button class="primary" id="recvbtn">Answer it</button>
     <div id="recvout"></div>
-  </section>
 
-  <section id="tab-finalize" class="card" hidden>
-    <p class="hint" style="margin-top:0">Finalize the answer to a payment you started: it's signed and sent to the network.</p>
+    <h3 class="sub">Finalize an answer</h3>
+    <p class="hint">Finalize the answer to a payment file you made: it's signed and sent to the network.</p>
     <label for="finfile">Answer file (<code>.s2.slate</code>)</label>
     <input id="finfile" type="file" accept=".slate,text/plain">
     <label for="fintext">…or paste its text</label>
@@ -402,27 +415,34 @@ async function busy(btn, fn) {
 }
 const AMOUNT = /^\d+(\.\d{1,9})?$/;
 
-$("sendbtn").addEventListener("click", () => busy($("sendbtn"), async () => {
-  const amount = $("amount").value.trim(), fee = $("fee").value.trim() || "0.0001", box = $("sendout");
+$("paybtn").addEventListener("click", () => busy($("paybtn"), async () => {
+  const to = $("payto").value.trim(), amount = $("amount").value.trim(), fee = $("fee").value.trim() || "0.0001", box = $("payout");
+  if (!to) { showError(box, new Error("Enter the address to send to.")); return; }
   if (!AMOUNT.test(amount) || !AMOUNT.test(fee)) { showError(box, new Error("Amounts are coins, like 1.5 (at most 9 decimals).")); return; }
-  const to = $("payto").value.trim();
   try {
-    if (to) {
-      await call("pay", { address: to, amount, fee });
-      box.replaceChildren(el("div", { class: "hint" }, "Finding the address…"));
-      const said = { finding: "Finding the address…", sending: "Sent: waiting for their wallet to answer…" };
-      for (let i = 0; i < 120; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        const p = await call("payment");
-        if (p.state === "paid") { box.replaceChildren(el("div", { class: "ok" }, `Paid ${coins(amount)}: the transaction is on its way to the network.`), el("div", { class: "hint" }, "Transaction " + p.txid)); break; }
-        if (p.state === "failed") { showError(box, new Error("The payment failed: " + p.error)); break; }
-        box.replaceChildren(el("div", { class: "hint" }, said[p.state] || "…"));
+    await call("pay", { address: to, amount, fee });
+    box.replaceChildren(el("div", { class: "hint" }, "Finding the address…"));
+    const said = { finding: "Finding the address…", sending: "Sent: waiting for their wallet to answer…" };
+    for (let i = 0; i < 120; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const p = await call("payment");
+      if (p.state === "paid") {
+        box.replaceChildren(el("div", { class: "ok" }, `Sent ${coins(amount)}: the transaction is on its way to the network.`), el("div", { class: "hint" }, "Transaction " + p.txid));
+        $("payto").value = ""; $("amount").value = "";
+        break;
       }
-      refresh();
-      return;
+      if (p.state === "failed") { showError(box, new Error("The payment failed: " + p.error)); break; }
+      box.replaceChildren(el("div", { class: "hint" }, said[p.state] || "…"));
     }
+    refresh();
+  } catch (e) { showError(box, e); }
+}));
+$("sendbtn").addEventListener("click", () => busy($("sendbtn"), async () => {
+  const amount = $("samount").value.trim(), fee = $("sfee").value.trim() || "0.0001", box = $("sendout");
+  if (!AMOUNT.test(amount) || !AMOUNT.test(fee)) { showError(box, new Error("Amounts are coins, like 1.5 (at most 9 decimals).")); return; }
+  try {
     const r = await call("send", { amount, fee });
-    slateResult(box, `Payment file for ${coins(amount)}`, r, "Give this file to the person you're paying. When they send their answer back, finalize it.");
+    slateResult(box, `Payment file for ${coins(amount)}`, r, "Give this file to the person you're paying. When they send their answer back, finalize it below.");
     refresh();
   } catch (e) { showError(box, e); }
 }));
