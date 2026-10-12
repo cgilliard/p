@@ -75,10 +75,8 @@ pub enum Request {
     SubmitFile { file: PathBuf },
     /// Summarize a transaction file.
     Inspect { file: PathBuf },
-    /// `--debug-disable-verification` only: fabricate a block of `count`
-    /// new outputs, then one spending them all and making `count` more
-    /// (`DebugBig`).
-    DebugBigBlock { count: usize },
+    /// `--debug-disable-verification` only: fabricate blocks (`DebugBig`).
+    DebugBigBlock(DebugBig),
     Quit,
 }
 
@@ -119,15 +117,54 @@ enum Miner {
     },
 }
 
-/// `debug-big-block`: what the next templates fabricate. Fan: `count`
-/// new outputs (bare commitments, random); then Spend: every one of them,
-/// and as many new ones -- a block as large as a full one, every input a
-/// real unspent output, so a node that skips proofs applies it as any
-/// other. Only on a chain no node verifies proofs on.
+/// `debug-big-block`: what the next templates fabricate -- bare
+/// commitments, random, and spends of real unspent outputs, so a node that
+/// skips proofs applies the blocks as any other. Only on a chain no node
+/// verifies proofs on.
+#[derive(Debug)]
 pub enum DebugBig {
     Idle,
-    Fan(usize),
+    /// `count` new outputs, for `blocks` blocks; then, if `then_spend`, a
+    /// block spending the last block's all and making as many more.
+    Fan { count: usize, blocks: usize, then_spend: bool },
+    /// Spend these, and make as many new outputs.
     Spend(Vec<[u8; 32]>),
+    /// Spend `count` of the live outputs: chosen at random (making as many
+    /// new ones -- a block like a full one's, its spends across the
+    /// state), or `spread`, one to a group of 16 positions spread evenly
+    /// over the state (making none: the most of the tree a block can make a
+    /// node rehash).
+    Live { count: usize, spread: bool },
+}
+
+/// `count` of the live outputs `live` (by position): random, or one each
+/// from `count` groups of 16 positions spread over them.
+fn pick_live(live: &[(u64, [u8; 32])], count: usize, spread: bool) -> Result<Vec<[u8; 32]>, String> {
+    if spread {
+        let mut firsts: Vec<[u8; 32]> = Vec::new();
+        let mut group = u64::MAX;
+        for (position, commitment) in live {
+            if position >> 4 != group {
+                group = position >> 4;
+                firsts.push(*commitment);
+            }
+        }
+        if firsts.len() < count {
+            return Err(format!("only {} groups of 16 positions hold a live output", firsts.len()));
+        }
+        Ok((0..count).map(|i| firsts[i * firsts.len() / count]).collect())
+    } else {
+        if live.len() < count {
+            return Err(format!("only {} live outputs", live.len()));
+        }
+        let mut indices: Vec<usize> = (0..live.len()).collect();
+        for i in 0..count {
+            let r = u64::from_le_bytes(crate::random_key()[..8].try_into().unwrap()) as usize;
+            let j = i + r % (indices.len() - i);
+            indices.swap(i, j);
+        }
+        Ok(indices[..count].iter().map(|&i| live[i].1).collect())
+    }
 }
 
 /// `count` fresh commitments (each word below the field's prime, as
@@ -727,8 +764,22 @@ impl Node {
     fn start_debug_template(&mut self, transactions: &[Transaction], reward: [u8; 32]) {
         let (spend, create) = match &self.debug_big {
             DebugBig::Idle => (Vec::new(), Vec::new()),
-            DebugBig::Fan(count) => (Vec::new(), fabricate(*count)),
+            DebugBig::Fan { count, .. } => (Vec::new(), fabricate(*count)),
             DebugBig::Spend(outputs) => (outputs.clone(), fabricate(outputs.len())),
+            DebugBig::Live { count, spread } => {
+                let picked = self.chain.debug_unspent().map_err(|e| e.to_string()).and_then(|live| pick_live(&live, *count, *spread));
+                match picked {
+                    Ok(spend) => {
+                        let create = if *spread { Vec::new() } else { fabricate(spend.len()) };
+                        (spend, create)
+                    }
+                    Err(e) => {
+                        error!("debug-big-block: {e}");
+                        self.debug_big = DebugBig::Idle;
+                        (Vec::new(), Vec::new())
+                    }
+                }
+            }
         };
         let start = Instant::now();
         let unproven = match self.chain.build_debug_block(transactions, &spend, &create) {
@@ -753,8 +804,9 @@ impl Node {
         }
         self.debug_next = match &self.debug_big {
             DebugBig::Idle => None,
-            DebugBig::Fan(_) => Some(DebugBig::Spend(create.iter().map(|(c, _)| *c).collect())),
-            DebugBig::Spend(_) => Some(DebugBig::Idle),
+            &DebugBig::Fan { count, blocks, then_spend } if blocks > 1 => Some(DebugBig::Fan { count, blocks: blocks - 1, then_spend }),
+            DebugBig::Fan { then_spend: true, .. } => Some(DebugBig::Spend(create.iter().map(|(c, _)| *c).collect())),
+            DebugBig::Fan { .. } | DebugBig::Spend(_) | DebugBig::Live { .. } => Some(DebugBig::Idle),
         };
         let (target, min_timestamp) = (unproven.target, unproven.min_timestamp);
         self.miner = Miner::Mining {
@@ -1033,7 +1085,7 @@ impl Node {
                     crate::mnemonic::display(&words)
                 ))
             }
-            Request::DebugBigBlock { count } => {
+            Request::DebugBigBlock(what) => {
                 if !self.debug_unverified {
                     return Err("only on a node run with --debug-disable-verification".into());
                 }
@@ -1041,11 +1093,42 @@ impl Node {
                     return Err("mining is off (mine on)".into());
                 }
                 self.abandon_template();
-                self.debug_big = DebugBig::Fan(count);
-                info!("debug-big-block: next, a block of {count} new outputs; then one spending them all and making {count} more");
-                Ok(format!("mining a block of {count} new outputs, then one spending them all and making {count} more (see the log)"))
+                let said = match &what {
+                    DebugBig::Fan { count, blocks, then_spend: true } => format!("{blocks} block(s) of {count} new outputs, then one spending the last's all and making {count} more"),
+                    DebugBig::Fan { count, blocks, .. } => format!("{blocks} block(s) of {count} new outputs"),
+                    DebugBig::Live { count, spread: false } => format!("a block spending {count} live outputs chosen at random and making {count} more"),
+                    DebugBig::Live { count, spread: true } => format!("a block spending {count} live outputs, one to a group of 16 positions"),
+                    DebugBig::Idle | DebugBig::Spend(_) => "nothing fabricated".into(),
+                };
+                self.debug_big = what;
+                info!("debug-big-block: next, {said}");
+                Ok(format!("mining {said} (see the log)"))
             }
             Request::Quit => Ok("bye".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    /// `pick_live`: random picks are distinct live outputs; spread picks
+    /// one to a group of 16 positions, evenly over the groups.
+    #[test]
+    fn debug_spends_pick_distinct_live_outputs() {
+        let live: Vec<(u64, [u8; 32])> = (0..1000u64).map(|p| (p * 3, [(p % 251) as u8, (p / 251) as u8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])).collect();
+        let position = |c: &[u8; 32]| live.iter().find(|(_, x)| x == c).unwrap().0;
+        let random = pick_live(&live, 500, false).unwrap();
+        let mut seen: Vec<u64> = random.iter().map(position).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 500);
+        let spread = pick_live(&live, 100, true).unwrap();
+        let mut groups: Vec<u64> = spread.iter().map(|c| position(c) >> 4).collect();
+        groups.dedup();
+        assert_eq!(groups.len(), 100, "one to a group, in order");
+        assert!(pick_live(&live, 1001, false).is_err());
+        assert!(pick_live(&live, 200, true).is_err(), "3000 positions: 188 groups");
     }
 }

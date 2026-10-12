@@ -94,6 +94,18 @@ blocks, state or undo data -- a block is checked against its parent's tip
 alone -- so a reorganization only moves the best tip. `scripts/test_main.sh`
 reruns the main tests and these timings.
 
+What it needs: memory, a fixed 64 MiB heap in QEMU's default 128 MiB --
+whatever the chain's size, its state being on the disk (the page cache is
+12 MiB of it; running out stops the node, saying so) -- about 120 MiB of the
+host's. And disk: `scripts/node.sh` makes `data/disk.img` 64 GiB, sparse (it
+takes only what's written). The first 2.5 GiB are the boot image, the tip
+log and the commit journal's room; the rest is the chain's -- its state (some
+500 MB for a million outputs, the groups' subtrees included) and every block
+whole. The node says at the start how much room is left, warns once under
+64 MiB, and stops, every commit before intact, rather than write past the
+end. A disk made smaller grows with the node stopped: `truncate -s 64G
+data/disk.img`.
+
 `src/state.fam` keeps the chain's state -- the unspent outputs, the index
 from commitment to position, and the Merkle tree over them -- on B+trees
 (`src/btree.fam`) over a page cache with atomic, journaled commits of any
@@ -134,11 +146,27 @@ searched by binary search in assembly (`src/btbs.S`), with `mcmp`, `ncpy`,
 `nzero` and `bmove` in assembly too; range scans read along a leaf
 (`btfrom`/`btnext`) rather than from the root for each entry; a spend's
 lookups and deletes, and an append's duplicate check and insert, made one
-descent each (`bttake`, `btins`); a page cache of 8 MiB that finds a page to
+descent each (`bttake`, `btins`); a page cache of 12 MiB that finds a page to
 evict without scanning every slot; and the peer timers a yield runs reading
 the clock once, not for each of the table's 256 slots (each read a long
 division: they had cost more than the work they interrupted). The Rust node
-updates its tree once per block too (`StateTree::apply`). The rest is
+updates its tree once per block too (`StateTree::apply`).
+
+That block is the easy case: its spends are consecutive outputs. On a state
+of 1.07 million outputs (25 blocks of 43,000 new ones: `debug-big-block fan
+43000 25`), a full block of 22,000 spends chosen at random and 22,000
+appends (`random 22000`) takes about 61 s (Rust: 5 s), and the worst a
+block can do -- 65,000 spends, one to each group of 16 positions (`spread
+65000`) -- about 112 s (Rust: 10 s). It's mostly the tree: a scattered spend
+shares no nodes until high up. What brought these down from about 3.3 and
+8.3 minutes: a node updated from its children where one is stored (no range
+scan) and both children read in one scan; a page cache of 12 MiB (16 would
+leave too little heap for a node using everything); and each group of 16
+positions (a stored level-4 node) kept with its whole subtree -- 16 leaves'
+hashes and 15 nodes, in B+tree 9 -- so a spend rehashes its leaf's 4
+ancestors rather than all 31 (`st4`). That costs disk: some 130 bytes an
+output, on this state (504 MB, from 364). A disk from before has no
+subtrees: a group's is made the first time it's touched, at the old cost. The rest is
 mostly Poseidon2 (some 43,000 permutations for the tree, 37,000 for the
 body hash).
 `src/net.fam` is UDP over virtio-net (ARP, IPv4, polled), and `src/peer.fam`

@@ -100,7 +100,11 @@ if [ -n "$APIKEY" ]; then
 	exit 0
 fi
 mkdir -p data
-[ -e data/disk.img ] || truncate -s 4G data/disk.img
+# Sparse: it takes only what the node writes.  The first 2.5 GiB are its
+# boot image, tip log and journal; the rest holds the chain (blocks are kept
+# whole).  A disk made smaller grows, with the node stopped: truncate -s 64G
+# data/disk.img.
+[ -e data/disk.img ] || truncate -s 64G data/disk.img
 # QEMU can't forward a port something else holds, and quits without a word.
 if command -v ss >/dev/null; then
 	if ss -Huln "sport = :$PORT" | grep -q .; then

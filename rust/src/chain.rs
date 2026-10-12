@@ -2183,6 +2183,13 @@ impl Chain {
 }
 
 impl Chain {
+    /// Every live output's position and commitment, by position -- for
+    /// `--debug-disable-verification`'s fabricated spends.
+    pub fn debug_unspent(&self) -> Result<Vec<(u64, [u8; 32])>> {
+        let txn = self.storage.read_txn()?;
+        Ok(self.state.unspent_in(&txn, 0, u64::MAX)?.into_iter().map(|(p, c, _, _)| (p, c)).collect())
+    }
+
     /// `build_block` for `--debug-disable-verification`: `transactions`,
     /// plus bare commitments -- `spend` (unspent outputs, which must
     /// exist) and `create` (new outputs, with their nonces) -- that no

@@ -495,7 +495,10 @@ B3FE7E00 ,   \ and t4,t4,t2
 \ lazy ( var n -- a )   var's buffer, allocating n bytes on first use
 \        (variables start at zero).
 : lazy ( var n -- a )
-	over @ dup if nip nip else drop alloc dup rot ! then
+	over @ dup if nip nip else
+		drop alloc dup 0= if "out of memory: the heap is full\n" puts bye then
+		dup rot !
+	then
 ;
 
 \ cpy ( src dst n -- )   copy n cells (n >= 1).

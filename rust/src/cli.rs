@@ -10,7 +10,12 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
-use crate::node::{Reply, Request};
+use crate::node::{DebugBig, Reply, Request};
+
+/// A positive count.
+fn parse_count(n: &str) -> Result<usize, String> {
+    n.parse::<usize>().ok().filter(|c| *c > 0).ok_or_else(|| format!("not a count: {n}"))
+}
 use crate::output::{UNITS_PER_COIN, parse_amount};
 
 /// The fee `send` uses unless told otherwise: 0.0001 coins.
@@ -31,6 +36,12 @@ const HELP: &str = "commands:
   debug-big-block <count>        with --debug-disable-verification: mine a block of <count>
                                  fabricated outputs, then one spending them all and making
                                  <count> more (12000 makes a block of about 1 MB)
+  debug-big-block fan <count> [blocks]
+                                 <blocks> blocks of <count> fabricated outputs (43000 fills one)
+  debug-big-block random <count> a block spending <count> live outputs chosen at random, and
+                                 making <count> more (22000: a full block's worth)
+  debug-big-block spread <count> a block spending <count> live outputs, one to a group of 16
+                                 positions (65000 fills one)
   help                           this
   quit                           stop the node
 
@@ -101,11 +112,17 @@ pub fn parse(line: &str) -> Option<Result<Request, String>> {
         ("mine", ["off"]) => Ok(Request::Mine(false)),
         ("mine", _) => usage("mine on|off"),
         ("seed", []) => Ok(Request::Seed),
-        ("debug-big-block", [n]) => match n.parse::<usize>() {
-            Ok(count) if count > 0 => Ok(Request::DebugBigBlock { count }),
-            _ => Err(format!("not a count: {n}")),
-        },
-        ("debug-big-block", _) => usage("debug-big-block <count>"),
+        ("debug-big-block", [n]) => parse_count(n).map(|count| Request::DebugBigBlock(DebugBig::Fan { count, blocks: 1, then_spend: true })),
+        ("debug-big-block", ["fan", n, rest @ ..]) if rest.len() <= 1 => (|| {
+            let blocks = match rest {
+                [b] => parse_count(b)?,
+                _ => 1,
+            };
+            Ok(Request::DebugBigBlock(DebugBig::Fan { count: parse_count(n)?, blocks, then_spend: false }))
+        })(),
+        ("debug-big-block", ["random", n]) => parse_count(n).map(|count| Request::DebugBigBlock(DebugBig::Live { count, spread: false })),
+        ("debug-big-block", ["spread", n]) => parse_count(n).map(|count| Request::DebugBigBlock(DebugBig::Live { count, spread: true })),
+        ("debug-big-block", _) => usage("debug-big-block <count> | fan <count> [blocks] | random <count> | spread <count>"),
         ("key", []) => Ok(Request::ContractKey { height: 0 }),
         ("key", [h]) => match h.parse::<usize>() {
             Ok(height) if height <= crate::keytree::MAX_HEIGHT => Ok(Request::ContractKey { height }),
@@ -241,7 +258,10 @@ mod tests {
         assert!(matches!(ok("finalize a.s2.slate"), Request::Finalize { .. }));
         assert!(matches!(ok("cancel 00112233445566778899aabbccddeeff"), Request::Cancel { id } if id[15] == 0xff));
         assert!(matches!(ok("mine off"), Request::Mine(false)));
-        assert!(matches!(ok("debug-big-block 22000"), Request::DebugBigBlock { count: 22000 }));
+        assert!(matches!(ok("debug-big-block 22000"), Request::DebugBigBlock(DebugBig::Fan { count: 22000, blocks: 1, then_spend: true })));
+        assert!(matches!(ok("debug-big-block fan 43000 25"), Request::DebugBigBlock(DebugBig::Fan { count: 43000, blocks: 25, then_spend: false })));
+        assert!(matches!(ok("debug-big-block random 22000"), Request::DebugBigBlock(DebugBig::Live { count: 22000, spread: false })));
+        assert!(matches!(ok("debug-big-block spread 65000"), Request::DebugBigBlock(DebugBig::Live { count: 65000, spread: true })));
         assert!(matches!(ok("quit"), Request::Quit));
     }
 

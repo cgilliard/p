@@ -24,13 +24,14 @@
 \ Meta page (cells): 0 "STAT"  4 version (2)  8 commits  C hwm  10 free list
 \ head  14 .. 24 four roots (src/btree.fam)  24 .. 100 the state (src/state.fam,
 \ src/accept.fam, src/snap.fam)  100 .. 114 five more roots  114 .. 11C the
-\ log's line numbers (src/logstore.fam)  200 .. 270 the wallet
+\ log's line numbers (src/logstore.fam)  120 a tenth root (the state's
+\ groups)  200 .. 270 the wallet
 \ (src/wallet.fam).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : pgbase ( -- sector )   110008 lit ;                 \ after the tip log (src/store.fam)
 : pgsz ( -- n )          1000 lit ;                    \ bytes a page
-: pgn ( -- n )           800 lit ;                     \ cache slots: 8 MiB
+: pgn ( -- n )           C00 lit ;                     \ cache slots: 12 MiB
 : pgjcap ( -- n )        80000 lit ;                   \ journal slots: 2^19
 : pgj0 ( -- p )          202 lit ;                     \ the first journal slot's page
 : pgd0 ( -- p )          80202 lit ;                   \ the first data page
@@ -166,7 +167,7 @@
 		-1 lit pgvd !
 		40 lit 0 lit do
 			pgvs @ 0< if
-				pgrr @ 1 lit + pgn 1 lit - and dup pgrr !
+				pgrr @ 1 lit + dup pgn = if drop 0 lit then dup pgrr !
 				dup pgce pgc@ pgep @ <> if
 					dup pgcd pgc@ 0= if pgvs ! else pgvd @ 0< if pgvd ! else drop then then
 				else drop then
@@ -177,7 +178,7 @@
 	pgvs @ 0< if
 		pgn 0 lit do
 			pgvs @ 0< if
-				pgrr @ 1 lit + pgn 1 lit - and dup pgrr !
+				pgrr @ 1 lit + dup pgn = if drop 0 lit then dup pgrr !
 				dup pgcd pgc@ 0= over pgce pgc@ pgep @ <> and if pgvs ! else drop then
 			then
 		loop
@@ -185,7 +186,7 @@
 	pgvs @ 0< if
 		pgn 0 lit do
 			pgvs @ 0< if
-				pgrr @ 1 lit + pgn 1 lit - and dup pgrr !
+				pgrr @ 1 lit + dup pgn = if drop 0 lit then dup pgrr !
 				dup pgce pgc@ pgep @ <> if dup pgspill pgvs ! else drop then
 			then
 		loop
@@ -220,12 +221,34 @@
 : pgm ( -- a )   0 lit pgget ;
 : pgmd ( -- )    0 lit pgdirty ;
 
+\ pgcap ( -- n )   how many pages the disk holds (its capacity, from the
+\        virtio-blk config: sectors, at the device's 0x100; past 2 TiB, as
+\        many as page numbers go).  pgleft ( -- n )   pages never yet used.
+: pgcap ( -- n )
+	dbds @ @ dup 104 lit + @ if drop FFFFFFFF lit else 100 lit + @ then
+	dup pgbase u< if drop 0 lit else pgbase - 3 lit rshift then
+;
+: pgleft ( -- n )   pgcap pgm C lit + @ 2dup u< if 2drop 0 lit else - then ;
+
+\ pgroom ( p -- p )   a new page past the disk's end stops the node, every
+\        commit before intact; with under 64 MiB left, a warning, once.
+: pgwarn variable ;
+: pgroom ( p -- p )
+	dup pgcap u< 0= if
+		"node: the disk is full: no room for the chain to grow (make the image larger, with the node stopped: truncate -s 64G data/disk.img)" lputs A lit lputc lfail
+	then
+	pgwarn @ 0=  pgcap 2 lit pick - 4000 lit u< and if
+		-1 lit pgwarn !
+		"node: the disk is nearly full (under 64 MiB left for the chain; to make it larger, with the node stopped: truncate -s 64G data/disk.img)" lputs A lit lputc
+	then
+;
+
 \ pgnew ( -- p )   a fresh, zeroed, changed page: from the free list, else new.
 : pgnew ( -- p )
 	pgm 10 lit + @ ?dup if
 		dup pgget @ pgm 10 lit + !
 	else
-		pgm C lit + @ dup 1 lit + pgm C lit + !
+		pgm C lit + @ pgroom dup 1 lit + pgm C lit + !
 	then
 	pgmd
 	dup pgget 400 lit zero

@@ -28,6 +28,7 @@
 	tsnn @
 ;
 : tsn1 variable ;
+: tsgvv variable ;  : tsgv ( -- a )  tsgvv 3E0 lit lazy ;
 
 \ tsok ( w0 .. w7 -- f )   whether the root is the 32 bytes whose words these are.
 : tsok ( w0 .. w7 -- f )
@@ -87,5 +88,17 @@ Test {
 		5 lit tsdata  tscm tsno 7 lit stadd 0= assert
 		13B6AC40 lit 3121B98D lit 4F9AA1D5 lit 766256D7 lit 65D9E3A0 lit 1508C31B lit 71E73F52 lit 1BCA7856 lit tsok assert
 		stc@ 0 lit asrt_eq 28 lit asrt_eq
+	}
+	state_groups_kept {
+		\ Each group's subtree, as kept through the spends and appends above,
+		\ is the one hashed afresh from the records (groups 0, 1 and 2: spent
+		\ outputs in each, and 2 past the count).
+		3 lit 0 lit do
+			stsubs  i 0 lit stk qbe!  stk tsgv btget assert
+			stsubs  i 0 lit stk qbe!  stk btdel assert                      \ gone: rebuilt whole
+			i stil !  0 lit stih !  stfrom stlvn !  0 lit st4m !  stlvl
+			st4b tsgv F8 lit ceq assert
+		loop
+		13B6AC40 lit 3121B98D lit 4F9AA1D5 lit 766256D7 lit 65D9E3A0 lit 1508C31B lit 71E73F52 lit 1BCA7856 lit tsok assert
 	}
 }

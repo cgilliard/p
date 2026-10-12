@@ -17,7 +17,8 @@
 \ commitment -> position.  2 stored nodes: level (1) and index (8) -> hash.
 \ 3 blocks: block hash -> 0 its undo data's first page, 4 outputs it spent,
 \ 8 outputs it appended, C its delta's first page (src/accept.fam), 10 the
-\ delta's length, 14 whether it's applied.
+\ delta's length, 14 whether it's applied.  9 groups: a stored level-4 node's
+\ index (8) -> the subtree under it, its 16 leaves and 15 nodes (st4).
 \ Meta page: 24 count (two cells)  2C the state root  4C the block it's at
 \ 6C that block's height (two cells)  74 whether it's at a block at all.
 \
@@ -256,67 +257,111 @@
 : stRv variable ;  : stR ( -- a )  stRv 20 lit lazy ;
 : stVv variable ;  : stV ( -- a )  stVv 20 lit lazy ;
 
-\ st4 ( -- )   stlvl at the lowest stored level (stfrom: 16 positions), done
-\        directly: its outputs read once, their leaves hashed, and pairs
-\        combined up four levels -- where both halves are all empty, or all
-\        spent, the level's fixed hash instead (as sthash does).  Slot j's
-\        tag: 0 hashed (in st4b), 1 all empty, 2 all spent.
+\ st4 ( -- )   stlvl at the lowest stored level (stfrom: a group of 16
+\        positions).  Kept with its node, in tree 9 (stsubs), the group's whole
+\        subtree: its 16 leaves' hashes and the 15 nodes over them (st4b:
+\        level l's j-th at 32 - 2^(5-l) + j, 32 bytes each).  The group's
+\        changes (st4m: a bit a position) then rehash only their leaves and
+\        the nodes over them -- a spend, 4 hashes rather than 31.  Kept, as the
+\        node is, while the group holds two or more unspent outputs; one
+\        without (from a disk made before, or a group come back) is hashed
+\        whole from the records.  Where both children are the level's all-
+\        empty, or all-spent, hash, so is the parent: no hash needed.
 : stlvn variable ;
-: st4bv variable ;  : st4b ( -- a )  st4bv 200 lit lazy ;     \ 16 hashes
-: st4tv variable ;  : st4t ( -- a )  st4tv 40 lit lazy ;      \ 16 tags
-: st4n variable ;  : st4k variable ;  : st4l variable ;
-: st4h ( j -- a )   5 lit lshift st4b + ;
-: st4g ( j -- a )   2 lit lshift st4t + ;
-\ st4v ( j -- a )   slot j's hash at level st4l, a fixed one if tagged so.
-: st4v ( j -- a )
-	dup st4g @ dup 0= if drop st4h else nip 1 lit = if st4l @ stemp else st4l @ stspt then then
+: st4bv variable ;  : st4b ( -- a )  st4bv 3E0 lit lazy ;     \ the subtree
+: st4ev variable ;  : st4e ( -- a )  st4ev 40 lit lazy ;      \ position j's entry (stent), or -1
+: st4n variable ;  : st4m variable ;  : st4l variable ;  : st4c variable ;
+: st4o variable ;  : st4x variable ;  : st4y variable ;  : st4j variable ;  : st4lv variable ;
+: stsubs ( -- )   9 lit 8 lit 3E0 lit btuse ;
+
+\ st4h ( l j -- a )   node (l, j) of the group's subtree.
+: st4h ( l j -- a )   swap 5 lit swap - 1 lit swap lshift 20 lit swap - + 5 lit lshift st4b + ;
+
+\ st4node ( l j -- )   node (l, j), from its children.
+: st4node ( l j -- )
+	over st4l !  2dup st4h st4o !  nip 1 lit lshift                     ( 2j )
+	st4l @ 1 lit - over st4h st4x !  st4l @ 1 lit - swap 1 lit + st4h st4y !
+	st4x @ st4y @ 8 lit ceq  st4x @ st4l @ 1 lit - stemp 8 lit ceq and if st4l @ stemp st4o @ 8 lit cpy else
+	st4x @ st4y @ 8 lit ceq  st4x @ st4l @ 1 lit - stspt 8 lit ceq and if st4l @ stspt st4o @ 8 lit cpy else
+		st4x @ st4y @ st4l @ 1 lit - st4o @ stnode
+	then then
 ;
+
+\ st4leaf ( j -- )   the group's position j's leaf: its output's, else spent
+\        (below the count) or empty.
+: st4leaf ( j -- )
+	dup st4j !  2 lit lshift st4e + @ dup 0< 0= if
+		ste dup 8 lit +  over 28 lit +  rot 38 lit + be32  0 lit st4j @ st4h stleaf
+	else
+		drop
+		stlvn @ 4 lit stf @ st4j @ +  stlvn @ 5 lit stf @  stc@ du< if 0 lit stspt else 0 lit stemp then
+		0 lit st4j @ st4h 8 lit cpy
+	then
+;
+
 : st4 ( -- )
 	stlvn @ 4 lit stf @ stlvn @ 5 lit stf @ stlvn @ 6 lit stf @ stlvn @ 7 lit stf @ 11 lit stun st4n !
 	st4n @ 2 lit < if
 		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk btdel drop
+		stsubs  stil @ stih @ stk qbe!  stk btdel drop
 	else
-		0 lit st4k !
-		10 lit 0 lit do                                      \ the leaves (the first position is a multiple of 16)
-			st4k @ st4n @ u< if
-				st4k @ ste qbe@  stlvn @ 5 lit stf @ =  swap stlvn @ 4 lit stf @ i + =  and
-			else 0 lit then
-			if
-				st4k @ ste dup 8 lit +  over 28 lit +  rot 38 lit + be32  i st4h stleaf
-				0 lit i st4g !  st4k @ 1 lit + st4k !
-			else
-				stlvn @ 4 lit stf @ i +  stlvn @ 5 lit stf @  stc@ du< if 2 lit else 1 lit then  i st4g !
-			then
-		loop
-		0 lit st4l !
-		4 lit 0 lit do                                       \ up to level 4
-			10 lit st4l @ 1 lit + rshift 0 lit do
-				i 1 lit lshift st4g @  i 1 lit lshift 1 lit + st4g @  over = over 0= 0= and if
-					i st4g !
-				else
-					drop  i 1 lit lshift st4v  i 1 lit lshift 1 lit + st4v  st4l @  i st4h stnode  0 lit i st4g !
-				then
+		10 lit 0 lit do -1 lit i 2 lit lshift st4e + ! loop
+		st4n @ 0 lit do i  i ste qbe@ drop F lit and 2 lit lshift st4e + ! loop
+		stsubs  stil @ stih @ stk qbe!  stk st4b btget if st4m @ else FFFF lit then st4c !
+		10 lit 0 lit do st4c @ i rshift 1 lit and if i st4leaf then loop
+		1 lit st4lv !
+		4 lit 0 lit do                                               \ the nodes over the changes
+			0 lit
+			10 lit st4lv @ rshift 0 lit do
+				st4c @ i 1 lit lshift rshift 3 lit and if 1 lit i lshift or  st4lv @ i st4node then
 			loop
-			st4l @ 1 lit + st4l !
+			st4c !  st4lv @ 1 lit + st4lv !
 		loop
-		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk 0 lit st4h btput
+		stsubs  stil @ stih @ stk qbe!  stk st4b btput
+		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk 4 lit 0 lit st4h btput
 	then
 ;
 
 \ stlvl ( -- )   the stored node (level stlvn, index stil/stih) brought up
 \        to date: kept exactly if its subtree holds two or more unspent
 \        outputs.  Its children must already be as they'll stay.
+: stckv variable ;  : stck ( -- a )  stckv 10 lit lazy ;   \ a child's key
+: stkl variable ;  : stkr variable ;
+
+\ stkids ( -- )   node stlvn/stil/stih's children, those stored, into stL and
+\        stR (stkl, stkr: whether each was): one scan, their keys being
+\        next to each other.
+: stkids ( -- )
+	0 lit stkl !  0 lit stkr !
+	stlvn @ 1 lit - stck c!  stil @ stih @ 1 lit q<< stck 1 lit + qbe!
+	stnodes stck btfrom
+	stq stv btnext if
+		stq stck 9 lit mcmp 0= if stv stL 8 lit cpy  -1 lit stkl !  stq stv btnext else -1 lit then
+	else 0 lit then
+	if
+		stck 8 lit + dup c@ 1 lit or swap c!
+		stq stck 9 lit mcmp 0= if stv stR 8 lit cpy  -1 lit stkr ! then
+	then
+;
+
 : stlvl ( -- )
 	stil @ stlvn @ 0 lit stf !  stih @ stlvn @ 1 lit stf !  stlvn @ stlohi
 	stlvn @ stfrom = if st4 else
-	stlvn @ 4 lit stf @ stlvn @ 5 lit stf @ stlvn @ 6 lit stf @ stlvn @ 7 lit stf @ 2 lit stun 2 lit < if
-		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk btdel drop
-	else
-		stlvn @ 1 lit -  stil @ stih @ 1 lit q<<  stL stget
-		stlvn @ 1 lit -  stil @ stih @ 1 lit q<< swap 1 lit or swap  stR stget
-		stL stR stlvn @ 1 lit - stV stnode
-		stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk stV btput
-	then then
+		\ Kept if it holds two or more unspent outputs: so if a child does
+		\ (it's stored); else count them.
+		stkids
+		stkl @ stkr @ or if -1 lit else
+			stlvn @ 4 lit stf @ stlvn @ 5 lit stf @ stlvn @ 6 lit stf @ stlvn @ 7 lit stf @ 2 lit stun 1 lit >
+		then
+		if
+			stkl @ 0= if stlvn @ 1 lit -  stil @ stih @ 1 lit q<<  stL stget then
+			stkr @ 0= if stlvn @ 1 lit -  stil @ stih @ 1 lit q<< swap 1 lit or swap  stR stget then
+			stL stR stlvn @ 1 lit - stV stnode
+			stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk stV btput
+		else
+			stnodes  stlvn @ stk c!  stil @ stih @ stk 1 lit + qbe!  stk btdel drop
+		then
+	then
 ;
 
 \ ── A block's changes: the nodes over them updated once ──
@@ -390,11 +435,27 @@
 ;
 
 \ stflush ( -- )   stop noting; the nodes over the changes up to date.
+\ st4all ( -- )   the lowest stored level's nodes over the (sorted) changes:
+\        a group at a time, with its changes' mask (st4m).
+: st4one ( -- )   stxl @ stil !  stxh @ stih !  stfrom stlvn !  stlvl ;
+: st4all ( -- )
+	0 lit st4m !  -1 lit stxl !  -1 lit stxh !
+	stcn @ 0 lit do
+		stcs @ i 3 lit lshift + dup @ swap 4 lit + @  2dup stph ! stpl !  4 lit q>>      ( glo ghi )
+		2dup stxh @ = swap stxl @ = and if 2drop else
+			st4m @ if st4one then
+			stxh ! stxl !  0 lit st4m !
+		then
+		1 lit stpl @ F lit and lshift st4m @ or st4m !
+	loop
+	st4m @ if st4one then
+;
+
 : stflush ( -- )
 	0 lit stbat !
 	stcn @ if
-		stsort  stfrom stshift
-		stdep 1 lit + stfrom do
+		stsort  st4all  stfrom 1 lit + stshift
+		stdep 1 lit + stfrom 1 lit + do
 			i stlvn !
 			stcn @ 0 lit do stcs @ i 3 lit lshift + dup @ stil ! 4 lit + @ stih !  stlvl loop
 			stlvn @ stdep u< if 1 lit stshift then
@@ -408,6 +469,7 @@
 : stupd ( plo phi -- )
 	stbat @ if stnote else
 		stph ! stpl !
+		1 lit stpl @ F lit and lshift st4m !                    \ the group's change (st4)
 		stdep 1 lit + stfrom do
 			stpl @ stph @ i q>> stih ! stil !  i stlvn !  stlvl
 		loop

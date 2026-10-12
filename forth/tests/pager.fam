@@ -6,9 +6,10 @@
 : tpr ( p -- v w )   pgget dup @ swap FFC lit + @ ;
 
 : tpgs variable ;   : tpg ( k -- p )   2 lit lshift tpgs @ + @ ;   \ pages the tests made
-: tbig ( -- n )   BB8 lit ;                                         \ 3,000: three cachefuls
+: tphw variable ;
+: tbig ( -- n )   pgn 1 lit lshift 1F4 lit + ;                       \ two cachefuls and more
 
-\ tbigok ( base -- f )   whether pages pgd0 + 4 .. + 3,003 hold base + k.
+\ tbigok ( base -- f )   whether pages pgd0 + 4 .. + tbig + 3 hold base + k.
 : tbigok ( base -- f )
 	-1 lit tbig 0 lit do
 		pgop pgd0 4 lit + i + tpr                            ( base f v w )
@@ -62,7 +63,7 @@ Test {
 	}
 	pager_big_transaction {
 		pgopen assert
-		tbig 0 lit do pgop pgd0 4 lit + i + 5000 lit i + tpw loop   \ 3,000 pages: the cache spills
+		tbig 0 lit do pgop pgd0 4 lit + i + 5000 lit i + tpw loop   \ more pages than the cache: it spills
 		pgjn @ 0 lit u> assert                                \ (journaled before the commit)
 		pgcommit assert
 		pgopen assert                                         \ a restart: all of it
@@ -79,5 +80,15 @@ Test {
 		pgjflush pgjwrite assert                              \ the whole journal, never applied
 		pgopen assert                                         \ restart: replayed
 		A000 lit tbigok assert
+	}
+	pager_disk_room {
+		\ The test disk: 4 GiB, its pages from pgbase (0x110008): 0xDDFFF.
+		pgop  pgcap DDFFF lit asrt_eq
+		pgleft  pgcap pgm C lit + @ - asrt_eq
+		\ A new page with under 64 MiB left: a warning (pgwarn), the page given.
+		pgm C lit + @ tphw !  0 lit pgwarn !
+		pgcap 10 lit - pgm C lit + !  0 lit pgm 10 lit + !  pgmd             \ (no free pages to reuse)
+		pgnew pgcap 10 lit - asrt_eq  pgwarn @ assert
+		pgabort  pgop pgm C lit + @ tphw @ asrt_eq                    \ as it was
 	}
 }

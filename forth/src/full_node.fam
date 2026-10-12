@@ -254,6 +254,7 @@
 		else "node: no disk" then lputs A lit lputc lfail
 	then
 	lgopen                                            \ the log, onto the disk from now on
+	"node: room on the disk for the chain: " lputs pgop pgleft 8 lit rshift fndec " MiB" lputs A lit lputc
 	imopen imsave
 	wlboot txstart
 	dbtip ?dup if "node: resuming at height " lputs 20 lit + @ fndec A lit lputc else "node: a new chain\n" lputs then
