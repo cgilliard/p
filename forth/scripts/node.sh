@@ -46,6 +46,8 @@
 #          (default 60); a silent host is kept and asked again (hourly after
 #          a day; removed after a week, or after 3 tries if it never answered)
 #   PERIP  the most hosts kept with one IP address (default 4)
+#   DISK   the disk image (default data/disk.img): another runs a second node
+#          (with its own PORT and API), and its own wallet
 #   BOOT   the seeds tabernacle starts from when the disk's copy isn't the
 #          build it expects: it finds peers through them and fetches the node
 #          from the peers holding it, the seeds only if no one else does
@@ -55,6 +57,7 @@
 # scripts/makenode.sh after scripts/build.sh.  To start over: rm
 # data/disk.img -- which deletes the wallet too (restore it with --recover).
 set -e
+DISK=${DISK:-./data/disk.img}
 SEED=${SEED:-159.54.172.190:3737 146.235.230.124:3737}
 DEPTH=${DEPTH:-25}
 PORT=${PORT:-3737}
@@ -100,8 +103,8 @@ esac
 # network, shows the key and stops (src/full_node.fam, fnkey).  The node itself
 # may be running.
 if [ -n "$APIKEY" ]; then
-	[ -e data/disk.img ] || { echo "node.sh: no data/disk.img yet (start the node first)" >&2; exit 1; }
-	printf 'apikey net=%s\004' "$NET" | ./tools/q32 bin/full_node.bin --disk-ro=./data/disk.img
+	[ -e "$DISK" ] || { echo "node.sh: no $DISK yet (start the node first)" >&2; exit 1; }
+	printf 'apikey net=%s\004' "$NET" | ./tools/q32 bin/full_node.bin --disk-ro="$DISK"
 	exit 0
 fi
 mkdir -p data
@@ -109,7 +112,7 @@ mkdir -p data
 # boot image, tip log and journal; the rest holds the chain (blocks are kept
 # whole).  A disk made smaller grows, with the node stopped: truncate -s 128G
 # data/disk.img.
-[ -e data/disk.img ] || truncate -s 128G data/disk.img
+[ -e "$DISK" ] || truncate -s 128G "$DISK"
 # QEMU can't forward a port something else holds, and quits without a word.
 if command -v ss >/dev/null; then
 	if ss -Huln "sport = :$PORT" | grep -q .; then
@@ -135,7 +138,7 @@ settings() {
 # non-blocking, and on a terminal that would be the keyboard's too.
 run() {
 	./tools/q32 bin/tabernacle \
-		--disk=./data/disk.img \
+		--disk="$DISK" \
 		--net \
 		--hostfwd=udp::$PORT-:$PORT,hostfwd=tcp:127.0.0.1:$API-:$API | cat
 }
