@@ -1,80 +1,73 @@
-\ tests/consensus.fam — the relay list (src/consensus.fam): entries made,
-\ checked and refused; consensus.txt read and refused; the aux tree's
-\ hashes (against Python's hashlib).
+\ tests/consensus.fam — the relay list (src/consensus.fam): a relay's key
+\ from the seed and the key number, its line; consensus.txt read and
+\ refused; the aux tree's hashes (against Python's hashlib).
 
 : tjsv variable ;  : tjsave ( -- a )  tjsv 20 lit lazy ;     \ the wallet's seed, put back after
-: tj1v variable ;  : tje1 ( -- a )  tj1v 1200 lit lazy ;     \ two relays' entries,
-: tj2v variable ;  : tje2 ( -- a )  tj2v 1200 lit lazy ;     \ tje1's id the smaller
-: tjiv variable ;  : tjid ( -- a )  tjiv 40 lit lazy ;
-: tjfv variable ;  : tjf ( -- a )  tjfv 6000 lit lazy ;     \ a file being written
+: tjiv variable ;  : tjid ( -- a )  tjiv 40 lit lazy ;       \ two relays' ids
+: tjfv variable ;  : tjf ( -- a )  tjfv 1000 lit lazy ;     \ a file being written
 : tjfn variable ;  : tjpn variable ;
 : tjov variable ;  : tjo ( -- a )  tjov 40 lit lazy ;
 
 : tjput ( a n -- )   tjpn !  tjf tjfn @ + tjpn @ ncpy  tjfn @ tjpn @ + tjfn ! ;
 : tjc ( c -- )   tjf tjfn @ + c!  tjfn @ 1 lit + tjfn ! ;
-: tjnib ( n -- c )   F lit and dup A lit u< if 30 lit + else 57 lit + then ;
-\ tjline ( e -- )   "relay <hex>\n"
-: tjline ( e -- )   "relay " 6 lit tjput  cnlen 0 lit do dup i + c@ dup 4 lit rshift tjnib tjc tjnib tjc loop drop  A lit tjc ;
+: tjs ( s -- )   dup strlen tjput ;
+\ tjline ( ip port id -- )   its line.
+: tjline ( ip port id -- )   cnfmt tjput ;
 \ tjhead ( -- )   a new file: its first line.
-: tjhead ( -- )   0 lit tjfn !  cnhead dup strlen tjput ;
+: tjhead ( -- )   0 lit tjfn !  cnhead tjs ;
+\ tjhex ( id -- )   an id in hex, no newline.
+: tjnib ( n -- c )   F lit and dup A lit u< if 30 lit + else 57 lit + then ;
+: tjhex ( id -- )   20 lit 0 lit do dup i + c@ dup 4 lit rshift tjnib tjc tjnib tjc loop drop ;
 
-\ tjrelay ( k -- )   a relay's keys (a seed of its own) and its entry, at cne.
+\ tjrelay ( k -- )   a relay's key (a seed of its own, key number 0): cnek,
+\        its id cnmid.
 : tjrelay ( k -- )
-	20 lit 0 lit do dup i 7 lit * + 3 lit + wlseed i + c! loop drop  0 lit cnok !
-	0A000202 lit E99 lit 7 lit cnmake
+	20 lit 0 lit do dup i 7 lit * + 3 lit + wlseed i + c! loop drop  0 lit cnok !  0 lit cnkn !  cnkeys
 ;
 
 Test {
-	consensus_entry {
+	consensus_key {
 		wlseed tjsave 20 lit ncpy  0 lit bnet !
-		1 lit tjrelay  cne tje1 cnlen ncpy
-		2 lit tjrelay  cne tje2 cnlen ncpy
-		tje1 tjid cnid  tje2 tjid 20 lit + cnid
-		tjid tjid 20 lit + 20 lit mcmp 0< 0= if                              \ tje1: the smaller id
-			tje1 tjf cnlen ncpy  tje2 tje1 cnlen ncpy  tjf tje2 cnlen ncpy
-			tje1 tjid cnid  tje2 tjid 20 lit + cnid
+		1 lit tjrelay  cnmid tjid 20 lit ncpy
+		cnek 320 lit tjo sha3256  tjo cnmid 20 lit mcmp 0 lit asrt_eq           \ the id: its key's hash
+		1 lit tjrelay  cnmid tjid 20 lit mcmp 0 lit asrt_eq                     \ the same seed: the same key
+		0 lit cnok !  1 lit cnkn !  cnkeys  cnmid tjid 20 lit mcmp 0= 0= assert  \ key number 1: another
+		\ the line
+		0 lit tjfn !  3ED2A3AB lit E99 lit tjid tjline
+		tjfn @ 5B lit asrt_eq  tjf "relay 62.210.163.171:3737 " 1A lit mcmp 0 lit asrt_eq
+		tjf 5A lit + c@ A lit asrt_eq
+		tjf 1A lit + tjo 20 lit cnunhex assert  tjo tjid 20 lit mcmp 0 lit asrt_eq
+		2 lit tjrelay  cnmid tjid 20 lit + 20 lit ncpy
+		tjid tjid 20 lit + 20 lit mcmp 0< 0= if                               \ tjid: the smaller first
+			tjid tjo 20 lit ncpy  tjid 20 lit + tjid 20 lit ncpy  tjo tjid 20 lit + 20 lit ncpy
 		then
-		tje1 cncheck assert  tje2 cncheck assert
-		tje1 be32 524C5931 lit asrt_eq  tje1 8 lit + be32 0A000202 lit asrt_eq  tje1 C lit + nb16@ E99 lit asrt_eq
-		\ a byte of its key, the network, the zeros, or the signature changed: refused
-		tje1 20 lit + dup c@ 1 lit xor swap c!  tje1 cncheck 0= assert  tje1 20 lit + dup c@ 1 lit xor swap c!
-		1 lit bnet !  tje1 cncheck 0= assert  0 lit bnet !
-		1 lit tje1 F lit + c!  tje1 cncheck 0= assert  0 lit tje1 F lit + c!
-		tje1 900 lit + dup c@ 1 lit xor swap c!  tje1 cncheck 0= assert  tje1 900 lit + dup c@ 1 lit xor swap c!
-		tje1 cncheck assert
-		tjsave wlseed 20 lit ncpy  0 lit cnok !
-	}
-	consensus_auto {
-		\ relayaddr=: our entry made, for that address and our port, 30 days;
-		\ due again with under 7 days left; none without the setting
-		wlseed tjsave 20 lit ncpy  3 lit tjrelay  0 lit bnet !
-		10000000 lit hnov !  19A lit hnoh !  0 lit cnmh !
-		0 lit cnmaddr !  cnrenew? 0= assert
-		3ED2A3AB lit cnmaddr !  nport @ tjfn !  E99 lit nport !
-		cnrenew? assert  cnauto
-		cnmine cncheck assert  cnmine 8 lit + be32 3ED2A3AB lit asrt_eq  cnmine C lit + nb16@ E99 lit asrt_eq
-		cnmine 10 lit + qbe@ 19A lit asrt_eq AA7EC800 lit asrt_eq
-		cnmine tjo cnid  tjo cnmid 20 lit mcmp 0 lit asrt_eq
-		cnrenew? 0= assert
-		814BE800 lit hnov !  cnrenew? 0= assert                              \ 8 days left
-		8B98A000 lit hnov !  cnrenew? assert                                  \ 6
-		0 lit hnov !  0 lit hnoh !  0 lit cnmaddr !  0 lit cnmh !  tjfn @ nport !
-		tjsave wlseed 20 lit ncpy  0 lit cnok !
+		tjsave wlseed 20 lit ncpy  0 lit cnok !  0 lit cnkn !
 	}
 	consensus_file {
 		tjhead  tjf tjfn @ cnparse assert  cnn @ 0 lit asrt_eq           \ no relays: valid
-		tjhead tje1 tjline tje2 tjline
+		tjhead  3ED2A3AB lit E99 lit tjid tjline  7F000001 lit 1 lit tjid 20 lit + tjline
 		tjf tjfn @ cnparse assert  cnn @ 2 lit asrt_eq
+		0 lit cnent @ 3ED2A3AB lit asrt_eq  0 lit cnent 4 lit + @ E99 lit asrt_eq  0 lit cnhas? 0 lit asrt_eq
+		1 lit cnent @ 7F000001 lit asrt_eq  1 lit cnent 4 lit + @ 1 lit asrt_eq
 		0 lit cnids tjid 20 lit mcmp 0 lit asrt_eq  1 lit cnids tjid 20 lit + 20 lit mcmp 0 lit asrt_eq
-		1 lit cnent tje2 cnlen mcmp 0 lit asrt_eq
-		\ out of order, twice, the other network, a byte more, a bad digit: not valid
-		tjhead tje2 tjline tje1 tjline  tjf tjfn @ cnparse 0= assert
-		tjhead tje1 tjline tje1 tjline  tjf tjfn @ cnparse 0= assert
-		1 lit bnet !  tjhead 0 lit bnet !  tje1 tjline  tjf tjfn @ cnparse 0= assert
-		tjhead tje1 tjline  20 lit tjc  tjf tjfn @ cnparse 0= assert
-		tjhead tje1 tjline  67 lit tjf 40 lit + c!  tjf tjfn @ cnparse 0= assert
-		tjhead tje1 tjline  tjf tjfn @ 1 lit - cnparse 0= assert             \ no newline at the end
-		tjhead tje1 tjline  tjf tjfn @ cnparse assert
+		\ out of order, twice, the other network: not valid
+		tjhead  1 lit 1 lit tjid 20 lit + tjline  1 lit 1 lit tjid tjline  tjf tjfn @ cnparse 0= assert  cnn @ 0 lit asrt_eq
+		tjhead  1 lit 1 lit tjid tjline  2 lit 1 lit tjid tjline  tjf tjfn @ cnparse 0= assert
+		1 lit bnet !  tjhead 0 lit bnet !  1 lit 1 lit tjid tjline  tjf tjfn @ cnparse 0= assert
+		\ by hand: as written, valid; then each a way not to be
+		tjhead "relay 255.0.10.1:65535 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse assert
+		0 lit cnent @ FF000A01 lit asrt_eq  0 lit cnent 4 lit + @ FFFF lit asrt_eq
+		tjhead "relay 256.0.10.1:3737 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 62.0.010.1:3737 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 0.0.0.0:3737 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 62.0.10.1:0 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 62.0.10.1:65536 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 62.0.10.1 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 62.0.10.1:3737  " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 62.0.10.1:3737 " tjs tjid tjhex  tjf tjfn @ cnparse 0= assert          \ no newline
+		tjhead "relay 62.0.10.1:3737 " tjs tjid tjhex 20 lit tjc A lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead "relay 62.0.10.1:3737 " tjs tjid tjhex A lit tjc  41 lit tjf tjfn @ + 2 lit - c!  tjf tjfn @ cnparse 0= assert   \ upper case
+		tjhead "relay 62.0.10.1:3737 " tjs tjid tjhex A lit tjc  tjf tjfn @ cnparse assert
 	}
 	consensus_aux_tree {
 		tjf 0 lit tjo cnleaf  tjo 20 lit "6E340B9CFFB37A989CA544E6BB780A2C78901D3FB33738768511A30617AFA01D" twhex assert

@@ -52,17 +52,17 @@ impl AuxTree {
 }
 
 /// Whether `text` starts as a consensus file for `network` must: the line
-/// `tabernacle-consensus 1 main` (or `dev`).
+/// `tabernacle-consensus 2 main` (or `dev`).
 pub fn check_consensus_head(text: &[u8], network: crate::network::Network) -> Result<(), String> {
     let net = match network {
         crate::network::Network::Main => "main",
         crate::network::Network::Dev => "dev",
     };
-    let head = format!("tabernacle-consensus 1 {net}\n");
+    let head = format!("tabernacle-consensus 2 {net}\n");
     if text.starts_with(head.as_bytes()) {
         Ok(())
     } else {
-        Err(format!("its first line isn't `tabernacle-consensus 1 {net}`"))
+        Err(format!("its first line isn't `tabernacle-consensus 2 {net}`"))
     }
 }
 
@@ -91,8 +91,8 @@ mod tests {
 
     #[test]
     fn the_first_line_names_the_network() {
-        assert!(check_consensus_head(b"tabernacle-consensus 1 dev\nrelay 00\n", crate::network::Network::Dev).is_ok());
-        assert!(check_consensus_head(b"tabernacle-consensus 1 dev\n", crate::network::Network::Main).is_err());
+        assert!(check_consensus_head(b"tabernacle-consensus 2 dev\nrelay 00\n", crate::network::Network::Dev).is_ok());
+        assert!(check_consensus_head(b"tabernacle-consensus 2 dev\n", crate::network::Network::Main).is_err());
         assert!(check_consensus_head(b"relay 00\n", crate::network::Network::Dev).is_err());
     }
 }

@@ -136,9 +136,9 @@ h3.sub { font-size: 15px; font-weight: 650; margin: 22px 0 4px; padding-top: 14p
       <div class="addrrow"><code id="payaddr">–</code><button class="secondary" id="copyaddr">Copy</button></div>
     </div>
     <div class="addrbox" id="relaybox" hidden>
-      <div class="label">Relay entry, for consensus.txt</div>
-      <div class="addrrow"><code id="relayinfo">–</code><button class="secondary" id="copyrelay">Copy line</button></div>
-      <div class="hint">Made by this node for its public address; renewed a week before its 30 days are up.</div>
+      <div class="label">Relay line, for consensus.txt</div>
+      <div class="addrrow"><code id="relayinfo">–</code><button class="secondary" id="copyrelay">Copy</button></div>
+      <div class="hint">Send it to whoever keeps the network's relay list. It changes only if this relay's address or key does.</div>
     </div>
   </div>
 
@@ -339,7 +339,7 @@ async function refresh() {
     note.hidden = true;
     $("payaddr").textContent = s.address || "–";
     $("relaybox").hidden = !s.relay_entry;
-    if (s.relay_entry) $("relayinfo").textContent = `${s.relay_entry.addr} · relay id ${short(s.relay_entry.id)}`;
+    if (s.relay_entry) $("relayinfo").textContent = `relay ${s.relay_entry.addr} ${s.relay_entry.id}`;
     const b = await call("balance");
     $("spendable").textContent = coins(b.spendable);
     $("immature").textContent = coins(b.immature);
@@ -627,11 +627,9 @@ $("copyaddr").addEventListener("click", async () => {
 });
 
 $("copyrelay").addEventListener("click", async () => {
-  try {
-    const r = await call("relayentry");
-    await navigator.clipboard.writeText(r.line + "\n");
-    $("copyrelay").textContent = "Copied"; setTimeout(() => { $("copyrelay").textContent = "Copy line"; }, 1500);
-  } catch (e) {}
+  const t = $("relayinfo").textContent;
+  if (!t.startsWith("relay ")) return;
+  try { await navigator.clipboard.writeText(t + "\n"); $("copyrelay").textContent = "Copied"; setTimeout(() => { $("copyrelay").textContent = "Copy"; }, 1500); } catch (e) {}
 });
 
 // ── The node's log ──

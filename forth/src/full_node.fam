@@ -37,10 +37,10 @@
 \                       messages (the seed nodes); `gateway`, its old name,
 \                       too
 \   relayaddr=A.B.C.D   a relay (as `relay`) reached at this public address,
-\                       on our port: the node makes its signed entry for
-\                       consensus.txt (good for 30 days, made again with 7
-\                       left), says so in the log and puts the line on the
-\                       console, the web wallet and the API (src/consensus.fam)
+\                       on our port: its consensus.txt line, in the log, the
+\                       web wallet and the API (src/consensus.fam)
+\   relaykey=N          the relay's key: the N-th from the seed (0); a new
+\                       N, a new key and relay id
 \   userelay=A.B.C.D:PORT  a relay to register with and ask (any number;
 \                       the seeds, if none); `usegw=`, its old name, too
 \   logmax=N            the most log lines kept for the Log tab (10,000; at
@@ -111,8 +111,8 @@
 
 : fnbad ( -- )   "node: a setting it doesn't know: " lputs  fncfg fnp @ + lputs  A lit lputc bye ;
 
-\ fnopt1 / fnopt2 ( -- f )   a setting at fnp, if it's one of theirs (two
-\        words: the compiler nests only so deep).
+\ fnopt1 / fnopt2 / fnopt3 ( -- f )   a setting at fnp, if it's one of
+\        theirs (three words: the compiler nests only so deep).
 : fnok variable ;
 : fnopt1 ( -- f )
 	-1 lit fnok !
@@ -143,10 +143,16 @@
 	else "seedmode" fnpre? if -1 lit rqforce !
 	else "direct" fnpre? if -1 lit ondirect !
 	else "mixdelay=" fnpre? if fnnum 2710 lit pumin ondly !
-	else "relayaddr=" fnpre? if fnip4 cnmaddr !  -1 lit rlserve !
 	else "relay" fnpre? "gateway" fnpre? or if -1 lit rlserve !
 	else "userelay=" fnpre? "usegw=" fnpre? or if fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then rluse  -1 lit rlset !
-	else 0 lit fnok ! then then then then then then then then then then then then
+	else 0 lit fnok ! then then then then then then then then then then then
+	fnok @
+;
+: fnopt3 ( -- f )
+	-1 lit fnok !
+	"relayaddr=" fnpre? if fnip4 cnmaddr !  -1 lit rlserve !
+	else "relaykey=" fnpre? if fnnum cnkn !
+	else 0 lit fnok ! then then
 	fnok @
 ;
 
@@ -156,7 +162,7 @@
 		begin fnc 20 lit = fnc A lit = or fnc D lit = or fnc 9 lit = or while fn+ repeat
 		fnc
 	while
-		fnopt1 0= if fnopt2 0= if fnbad then then
+		fnopt1 0= if fnopt3 0= if fnopt2 0= if fnbad then then then      \ relayaddr= before relay
 	repeat
 ;
 
@@ -295,11 +301,18 @@
 	bye
 ;
 
-\ fnrent ( -- )   our relay entry (relayaddr=): made once the wallet is open,
-\        made again with under 7 days left (checked each minute).
-: fnrt variable ;
+\ fnrent ( -- )   a relay, once the wallet is open: its key (from the seed),
+\        and its line for consensus.txt (relayaddr=), said in the log.
+: fnrd variable ;
 : fnrent ( -- )
-	wl? if fnrt @ 0= fnrt @ pago EA60 lit u> or if pms fnrt !  cnrenew? if cnauto then then then
+	rlserve @ wl? and fnrd @ 0= and if
+		-1 lit fnrd !  cnkeys
+		cnmaddr @ if
+			"relay: for consensus.txt: " lputs  cnmaddr @ nport @ cnmid cnfmt 1 lit - 0 lit do dup i + c@ lputc loop drop  A lit lputc
+		else
+			"relay: our relay id " lputs cnmid 20 lit fnhex  " (relayaddr=, --relay-addr: its consensus.txt line)" lputs A lit lputc
+		then
+	then
 ;
 
 \ fnmain ( -- )

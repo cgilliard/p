@@ -39,7 +39,7 @@
 \ for our NAT, built anew hourly; a
 \ new one makes a new record (src/relay.fam: rlregs), registered along
 \ every circuit.  One is built at a time (sending first): the guard the
-\ live relay with the highest SHA3-256(
+\ listed relay whose key is known with the highest SHA3-256(
 \ "tabernacle-guard-v1" ‖ the wallet's seed ‖ the period ‖ its id) -- a
 \ period: 2^32 ms, about 50 days -- the middle at random, the home the
 \ target; three different relays, none of our own home relays and (main)
@@ -94,8 +94,8 @@
 	oni oninn nzero  dup oni 1 lit + nb16!  oni 3 lit + swap ncpy  oni c!
 ;
 
-: ocmap ( i -- ip )   cnent 8 lit + be32 dup 18 lit rshift 7F lit = if drop A000202 lit then ;
-: ocport ( i -- port )   cnent C lit + nb16@ ;
+: ocmap ( i -- ip )   cnent @ dup 18 lit rshift 7F lit = if drop A000202 lit then ;
+: ocport ( i -- port )   cnent 4 lit + @ ;
 
 \ onrly? ( -- f )   the datagram comes from a listed relay.
 : onrly? ( -- f )   0 lit cnn @ ?dup if 0 lit do i ocmap nsrc @ = i ocport nsport @ = and or loop then ;
@@ -214,23 +214,9 @@
 ;
 
 \ ── Our onion key ──
-\ The Kyber key of our entry in the list in use: made from the seed and the
-\ entry's expiry (src/consensus.fam: cnonion), so a new entry brings a new
-\ key.  Not listed: the expiry's 0.
-: onmiv variable ;  : onmid ( -- a )  onmiv 20 lit lazy ;   \ our relay id
-: onkiv variable ;  : onkid ( -- a )  onkiv 20 lit lazy ;   \ the id the key's for
-: onkev variable ;  : onke ( -- a )  onkev 320 lit lazy ;
-: onkdv variable ;  : onkd ( -- a )  onkdv 660 lit lazy ;
-: ongen variable ;  : ongok variable ;
-\ onmyk ( -- dk )
-: onmyk ( -- dk )
-	cnkeys  88 lit 6 lit kbeg  cnpk 520 lit kabs  kend  onmid 20 lit ksqz
-	0 lit  cnn @ ?dup if 0 lit do i cnids onmid 20 lit mcmp 0= if drop i cnent 10 lit + qbe@ drop then loop then
-	dup ongen @ = ongok @ and  onkid onmid 20 lit mcmp 0= and if drop else
-		dup ongen !  onke onkd cnonion  onmid onkid 20 lit ncpy  -1 lit ongok !
-	then
-	onkd
-;
+\ onmyk ( -- dk )   our relay key's secret half (src/consensus.fam): from
+\        the seed and the relaykey= setting.
+: onmyk ( -- dk )   cnkeys cndk ;
 
 \ ── Links ──
 
@@ -439,7 +425,7 @@
 \ Each: 0 state (0 none, 1 being built, 2 built, 3 wanted: waiting its turn)
 \ 4 hops with keys  8 circuit id  C a step sent  10 begun  14 last used
 \ 18 tries  1C the target (rlt; sending)  20 the hops: 0 guard 1 middle
-\ 2 home, each 0 ip 4 port 8 its entry (cnent)  50 their keys: forward,
+\ 2 home, each 0 ip 4 port 8 its place in the list (cnent)  50 their keys: forward,
 \ backward  110 built  118 the home's ip  11C port  120 failed  124 a KEEP
 \ sent, not answered yet.
 \ The words below act on the slot occ names.
@@ -511,7 +497,7 @@
 : ochop ( -- )
 	ocw 40 lit onrand  ocw ocek ocdk kykeys
 	ocw 40 lit + 20 lit onrand
-	ochn @ ocp 8 lit + @ cnent 18 lit +  ocw 40 lit +  ocw 60 lit +  occt kyencap drop
+	ochn @ ocp 8 lit + @ cnkey  ocw 40 lit +  ocw 60 lit +  occt kyencap drop
 	ocstep
 ;
 

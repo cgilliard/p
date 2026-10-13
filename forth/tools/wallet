@@ -20,13 +20,10 @@ Commands:
                             signs it and announces it to its peers
   cancel ID                 undo a payment that was never finalized
   slates                    payments, and where they've got to
-  relay-entry [IP PORT [DAYS]]
-                            this node's signed entry as a relay, a
-                            consensus.txt line (tools/consensus assembles
-                            them): with no address, the one the node made
-                            itself (node.sh --relay-addr); else one for
-                            IP:PORT (its public address), good for DAYS (7;
-                            1 to 30)
+  relay-entry [IP PORT]     this relay's consensus.txt line, "relay
+                            IP:PORT ID": for the address it was started
+                            with (node.sh --relay-addr), or for IP:PORT
+                            (tools/consensus assembles the lines)
   key                       enter the API key again
 
 Payments are slates exchanged as files, as with the Rust node's wallet (the
@@ -216,7 +213,7 @@ def show_status(node):
         print(f"address:      {s['address']}")
     if s.get("relay_entry"):
         e = s["relay_entry"]
-        print(f"relay entry:  {e['addr']}, relay id {e['id'][:16]} (the line: relay-entry)")
+        print(f"relay line:   relay {e['addr']} {e['id']}")
 
 
 def do_pay(node, args):
@@ -260,16 +257,11 @@ def do_lookup(node, args):
 
 def do_relay_entry(node, args):
     if not args:
-        try:
-            r = node.call("relayentry")
-        except Failure:
-            raise Failure("the node made no entry of its own (start it with node.sh --relay-addr IP), "
-                          "so give one: relay-entry IP PORT [DAYS]")
+        r = node.call("relayentry")
+    elif len(args) == 2 and args[1].isdigit():
+        r = node.call("relayentry", ip=args[0], port=int(args[1]))
     else:
-        if len(args) not in (2, 3) or not args[1].isdigit() or (len(args) == 3 and not args[2].isdigit()):
-            raise Failure("usage: relay-entry [IP PORT [DAYS]]")
-        r = node.call("relayentry", ip=args[0], port=int(args[1]), days=int(args[2]) if len(args) == 3 else 7)
-    print(f"relay id {r['id']}", file=sys.stderr)
+        raise Failure("usage: relay-entry [IP PORT]")
     print(r["line"])
 
 

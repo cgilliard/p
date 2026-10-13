@@ -344,8 +344,8 @@ one (and 3 live relays on dev, 8 on main), each address has 3 home
 relays -- the node registers with its own, and looks up and pays through
 the receiver's; without, the seeds, as before. A relay started with
 `node.sh --relay-addr IP` (its public address) makes its own signed line,
-good for 30 days and made again with 7 left, and prints it on the console
-(also in the web wallet, and from `tools/wallet relay-entry`);
+good for 30 days and made again with 7 left, and gives it to `tools/wallet
+relay-entry` and the web wallet;
 `tools/consensus` assembles the lines;
 `status` reports the list (`relay_list`); the setting `seedmode` keeps a
 node on the seeds, for testing. In listed mode a lookup and a payment's

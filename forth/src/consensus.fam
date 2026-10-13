@@ -1,66 +1,47 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/consensus.fam — the relay list (docs/RELAYS.md): a relay's entry, the
-\ consensus.txt that lists them, and the aux tree a block's aux_hash roots.
+\ src/consensus.fam — the relay list (docs/RELAYS.md): a relay's key and
+\ line, the consensus.txt that lists them, and the aux tree a block's
+\ aux_hash roots.
 \
-\ A relay's keys come from its wallet's seed, as the payment address's do
-\ (src/address.fam), under their own tags: Dilithium's ξ = SHAKE256(
-\ "tabernacle-relay-dilithium-v1" ‖ seed ‖ 0, 32); its relay id is
-\ SHA3-256 of the Dilithium key.  The onion key, Kyber's (d, z) =
-\ SHAKE256("tabernacle-relay-kyber-v1" ‖ seed ‖ g, 64), g the entry's
-\ expiry's low 32 bits (big-endian): each new entry, a new onion key.
+\ A relay's key is its onion key, Kyber's (d, z) = SHAKE256(
+\ "tabernacle-relay-kyber-v1" ‖ seed ‖ n, 64), n the relaykey= setting (a
+\ u32, big-endian; 0): from the wallet's seed, as the payment address's
+\ keys are, so the backup words bring it back; a new n, a new key.  Its
+\ relay id is SHA3-256 of the public key.
 \
-\ An entry (0x11CC bytes, numbers big-endian): 0 "RLY1"  4 the network
-\ (u32: 0 main, 1 dev)  8 IP (4)  C port (2)  E zeros (2)  10 expiry (ms
-\ since the epoch, u64)  18 Kyber's key (0x320, its onion key)  338
-\ Dilithium's (0x520)  858 the signature (Dilithium, of bytes 0 .. 858).
-\
-\ consensus.txt: the line "tabernacle-consensus 1 main" ("dev" on dev),
-\ then a line "relay <an entry in hex>" for each relay, sorted by relay id,
-\ every line ending in a newline.  Anything else -- a bad line, a bad
-\ signature, another network's entry, out of order -- and it's not valid.
-\ (Expiry is no part of validity: where the list is used, an expired entry
-\ is skipped.)
+\ consensus.txt: the line "tabernacle-consensus 2 main" ("dev" on dev),
+\ then a line "relay A.B.C.D:PORT ID" for each relay -- where it's reached
+\ and its id in lower-case hex -- sorted by id, numbers without leading
+\ zeros, every line ending in a newline.  Anything else (a bad line, an
+\ id twice, out of order, more than cnmax) and it's not valid.  Nothing
+\ expires: a line changes when its relay's address or key does.  The keys
+\ themselves come from the relays, through peers (src/rlist.fam: GET_RKEY),
+\ each checked against its id.
 \
 \ The aux tree: a node's bytes are 0x01 ‖ left ‖ right, a leaf's 0x00 ‖
 \ its content; each hash is SHA-256 of those bytes.  The root's left child
 \ is the leaf of the consensus.txt the block backs (zeros: none).
 \
-\   cnkeys ( -- )               the relay's keys: cnek, cnpk (cndk, cnsk)
-\   cnonion ( g ek dk -- )      its onion key for g
-\   cnmake ( ip port days -- )  our entry, good for that many days (1 to
-\                               30), at cne
-\   cncheck ( e -- ok )         an entry's form, network and signature
-\   cnid ( e out -- )           its relay id
-\   cnauto ( -- )               our entry for the relayaddr= setting (cnmaddr,
-\                               our port), good for 30 days, at cnmine; said
-\                               in the log, the line itself on the console
-\   cnrenew? ( -- f )           whether that's due: none yet, or under 7
-\                               days left
-\   cnparse ( a n -- ok )       a consensus.txt: then cnn entries, the
-\                               k-th at cnent k, its id at cnids k
+\   cnkeys ( -- )               our key: cnek, cndk, its id cnmid
+\   cnonion ( g ek dk -- )      the key for n = g
+\   cnfmt ( ip port id -- a n )  a consensus.txt line (its newline too)
+\   cnparse ( a n -- ok )       a consensus.txt: then cnn relays, the k-th
+\                               at cnent k (0 ip, 4 port, 8 its key's
+\                               known), its id at cnids k, key at cnkey k
 \   cnleaf ( a n out -- )       a leaf's hash
 \   cnnode ( l r out -- )       a node's hash
 \ ──────────────────────────────────────────────────────────────────────────────
 
-: cnlen ( -- n )   11CC lit ;                             \ an entry
-: cnsgn ( -- n )   858 lit ;                              \ the part signed
-: cnmax ( -- n )   40 lit ;                               \ entries a file may hold
+: cnmax ( -- n )   40 lit ;                               \ relays a file may hold
 
-\ ── The relay's keys ──
+\ ── Our key ──
 
 : cnekv variable ;  : cnek ( -- a )  cnekv 320 lit lazy ;   \ Kyber's public key
 : cndkv variable ;  : cndk ( -- a )  cndkv 660 lit lazy ;   \ its secret key
-: cnpkv variable ;  : cnpk ( -- a )  cnpkv 520 lit lazy ;   \ Dilithium's public key
-: cnskv variable ;  : cnsk ( -- a )  cnskv A00 lit lazy ;   \ its secret key
-: cnok variable ;   \ the keys are made
-
-: cnkeys ( -- )
-	cnok @ 0= if
-		"tabernacle-relay-kyber-v1" 19 lit pab 40 lit pader  pab cnek cndk kykeys
-		"tabernacle-relay-dilithium-v1" 1D lit pab 20 lit pader  pab cnpk cnsk dikeys
-		-1 lit cnok !
-	then
-;
+: cnmiv variable ;  : cnmid ( -- a )  cnmiv 20 lit lazy ;   \ our relay id
+: cnok variable ;   \ made
+: cnkn variable ;   \ the relaykey= setting
+: cnmaddr variable ;   \ the relayaddr= setting: our public IP
 
 \ cnonion ( g ek dk -- )
 : cngv variable ;  : cng ( -- a )  cngv 4 lit lazy ;
@@ -70,74 +51,40 @@
 	pab -rot kykeys
 ;
 
-\ ── Entries ──
-
-: cnev variable ;  : cne ( -- a )  cnev 1200 lit lazy ;   \ ours
-: cnrv variable ;  : cnrnd ( -- a )  cnrv 20 lit lazy ;
-: cnip variable ;  : cnpo variable ;  : cndy variable ;
-
-\ cnmake ( ip port days -- )
-: cnmake ( ip port days -- )
-	cndy ! cnpo ! cnip !
-	cnkeys  cne cnlen nzero
-	524C5931 lit cne be!                                              \ "RLY1"
-	bnet @ 1 lit and cne 4 lit + be!
-	cnip @ cne 8 lit + be!  cnpo @ cne C lit + nb16!
-	hnow cndy @ 5265C00 lit * 0 lit wlq+ cne 10 lit + qbe!            \ days of ms
-	cne 10 lit + qbe@ drop cnek cndk cnonion                              \ its onion key
-	cnek cne 18 lit + 320 lit ncpy  cnpk cne 338 lit + 520 lit ncpy
-	cnrnd 20 lit rnget 0= if cnrnd 20 lit nzero then                  \ hedged; else deterministic
-	cnsk cne cnsgn cnrnd cne cnsgn + disign
+: cnkeys ( -- )
+	cnok @ 0= if cnkn @ cnek cndk cnonion  cnek 320 lit cnmid sha3256  -1 lit cnok ! then
 ;
 
-\ cncheck ( e -- ok )
-: cncheck ( e -- ok )
-	dup be32 524C5931 lit =
-	over 4 lit + be32 bnet @ 1 lit and = and
-	over 8 lit + be32 0= 0= and  over C lit + nb16@ 0= 0= and  over E lit + nb16@ 0= and
-	if dup 338 lit + over cnsgn 3 lit pick cnsgn + diverify else 0 lit then
-	nip
-;
+\ ── A line ──
 
-\ cnid ( e out -- )
-: cnid ( e out -- )   swap 338 lit + 520 lit rot sha3256 ;
+: cnfv variable ;  : cnfb ( -- a )  cnfv 80 lit lazy ;  : cnfn variable ;
+: cnfc ( c -- )   cnfb cnfn @ + c!  cnfn @ 1 lit + cnfn ! ;
+: cnfd ( n -- )   dup A lit u< if 30 lit + cnfc else dup A lit / cnfd A lit % 30 lit + cnfc then ;
+: cnfx ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then cnfc ;
 
-\ ── Our entry, made by the node (the relayaddr= setting) ──
-\ The consensus.txt line is too long for the log (src/log.fam): it goes on
-\ the console alone, "relay <hex>", and the web wallet and the API's
-\ relayentry (with no address) give it too.
-
-: cnmaddr variable ;  : cnmh variable ;                  \ our public IP; made
-: cnmv variable ;  : cnmine ( -- a )  cnmv 1200 lit lazy ;
-: cnmiv variable ;  : cnmid ( -- a )  cnmiv 20 lit lazy ;   \ its relay id
-
-: cnnb ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then lputc ;
-: cnauto ( -- )
-	cnmaddr @ nport @ 1E lit cnmake  cne cnmine cnlen ncpy  cnmine cnmid cnid  -1 lit cnmh !
-	"relay: our entry, for consensus.txt: " lputs  cnmaddr @ fnip. 3A lit lputc nport @ fndec
-	", relay id " lputs  20 lit 0 lit do cnmid i + c@ dup 4 lit rshift cnnb cnnb loop
-	", good for 30 days (the line: on the console, in the web wallet, tools/wallet relay-entry)\n" lputs
-	"relay " puts  cnmine cnlen wlhex  A lit putc
-;
-
-: cnrenew? ( -- f )
-	cnmaddr @ 0= if 0 lit else cnmh @ 0= if -1 lit else
-		cnmine 10 lit + qbe@  hnow 240C8400 lit 0 lit wlq+ du<            \ under 7 days
-	then then
+\ cnfmt ( ip port id -- a n )
+: cnfmt ( ip port id -- a n )
+	0 lit cnfn !  "relay " dup strlen 0 lit do dup i + c@ cnfc loop drop
+	rot 4 lit 0 lit do dup 18 lit i 3 lit lshift - rshift FF lit and cnfd  i 3 lit u< if 2E lit cnfc then loop drop
+	swap 3A lit cnfc cnfd  20 lit cnfc
+	20 lit 0 lit do dup i + c@ dup 4 lit rshift cnfx cnfx loop drop
+	A lit cnfc  cnfb cnfn @
 ;
 
 \ ── consensus.txt ──
 
-: cnlv variable ;  : cnent ( k -- a )  cnlen * cnlv cnmax cnlen * lazy + ;
+: cnlv variable ;  : cnent ( k -- a )  5 lit lshift cnlv cnmax 5 lit lshift lazy + ;
 : cniv variable ;  : cnids ( k -- a )  5 lit lshift cniv cnmax 5 lit lshift lazy + ;
+: cnkv variable ;  : cnkey ( k -- a )  320 lit * cnkv cnmax 320 lit * lazy + ;
 : cnn variable ;
+: cnhas? ( k -- f )   cnent 8 lit + @ ;
 
-: cnhead ( -- s )   bnet @ if "tabernacle-consensus 1 dev\n" else "tabernacle-consensus 1 main\n" then ;
+: cnhead ( -- s )   bnet @ if "tabernacle-consensus 2 dev\n" else "tabernacle-consensus 2 main\n" then ;
 
-\ cnhv ( c -- v | -1 )   a hex digit's value (either case).
+\ cnhv ( c -- v | -1 )   a hex digit's value (lower case).
 : cnhv ( c -- v | -1 )
 	dup 30 lit - A lit u< if 30 lit - else
-	20 lit or dup 61 lit - 6 lit u< if 57 lit - else drop -1 lit then then
+	dup 61 lit - 6 lit u< if 57 lit - else drop -1 lit then then
 ;
 
 \ cnunhex ( a out n -- ok )   2n hex digits at a as n bytes at out.
@@ -152,25 +99,43 @@
 
 \ cnparse ( a n -- ok )
 : cnpa variable ;  : cnpe variable ;  : cnpok variable ;
+: cnpc ( -- c )   cnpa @ cnpe @ u< if cnpa @ c@ else 0 lit then ;
+\ cnpnum ( max c -- n )   a decimal number below max, no leading zero,
+\        then the character c (else not valid).
+: cnpv variable ;  : cnpd variable ;
+: cnpnum ( max c -- n )
+	0 lit cnpv !  0 lit cnpd !
+	begin cnpc 30 lit - A lit u< cnpd @ 6 lit u< and while
+		cnpv @ A lit * cnpc 30 lit - + cnpv !  cnpd @ 1 lit + cnpd !  cnpa @ 1 lit + cnpa !
+	repeat
+	cnpc = 0= if 0 lit cnpok ! then  cnpa @ 1 lit + cnpa !
+	cnpd @ 0= if 0 lit cnpok ! then
+	cnpd @ 1 lit u> if cnpa @ cnpd @ - 1 lit - c@ 30 lit = if 0 lit cnpok ! then then
+	cnpv @ swap u< 0= if 0 lit cnpok ! then  cnpv @
+;
+: cnpline ( -- )
+	cnpe @ cnpa @ - 6 lit u< 0= if cnpa @ "relay " 6 lit mcmp 0= else 0 lit then
+	cnn @ cnmax u< and if
+		cnpa @ 6 lit + cnpa !
+		cnn @ cnent dup 20 lit nzero
+		0 lit  3 lit 0 lit do 100 lit 2E lit cnpnum swap 8 lit lshift or loop  100 lit 3A lit cnpnum swap 8 lit lshift or
+		dup 0= if 0 lit cnpok ! then  over !
+		10000 lit 20 lit cnpnum  dup 0= if 0 lit cnpok ! then  swap 4 lit + !
+		cnpe @ cnpa @ - 41 lit u< 0= if
+			cnpa @ cnn @ cnids 20 lit cnunhex  cnpa @ 40 lit + c@ A lit = and 0= if 0 lit cnpok ! then
+			cnpa @ 41 lit + cnpa !
+		else 0 lit cnpok ! then
+		cnn @ if cnn @ 1 lit - cnids cnn @ cnids 20 lit mcmp 0< 0= if 0 lit cnpok ! then then   \ in order
+		cnn @ 1 lit + cnn !
+	else 0 lit cnpok ! then
+;
 : cnparse ( a n -- ok )
 	over + cnpe !  cnpa !  0 lit cnn !
 	cnhead strlen  cnpe @ cnpa @ - over u< 0=  if
 		cnpa @ cnhead 2 lit pick mcmp 0= cnpok !  cnpa @ + cnpa !
 	else drop 0 lit cnpok ! then
-	begin cnpok @ cnpa @ cnpe @ u< and while
-		cnpe @ cnpa @ - cnlen 1 lit lshift 7 lit + u< 0=                   \ "relay ", the hex, "\n"
-		cnn @ cnmax u< and
-		cnpa @ "relay " 6 lit mcmp 0= and
-		cnpa @ cnlen 1 lit lshift 6 lit + + c@ A lit = and if
-			cnpa @ 6 lit + cnn @ cnent cnlen cnunhex
-			cnn @ cnent cncheck and if
-				cnn @ cnent cnn @ cnids cnid
-				cnn @ if cnn @ 1 lit - cnids cnn @ cnids 20 lit mcmp 0< else -1 lit then    \ in order
-				if cnn @ 1 lit + cnn !  cnpa @ cnlen 1 lit lshift 7 lit + + cnpa !
-				else 0 lit cnpok ! then
-			else 0 lit cnpok ! then
-		else 0 lit cnpok ! then
-	repeat
+	begin cnpok @ cnpa @ cnpe @ u< and while cnpline repeat
+	cnpok @ 0= if 0 lit cnn ! then
 	cnpok @
 ;
 

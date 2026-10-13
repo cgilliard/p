@@ -413,8 +413,9 @@
 	"mode" jkey rqst @ 2 lit = if "\"listed\"" else rqst @ if "\"seed\"" else "\"unknown\"" then then js
 	"epoch" jkey rqepn @ jdec  "window" jkey rqwb @ rqwa @ - jdec  "voted" jkey rqvoted @ jdec
 	"for_list" jkey rqfor @ jdec  "unresolved" jkey rqunres @ jdec  "listed_relays" jkey rqlive @ jdec
+	"keys_known" jkey 0 lit cnn @ ?dup if 0 lit do i cnhas? if 1 lit + then loop then jdec
 	7D lit jc
-	"relay_entry" jkey cnmh @ if
+	"relay_entry" jkey cnok @ cnmaddr @ and if
 		jobj "addr" jkey 22 lit jc  4 lit 0 lit do cnmaddr @ 18 lit i 3 lit lshift - rshift FF lit and jdec  i 3 lit u< if 2E lit jc then loop
 		3A lit jc nport @ jdec 22 lit jc  "id" jkey cnmid 20 lit jqhex  7D lit jc
 	else "null" js then
@@ -604,25 +605,17 @@
 	jipv @ 8 lit lshift jipn @ or  jnok @
 ;
 
-\ jrentry ( -- )   relayentry: our entry as a relay, a consensus.txt line --
-\        made for ip, port, days; with no ip, the one the node made
-\        (relayaddr=: src/consensus.fam).
+\ jrentry ( -- )   relayentry: our consensus.txt line as a relay -- for ip
+\        and port if given, else for the relayaddr= setting's address and
+\        our port.
 : jrip variable ;
-: jrline ( e -- )
-	-1 lit jhead jobj
-	"line" jkey 22 lit jc "relay " js dup cnlen jhex 22 lit jc
-	"id" jkey jabuf cnid jabuf 20 lit jqhex
-	jdone jdone
-;
-: jrmake ( -- )
-	"ip" jget 1 lit = if jipp else 2drop 0 lit 0 lit then  jsok ! jrip !
-	"port" 0 lit jnum  "days" 7 lit jnum
-	over 1 lit - FFFF lit u< jsok @ and  over 1 lit - 1E lit u< and if
-		jrip @ -rot cnmake  cne jrline
-	else 2drop "ip (A.B.C.D, the relay's public address), port, days (1 to 30)" jerr then
-;
 : jrentry ( -- )
-	"ip" jget nip nip 0= cnmh @ and if cnmine jrline else jrmake then
+	"ip" jget 1 lit = if jipp else 2drop cnmaddr @ dup 0= 0= then  jsok ! jrip !
+	"port" nport @ jnum
+	jrip @ 0= 0= jsok @ and  over 1 lit - FFFF lit u< and  wl? and if
+		cnkeys  jrip @ swap cnmid cnfmt
+		-1 lit jhead jobj  "line" jkey 1 lit - jstr  "id" jkey cnmid 20 lit jqhex  jdone jdone
+	else drop "ip (A.B.C.D, the relay's public address) and port; or start the node with --relay-addr IP" jerr then
 ;
 
 : apirun ( a n auth -- auth' )

@@ -13,7 +13,7 @@
 Test {
 	onion_handshake {
 		wlseed tjsave 20 lit ncpy  1 lit bnet !
-		21 lit tjrelay  cne 0 lit cnent cnlen ncpy  1 lit cnn !  0 lit cnent 0 lit cnids cnid
+		21 lit tjrelay  cnek 0 lit cnkey 320 lit ncpy  -1 lit 0 lit cnent 8 lit + !  1 lit cnn !  cnmid 0 lit cnids 20 lit ncpy
 		\ the client: one hop, to that relay (its onion key: ours)
 		0 lit ocst !  0 lit ochn !  0A000202 lit 0 lit ocp !  BA5E lit 0 lit ocp 4 lit + !  0 lit 0 lit ocp 8 lit + !
 		0 lit ocp 1 lit ocp 20 lit ncpy  0 lit ocp 2 lit ocp 10 lit ncpy

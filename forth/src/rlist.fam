@@ -8,19 +8,24 @@
 \ consensus.txt whose leaf is its aux tree's root's left child (zeros, an
 \ all-zero aux_hash, a tree no one serves, or a file that isn't valid:
 \ abstains).  The file with the most votes wins, however few (a tie: the one
-\ voted for latest).  Listed mode: a winner, valid, with at least rqmn relays
-\ (8; dev 3) whose entries haven't expired by the window's last block's time;
-\ else seed mode (the seeds as relays, as before the list).  Payments wait
-\ while it isn't known yet (headers, trees or the file still coming).
+\ voted for latest).  Listed mode: a winner, valid, listing at least rqmn
+\ relays (8; dev 3); else seed mode (the seeds as relays, as before the
+\ list).  Payments wait while it isn't known yet (headers, trees or the file
+\ still coming).
 \
 \ Headers: a ring of the last 0x200 heights, each the header and its id --
 \ the node's own blocks (from its tip down), then, below the oldest it has,
 \ fetched from peers and checked by hash down from there:
 \   0x19 GET_HDRS  cookie (8), first height (u32), count (u16, up to 6)
 \   0x1A HDRS      first height (u32), count (u16), the 188-byte headers
-\ and served from the ring.
+\ and served from the ring.  The listed relays' keys (src/consensus.fam),
+\ asked of a peer every 0.5 s while one is missing, each checked against
+\ its id -- every 4th time for a relay, the relay itself made a peer too:
+\   0x20 GET_RKEY  cookie (8), the relay id (32)
+\   0x21 RKEY      the key (0x320)
+\ and served by any node that has it (a relay: its own).
 \
-\ Home relays: an address's 3 live relays with the highest SHA3-256(
+\ Home relays: an address's 3 listed relays with the highest SHA3-256(
 \ "tabernacle-home-v1" ‖ the address ‖ the relay id ‖ the epoch seed), the
 \ seed the id of the window's last block.  In listed mode the wallet
 \ registers with its own, and a lookup or a message goes to the address's;
@@ -34,7 +39,8 @@
 \   rqst               0 not known yet, 1 seed mode, 2 listed mode
 \   rqepn rqseed       the epoch, its seed (the window's last block's id)
 \   rqvoted rqfor rqunres rqlive   the window's votes, the winner's, those
-\                      unresolved, and the list's live relays
+\                      unresolved, and the list's relays
+\   rqlive? ( i -- f )  relay i's key is known (circuits through it)
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : rqep ( -- n )   bnet @ if C lit else 90 lit then ;      \ an epoch's blocks
@@ -152,15 +158,6 @@
 	then
 ;
 
-\ rqin ( -- f )
-: rqin ( -- f )
-	pok? if npay @ 5 lit + c@ dup 19 lit = swap 1A lit = or else 0 lit then
-	dup if
-		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
-		npay @ 5 lit + c@ 19 lit = if rqserve else rqhdrs then
-	then
-;
-
 \ ── The tally ──
 \ Candidates: 0 the file's leaf (32)  20 votes  24 the latest height voting.
 
@@ -227,13 +224,6 @@
 	loop then
 ;
 
-\ rqlivec ( -- n )   the list's entries good past the window's last block.
-: rqlivec ( -- n )
-	0 lit  cnn @ ?dup if 0 lit do
-		rqwb @ 1 lit - rqtime  i cnent 10 lit + qbe@ du< if 1 lit + then
-	loop then
-;
-
 \ rqwfile ( -- )   the winner's file: wanted, or read (not valid: its votes
 \        don't count, and the next tally goes on without it), then the mode.
 : rqwfile ( -- )
@@ -246,7 +236,7 @@
 			then
 		then
 		rqwin rqparsed 20 lit mcmp if drop 0 lit rqst ! else
-			1 lit + axpin !  rqlivec dup rqlive !  rqmn u< 0= if 2 lit else 1 lit then rqst !
+			1 lit + axpin !  cnn @ dup rqlive !  rqmn u< 0= if 2 lit else 1 lit then rqst !
 		then
 	then
 ;
@@ -287,6 +277,66 @@
 	then
 ;
 
+\ ── The relays' keys ──
+
+\ rqkserve ( -- )   GET_RKEY: the key, ours or a listed relay's we have.
+: rqkserve ( -- )
+	pbn @ 28 lit = pbd @ rlck? and if
+		-1 lit  cnn @ ?dup if 0 lit do i cnhas? if i cnids pbd @ 8 lit + 20 lit mcmp 0= if drop i then then loop then
+		dup 0< if drop  rlserve @ cnok @ and if pbd @ 8 lit + cnmid 20 lit mcmp 0= else 0 lit then if cnek else 0 lit then
+		else cnkey then
+		?dup if 21 lit phdr 320 lit ncpy  326 lit preply then
+	then
+;
+
+\ rqkey ( -- )   RKEY: the listed relay whose id it hashes to, if missing.
+: rqkhv variable ;  : rqkh ( -- a )  rqkhv 20 lit lazy ;
+: rqkey ( -- )
+	pbn @ 320 lit = if
+		pbd @ 320 lit rqkh sha3256
+		cnn @ ?dup if 0 lit do
+			i cnhas? 0= if i cnids rqkh 20 lit mcmp 0= if
+				pbd @ i cnkey 320 lit ncpy  -1 lit i cnent 8 lit + !
+			then then
+		loop then
+	then
+;
+
+\ rqkfill ( -- )   a missing key, asked for (each relay's every 2 s at most).
+: rqkp variable ;  : rqka variable ;
+: rqkfill ( -- )
+	rqst @ 2 lit =  rqka @ pago 1F4 lit u> and if
+		pms rqka !
+		-1 lit  cnn @ ?dup if 0 lit do
+			i cnhas? 0= if
+				cnok @ if i cnids cnmid 20 lit mcmp 0= else 0 lit then if
+					cnek i cnkey 320 lit ncpy  -1 lit i cnent 8 lit + !                 \ ours
+				else dup 0< i cnent C lit + @ pago 7D0 lit u> and if drop i then then
+			then
+		loop then
+		dup 0< if drop else
+			pms over cnent C lit + !  dup cnent 10 lit + dup @ 1 lit + dup rot !
+			3 lit and 0= if
+				dup cnent @ dup 18 lit rshift 7F lit = if drop A000202 lit then over cnent 4 lit + @ padd drop
+			then
+			rqkp @ rqpeer dup 0< if 2drop else
+				dup rqkp !  20 lit phdr  over pp C lit + @ 2 lit pick pp 10 lit + @ 2 lit pick qbe!   ( k p body )
+				rot cnids swap 8 lit + 20 lit ncpy  2E lit psendk
+			then
+		then
+	then
+;
+
+\ rqin ( -- f )
+: rqin ( -- f )
+	pok? if npay @ 5 lit + c@ 19 lit - 2 lit u<  npay @ 5 lit + c@ 20 lit - 2 lit u< or else 0 lit then
+	dup if
+		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+		npay @ 5 lit + c@
+		dup 19 lit = if rqserve else dup 1A lit = if rqhdrs else dup 20 lit = if rqkserve else rqkey then then then drop
+	then
+;
+
 \ ── Home relays ──
 
 : rqscv variable ;  : rqsc ( i -- a )  5 lit lshift rqscv cnmax 5 lit lshift lazy + ;
@@ -295,8 +345,8 @@
 : rqdn variable ;
 : rqad variable ;  : rqhs variable ;
 
-\ rqlive? ( i -- f )   entry i good past the window's last block.
-: rqlive? ( i -- f )   rqwb @ 1 lit - rqtime rot cnent 10 lit + qbe@ du< ;
+\ rqlive? ( i -- f )   relay i's key is known.
+: rqlive? ( i -- f )   cnhas? ;
 
 \ rqdadd ( ip port -- )   one more relay for rqd, unless it's there.
 : rqdadd ( ip port -- )
@@ -309,16 +359,14 @@
 : rqhome ( addr seed -- )
 	rqhs ! rqad !  0 lit rqtk cnmax nzero
 	cnn @ ?dup if 0 lit do
-		i rqlive? if
-			88 lit 6 lit kbeg  "tabernacle-home-v1" 12 lit kabs  rqad @ 20 lit kabs  i cnids 20 lit kabs
-			rqhs @ 20 lit kabs  kend  i rqsc 20 lit ksqz
-		else -1 lit i rqtk c! then
+		88 lit 6 lit kbeg  "tabernacle-home-v1" 12 lit kabs  rqad @ 20 lit kabs  i cnids 20 lit kabs
+		rqhs @ 20 lit kabs  kend  i rqsc 20 lit ksqz
 	loop then
 	3 lit 0 lit do
 		-1 lit  cnn @ ?dup if 0 lit do
 			i rqtk c@ 0= if dup 0< if drop i else i rqsc over rqsc 20 lit mcmp 0 lit > if drop i then then then
 		loop then
-		dup 0< if drop else -1 lit over rqtk c!  dup cnent 8 lit + be32 swap cnent C lit + nb16@ rqdadd then
+		dup 0< if drop else -1 lit over rqtk c!  dup cnent @ swap cnent 4 lit + @ rqdadd then
 	loop
 ;
 
@@ -364,4 +412,4 @@
 ;
 
 : rqt variable ;
-: rqtick ( -- )   rqt @ pago 3E8 lit u> if pms rqt !  rqtally rqsay rqroute then  rqfill ;
+: rqtick ( -- )   rqt @ pago 3E8 lit u> if pms rqt !  rqtally rqsay rqroute then  rqfill rqkfill ;

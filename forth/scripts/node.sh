@@ -6,7 +6,7 @@
 #   node.sh [--recover] [--passphrase] [--api-key]
 #           [--log-dest webui|console|both] [--log-max-entries N]
 #           [--debug-disable-verification] [--relay] [--relay-addr IP]
-#           [--mix-delay MS]
+#           [--relay-key N] [--mix-delay MS]
 #           [--direct] [--seed-mode]
 #
 #   --recover     restore the wallet from its 24 backup words, typed when the
@@ -26,11 +26,14 @@
 #                 (src/relay.fam; --gateway, its old name, works too)
 #   --relay-addr IP
 #                 a relay (as --relay) reached at this public IPv4 address,
-#                 on PORT: the node makes its own signed entry for
-#                 consensus.txt (good for 30 days, made again with 7 left)
-#                 and prints the line on the console, alone, starting
-#                 "relay " -- also in the web wallet, and from
-#                 `tools/wallet relay-entry` (docs/RELAYS.md)
+#                 on PORT: the node logs its line for consensus.txt,
+#                 "relay IP:PORT ID", to send to whoever keeps the list (also
+#                 in the web wallet and `tools/wallet relay-entry`); it
+#                 changes only with the address or the key (docs/RELAYS.md)
+#   --relay-key N
+#                 the relay's key: the N-th from the wallet's seed (default
+#                 0), so the backup words bring it back; a new N cycles it
+#                 (a new relay id, so a new line for the list)
 #   --mix-delay MS
 #                 a relay: hold each cell it passes on a random 0 .. MS ms
 #                 first (at most 10000), so cells in and out are harder to
@@ -109,10 +112,11 @@ NOVERIFY=""
 RELAY=""
 MIXDELAY=""
 RELAYADDR=""
+RELAYKEY=""
 DIRECT=""
 SEEDMODE=""
 usage() {
-	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N] [--debug-disable-verification] [--relay] [--relay-addr IP] [--mix-delay MS] [--direct] [--seed-mode]" >&2
+	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N] [--debug-disable-verification] [--relay] [--relay-addr IP] [--relay-key N] [--mix-delay MS] [--direct] [--seed-mode]" >&2
 	exit 1
 }
 while [ $# -gt 0 ]; do
@@ -128,6 +132,8 @@ while [ $# -gt 0 ]; do
 		--relay|--gateway) RELAY=1 ;;
 		--relay-addr=*) RELAYADDR=${1#*=}; RELAY=1 ;;
 		--relay-addr) [ $# -ge 2 ] || usage; RELAYADDR=$2; RELAY=1; shift ;;
+		--relay-key=*) RELAYKEY=${1#*=} ;;
+		--relay-key) [ $# -ge 2 ] || usage; RELAYKEY=$2; shift ;;
 		--mix-delay=*) MIXDELAY=${1#*=} ;;
 		--mix-delay) [ $# -ge 2 ] || usage; MIXDELAY=$2; shift ;;
 		--direct) DIRECT=1 ;;
@@ -148,6 +154,11 @@ if [ -n "$RELAYADDR" ]; then
 	case "$RELAYADDR" in 0.*|10.0.2.*) ok="" ;; esac
 	[ -n "$ok" ] || { echo "node.sh: --relay-addr: the relay's public IPv4 address, A.B.C.D" >&2; exit 1; }
 fi
+case "$RELAYKEY" in
+	'') ;;
+	*[!0-9]*) echo "node.sh: --relay-key: a number, 0 to 4294967295" >&2; exit 1 ;;
+	*) [ ${#RELAYKEY} -le 10 ] && [ "$RELAYKEY" -le 4294967295 ] || { echo "node.sh: --relay-key: at most 4294967295" >&2; exit 1; } ;;
+esac
 case "$MIXDELAY" in
 	"") ;;
 	*[!0-9]*) echo "node.sh: --mix-delay: a number of ms, 0 to 10000" >&2; exit 1 ;;
@@ -192,7 +203,7 @@ settings() {
 	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s%s%s%s%s%s%s\004' \
 		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
 		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}" "${PERIP:+ perip=$PERIP}" \
-		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${RELAY:+ relay}${RELAYADDR:+ relayaddr=$RELAYADDR}" "${DNS:+ dns=$DNS}" \
+		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${RELAY:+ relay}${RELAYADDR:+ relayaddr=$RELAYADDR}${RELAYKEY:+ relaykey=$RELAYKEY}" "${DNS:+ dns=$DNS}" \
 		"${MIXDELAY:+ mixdelay=$MIXDELAY}" "${DIRECT:+ direct}" "${SEEDMODE:+ seedmode}"
 }
 # QEMU's output goes through a pipe (| cat): QEMU makes its output
