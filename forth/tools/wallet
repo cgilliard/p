@@ -95,7 +95,8 @@ def ask_key(path):
         if len(text) == 64 and all(c in "0123456789abcdef" for c in text):
             break
         print("That isn't an API key: it's 64 hex digits.")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.dirname(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text + "\n")
