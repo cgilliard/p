@@ -84,6 +84,11 @@ const TYPE_GET_SYNC_POINT: u8 = 11;
 const TYPE_SYNC_POINT: u8 = 12;
 const TYPE_GET_PIECE: u8 = 13;
 const TYPE_PIECE_CHUNK: u8 = 14;
+// The relay list's (docs/RELAYS.md): after the Forth node's own 15..22.
+const TYPE_GET_AUX: u8 = 0x17;
+const TYPE_AUX: u8 = 0x18;
+const TYPE_GET_HDRS: u8 = 0x19;
+const TYPE_HDRS: u8 = 0x1A;
 
 pub const HEADER_LEN: usize = MAGIC.len() + 2;
 const GET_HOSTS_MIN: usize = HEADER_LEN + 8 + 2;
@@ -101,6 +106,12 @@ const GET_SYNC_POINT_LEN: usize = HEADER_LEN + 32;
 const SYNC_POINT_LEN: usize = HEADER_LEN + 32 + 32 + 8 + 32;
 const GET_PIECE_LEN: usize = HEADER_LEN + 8 + 32 + 1 + 4 + 4 + 2;
 const PIECE_CHUNK_HEADER_LEN: usize = HEADER_LEN + 32 + 1 + 4 + 4 + 4;
+const GET_AUX_LEN: usize = HEADER_LEN + 8 + 32 + 4 + 2;
+const AUX_HEADER_LEN: usize = HEADER_LEN + 32 + 4 + 4;
+const GET_HDRS_LEN: usize = HEADER_LEN + 8 + 4 + 2;
+const HDRS_HEADER_LEN: usize = HEADER_LEN + 4 + 2;
+/// The most block headers one `HDRS` carries.
+pub const MAX_HDRS: usize = (MAX_PACKET - HDRS_HEADER_LEN) / crate::block::HEADER_LEN;
 
 /// The most transactions one `TX_INV` announces.
 pub const MAX_TX_INV: usize = (MAX_PACKET - HEADER_LEN - 1) / TX_INV_ENTRY;
@@ -112,6 +123,7 @@ const _: () = assert!(CHUNK_HEADER_LEN + CHUNK_LEN <= MAX_PACKET);
 const _: () = assert!(INV_LEN <= GET_INV_LEN * AMPLIFICATION_FACTOR);
 const _: () = assert!(SYNC_POINT_LEN <= GET_SYNC_POINT_LEN * AMPLIFICATION_FACTOR);
 const _: () = assert!(PIECE_CHUNK_HEADER_LEN + CHUNK_LEN <= MAX_PACKET);
+const _: () = assert!(AUX_HEADER_LEN + CHUNK_LEN <= MAX_PACKET);
 
 /// Which block a `GET_INV` asks about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +178,16 @@ pub enum Message {
     GetPiece { cookie: u64, at: [u8; 32], level: u8, index: u32, first: u32, count: u16 },
     /// One chunk of a piece, which is `size` bytes in all.
     PieceChunk { at: [u8; 32], level: u8, index: u32, size: u32, chunk: u32, data: Vec<u8> },
+    /// "Send me chunks `first .. first + count` of the bytes whose SHA-256
+    /// is `hash`" -- a node or leaf of a block's aux tree (`auxtree`).
+    GetAux { cookie: u64, hash: [u8; 32], first: u32, count: u16 },
+    /// One chunk of those bytes, which are `total` long in all.
+    Aux { hash: [u8; 32], total: u32, index: u32, data: Vec<u8> },
+    /// "Send me the active chain's headers from height `first`, `count`
+    /// of them" (at most `MAX_HDRS`).
+    GetHdrs { cookie: u64, first: u32, count: u16 },
+    /// Headers from height `first` on, each `block::HEADER_LEN` bytes.
+    Hdrs { first: u32, headers: Vec<[u8; crate::block::HEADER_LEN]> },
 }
 
 /// Size of a `HOSTS` packet carrying `count` addresses.
@@ -346,6 +368,35 @@ impl Message {
                 out.extend_from_slice(&chunk.to_be_bytes());
                 out.extend_from_slice(&data[..data.len().min(CHUNK_LEN)]);
             }
+            Message::GetAux { cookie, hash, first, count } => {
+                out.push(TYPE_GET_AUX);
+                out.extend_from_slice(&cookie.to_be_bytes());
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&first.to_be_bytes());
+                out.extend_from_slice(&count.to_be_bytes());
+            }
+            Message::Aux { hash, total, index, data } => {
+                out.push(TYPE_AUX);
+                out.extend_from_slice(hash);
+                out.extend_from_slice(&total.to_be_bytes());
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&data[..data.len().min(CHUNK_LEN)]);
+            }
+            Message::GetHdrs { cookie, first, count } => {
+                out.push(TYPE_GET_HDRS);
+                out.extend_from_slice(&cookie.to_be_bytes());
+                out.extend_from_slice(&first.to_be_bytes());
+                out.extend_from_slice(&count.to_be_bytes());
+            }
+            Message::Hdrs { first, headers } => {
+                out.push(TYPE_HDRS);
+                out.extend_from_slice(&first.to_be_bytes());
+                let n = headers.len().min(MAX_HDRS);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+                for header in &headers[..n] {
+                    out.extend_from_slice(header);
+                }
+            }
         }
         out
     }
@@ -463,6 +514,33 @@ impl Message {
                 chunk: read_u32(&body[41..]),
                 data: body[45..].to_vec(),
             }),
+            TYPE_GET_AUX if bytes.len() == GET_AUX_LEN => Some(Message::GetAux {
+                cookie: read_u64(body),
+                hash: read_hash(&body[8..]),
+                first: read_u32(&body[40..]),
+                count: read_u16(&body[44..]),
+            }),
+            TYPE_AUX if (AUX_HEADER_LEN..=AUX_HEADER_LEN + CHUNK_LEN).contains(&bytes.len()) => Some(Message::Aux {
+                hash: read_hash(body),
+                total: read_u32(&body[32..]),
+                index: read_u32(&body[36..]),
+                data: body[40..].to_vec(),
+            }),
+            TYPE_GET_HDRS if bytes.len() == GET_HDRS_LEN => Some(Message::GetHdrs {
+                cookie: read_u64(body),
+                first: read_u32(&body[8..]),
+                count: read_u16(&body[12..]),
+            }),
+            TYPE_HDRS if bytes.len() >= HDRS_HEADER_LEN => {
+                let n = read_u16(&body[4..]) as usize;
+                if n > MAX_HDRS || bytes.len() != HDRS_HEADER_LEN + n * crate::block::HEADER_LEN {
+                    return None;
+                }
+                Some(Message::Hdrs {
+                    first: read_u32(body),
+                    headers: body[6..].chunks(crate::block::HEADER_LEN).map(|h| h.try_into().unwrap()).collect(),
+                })
+            }
             _ => None,
         }
     }
@@ -507,6 +585,10 @@ impl Message {
             Message::PieceChunk {
                 at, level, index, chunk, data, ..
             } => format!("PIECE_CHUNK({} {level}/{index} #{chunk}, {} bytes)", short(at), data.len()),
+            Message::GetAux { hash, first, count, .. } => format!("GET_AUX({} {first}..{})", short(hash), *first as u64 + *count as u64),
+            Message::Aux { hash, index, data, .. } => format!("AUX({} #{index}, {} bytes)", short(hash), data.len()),
+            Message::GetHdrs { first, count, .. } => format!("GET_HDRS({first}..{})", *first as u64 + *count as u64),
+            Message::Hdrs { first, headers } => format!("HDRS({first}, {} headers)", headers.len()),
         }
     }
 }
@@ -522,6 +604,12 @@ mod tests {
 
     fn all_kinds() -> Vec<Message> {
         vec![
+            Message::GetAux { cookie: 5, hash: [2; 32], first: 1, count: 32 },
+            Message::Aux { hash: [2; 32], total: 5000, index: 4, data: vec![9; CHUNK_LEN] },
+            Message::Aux { hash: [2; 32], total: 65, index: 0, data: vec![1; 65] },
+            Message::GetHdrs { cookie: 5, first: 1000, count: 6 },
+            Message::Hdrs { first: 1000, headers: vec![[7; crate::block::HEADER_LEN]; MAX_HDRS] },
+            Message::Hdrs { first: 3, headers: vec![] },
             Message::GetSyncPoint { hash: [3; 32] },
             Message::SyncPoint {
                 hash: [4; 32],
@@ -651,7 +739,7 @@ mod tests {
             trailing.push(1);
             let variable = match &message {
                 Message::Chunk { .. } | Message::TxChunk { .. } => true,
-                Message::PieceChunk { data, .. } => data.len() < CHUNK_LEN,
+                Message::PieceChunk { data, .. } | Message::Aux { data, .. } => data.len() < CHUNK_LEN,
                 _ => false,
             };
             if !variable {
@@ -670,6 +758,7 @@ mod tests {
                 Message::Chunk { .. } | Message::TxChunk { .. } => CHUNK_HEADER_LEN + 1,
                 Message::GetHosts { .. } => GET_HOSTS_MIN,
                 Message::PieceChunk { .. } => PIECE_CHUNK_HEADER_LEN,
+                Message::Aux { .. } => AUX_HEADER_LEN,
                 _ => good.len(),
             };
             assert_eq!(Message::decode(&good[..shortest_valid - 1]), None, "{message:?}");

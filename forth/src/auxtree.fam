@@ -1,0 +1,213 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/auxtree.fam — the aux exchange (docs/RELAYS.md): the bytes behind a
+\ block's aux_hash, fetched from peers by their hash, kept, and served.
+\ Bytes are a node's (0x01 ‖ left ‖ right, 65 of them) or a leaf's (0x00 ‖
+\ its content: here, a consensus.txt); a hash is the SHA-256 of those bytes,
+\ so what comes is checked by hashing it, from whoever it comes.
+\
+\   0x17 GET_AUX  cookie (8), hash (32), first chunk (u32), count (u16)
+\   0x18 AUX      hash (32), total length (u32), chunk (u32), up to 0x400
+\                 bytes
+\
+\ Kept: up to 0x200 nodes (a ring: the oldest goes), and 2 files -- one may
+\ be pinned (the relay list in use), the other is where the next goes.
+\ Fetched: one thing at a time, from a queue of wants: asked of a peer that
+\ has answered us, a window of 32 chunks every 0.3 s while chunks come; a
+\ peer that sends nothing new is passed over for the next.  Given up after
+\ every answered peer (and 2 more tries) sent nothing new; a hash given up on
+\ isn't wanted again for a minute.  Served: to an asker quoting our cookie,
+\ what we keep.
+\
+\   axwant ( hash kind -- )   fetch it (kind axkn a node, axkf a file),
+\                             unless it's kept, coming or queued
+\   axnfind ( hash -- e | 0 ) a kept node: its left at e + 20, right e + 40
+\   axffind ( hash -- k | -1 )  a kept file's slot: axfb k (its 0x00 first)
+\                             and axflen k @ bytes
+\   axfail? ( hash -- f )     given up on, in the last minute
+\   axin ( -- f )             a datagram of ours (types 0x17, 0x18): handled
+\   axtick ( -- )
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: axkn ( -- n )   1 lit ;                                  \ a node
+: axkf ( -- n )   2 lit ;                                  \ a file
+: axfcap ( -- n )   90000 lit ;                            \ a file's bytes, at most (0x00 too)
+
+\ ── Kept ──
+
+: axnv variable ;  : axne ( k -- a )  60 lit * axnv 200 lit 60 lit * lazy + ;   \ hash, left, right
+: axnn variable ;                                            \ nodes ever kept
+
+: axnfind ( hash -- e | 0 )
+	0 lit swap  axnn @ 200 lit pumin ?dup if 0 lit do i axne over 20 lit mcmp 0= if nip i axne swap then loop then drop
+;
+
+\ axnput ( hash l r -- )
+: axnput ( hash l r -- )
+	axnn @ 1FF lit and axne  tuck 40 lit + 20 lit ncpy  tuck 20 lit + 20 lit ncpy  20 lit ncpy
+	axnn @ 1 lit + axnn !
+;
+
+: axfv variable ;  : axfb ( k -- a )  axfcap * axfv axfcap 1 lit lshift lazy + ;
+: axfhv variable ;  : axfhash ( k -- a )  5 lit lshift axfhv 40 lit lazy + ;
+: axflv variable ;  : axflen ( k -- a )  2 lit lshift axflv 8 lit lazy + ;    \ 0: empty
+: axpin variable ;                                           \ 1 + the slot in use; 0 none
+
+: axffind ( hash -- k | -1 )
+	-1 lit swap  2 lit 0 lit do i axflen @ if i axfhash over 20 lit mcmp 0= if nip i swap then then loop drop
+;
+: axfnew ( -- k )   axpin @ 1 lit = if 1 lit else 0 lit then ;  \ the slot not in use
+
+\ axbytes ( hash -- a n )   what we keep under that hash (n 0: nothing).
+: axtv variable ;  : axtmp ( -- a )  axtv 50 lit lazy ;   \ a node's 65 bytes
+: axbytes ( hash -- a n )
+	dup axnfind ?dup if
+		nip  1 lit axtmp c!  dup 20 lit + axtmp 1 lit + 20 lit ncpy  40 lit + axtmp 21 lit + 20 lit ncpy  axtmp 41 lit
+	else
+		axffind dup 0< if drop 0 lit 0 lit else dup axfb swap axflen @ then
+	then
+;
+
+\ ── Given up on ──
+
+: axgv variable ;  : axge ( k -- a )  24 lit * axgv 24 lit 40 lit * lazy + ;   \ hash, when
+: axgn variable ;
+: axfail? ( hash -- f )
+	0 lit swap  axgn @ 40 lit pumin ?dup if 0 lit do
+		i axge over 20 lit mcmp 0=  i axge 20 lit + @ pago EA60 lit u< and if nip -1 lit swap then
+	loop then drop
+;
+: axgive ( hash -- )   axgn @ 3F lit and axge  tuck 20 lit ncpy  pms swap 20 lit + !  axgn @ 1 lit + axgn ! ;
+
+\ ── Wanted ──
+
+: axqv variable ;  : axq ( k -- a )  24 lit * axqv 24 lit 100 lit * lazy + ;   \ kind, hash
+: axqn variable ;
+: axwv variable ;  : axwh ( -- a )  axwv 20 lit lazy ;   \ what's being fetched
+: axwk variable ;   \ its kind; 0: nothing
+: axwt variable ;   \ its length (0: not known yet)
+: axwg variable ;   \ chunks had
+: axwb variable ;   \ where its bytes go
+: axbv variable ;  : axbm ( -- a )  axbv 50 lit lazy ;   \ the chunks had, a bit each
+: axwp variable ;   \ the peer asked last
+: axwa variable ;   \ when
+: axwq variable ;   \ asks in a row with nothing new
+: axpr variable ;   \ something new since the last ask
+
+: axqd? ( hash -- f )
+	0 lit swap  axqn @ ?dup if 0 lit do i axq 4 lit + over 20 lit mcmp 0= if nip -1 lit swap then loop then drop
+;
+
+: axwant ( hash kind -- )
+	over axnfind 0=  2 lit pick axffind 0< and  2 lit pick axfail? 0= and
+	axwk @ 0= 3 lit pick axwh 20 lit mcmp 0= 0= or and
+	2 lit pick axqd? 0= and  axqn @ 100 lit u< and if
+		axqn @ axq !  axqn @ axq 4 lit + 20 lit ncpy  axqn @ 1 lit + axqn !
+	else 2drop then
+;
+
+\ axnext ( -- )   start the next want.
+: axnext ( -- )
+	axqn @ if
+		0 lit axq @ axwk !  0 lit axq 4 lit + axwh 20 lit ncpy
+		axqn @ 1 lit - dup axqn !  ?dup if 1 lit axq 0 lit axq rot 24 lit * ncpy then
+		0 lit axwt !  0 lit axwg !  axbm 50 lit nzero  0 lit axwq !  -1 lit axpr !  0 lit axwa !
+		axwk @ axkf = if axfnew dup axfb axwb !  0 lit swap axflen ! else axtmp axwb ! then
+	then
+;
+
+\ axchunks ( -- n )   the thing's chunks (1 while its length isn't known).
+: axchunks ( -- n )   axwt @ ?dup if 3FF lit + A lit rshift else 1 lit then ;
+
+\ axask ( peer -- )   GET_AUX: the first window still missing.
+: axfirst ( -- i )   0 lit  begin dup axchunks u<  over 3 lit rshift axbm + c@ 2 lit pick 7 lit and rshift 1 lit and and while 1 lit + repeat ;
+: axask ( k -- )
+	17 lit phdr  over pp C lit + @ 2 lit pick pp 10 lit + @ 2 lit pick qbe!
+	axwh over 8 lit + 20 lit ncpy  axfirst over 28 lit + be!  20 lit swap 2C lit + nb16!
+	34 lit psendk
+;
+
+\ axpeer ( -- k | -1 )   the next answered peer after the last asked.
+: axpeer ( -- k | -1 )
+	-1 lit  ppn 0 lit do
+		dup 0< if axwp @ 1 lit + i + ppn % dup pp 8 lit + @ 2 lit = if nip else drop then then
+	loop
+;
+: axpeers ( -- n )   0 lit ppn 0 lit do i pp 8 lit + @ 2 lit = if 1 lit + then loop ;
+
+\ axdone ( -- )   all of it in: hashed, then kept, or not (and given up on).
+: axhv variable ;  : axhash ( -- a )  axhv 20 lit lazy ;
+: axdone ( -- )
+	axwb @ axwt @ axhash sha256
+	axhash axwh 20 lit mcmp 0=  axwb @ c@ axwk @ axkn = if 1 lit else 0 lit then = and if
+		axwk @ axkn = if axwh axtmp 1 lit + axtmp 21 lit + axnput
+		else axfnew  axwh over axfhash 20 lit ncpy  axwt @ swap axflen ! then
+	else axwh axgive then
+	0 lit axwk !
+;
+
+\ axaux ( -- )   AUX: a chunk of what's being fetched.
+: axat variable ;  : axai variable ;
+: axaux ( -- )
+	axwk @  pbn @ 28 lit u< 0= and  if pbd @ axwh 20 lit mcmp 0= if
+		pbd @ 20 lit + be32 axat !  pbd @ 24 lit + be32 axai !
+		axwk @ axkn = if axat @ 41 lit = else axat @ 1 lit - axfcap u< then
+		axwt @ 0= axwt @ axat @ = or and if
+			axat @ axwt !
+			axai @ axchunks u<
+			axai @ 3 lit rshift axbm + c@ axai @ 7 lit and rshift 1 lit and 0= and
+			pbn @ 28 lit -  axat @ axai @ A lit lshift - 400 lit pumin = and if
+				pbd @ 28 lit + axwb @ axai @ A lit lshift + pbn @ 28 lit - ncpy
+				axai @ 3 lit rshift axbm +  dup c@ 1 lit axai @ 7 lit and lshift or swap c!
+				axwg @ 1 lit + axwg !  -1 lit axpr !
+				axwg @ axchunks = if axdone then
+			then
+		then
+	then then
+;
+
+\ axserve ( -- )   GET_AUX: the chunks asked for (a window at most) of
+\        what we keep, to an asker quoting our cookie.
+: axsa variable ;  : axsn variable ;
+: axserve ( -- )
+	pbn @ 2E lit = pbd @ rlck? and if
+		pbd @ 8 lit + axbytes axsn ! axsa !
+		axsn @ if
+			pbd @ 28 lit + be32  axsn @ 3FF lit + A lit rshift  over pbd @ 2C lit + nb16@ 20 lit pumin + pumin
+			2dup u< if swap do
+				18 lit phdr  pbd @ 8 lit + over 20 lit ncpy  axsn @ over 20 lit + be!  i over 24 lit + be!
+				axsn @ i A lit lshift - 400 lit pumin                          ( body len )
+				axsa @ i A lit lshift + 2 lit pick 28 lit + 2 lit pick ncpy
+				nip nsrc @ nsport @ rot 2E lit + nsend drop
+			loop else 2drop then
+		then
+	then
+;
+
+\ axin ( -- f )
+: axin ( -- f )
+	pok? if npay @ 5 lit + c@ dup 17 lit = swap 18 lit = or else 0 lit then
+	dup if
+		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+		npay @ 5 lit + c@ 17 lit = if axserve else axaux then
+	then
+;
+
+\ axtick ( -- )
+: axtick ( -- )
+	axwk @ 0= if axnext then
+	axwk @ if axwa @ pago 12C lit u> if
+		axpr @ if 0 lit axwq ! else axwq @ 1 lit + axwq !  axpeer dup 0< 0= if axwp ! else drop then then
+		axwq @ axpeers 2 lit + u> if axwh axgive  0 lit axwk ! else
+			axwp @ dup pp 8 lit + @ 2 lit = if axask else drop then
+			0 lit axpr !  pms axwa !
+		then
+	then then
+;
+
+\ p2rlz -- the yield's second relay: src/net.fam's p2rly jumps here, and from
+\ here to src/full_node.fam's p2yhk -- the node has grown past one jal's
+\ 1 MiB between them.  "p2rl" "y": p2rly's name.
+: p2rlz ( -- )
+	6C723270 79 hookto
+6F004000 ,   \ jal x0,+4: rewritten by p2yhk's hookto
+;

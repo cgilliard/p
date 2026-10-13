@@ -189,7 +189,7 @@ impl Discovery {
     }
 
     /// The cookie this node issues to `addr` -- see the module docs.
-    fn issue_cookie(&self, addr: SocketAddrV4) -> u64 {
+    pub(crate) fn issue_cookie(&self, addr: SocketAddrV4) -> u64 {
         let mut input = [0u8; 32 + peers::ADDR_LEN];
         input[..32].copy_from_slice(&self.cookie_key);
         input[32..].copy_from_slice(&peers::encode_addr(addr));

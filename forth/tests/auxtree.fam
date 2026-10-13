@@ -1,0 +1,49 @@
+\ tests/auxtree.fam — the aux exchange (src/auxtree.fam): what's fetched is
+\ kept only if it hashes to what was asked for; chunks come in any order,
+\ each once; what's kept is served as the bytes that hash to it.
+
+: tufv variable ;  : tuf ( -- a )  tufv 1000 lit lazy ;     \ a file's bytes (0x00 first)
+: tuhv variable ;  : tuh ( -- a )  tuhv 20 lit lazy ;       \ their hash
+: tupv variable ;  : tup ( -- a )  tupv 440 lit lazy ;      \ an AUX's body
+: tuc variable ;   \ a byte to spoil a chunk with (0: none)
+
+\ tuchunk ( i n -- )   chunk i of the n bytes at tuf, to axaux.
+: tuchunk ( i n -- )
+	tuh tup 20 lit ncpy  dup tup 20 lit + be!  over tup 24 lit + be!
+	over A lit lshift - 400 lit pumin                                     ( i len )
+	swap A lit lshift tuf + tup 28 lit + 2 lit pick ncpy
+	tuc @ if tup 30 lit + dup c@ tuc @ xor swap c! then
+	tup pbd !  28 lit + pbn !  axaux
+;
+
+Test {
+	aux_file_fetched {
+		0 lit axqn !  0 lit axwk !  0 lit axpin !
+		0 lit tuf c!  BB8 lit 1 lit do i 7 lit * tuf i + c! loop               \ 3,000 bytes
+		tuf BB8 lit tuh sha256
+		tuh axkf axwant  axqn @ 1 lit asrt_eq  tuh axkf axwant  axqn @ 1 lit asrt_eq   \ once
+		axnext  axwk @ axkf asrt_eq
+		2 lit BB8 lit tuchunk  0 lit BB8 lit tuchunk  0 lit BB8 lit tuchunk         \ any order; twice: once
+		axwg @ 2 lit asrt_eq  tuh axffind -1 lit asrt_eq
+		1 lit BB8 lit tuchunk
+		axwk @ 0 lit asrt_eq  tuh axffind dup 0< 0= assert
+		dup axflen @ BB8 lit asrt_eq  axfb tuf BB8 lit mcmp 0 lit asrt_eq
+		tuh axbytes BB8 lit asrt_eq  tuf BB8 lit mcmp 0 lit asrt_eq
+		tuh axkf axwant  axqn @ 0 lit asrt_eq                                 \ kept: not wanted
+	}
+	aux_bad_copy_refused {
+		5 lit tuf 1 lit + c!  tuf BB8 lit tuh sha256                          \ another file
+		tuh axkf axwant axnext
+		5A lit tuc !  0 lit BB8 lit tuchunk  0 lit tuc !  1 lit BB8 lit tuchunk  2 lit BB8 lit tuchunk
+		axwk @ 0 lit asrt_eq  tuh axffind -1 lit asrt_eq  tuh axfail? assert
+		tuh axkf axwant  axqn @ 0 lit asrt_eq                                 \ given up on: not again yet
+	}
+	aux_node_fetched {
+		1 lit tuf c!  41 lit 1 lit do i tuf i + c! loop  tuf 41 lit tuh sha256
+		tuh axkn axwant axnext
+		0 lit 40 lit tuchunk  axwk @ axkn asrt_eq                             \ the wrong length: ignored
+		0 lit 41 lit tuchunk  axwk @ 0 lit asrt_eq
+		tuh axnfind dup assert  20 lit + tuf 1 lit + 40 lit mcmp 0 lit asrt_eq
+		tuh axbytes 41 lit asrt_eq  tuf 41 lit mcmp 0 lit asrt_eq
+	}
+}

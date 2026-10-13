@@ -1,0 +1,367 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/rlist.fam — the relay list in use (docs/RELAYS.md): the window's
+\ headers, the votes in them, the winning consensus.txt, and the mode.
+\
+\ Epochs of rqep blocks (a day: 144; dev 12).  Epoch e's list comes from its
+\ window: the rqep blocks ending rqmg (12; dev 2) before the epoch starts --
+\ heights e*rqep - rqmg - rqep .. e*rqep - rqmg - 1.  A block votes for the
+\ consensus.txt whose leaf is its aux tree's root's left child (zeros, an
+\ all-zero aux_hash, a tree no one serves, or a file that isn't valid:
+\ abstains).  The file with the most votes wins, however few (a tie: the one
+\ voted for latest).  Listed mode: a winner, valid, with at least rqmn relays
+\ (8; dev 3) whose entries haven't expired by the window's last block's time;
+\ else seed mode (the seeds as relays, as before the list).  Payments wait
+\ while it isn't known yet (headers, trees or the file still coming).
+\
+\ Headers: a ring of the last 0x200 heights, each the header and its id --
+\ the node's own blocks (from its tip down), then, below the oldest it has,
+\ fetched from peers and checked by hash down from there:
+\   0x19 GET_HDRS  cookie (8), first height (u32), count (u16, up to 6)
+\   0x1A HDRS      first height (u32), count (u16), the 188-byte headers
+\ and served from the ring.
+\
+\ Home relays: an address's 3 live relays with the highest SHA3-256(
+\ "tabernacle-home-v1" ‖ the address ‖ the relay id ‖ the epoch seed), the
+\ seed the id of the window's last block.  In listed mode the wallet
+\ registers with its own, and a lookup or a message goes to the address's;
+\ for the first quarter of an epoch, the last epoch's home relays too (by
+\ its seed, the block just below the window).  In seed mode, as before.
+\
+\   rqtick ( -- )      keep up: headers, the tally (every second)
+\   rqtgt ( addr -- )   the relays a lookup or message for addr goes to
+\                      (src/relay.fam's rlt)
+\   rqin ( -- f )      a datagram of ours (0x19, 0x1A): handled
+\   rqst               0 not known yet, 1 seed mode, 2 listed mode
+\   rqepn rqseed       the epoch, its seed (the window's last block's id)
+\   rqvoted rqfor rqunres rqlive   the window's votes, the winner's, those
+\                      unresolved, and the list's live relays
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: rqep ( -- n )   bnet @ if C lit else 90 lit then ;      \ an epoch's blocks
+: rqmg ( -- n )   bnet @ if 2 lit else C lit then ;       \ the margin
+: rqmn ( -- n )   bnet @ if 3 lit else 8 lit then ;       \ relays, at least
+
+\ ── Headers ──
+\ The ring: 0 the height + 1 (0: empty)  4 the id  24 the header (0xBC).
+
+: rqhv variable ;  : rqh ( h -- a )  1FF lit and E0 lit * rqhv 200 lit E0 lit * lazy + ;
+: rqid ( h -- a )    rqh 4 lit + ;
+: rqhdr ( h -- a )   rqh 24 lit + ;
+: rqprev ( h -- a )  rqhdr 4 lit + ;
+: rqaux ( h -- a )   rqhdr 64 lit + ;
+: rqtime ( h -- lo hi )   rqhdr dup 98 lit + be32 swap 94 lit + be32 ;
+: rqhas ( h -- f )   dup rqh @ swap 1 lit + = ;
+
+: rqb variable ;
+: rqset ( hdr id h -- )
+	dup 1 lit + over rqh !  rqh rqb !  rqb @ 4 lit + 20 lit ncpy  rqb @ 24 lit + BC lit ncpy
+;
+
+\ rqown ( h -- f )   the active chain's block at h, if kept: into the ring.
+: rqhhv variable ;  : rqhh ( -- a )  rqhhv 20 lit lazy ;
+: rqown ( h -- f )
+	dup blat if
+		blv rqhh 20 lit ncpy  rqhh blfind if blv @ pgget 8 lit + rqhh rot rqset -1 lit else drop 0 lit then
+	else drop 0 lit then
+;
+
+\ rqsync ( -- )   the ring from the tip down, as far as it's the tip's chain:
+\        rqtop .. rqlo.
+: rqtop variable ;  : rqlo variable ;  : rqgo variable ;
+: rqsync ( -- )
+	dbtip ?dup if
+		20 lit + @ dup rqtop !  -1 lit rqgo !
+		begin rqgo @ while
+			dup blat 0= if 0 lit rqgo ! else
+				dup rqhas if blv over rqid 20 lit mcmp 0= else 0 lit then
+				if 0 lit rqgo ! else dup rqown drop then                  \ the same from here down
+			then
+			dup 0=  rqtop @ 2 lit pick - 1FF lit u< 0= or if 0 lit rqgo ! then
+			rqgo @ if 1 lit - then
+		repeat drop
+		rqtop @ dup rqhas if
+			begin
+				dup 0= 0= if dup 1 lit - rqhas if dup rqprev over 1 lit - rqid 20 lit mcmp 0= else 0 lit then else 0 lit then
+				rqtop @ 2 lit pick - 1FF lit u< and
+			while 1 lit - repeat
+		else 1 lit + then rqlo !
+	then
+;
+
+\ ── Peers asked ──
+
+\ rqpeer ( last -- k | -1 )   the next answered peer after the last.
+: rqpeer ( last -- k | -1 )
+	-1 lit  ppn 0 lit do
+		dup 0< if over 1 lit + i + ppn % dup pp 8 lit + @ 2 lit = if nip else drop then then
+	loop nip
+;
+
+\ ── The backfill ──
+
+: rqneed variable ;   \ the lowest height wanted
+: rqhp variable ;  : rqha variable ;
+
+\ rqfill ( -- )   below rqlo, down to rqneed: asked of a peer every 0.5 s.
+: rqfill ( -- )
+	rqneed @ rqlo @ u<  rqha @ pago 1F4 lit u> and if
+		rqhp @ rqpeer dup 0< if drop else
+			dup rqhp !
+			19 lit phdr  over pp C lit + @ 2 lit pick pp 10 lit + @ 2 lit pick qbe!     ( k body )
+			rqlo @ rqneed @ - 6 lit pumin                                       ( k body count )
+			2dup swap C lit + nb16!  rqlo @ swap - swap 8 lit + be!
+			14 lit psendk  pms rqha !
+		then
+	then
+;
+
+\ rqhdrs ( -- )   HDRS: from the last down, each the one below rqlo whose id
+\        the header above it names.
+: rqidv variable ;  : rqidb ( -- a )  rqidv 40 lit lazy ;
+: rqhdrs ( -- )
+	pbn @ 6 lit u< 0= if
+		pbd @ 4 lit + nb16@  dup 6 lit u> 0=  over BC lit * 6 lit + pbn @ = and if
+			?dup if dup 0 lit do                                              ( n )
+				dup 1 lit - i -  pbd @ be32 over +                               ( n j h )
+				dup 1 lit + rqlo @ =  over rqneed @ u< 0= and if
+					over BC lit * pbd @ 6 lit + +  dup rqidb hdrid                  ( n j h hdr )
+					rqidb 2 lit pick 1 lit + rqprev 20 lit mcmp 0= if
+						rqidb rot rqset  rqlo @ 1 lit - rqlo !
+					else 2drop then
+				else drop then
+				drop
+			loop drop then
+		else drop then
+	then
+;
+
+\ rqserve ( -- )   GET_HDRS: from the ring (rqlo .. rqtop), as many in a row
+\        as we have.
+: rqsf variable ;  : rqsk variable ;  : rqsb variable ;  : rqsn variable ;
+: rqserve ( -- )
+	pbn @ E lit = pbd @ rlck? and if
+		pbd @ 8 lit + be32 rqsf !  pbd @ C lit + nb16@ 6 lit pumin rqsk !
+		1A lit phdr rqsb !  rqsf @ rqsb @ be!  0 lit rqsn !
+		begin
+			rqsn @ rqsk @ u<  rqsf @ rqsn @ + dup rqlo @ u< 0= over rqtop @ u> 0= and swap rqhas and and
+		while
+			rqsf @ rqsn @ + rqhdr  rqsb @ 6 lit + rqsn @ BC lit * + BC lit ncpy
+			rqsn @ 1 lit + rqsn !
+		repeat
+		rqsn @ if rqsn @ rqsb @ 4 lit + nb16!  nsrc @ nsport @ rqsn @ BC lit * C lit + nsend drop then
+	then
+;
+
+\ rqin ( -- f )
+: rqin ( -- f )
+	pok? if npay @ 5 lit + c@ dup 19 lit = swap 1A lit = or else 0 lit then
+	dup if
+		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+		npay @ 5 lit + c@ 19 lit = if rqserve else rqhdrs then
+	then
+;
+
+\ ── The tally ──
+\ Candidates: 0 the file's leaf (32)  20 votes  24 the latest height voting.
+
+: rqcv variable ;  : rqc ( k -- a )  28 lit * rqcv 28 lit 40 lit * lazy + ;
+: rqcn variable ;
+: rqbv variable ;  : rqbad ( k -- a )  5 lit lshift rqbv 400 lit lazy + ;   \ files found not valid
+: rqbn variable ;
+: rqbad? ( leaf -- f )
+	0 lit swap  rqbn @ 20 lit pumin ?dup if 0 lit do i rqbad over 20 lit mcmp 0= if nip -1 lit swap then loop then drop
+;
+: rqzero? ( a n -- f )   0 lit swap 0 lit do over i + c@ or loop nip 0= ;
+
+: rqforce variable ;   \ the setting seedmode: seed mode, whatever the chain says
+: rqst variable ;  : rqepn variable ;  : rqvoted variable ;  : rqfor variable ;
+: rqunres variable ;  : rqlive variable ;  : rqpend variable ;
+: rqsv variable ;  : rqseed ( -- a )  rqsv 20 lit lazy ;
+: rqpsv variable ;  : rqpseed ( -- a )  rqpsv 20 lit lazy ;   \ the last epoch's
+: rqpok variable ;
+: rqwv variable ;  : rqwin ( -- a )  rqwv 20 lit lazy ;     \ the winner
+: rqpv variable ;  : rqparsed ( -- a )  rqpv 20 lit lazy ; \ whose entries cnent holds
+: rqwa variable ;  : rqwb variable ;                      \ the window: rqwa .. rqwb - 1
+
+\ rqvote ( leaf h -- )
+: rqvl variable ;  : rqvh variable ;
+: rqvote ( leaf h -- )
+	rqvh ! rqvl !
+	-1 lit  rqcn @ ?dup if 0 lit do i rqc rqvl @ 20 lit mcmp 0= if drop i then loop then
+	dup 0< if drop rqcn @ 40 lit u< if
+		rqcn @ dup rqc 28 lit nzero  rqvl @ over rqc 20 lit ncpy  rqcn @ 1 lit + rqcn !
+	else -1 lit then then
+	dup 0< if drop else
+		rqc  dup 20 lit + dup @ 1 lit + swap !
+		dup 24 lit + @ rqvh @ u< if rqvh @ swap 24 lit + ! else drop then
+	then
+;
+
+\ rqcount ( -- )   the window's votes; the trees not kept yet, wanted.
+: rqcount ( -- )
+	0 lit rqcn !  0 lit rqvoted !  0 lit rqunres !  0 lit rqpend !
+	rqwb @ rqwa @ - ?dup if 0 lit do
+		rqwa @ i + dup rqaux                                             ( h aux )
+		dup 20 lit rqzero? if 2drop else
+			dup axnfind ?dup if
+				nip 20 lit +  dup 20 lit rqzero? over rqbad? or if 2drop else
+					swap rqvote  rqvoted @ 1 lit + rqvoted !
+				then
+			else
+				dup axfail? if 2drop rqunres @ 1 lit + rqunres ! else
+					axkn axwant drop  rqpend @ 1 lit + rqpend !
+				then
+			then
+		then
+	loop then
+;
+
+\ rqwinner ( -- k | -1 )   the most votes; a tie, the latest.
+: rqwinner ( -- k | -1 )
+	-1 lit  rqcn @ ?dup if 0 lit do
+		dup 0< if drop i else
+			i rqc 20 lit + @ over rqc 20 lit + @ 2dup u> if 2drop drop i else
+				= if i rqc 24 lit + @ over rqc 24 lit + @ u> if drop i then then
+			then
+		then
+	loop then
+;
+
+\ rqlivec ( -- n )   the list's entries good past the window's last block.
+: rqlivec ( -- n )
+	0 lit  cnn @ ?dup if 0 lit do
+		rqwb @ 1 lit - rqtime  i cnent 10 lit + qbe@ du< if 1 lit + then
+	loop then
+;
+
+\ rqwfile ( -- )   the winner's file: wanted, or read (not valid: its votes
+\        don't count, and the next tally goes on without it), then the mode.
+: rqwfile ( -- )
+	rqwin axffind dup 0< if
+		drop  rqwin axfail? 0= if rqwin axkf axwant then  0 lit rqst !
+	else
+		rqwin rqparsed 20 lit mcmp if
+			dup axfb 1 lit + over axflen @ 1 lit - cnparse if rqwin rqparsed 20 lit ncpy else
+				rqparsed 20 lit nzero  rqwin rqbn @ 1F lit and rqbad 20 lit ncpy  rqbn @ 1 lit + rqbn !
+			then
+		then
+		rqwin rqparsed 20 lit mcmp if drop 0 lit rqst ! else
+			1 lit + axpin !  rqlivec dup rqlive !  rqmn u< 0= if 2 lit else 1 lit then rqst !
+		then
+	then
+;
+
+\ rqtally ( -- )
+: rqtally ( -- )
+	rqsync
+	rqtop @ rqep / dup rqepn !  rqep *
+	dup rqmg u< if drop 0 lit else rqmg - then  dup rqwb !
+	dup rqep u< if drop 0 lit else rqep - then  rqwa !
+	rqwa @ dup if 1 lit - then rqneed !  rqfill                             \ and the one below
+	0 lit rqfor !  0 lit rqlive !
+	rqwb @ rqwa @ = rqforce @ or if 0 lit rqcn !  0 lit rqvoted !  0 lit rqunres !  1 lit rqst ! else    \ no window yet
+	rqlo @ rqneed @ u> if 0 lit rqst ! else                                \ headers still coming
+		rqwb @ 1 lit - rqid rqseed 20 lit ncpy
+		rqwa @ dup rqpok !  if rqwa @ 1 lit - rqid rqpseed 20 lit ncpy then
+		rqcount
+		rqpend @ if 0 lit rqst ! else
+			rqwinner dup 0< if drop 1 lit rqst ! else
+				dup rqc rqwin 20 lit ncpy  rqc 20 lit + @ rqfor !
+				rqwfile
+			then
+		then
+	then then
+;
+
+\ rqsay ( -- )   a line when the list in use changes.
+: rqo variable ;  : rqoe variable ;  : rqof variable ;
+: rqsay ( -- )
+	rqst @ rqo @ = rqepn @ rqoe @ = and rqfor @ rqof @ = and 0= if
+		rqst @ rqo !  rqepn @ rqoe !  rqfor @ rqof !
+		"relay list: epoch " lputs rqepn @ fndec
+		rqst @ 0= if ", not known yet (fetching)" lputs then
+		rqst @ 1 lit = if ", seed mode" lputs then
+		rqst @ 2 lit = if ", listed mode, " lputs rqlive @ fndec " relays" lputs then
+		": " lputs rqvoted @ fndec " of the window's " lputs rqwb @ rqwa @ - fndec " blocks voted, " lputs
+		rqfor @ fndec " for the winner, " lputs rqunres @ fndec " unresolved" lputs A lit lputc
+	then
+;
+
+\ ── Home relays ──
+
+: rqscv variable ;  : rqsc ( i -- a )  5 lit lshift rqscv cnmax 5 lit lshift lazy + ;
+: rqtkv variable ;  : rqtk ( i -- a )  rqtkv cnmax lazy + ;
+: rqdv variable ;  : rqd ( k -- a )  3 lit lshift rqdv 40 lit lazy + ;   \ ip, port
+: rqdn variable ;
+: rqad variable ;  : rqhs variable ;
+
+\ rqlive? ( i -- f )   entry i good past the window's last block.
+: rqlive? ( i -- f )   rqwb @ 1 lit - rqtime rot cnent 10 lit + qbe@ du< ;
+
+\ rqdadd ( ip port -- )   one more relay for rqd, unless it's there.
+: rqdadd ( ip port -- )
+	over 18 lit rshift 7F lit = if swap drop A000202 lit swap then        \ this machine
+	0 lit  rqdn @ ?dup if 0 lit do i rqd @ 3 lit pick = i rqd 4 lit + @ 3 lit pick = and or loop then
+	rqdn @ 8 lit u< 0= or if 2drop else rqdn @ rqd 4 lit + !  rqdn @ rqd !  rqdn @ 1 lit + rqdn ! then
+;
+
+\ rqhome ( addr seed -- )   addr's 3 home relays, by that seed, into rqd.
+: rqhome ( addr seed -- )
+	rqhs ! rqad !  0 lit rqtk cnmax nzero
+	cnn @ ?dup if 0 lit do
+		i rqlive? if
+			88 lit 6 lit kbeg  "tabernacle-home-v1" 12 lit kabs  rqad @ 20 lit kabs  i cnids 20 lit kabs
+			rqhs @ 20 lit kabs  kend  i rqsc 20 lit ksqz
+		else -1 lit i rqtk c! then
+	loop then
+	3 lit 0 lit do
+		-1 lit  cnn @ ?dup if 0 lit do
+			i rqtk c@ 0= if dup 0< if drop i else i rqsc over rqsc 20 lit mcmp 0 lit > if drop i then then then
+		loop then
+		dup 0< if drop else -1 lit over rqtk c!  dup cnent 8 lit + be32 swap cnent C lit + nb16@ rqdadd then
+	loop
+;
+
+\ rqovl? ( -- f )   the first quarter of an epoch: the last one's too.
+: rqovl? ( -- f )   rqpok @  rqtop @ rqepn @ rqep * - rqep 2 lit rshift u< and ;
+
+\ rqpadd ( ip port -- )   a relay we'll talk to directly: a peer (for its
+\        cookie) -- not by circuit, where we never talk to it but through
+\        our guard.
+: rqpadd ( ip port -- )   rlcirc @ if 2drop else padd drop then ;
+
+\ rqtgt ( addr -- )
+: rqtgt ( addr -- )
+	0 lit rltn !
+	rqst @ 2 lit = rlset @ 0= and if
+		0 lit rqdn !  dup rqseed rqhome  rqovl? if rqpseed rqhome else drop then
+		rqdn @ ?dup if 0 lit do i rqd @ i rqd 4 lit + @ 2dup rqpadd rltuse loop then
+	else drop  rlgn @ ?dup if 0 lit do i rlg @ i rlg 4 lit + @ rltuse loop then then
+;
+
+\ rqsame? ( -- f )   rqd holds just the relays rlg does.
+: rqsame? ( -- f )
+	rqdn @ rlgn @ = if
+		-1 lit  rqdn @ ?dup if 0 lit do
+			0 lit  rlgn @ 0 lit do i rlg @ j rqd @ = i rlg 4 lit + @ j rqd 4 lit + @ = and or loop  and
+		loop then
+	else 0 lit then
+;
+
+\ rqroute ( -- )   our relays: in listed mode our home relays (and, for a
+\        while, the last epoch's); back in seed mode, the seeds again.
+: rqroute ( -- )
+	rlset @ 0= if
+		rqst @ 2 lit = wl? and if
+			pakeys  0 lit rqdn !  paid rqseed rqhome  rqovl? if paid rqpseed rqhome then
+			rqsame? 0= if
+				0 lit rlgn !  rqdn @ ?dup if 0 lit do i rqd @ i rqd 4 lit + @ 2dup rqpadd rluse loop then
+				0 lit rlmat !  -1 lit rlhome !
+				"relays: registering with our home relays (" lputs rlgn @ fndec ")" lputs A lit lputc
+			then
+		else rqst @ 1 lit = rlhome @ and if 0 lit rlgn !  0 lit rlhome !  0 lit rlmat ! then then
+	then
+;
+
+: rqt variable ;
+: rqtick ( -- )   rqt @ pago 3E8 lit u> if pms rqt !  rqtally rqsay rqroute then  rqfill ;

@@ -1,6 +1,6 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 \ src/pay.fam — paying a payment address: the slates exchanged end to end,
-\ encrypted, through the gateways (src/gateway.fam relays; it reads nothing).
+\ encrypted, through the relays (src/relay.fam; they read nothing).
 \
 \ One round trip.  PAY1, sender to receiver: a one-time Kyber key pair is
 \ made; the receiver's Kyber key (from its record) gets a key encapsulated
@@ -21,13 +21,16 @@
 \ message's first 12 bytes as associated data.
 \
 \ A message goes in parts: id (4), part, parts, up to 0x3E0 bytes -- each
-\ RELAYed by every gateway the sender uses, DELIVERed by the one that keeps
-\ the receiver.  Up to 40 parts (S1 of a dozen or more inputs).
+\ RELAYed by every relay the sender uses, DELIVERed by the one that keeps
+\ the receiver (by circuit, in listed mode: src/onion.fam).  Up to 40
+\ parts (S1 of a dozen or more inputs).
 \
 \   pzpay ( addr alo ahi flo fhi -- ok )   start paying (one at a time)
 \   pzst ( -- a )        0 none, 1 finding the address, 2 sending, 3 paid
 \                        (pztxid), 4 failed (pzwhy)
 \   pzin ( -- f )        a DELIVER: handled
+\   pzcin ( -- f )       a circuit's datagram (src/onion.fam), a DELIVER
+\                        along one of ours handled
 \   pztick ( -- )
 \ ──────────────────────────────────────────────────────────────────────────────
 
@@ -65,14 +68,17 @@
 
 \ ── Parts ──
 
-\ pzsend ( msg n dest -- )   the message, RELAYed for dest by each of our
-\        gateways (those that have answered us), every part.
+\ pzsend ( msg n dest -- )   the message, RELAYed for dest by each of its
+\        relays (src/rlist.fam: rqtgt; those that have answered us),
+\        every part.
 : pzsm variable ;  : pzsn variable ;  : pzsd variable ;  : pzsp variable ;  : pzsk variable ;  : pzsl variable ;
 : pzsend ( msg n dest -- )
 	pzsd ! pzsn ! pzsm !
 	pzsn @ 3DF lit + 3E0 lit / pzsp !
-	gwgn @ ?dup if 0 lit do
-		i gwpeer dup 0< if drop else pzsk !
+	rlcirc @ if pzsm @ pzsn @ pzsd @ pzmid @ onsend else
+	pzsd @ rqtgt
+	rltn @ ?dup if 0 lit do
+		i rltpeer dup 0< if drop else pzsk !
 			pzsp @ 0 lit do
 				14 lit phdr  pzsk @ pp C lit + @ pzsk @ pp 10 lit + @ 2 lit pick qbe!
 				pzsd @ over 8 lit + 20 lit ncpy  28 lit +
@@ -82,7 +88,7 @@
 				pzsk @ 34 lit pzsl @ + psendk
 			loop
 		then
-	loop then
+	loop then then
 ;
 
 \ Reassembly: 2 slots: 0 the id, 4 parts, 8 parts had (bits, two cells),
@@ -133,8 +139,8 @@
 	lputs pzwho lputs A lit lputc
 ;
 
-\ pzregd ( -- f )   some gateway holds our record (so an answer can reach us).
-: pzregd ( -- f )   0 lit gwgn @ ?dup if 0 lit do i gwg 8 lit + @ or loop then ;
+\ pzregd ( -- f )   some relay holds our record (so an answer can reach us).
+: pzregd ( -- f )   0 lit rlgn @ ?dup if 0 lit do i rlg 8 lit + @ or loop then ;
 
 : pzmsg variable ;  : pzok variable ;  : pzl variable ;  : pzlat variable ;
 
@@ -210,7 +216,7 @@
 	pzst @ 1 lit = pzst @ 2 lit = or if 2drop 2drop drop 0 lit else
 		pzfh ! pzfl ! pzah ! pzal !  pzdest 20 lit ncpy
 		0 lit pzslm !  0 lit pzwhy !  pztxid 20 lit nzero
-		pzdest gwlook  1 lit pzst !  pms pzt !  -1 lit
+		pzdest rqtgt  pzdest rllook  1 lit pzst !  pms pzt !  -1 lit
 	then
 ;
 
@@ -222,7 +228,7 @@
 		pzsid 8 lit pzrand  pzsid pzm 4 lit + 8 lit ncpy
 		pzk A0 lit + 40 lit pzrand  pzk A0 lit + pzek pzdk kykeys            \ the one-time key pair
 		pzk A0 lit + 20 lit pzrand
-		gwrec 18 lit +  pzk A0 lit +  pzk  pzm C lit +  kyencap 0= if "the receiver's key is refused" pzfail else
+		rlrec 18 lit +  pzk A0 lit +  pzk  pzm C lit +  kyencap 0= if "the receiver's key is refused" pzfail else
 			pzek pzm 30C lit + 320 lit ncpy
 			pzm pzth  pzk1
 			paid pzpt 20 lit ncpy  wsb pzpt 20 lit + wsn @ ncpy
@@ -236,8 +242,8 @@
 
 : pztick ( -- )
 	pzst @ 1 lit = if
-		gwlst @ 3 lit = if "the address isn't registered with our gateways" pzfail else
-		gwfound gwla pzdest 20 lit mcmp 0= and pzregd and if pzbuild else
+		rllst @ 3 lit = if "the address isn't registered with our relays" pzfail else
+		rlfound rlla pzdest 20 lit mcmp 0= and pzregd and if pzbuild else
 		pzt @ pago EA60 lit u> if "timed out finding the address (or registering ours)" pzfail then
 		then then
 	then
@@ -247,18 +253,26 @@
 	then then
 ;
 
-\ pzin ( -- f )   DELIVER (from one of our gateways): a part; a whole PAY1 or
-\        PAY2, handled.
-: pzgw? ( -- f )   0 lit gwgn @ ?dup if 0 lit do i gwg @ nsrc @ = i gwg 4 lit + @ nsport @ = and or loop then ;
+\ pzgot ( -- )   a DELIVERed part (pbd, pbn); a whole PAY1 or PAY2, handled.
+: pzgot ( -- )
+	pzpart ?dup if
+		over be32 50415931 lit = if pzpay1 else
+		over be32 50415932 lit = if pzpay2 else 2drop then then
+	then
+;
+
+\ pzin ( -- f )   DELIVER (from one of our relays): a part.
+: pzgw? ( -- f )   0 lit rlgn @ ?dup if 0 lit do i rlg @ nsrc @ = i rlg 4 lit + @ nsport @ = and or loop then ;
 : pzin ( -- f )
 	pok? if npay @ 5 lit + c@ 15 lit = else 0 lit then
 	dup if
 		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
-		pzgw? if
-			pzpart ?dup if
-				over be32 50415931 lit = if pzpay1 else
-				over be32 50415932 lit = if pzpay2 else 2drop then then
-			then
-		then
+		pzgw? if pzgot then
 	then
+;
+
+\ pzcin ( -- f )   a circuit's datagram (src/onion.fam: onin); a part
+\        DELIVERed along one of ours for receiving, handled.
+: pzcin ( -- f )
+	onin dup if ondn @ ?dup if pbn !  ondb pbd !  0 lit ondn !  pzgot then then
 ;

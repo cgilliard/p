@@ -232,6 +232,9 @@ pub struct Node {
     /// node's blocks carry none (nothing could prove a chain past a block
     /// without one).
     pub debug_unverified: bool,
+    /// The `aux_hash` this node's blocks carry (`--consensus-file`; zeros:
+    /// none).
+    pub aux_hash: [u8; 32],
     debug_big: DebugBig,
     /// What `debug_big` becomes once the template being mined is applied.
     debug_next: Option<DebugBig>,
@@ -280,6 +283,7 @@ impl Node {
             fast_sync: None,
             sync_events: None,
             debug_unverified: false,
+            aux_hash: [0; 32],
             debug_big: DebugBig::Idle,
             debug_next: None,
         }
@@ -711,7 +715,7 @@ impl Node {
             self.start_debug_template(&transactions, reward.commitment());
             return;
         }
-        let unproven = match self.chain.build_block(&transactions) {
+        let mut unproven = match self.chain.build_block(&transactions) {
             Ok(u) => u,
             Err(e) => {
                 error!("failed to build a block template: {e}; the next one leaves out the mempool");
@@ -720,6 +724,7 @@ impl Node {
                 return;
             }
         };
+        unproven.aux_hash = self.aux_hash;
         if count > 0 {
             info!(
                 "block template #{}: {count} transaction(s), fees {} -- proving{}",
@@ -782,7 +787,7 @@ impl Node {
             }
         };
         let start = Instant::now();
-        let unproven = match self.chain.build_debug_block(transactions, &spend, &create) {
+        let mut unproven = match self.chain.build_debug_block(transactions, &spend, &create) {
             Ok(u) => u,
             Err(e) => {
                 error!("failed to build a block template: {e}; the next one leaves out the mempool and anything fabricated");
@@ -792,6 +797,7 @@ impl Node {
                 return;
             }
         };
+        unproven.aux_hash = self.aux_hash;
         if !spend.is_empty() || !create.is_empty() {
             info!(
                 "debug block template #{}: {} inputs, {} outputs, {} bytes -- built (the state applied, not committed) in {:.2?}",

@@ -32,12 +32,21 @@
 \                       where the log goes: the web wallet's Log tab (kept on
 \                       the disk: src/logstore.fam), the console, or both
 \                       (webui)
-\   gateway             serve as a payment gateway (src/gateway.fam): keep
-\                       wallets' records, answer lookups (the seed nodes)
-\   usegw=A.B.C.D:PORT  a gateway to register with and ask (any number; the
-\                       seeds, if none)
+\   relay               serve as a payment relay (src/relay.fam): keep
+\                       wallets' records, answer lookups, relay their
+\                       messages (the seed nodes); `gateway`, its old name,
+\                       too
+\   userelay=A.B.C.D:PORT  a relay to register with and ask (any number;
+\                       the seeds, if none); `usegw=`, its old name, too
 \   logmax=N            the most log lines kept for the Log tab (10,000; at
 \                       most 1,000,000)
+\   direct              no circuits: lookups and payments go straight to the
+\                       receiver's relays (docs/RELAYS.md, phase 1), for testing
+\   mixdelay=MS         a relay holds each cell it passes on a random 0 .. MS
+\                       ms (at most 10,000) first: harder to match cells in
+\                       and out by time (src/onion.fam)
+\   seedmode            the seeds (or userelay=) as relays, even when the
+\                       chain lists relays (docs/RELAYS.md): for testing
 \   noverify            debugging: don't check blocks' proofs (block or chain
 \                       proofs; everything else is checked), to time the rest
 \                       of what a block costs.  Only with a private network
@@ -97,34 +106,51 @@
 
 : fnbad ( -- )   "node: a setting it doesn't know: " lputs  fncfg fnp @ + lputs  A lit lputc bye ;
 
+\ fnopt1 / fnopt2 ( -- f )   a setting at fnp, if it's one of theirs (two
+\        words: the compiler nests only so deep).
+: fnok variable ;
+: fnopt1 ( -- f )
+	-1 lit fnok !
+	"seed=" fnpre? if
+		fnname? if fnseedn else fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then pseed then
+	else "dns=" fnpre? if fnip4 dnsv !
+	else "port=" fnpre? if fnnum nport !
+	else "depth=" fnpre? if fnnum pfdep !
+	else "net=dev" fnpre? if 1 lit bnet !
+	else "net=main" fnpre? if 0 lit bnet !
+	else "recover" fnpre? if -1 lit wlrec !
+	else "passphrase" fnpre? if -1 lit wlpass !
+	else "api=" fnpre? if fnnum naport !
+	else "peers=" fnpre? if fnnum 3E8 lit pumin dup 0= if drop 1 lit then ppmx !
+	else "probe=" fnpre? if fnnum 3E8 lit * dup 0= if drop 3E8 lit then pprb !
+	else "perip=" fnpre? if fnnum dup 0= if drop 1 lit then ppip !
+	else 0 lit fnok ! then then then then then then then then then then then then
+	fnok @
+;
+: fnopt2 ( -- f )
+	-1 lit fnok !
+	"apikey" fnpre? if -1 lit wlshowk !
+	else "log=webui" fnpre? if 2 lit lgdst !
+	else "log=console" fnpre? if 1 lit lgdst !
+	else "log=both" fnpre? if 3 lit lgdst !
+	else "logmax=" fnpre? if fnnum F4240 lit pumin dup 0= if drop 1 lit then lgmax !
+	else "noverify" fnpre? if -1 lit bnover !
+	else "seedmode" fnpre? if -1 lit rqforce !
+	else "direct" fnpre? if -1 lit ondirect !
+	else "mixdelay=" fnpre? if fnnum 2710 lit pumin ondly !
+	else "relay" fnpre? "gateway" fnpre? or if -1 lit rlserve !
+	else "userelay=" fnpre? "usegw=" fnpre? or if fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then rluse  -1 lit rlset !
+	else 0 lit fnok ! then then then then then then then then then then then
+	fnok @
+;
+
 \ fnparse ( -- )
 : fnparse ( -- )
 	begin
 		begin fnc 20 lit = fnc A lit = or fnc D lit = or fnc 9 lit = or while fn+ repeat
 		fnc
 	while
-		"seed=" fnpre? if
-			fnname? if fnseedn else fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then pseed then
-		else "dns=" fnpre? if fnip4 dnsv !
-		else "port=" fnpre? if fnnum nport !
-		else "depth=" fnpre? if fnnum pfdep !
-		else "net=dev" fnpre? if 1 lit bnet !
-		else "net=main" fnpre? if 0 lit bnet !
-		else "recover" fnpre? if -1 lit wlrec !
-		else "passphrase" fnpre? if -1 lit wlpass !
-		else "api=" fnpre? if fnnum naport !
-		else "peers=" fnpre? if fnnum 3E8 lit pumin dup 0= if drop 1 lit then ppmx !
-		else "probe=" fnpre? if fnnum 3E8 lit * dup 0= if drop 3E8 lit then pprb !
-		else "perip=" fnpre? if fnnum dup 0= if drop 1 lit then ppip !
-		else "apikey" fnpre? if -1 lit wlshowk !
-		else "log=webui" fnpre? if 2 lit lgdst !
-		else "log=console" fnpre? if 1 lit lgdst !
-		else "log=both" fnpre? if 3 lit lgdst !
-		else "logmax=" fnpre? if fnnum F4240 lit pumin dup 0= if drop 1 lit then lgmax !
-		else "noverify" fnpre? if -1 lit bnover !
-		else "gateway" fnpre? if -1 lit gwserve !
-		else "usegw=" fnpre? if fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then gwuse  -1 lit gwset !
-		else fnbad then then then then then then then then then then then then then then then then then then then then
+		fnopt1 0= if fnopt2 0= if fnbad then then
 	repeat
 ;
 
@@ -170,9 +196,9 @@
 \        transaction relay's and boot image's datagrams -- then the timers.
 : fnstep ( -- )
 	begin nrecv while
-		nproto @ 6 lit = if tin else dnin 0= if txin 0= if pzin 0= if gwin 0= if imin 0= if pin then then then then then then
+		nproto @ 6 lit = if tin else dnin 0= if txin 0= if pzin 0= if rlin 0= if axin 0= if rqin 0= if pzcin 0= if imin 0= if pin then then then then then then then then then
 	repeat
-	ptick txtick ttick wtick gwtick pztick dntick
+	ptick txtick ttick wtick rltick pztick dntick axtick rqtick ontick
 ;
 
 \ ── Time-sharing: the yield ──
@@ -238,7 +264,7 @@
 
 \ p2yhk -- where p2hook now jumps (through p2rly): the yield, then back to
 \ p2hook's caller.
-: p2yhk  6C723270 79 hookto pyield ;           \ "p2rl" "y": src/net.fam's relay
+: p2yhk  6C723270 7A hookto pyield ;           \ "p2rl" "z": src/auxtree.fam's relay
 
 \ fnclean ( -- )   zero the heap, from here to below the data stack (64 MiB
 \        above the heap's base, `init`): booted by tabernacle, that memory
@@ -280,7 +306,7 @@
 	then
 	"node: " lputs  bnet @ if "dev" else "main" then lputs  " network, UDP port " lputs nport @ fndec
 	", fast sync depth " lputs pfdep @ fndec  ", wallet API port " lputs naport @ fndec A lit lputc
-	gwserve @ if "node: a payment gateway: keeping wallets' records\n" lputs then
+	rlserve @ if "node: a payment relay: keeping wallets' records\n" lputs then
 	bnover @ if "node: noverify: blocks' proofs are NOT checked (a debugging aid, for a private network)\n" lputs then
 	acopen 0= if
 		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"

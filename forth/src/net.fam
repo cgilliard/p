@@ -279,9 +279,9 @@
 ;
 
 \ p2rly -- the yield's relay (src/poseidon2.fam's p2hook jumps here, and
-\ from here to the yield, src/full_node.fam's p2yhk): half way, so each jump
-\ is within a jal's 1 MiB.  "p2ho" "ok": p2hook's name.
+\ from here to the yield -- by src/auxtree.fam's p2rlz, to src/full_node.fam's
+\ p2yhk): so each jump is within a jal's 1 MiB.  "p2ho" "ok": p2hook's name.
 : p2rly ( -- )
 	6F683270 6B6F hookto
-6F004000 ,   \ jal x0,+4: rewritten by p2yhk's hookto
+6F004000 ,   \ jal x0,+4: rewritten by p2rlz's hookto
 ;

@@ -1,6 +1,6 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 \ src/address.fam — the wallet's payment address: where others send it slates,
-\ through the gateways.  Its keys come from the wallet's seed (so the backup
+\ through the relays.  Its keys come from the wallet's seed (so the backup
 \ words, and passphrase, give the same address in any wallet):
 \   Kyber-512's (d, z) = SHAKE256("tabernacle-kyber-v1" ‖ seed ‖ index, 64)
 \   Dilithium2's xi    = SHAKE256("tabernacle-dilithium-v1" ‖ seed ‖ index, 32)

@@ -1,4 +1,5 @@
 mod aggregate;
+mod auxtree;
 mod block;
 mod block_air;
 mod bus;
@@ -295,6 +296,8 @@ struct Args {
     standalone: bool,
     /// Skip proofs, and mine without them (`node::DebugBig`).
     debug_unverified: bool,
+    /// The relay list this miner's blocks back (`auxtree`).
+    consensus_file: Option<std::path::PathBuf>,
 }
 
 /// The seeds a node starts from when no `--seed` is given: the public
@@ -426,6 +429,7 @@ const USAGE: &str = "usage: p [--data-dir PATH] [--port PORT] [--seed HOST:PORT[
          [--wallet-dir PATH] [--recover] [--passphrase] [--network main|dev]
          [--full-sync] [--sync-depth BLOCKS] [--max-hosts N] [--probe-interval SECONDS]
          [--max-per-ip N] [--standalone] [--debug-disable-verification]
+         [--consensus-file PATH]
 
 A seed's HOST is an IPv4 address or a name (looked up when the node starts
 and every hour); /IPV4 is the address to use if the name gets no answer.
@@ -436,7 +440,11 @@ a peer).
 --debug-disable-verification: don't check blocks' proofs (everything else
 still is), and mine blocks without any -- so the CLI's debug-big-block can
 fabricate full-size blocks, to time what a node does with one. Only for a
-private network: no node that checks proofs takes these blocks.";
+private network: no node that checks proofs takes these blocks.
+
+--consensus-file: the relay list (a consensus.txt, docs/RELAYS.md) this
+miner's blocks back: their aux_hash roots a tree whose left leaf is the file,
+and the node serves the tree to peers that ask. Read once, at the start.";
 
 fn parse_args() -> Args {
     let mut data_dir = None;
@@ -459,6 +467,7 @@ fn parse_args() -> Args {
         max_per_ip: DEFAULT_MAX_PER_IP,
         standalone: false,
         debug_unverified: false,
+        consensus_file: None,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -494,6 +503,7 @@ fn parse_args() -> Args {
             "--no-mine" => args.mine = false,
             "--standalone" => args.standalone = true,
             "--debug-disable-verification" => args.debug_unverified = true,
+            "--consensus-file" => args.consensus_file = Some(value().into()),
             "--log-file" => args.log_file = Some(value().into()),
             "--log-level" => {
                 let v = value();
@@ -631,7 +641,7 @@ type Network = (
     std::sync::Arc<std::sync::atomic::AtomicU64>,
 );
 
-fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>, max_hosts: usize, max_per_ip: usize, probe_interval_s: u64) -> Network {
+fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>, max_hosts: usize, max_per_ip: usize, probe_interval_s: u64, aux: Option<std::sync::Arc<auxtree::AuxTree>>) -> Network {
     let socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap_or_else(|e| {
         die(&format!("failed to bind UDP port {port}: {e}"));
     });
@@ -677,6 +687,7 @@ fn spawn_network(storage: &Storage, port: u16, seeds: Vec<SocketAddrV4>, max_hos
     // labeled with this node's port so several local nodes' logs are
     // easy to tell apart.
     node.log = Some(format!(":{port}"));
+    node.aux = aux;
     let peer_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(net::NO_PEER_HEIGHT));
     node.peer_height = Some(peer_height.clone());
 
@@ -980,7 +991,16 @@ fn main() {
         info!("Listening on UDP port {}, seeds: {}.", args.port, shown.join(", "));
     }
     let standalone = args.standalone;
-    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, seeds, args.max_hosts, args.max_per_ip, args.probe_interval_s);
+    let aux = args.consensus_file.as_ref().map(|path| {
+        let text = std::fs::read(path).unwrap_or_else(|e| die(&format!("failed to read {}: {e}", path.display())));
+        if let Err(e) = auxtree::check_consensus_head(&text, args.network) {
+            die(&format!("{} isn't a relay list for this network: {e}", path.display()));
+        }
+        let tree = auxtree::AuxTree::backing(&text);
+        info!("Backing the relay list {} (leaf {}): aux_hash {}.", path.display(), hex(&tree.leaf()), hex(&tree.root()));
+        std::sync::Arc::new(tree)
+    });
+    let (received, received_txs, sync_events, commands, peer_height) = spawn_network(&storage, args.port, seeds, args.max_hosts, args.max_per_ip, args.probe_interval_s, aux.clone());
     spawn_seed_lookups(args.seeds.clone(), seed_addrs, commands.clone());
     let fast_sync = (fresh && !args.full_sync).then(|| fastsync::FastSync::new(args.sync_depth, &commands));
     let reader = BlockReader::open(&storage).expect("failed to open block reader");
@@ -1025,6 +1045,7 @@ fn main() {
     node.fast_sync = fast_sync;
     node.sync_events = Some(sync_events);
     node.debug_unverified = args.debug_unverified;
+    node.aux_hash = aux.as_ref().map_or([0; 32], |tree| tree.root());
     node.run();
     std::process::exit(0);
 }

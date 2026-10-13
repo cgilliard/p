@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""consensus -- assemble relays' entries into a consensus.txt (docs/RELAYS.md,
+src/consensus.fam).
+
+Usage: tools/consensus [--net main|dev] [FILE...] > consensus.txt
+
+Reads `relay <hex>` lines (from the files, else stdin) -- each the output of
+`tools/wallet relay-entry` on a relay -- and writes the file: the line
+`tabernacle-consensus 1 <net>`, then one line per relay, sorted by relay id
+(SHA3-256 of its Dilithium key); a relay listed twice keeps the entry that
+expires last.  An entry for another network, or the wrong length, is an
+error.  Signatures aren't checked here (the nodes check them: a file with a
+bad one backs nothing).  Other lines (blank, or starting with #) are skipped.
+
+On stderr: the relays, the file's leaf hash -- SHA-256(0x00 || the file) --
+and the aux_hash a miner backing it alone sets: SHA-256(0x01 || leaf || 32
+zero bytes).
+"""
+import argparse
+import hashlib
+import struct
+import sys
+import time
+
+ENTRY = 0x11CC
+
+
+def main():
+    p = argparse.ArgumentParser(description="Assemble relays' entries into a consensus.txt.")
+    p.add_argument("--net", choices=["main", "dev"], default="dev")
+    p.add_argument("files", nargs="*")
+    a = p.parse_args()
+    want = 1 if a.net == "dev" else 0
+    lines = []
+    for f in a.files or ["-"]:
+        lines += (sys.stdin if f == "-" else open(f)).read().splitlines()
+    best = {}
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith("relay "):
+            sys.exit(f"consensus: line {n}: not a `relay <hex>` line")
+        try:
+            e = bytes.fromhex(line[6:])
+        except ValueError:
+            sys.exit(f"consensus: line {n}: not hex")
+        if len(e) != ENTRY or e[:4] != b"RLY1":
+            sys.exit(f"consensus: line {n}: not a relay entry")
+        net, = struct.unpack(">I", e[4:8])
+        if net != want:
+            sys.exit(f"consensus: line {n}: an entry for the {'dev' if net else 'main'} network")
+        rid = hashlib.sha3_256(e[0x338:0x858]).digest()
+        expiry, = struct.unpack(">Q", e[0x10:0x18])
+        if rid not in best or expiry > best[rid][0]:
+            best[rid] = (expiry, e)
+    out = f"tabernacle-consensus 1 {a.net}\n" + "".join(f"relay {best[r][1].hex()}\n" for r in sorted(best))
+    sys.stdout.write(out)
+    now = time.time() * 1000
+    for r in sorted(best):
+        expiry, e = best[r]
+        ip = ".".join(str(b) for b in e[8:12])
+        port, = struct.unpack(">H", e[12:14])
+        left = (expiry - now) / 86400000
+        print(f"relay {r.hex()[:16]}  {ip}:{port}  " + (f"good {left:.1f} more days" if left > 0 else "EXPIRED"), file=sys.stderr)
+    leaf = hashlib.sha256(b"\x00" + out.encode()).digest()
+    print(f"{len(best)} relays; leaf {leaf.hex()}", file=sys.stderr)
+    root = hashlib.sha256(b"\x01" + leaf + bytes(32)).hexdigest()
+    print(f"aux_hash backing it alone: {root}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,370 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/relay.fam — the payment network's relays: where a wallet's payment
+\ address (src/address.fam) is found.  A wallet registers a record of its
+\ keys with its relays (the seed nodes, by default); a sender asks one for
+\ the record of the address it's paying, and gets it with the ip:port the
+\ relay last heard it from.  The first step towards onion routing
+\ (docs/RELAYS.md; this is its seed mode).  Called relays before: the
+\ old setting names still work, and the wire format (the record's "GWR1")
+\ is unchanged.
+\
+\ The record (0x11CC bytes): 0 "GWR1"  4 the network (0 main, 1 dev)
+\ 8 its sequence (ms since the epoch, big-endian)  10 when it expires
+\ 18 Kyber's public key (0x320)  338 Dilithium's (0x520)  858 the signature
+\ (Dilithium, of bytes 0 .. 858).  Anyone can check it: the keys hash to the
+\ address, the signature is good.  A relay that lies can only misroute.
+\
+\ Messages (types the Rust node ignores):
+\   10 REG   the record, in parts, to a relay: cookie (8), id (4), part,
+\            parts, then up to 0x400 bytes
+\   11 ACK   from the relay: id (4), status (0 kept, 1 bad, 2 not newer,
+\            3 full, 4 too soon, 5 not found), the address (32)
+\   12 ASK   a lookup: cookie (8), id (4), the address (32)
+\   13 PART  the answer: id (4), part, parts, then up to 0x400 bytes of the
+\            record and the ip (4) and port (2) it was heard from
+\   14 RELAY a part of a message for an address: cookie (8), the address
+\            (32), then the part -- forwarded as
+\   15 DELIVER  the part, to where the address was heard from (src/pay.fam)
+\   16 KEEP  cookie (8): every 20 s from a wallet, so its NAT keeps the way
+\            open for DELIVERs; nothing else
+\ The cookie is the one the relay issued the asker (src/peer.fam): a
+\ relay answers 4.6 KB only to an address that's shown it's real.
+\
+\ A relay (the `relay` setting) keeps each address's latest record in
+\ B+tree 10 -- the address -> sequence (8), expiry (8), ip (4), port (2),
+\ the record's two pages (4 each) -- at most 10,000, a registration from an
+\ IP at most every 10 s.
+\
+\ A wallet registers with every relay (`userelay=` settings, else the
+\ seeds) once it has their cookies: a record good for 6 hours, made anew
+\ every hour, its parts sent again every 5 s until acknowledged.
+\
+\   rlin ( -- f )          a datagram of ours (but DELIVER's: src/pay.fam): handled
+\   rltick ( -- )          registering, lookups' retries
+\   rllook ( addr -- )     look up an address (its 32 bytes)
+\   rlfound ( -- f )       the last lookup's record is in: rlrec (checked),
+\                          rlip / rlport where it was heard
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: rlserve variable ;   \ this node is a relay (setting `relay`)
+: rllen ( -- n )   11CC lit ;                             \ a record
+: rlsgn ( -- n )   858 lit ;                              \ the part signed
+
+\ ── Records ──
+
+: rlmine variable ;  : rlmy ( -- a )  rlmine 1200 lit lazy ;   \ ours
+: rlrv variable ;  : rlrec ( -- a )  rlrv 1200 lit lazy ;      \ one looked up
+: rlhv variable ;  : rlh ( -- a )  rlhv 20 lit lazy ;         \ an address
+: rlnow ( -- lo hi )   hnow ;
+
+\ rlcheck ( rec -- ok )   a record: ours, this network's, not expired (and
+\        not more than a day ahead), signed by the key it carries.  Its
+\        address (the keys' hash) at rlh.
+: rlok variable ;
+: rlcheck ( rec -- ok )
+	dup c@ 47 lit =  over 1 lit + c@ 57 lit = and  over 2 lit + c@ 52 lit = and  over 3 lit + c@ 31 lit = and
+	over 4 lit + c@ bnet @ 1 lit and = and  rlok !
+	dup 10 lit + qbe@ rlnow du< 0= rlok @ and rlok !                      \ not expired
+	dup 10 lit + qbe@ rlnow 5265C00 lit 0 lit wlq+ du< rlok @ and rlok !  \ within a day
+	rlok @ if
+		88 lit 6 lit kbeg  dup 18 lit + 320 lit kabs  dup 338 lit + 520 lit kabs  kend  rlh 20 lit ksqz
+		dup 338 lit +  over rlsgn  3 lit pick 858 lit + diverify rlok @ and rlok !
+	then
+	drop rlok @
+;
+
+\ rlmake ( -- )   our record: sequence now, good for 6 hours, signed.
+: rlmake ( -- )
+	pakeys
+	rlmy rllen nzero
+	47 lit rlmy c!  57 lit rlmy 1 lit + c!  52 lit rlmy 2 lit + c!  31 lit rlmy 3 lit + c!
+	bnet @ 1 lit and rlmy 4 lit + c!
+	rlnow rlmy 8 lit + qbe!
+	rlnow 1499700 lit 0 lit wlq+ rlmy 10 lit + qbe!
+	paek rlmy 18 lit + 320 lit ncpy  papk rlmy 338 lit + 520 lit ncpy
+	rlh 20 lit rnget 0= if rlh 20 lit nzero then                          \ hedged; else deterministic
+	pask rlmy rlsgn rlh rlmy 858 lit + disign
+;
+
+\ ── Reassembly ──
+\ A message in up to 5 parts of 0x400 bytes: 4 slots, each 0 its source's
+\ ip, 4 port, 8 id, C the parts expected, 10 a bit a part had, 14 when it
+\ began, then its bytes (from 0x20).
+: rlsv variable ;  : rls ( k -- a )  1300 lit * rlsv 4C00 lit lazy + ;
+: rlk variable ;  : rlpt variable ;  : rlpn variable ;  : rlid variable ;  : rlfrom variable ;
+
+\ rlslot ( -- a )   the slot for this datagram's (source, id): its own, else
+\        an empty or stale one (older than 10 s), else the oldest; 0 if the
+\        message's parts don't fit.
+: rlslot ( -- a )
+	-1 lit rlk !
+	4 lit 0 lit do
+		i rls @ nsrc @ =  i rls 4 lit + @ nsport @ = and  i rls 8 lit + @ rlid @ = and if i rlk ! then
+	loop
+	rlk @ 0< if
+		0 lit  4 lit 1 lit do i rls 14 lit + @ over rls 14 lit + @ - 0< if drop i then loop rlk !   \ the oldest
+		rlk @ rls 20 lit zero
+		nsrc @ rlk @ rls !  nsport @ rlk @ rls 4 lit + !  rlid @ rlk @ rls 8 lit + !
+		rlpn @ rlk @ rls C lit + !  pms rlk @ rls 14 lit + !
+	then
+	rlk @ rls
+;
+
+\ rlpart ( a n -- whole | 0 )   a part (its bytes at a, n of them): into its
+\        slot; the slot's bytes once every part is in.
+: rlpa variable ;  : rlpl variable ;  : rlsa variable ;
+: rlpart ( a n -- whole )
+	rlpl ! rlpa !
+	rlpt @ rlpn @ u<  rlpn @ 6 lit u< and  rlpn @ 0= 0= and  rlpl @ 401 lit u< and if
+		rlslot rlsa !
+		rlpa @  rlsa @ 20 lit + rlpt @ A lit lshift +  rlpl @ ncpy
+		rlsa @ 10 lit + @  1 lit rlpt @ lshift or  rlsa @ 10 lit + !
+		rlsa @ 10 lit + @  1 lit rlpn @ lshift 1 lit - = if
+			0 lit rlsa @ !  0 lit rlsa @ 10 lit + !  rlsa @ 20 lit +                   \ whole: the slot's free again
+		else 0 lit then
+	else 0 lit then
+;
+
+\ rlsendp ( src n type ip port cookie? -- )   n bytes in parts of 0x400, each
+\        a packet of the type to ip:port: (the cookie,) the id, part, parts.
+: rlsrc variable ;  : rlsn variable ;  : rlty variable ;  : rlip0 variable ;  : rlpo0 variable ;  : rlck variable ;
+: rlckl variable ;  : rlckh variable ;  : rloff variable ;
+: rlsendp ( src n type ip port -- )
+	rlpo0 ! rlip0 ! rlty ! rlsn ! rlsrc !
+	rlsn @ 3FF lit + A lit rshift rlpn !
+	rlpn @ 0 lit do
+		rlty @ phdr
+		rlck @ if rlckl @ rlckh @ 2 lit pick qbe! 8 lit + then             ( body )
+		rlid @ over be!  i over 4 lit + c!  rlpn @ over 5 lit + c!  6 lit +
+		rlsn @ i A lit lshift - 400 lit pumin rloff !
+		rlsrc @ i A lit lshift + over rloff @ ncpy
+		npkt - rloff @ +  rlip0 @ rlpo0 @ rot nsend drop
+	loop
+;
+
+\ rlack ( status -- )   ACK to this datagram's source, for its id and rlh.
+: rlack ( status -- )
+	11 lit phdr  rlid @ over be!  tuck 4 lit + c!  rlh over 5 lit + 20 lit ncpy  drop
+	nsrc @ nsport @ 6 lit 25 lit + nsend drop
+;
+
+\ ── The relay's side ──
+
+: rldir ( -- )   A lit 20 lit 20 lit btuse ;
+: rlvv variable ;  : rlv ( -- a )  rlvv 20 lit lazy ;      \ an entry's value
+: rlcnt ( -- a )   pgm 128 lit + ;                         \ entries kept
+: rlrv2 variable ;  : rlrt ( -- n )  rlrv2 100 lit lazy ;  \ the last registration from each IP (hashed)
+
+\ rlck? ( body -- ok )   the cookie the body starts with is the one we
+\        issued its source.
+: rlck? ( body -- ok )   qbe@ nsrc @ nsport @ pcookie rot = -rot = and ;
+
+\ rlkeep ( rec -- status )   a whole registration: checked, then kept, with
+\        the way back to it: rlrip / rlrpt -- the ip and port it came from,
+\        or (src/onion.fam) a circuit: its id, then 0xFFFF0000 + its slot.
+: rlrip variable ;  : rlrpt variable ;
+: rlkeep ( rec -- status )
+	dup rlcheck 0= if drop 1 lit else
+		rldir rlh rlv btget  if rlv qbe@ 2 lit pick 8 lit + qbe@ du< 0= else 0 lit then if drop 2 lit else   \ not newer
+		rldir rlh rlv btget 0=  rlcnt @ 2710 lit u< 0= and if drop 3 lit else                      \ full
+			rldir rlh rlv btget if rlv 18 lit + @ pgfree  rlv 1C lit + @ pgfree else rlcnt @ 1 lit + rlcnt ! pgmd then
+			pgnew pgnew  rlv 1C lit + !  rlv 18 lit + !
+			dup rlv 18 lit + @ pgget 1000 lit ncpy  rlv 18 lit + @ pgdirty
+			dup 1000 lit + rlv 1C lit + @ pgget rllen 1000 lit - ncpy  rlv 1C lit + @ pgdirty
+			dup 8 lit + qbe@ rlv qbe!  10 lit + qbe@ rlv 8 lit + qbe!
+			rlrip @ rlv 10 lit + !  rlrpt @ rlv 14 lit + !
+			rldir rlh rlv btput  pgcommit drop  0 lit
+		then then
+	then
+;
+
+\ rlreg ( -- )   REG: a part; a whole record, kept (at most one an IP every
+\        10 s), acknowledged.
+: rlreg ( -- )
+	pbn @ E lit u> pbd @ rlck? and if
+		pbd @ 8 lit + be32 rlid !  pbd @ C lit + c@ rlpt !  pbd @ D lit + c@ rlpn !
+		pbd @ E lit + pbn @ E lit - rlpart ?dup if
+			nsrc @ dup 10 lit rshift xor FF lit and 2 lit lshift rlrt +      ( rec slot )
+			dup @ pago 2710 lit u> over @ 0= or if pms swap !  nsrc @ rlrip !  nsport @ rlrpt !  rlkeep else drop drop 4 lit then
+			rlack
+		then
+	then
+;
+
+\ rlvia? ( -- f )   the entry at rlv is reached by circuit (src/onion.fam).
+: rlvia? ( -- f )   rlv 14 lit + @ 10 lit rshift 0= 0= ;
+\ rlhrd ( a -- )   where the entry at rlv was heard (ip, port), at a:
+\        zeros for one reached by circuit -- its IP no one here knows.
+: rlhrd ( a -- )
+	rlvia? if 0 lit over !  0 lit swap 4 lit + nb16! else rlv 10 lit + @ over be!  rlv 14 lit + @ swap 4 lit + nb16! then
+;
+
+\ rlask ( -- )   ASK: the record and where it was heard, in parts; or
+\        ACK 5, not found.
+: rlout variable ;  : rlo ( -- a )  rlout 1200 lit lazy ;
+: rlans ( -- )
+	pbn @ 2C lit = pbd @ rlck? and if
+		pbd @ 8 lit + be32 rlid !  pbd @ C lit + rlh 20 lit ncpy
+		rldir rlh rlv btget dup if drop rlv 8 lit + qbe@ rlnow du< 0= then if         \ kept, not expired
+			rlv 18 lit + @ pgget rlo 1000 lit ncpy  rlv 1C lit + @ pgget rlo 1000 lit + rllen 1000 lit - ncpy
+			rlo rllen + rlhrd
+			0 lit rlck !  rlo rllen 6 lit + 13 lit nsrc @ nsport @ rlsendp
+		else 5 lit rlack then
+	then
+;
+
+\ rlrelay ( -- )   RELAY: forwarded (DELIVER) if the address is kept here and
+\        its record hasn't expired; at most 256 KB a second from an IP.
+\        Not to one reached by circuit: that's for a circuit's end
+\        (src/onion.fam: ondeliv).
+: rlrbv variable ;  : rlrb ( -- a )  rlrbv 200 lit lazy ;   \ an IP's window: start, bytes
+: rlrelay ( -- )
+	pbn @ 2E lit u> pbd @ rlck? and if
+		nsrc @ dup 10 lit rshift xor 3F lit and 3 lit lshift rlrb +         ( slot )
+		dup @ pago 3E8 lit u> if pms over !  0 lit over 4 lit + ! then
+		dup 4 lit + @ pbn @ + dup 40000 lit u< if swap 4 lit + !
+			rldir pbd @ 8 lit + rlv btget if rlv 8 lit + qbe@ rlnow du< 0= rlvia? 0= and if
+				15 lit phdr  pbd @ 28 lit + swap pbn @ 28 lit - ncpy
+				rlv 10 lit + @ rlv 14 lit + @  pbn @ 28 lit - 6 lit +  nsend drop
+			then then
+		else 2drop then
+	then
+;
+
+\ ── The wallet's side ──
+\ Each relay's state: its peer index (or -1), the sequence it's
+\ acknowledged; ours made at rlmat.  Up to 4.
+
+: rlgv variable ;  : rlg ( k -- a )  4 lit lshift rlgv 80 lit lazy + ;   \ 0 ip 4 port 8 acked C last sent
+: rlgn variable ;  : rlmat variable ;  : rlmid variable ;
+: rlset variable ;                                     \ userelay= given (else the seeds: rlseeds)
+: rlhome variable ;                                    \ rlg holds our home relays (src/rlist.fam)
+: rlcirc variable ;                                    \ lookups go by circuit (src/onion.fam)
+: rluse ( ip port -- )   rlgn @ 8 lit u< if rlgn @ rlg 4 lit + !  rlgn @ rlg !  0 lit rlgn @ rlg 8 lit + !  rlgn @ 1 lit + rlgn ! else 2drop then ;
+
+\ The relays a lookup or a message goes to (src/rlist.fam: rqtgt): our
+\ own, in seed mode; in listed mode, the address's home relays.
+: rltv variable ;  : rlt ( k -- a )  3 lit lshift rltv 40 lit lazy + ;   \ 0 ip 4 port
+: rltn variable ;
+: rltuse ( ip port -- )   rltn @ 8 lit u< if rltn @ rlt 4 lit + !  rltn @ rlt !  rltn @ 1 lit + rltn ! else 2drop then ;
+\ rltpeer ( t -- k | -1 )   target t's peer entry, if it's answered.
+: rltpeer ( t -- k )   dup rlt @ swap rlt 4 lit + @ pfind dup 0< 0= if dup pp 8 lit + @ 2 lit = 0= if drop -1 lit then then ;
+
+\ rlseeds ( -- )   no relays set: the seeds, then.
+: rlseeds ( -- )   rlgn @ 0= if ppn 0 lit do i pp 38 lit + @ i pp 8 lit + @ and if i pp @ i pp 4 lit + @ rluse then loop then ;
+
+\ rlckof ( k -- )   the cookie peer k issued us, for rlsendp.
+: rlckof ( k -- )   pp dup C lit + @ rlckl !  10 lit + @ rlckh !  -1 lit rlck ! ;
+\ rlpeer ( g -- k | -1 )   relay g's peer entry, if it's answered (so we
+\        have its cookie).
+: rlpeer ( g -- k )   dup rlg @ swap rlg 4 lit + @ pfind dup 0< 0= if dup pp 8 lit + @ 2 lit = 0= if drop -1 lit then then ;
+
+\ rlregs ( -- )   our record to each relay not yet acknowledging it, every
+\        5 s; a new record every hour (or when rlmat is cleared).  By
+\        circuit, src/onion.fam sends it.
+: rlregs ( -- )
+	wl? rlgn @ and if
+		rlmat @ 0= rlmat @ pago 36EE80 lit u> or if
+			rlmake pms rlmat !  pnonce drop rlmid !
+			rlgn @ 0 lit do 0 lit i rlg 8 lit + !  0 lit i rlg C lit + ! loop
+		then
+		rlcirc @ 0= if rlgn @ 0 lit do
+			i rlg 8 lit + @ 0=  i rlg C lit + @ pago 1388 lit u> and if
+				i rlpeer dup 0< if drop else
+					rlckof  rlmid @ rlid !
+					rlmy rllen 10 lit i rlg @ i rlg 4 lit + @ rlsendp
+					pms i rlg C lit + !
+				then
+			then
+		loop then
+	then
+;
+
+\ ── Lookups ──
+: rllav variable ;  : rlla ( -- a )  rllav 20 lit lazy ;     \ the address asked for
+: rllst variable ;   \ 0 none, 1 asking, 2 found, 3 not found
+: rllid variable ;  : rllt variable ;  : rlln variable ;  : rlnf variable ;
+: rlip variable ;  : rlport variable ;
+
+: rllook ( addr -- )
+	rlla 20 lit ncpy  1 lit rllst !  pnonce drop rllid !  0 lit rllt !  0 lit rlln !  0 lit rlnf !
+;
+: rlfound ( -- f )   rllst @ 2 lit = ;
+
+\ rlasks ( -- )   ASK every target relay, every 2 s; after 5 rounds, not found.
+: rlasks ( -- )
+	rllst @ 1 lit = rltn @ and rlcirc @ 0= and if rllt @ pago 7D0 lit u> if
+		rlln @ 5 lit u< if
+			rltn @ 0 lit do
+				i rltpeer dup 0< if drop else
+					12 lit phdr  over pp C lit + @ 2 lit pick pp 10 lit + @ 2 lit pick qbe!
+					rllid @ over 8 lit + be!  rlla over C lit + 20 lit ncpy  drop
+					32 lit psendk                                      \ 6 + 8 + 4 + 32
+				then
+			loop
+			pms rllt !  rlln @ 1 lit + rlln !
+		else 3 lit rllst ! then
+	then then
+;
+
+\ rlacked ( -- )   ACK: a relay's answer to our registration, or a lookup
+\        not found.
+: rlacked ( -- )
+	pbn @ 25 lit = if
+		pbd @ be32  pbd @ 4 lit + c@                                       ( id status )
+		over rlmid @ = if
+			dup 0= over 2 lit = or if
+				rlgn @ 0 lit do i rlg @ nsrc @ = i rlg 4 lit + @ nsport @ = and if -1 lit i rlg 8 lit + ! then loop
+			then
+			dup 1 lit = if "relay: " lputs nsrc @ fnip. " refused our record" lputs A lit lputc then
+		then
+		swap rllid @ = rllst @ 1 lit = and swap 5 lit = and if
+			rlnf @ 1 lit + dup rlnf !  rltn @ u< 0= if 3 lit rllst ! then
+		else then
+	then
+;
+
+\ rlparts ( -- )   PART: a lookup's answer; whole, checked: found.
+: rlparts ( -- )
+	rllst @ 1 lit = pbn @ 6 lit u> and if
+		pbd @ be32 dup rlid ! rllid @ = if
+			pbd @ 4 lit + c@ rlpt !  pbd @ 5 lit + c@ rlpn !
+			pbd @ 6 lit + pbn @ 6 lit - rlpart ?dup if
+				dup rlrec rllen 6 lit + ncpy
+				rlrec rlcheck rlh rlla 20 lit mcmp 0= and if
+					rlrec rllen + be32 rlip !  rlrec rllen + 4 lit + nb16@ rlport !  2 lit rllst !
+				then
+				drop
+			then
+		then
+	then
+;
+
+\ rlin ( -- f )   a datagram of ours (types 10 .. 13): handled.
+: rlin ( -- f )
+	pok? if npay @ 5 lit + c@ dup 10 lit - 7 lit u< swap 15 lit <> and else 0 lit then
+	dup if
+		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+		npay @ 5 lit + c@
+		dup 10 lit = rlserve @ and if rlreg then
+		dup 11 lit = if rlacked then
+		dup 12 lit = rlserve @ and if rlans then
+		dup 13 lit = if rlparts then
+		dup 14 lit = rlserve @ and if rlrelay then
+		drop
+	then
+;
+
+: rlkt variable ;
+\ rlkeeps ( -- )   KEEP to each relay, every 20 s (by circuit: to the guard,
+\        src/onion.fam).
+: rlkeeps ( -- )
+	rlkt @ pago 4E20 lit u> rlcirc @ 0= and if
+		pms rlkt !
+		rlgn @ ?dup if 0 lit do i rlpeer dup 0< if drop else
+			16 lit phdr  over pp C lit + @ 2 lit pick pp 10 lit + @ rot qbe!  E lit psendk
+		then loop then
+	then
+;
+
+: rltick ( -- )   rlseeds rlregs rlasks rlkeeps ;

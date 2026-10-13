@@ -9,8 +9,8 @@
 \ hour (every minute while lookups fail), so where the names point can be
 \ changed without updating nodes.  Each address it has (up to 4) is a
 \ seed; one it no longer has stops being one (and is then kept, or
-\ dropped, as any host).  The gateways, when taken from the seeds (no
-\ usegw=), are taken again when the seeds change.
+\ dropped, as any host).  The relays, when taken from the seeds (no
+\ userelay=), are taken again when the seeds change.
 \
 \ Queries go from the node's own UDP port; an answer counts only from the
 \ resolver's address and port 53, with the query's id (random) and
@@ -163,7 +163,7 @@
 		i dnnw @ dnen @ 4 lit + @ pseed
 	loop then
 	0 lit dnnw dnen @ 18 lit + 10 lit ncpy  dnnc @ dnen @ 14 lit + !
-	dnchg @ gwset @ 0= and if 0 lit gwgn ! then           \ the gateways: the seeds again
+	dnchg @ rlset @ 0= and if 0 lit rlgn ! then           \ the relays: the seeds again
 ;
 
 \ dnfail ( -- )   no answer for name dnpk (its addresses are kept).

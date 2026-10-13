@@ -1,0 +1,96 @@
+\ tests/onion.fam — circuits (src/onion.fam), both ends in one process: the
+\ handshake gives the client and the relay the same keys, a cell through
+\ three layers comes out as it went in (and not when touched), an answer
+\ comes back through them; a record registered along a circuit, and a part
+\ delivered back along it; the relay's circuit table, its limits, padding,
+\ a mixing delay.  After tests/consensus.fam (its helpers) and
+\ tests/net.fam (the network open: the handshake sends).
+
+: tcibv variable ;  : tcib ( -- a )  tcibv 460 lit lazy ;   \ contents, kept
+: tqgc variable ;
+: tcipv variable ;  : tcip ( -- a )  tcipv 480 lit lazy ;   \ a BCELL's body: id, nonce, body
+
+Test {
+	onion_handshake {
+		wlseed tjsave 20 lit ncpy  1 lit bnet !
+		21 lit tjrelay  cne 0 lit cnent cnlen ncpy  1 lit cnn !  0 lit cnent 0 lit cnids cnid
+		\ the client: one hop, to that relay (its onion key: ours)
+		0 lit ocst !  0 lit ochn !  0A000202 lit 0 lit ocp !  BA5E lit 0 lit ocp 4 lit + !  0 lit 0 lit ocp 8 lit + !
+		0 lit ocp 1 lit ocp 20 lit ncpy  0 lit ocp 2 lit ocp 10 lit ncpy
+		ochop
+		\ the relay: both halves, its answer
+		0 lit onc 80 lit nzero  1 lit 0 lit onc !  0A000202 lit 0 lit onc 4 lit + !  BA5E lit 0 lit onc 8 lit + !
+		occt 0 lit onpget 300 lit ncpy  ocek 0 lit onhs 300 lit + 320 lit ncpy
+		0 lit onresp  0 lit onc @ 2 lit asrt_eq
+		\ the client: the same keys
+		1 lit ocst !  0 lit onhs 0 lit onhs 300 lit + ocfin
+		ochn @ 1 lit = ochn @ 2 lit = or assert                               \ (and on to the next hop)
+		0 lit ock 0 lit onc 20 lit + 40 lit mcmp 0 lit asrt_eq
+		\ a wrong confirmation: refused
+		1 lit ochn !  0 lit onhs 300 lit + dup c@ 1 lit xor swap c!  0 lit onhs 0 lit onhs 300 lit + ocfin
+		ochn @ 1 lit asrt_eq
+		0 lit onprel  0 lit onc 80 lit nzero  0 lit ocst !  0 lit cnn !  0 lit bnet !  tjsave wlseed 20 lit ncpy  0 lit cnok !
+	}
+	onion_layers {
+		C0 lit 0 lit do i 5 lit * 3 lit + 0 lit ock i + c! loop  3 lit ochn !
+		\ forward: sealed for hop 2, layered for 1 and 0; each hop takes its own off
+		3 lit "abc" 3 lit oncmd  oni tcib oninn ncpy
+		onn C lit onrand  2 lit ock onn oni onb onseal  1 lit ock onn onb onxor  0 lit ock onn onb onxor
+		0 lit ock onn onb onxor  1 lit ock onn onb onxor
+		onb tcip onbody ncpy  2 lit ock onn tcip oni onopen assert  oni tcib oninn mcmp 0 lit asrt_eq
+		onb 40 lit + dup c@ 1 lit xor swap c!  2 lit ock onn onb oni onopen 0= assert       \ touched
+		\ back: the end seals, the hops add theirs, the client takes them off
+		1 lit rllst !  7 lit onz 0 lit oncmd
+		onn C lit onrand  2 lit ock 20 lit + onn oni onb onseal
+		1 lit ock 20 lit + onn onb onxor  0 lit ock 20 lit + onn onb onxor
+		0 lit tcip !  onn tcip 4 lit + C lit ncpy  onb tcip 10 lit + onbody ncpy
+		tcip pbd !  460 lit pbn !  ocback  rllst @ 3 lit asrt_eq                     \ NOTFOUND
+		0 lit ochn !  0 lit rllst !
+	}
+	onion_register {
+		\ a relay's circuit 0 ends here (made, no next hop; its id 0x1234)
+		0 lit onc 80 lit nzero  2 lit 0 lit onc !  0A000202 lit 0 lit onc 4 lit + !  BA5E lit 0 lit onc 8 lit + !
+		1234 lit 0 lit onc C lit + !
+		\ REGISTER, our record in 5 parts: kept, reached by circuit 0
+		0 lit bnet !  rlmake
+		5 lit 0 lit do
+			i onpt c!  5 lit onpt 1 lit + c!  rllen i 438 lit * - 438 lit pumin
+			rlmy i 438 lit * + onpt 2 lit + 2 lit pick ncpy  8 lit onpt rot 2 lit + oncmd  0 lit onreg
+		loop
+		oni c@ 9 lit asrt_eq  oni 3 lit + c@ 0 lit asrt_eq                      \ REGISTERED, kept
+		rldir paid rlv btget assert  rlvia? assert
+		rlv 10 lit + @ 1234 lit asrt_eq  rlv 14 lit + @ FFFF0000 lit asrt_eq
+		\ RELAY for us: DELIVERed back along circuit 0
+		paid ocx 20 lit ncpy  A lit 0 lit do 5A lit ocx 20 lit + i + c! loop  4 lit ocx 2A lit oncmd  0 lit ondeliv
+		oni c@ A lit asrt_eq  oni 1 lit + nb16@ A lit asrt_eq  oni 3 lit + c@ 5A lit asrt_eq
+		\ the circuit gone (another in its slot): not delivered
+		9999 lit 0 lit onc C lit + !  4 lit ocx 2A lit oncmd  0 lit ondeliv  oni c@ 4 lit asrt_eq
+		0 lit onc 80 lit nzero
+	}
+	onion_table {
+		\ three circuits on one link: found by where they come from; one taken out
+		3 lit 0 lit do
+			i onc 80 lit nzero  2 lit i onc !  0A000202 lit i onc 4 lit + !  BA5E lit i onc 8 lit + !
+			i 100 lit + i onc C lit + !  i 0 lit onins
+		loop
+		0A000202 lit BA5E lit 101 lit onfp 1 lit asrt_eq  0A000202 lit BA5E lit 102 lit onfp 2 lit asrt_eq
+		0A000202 lit BA5E lit 105 lit onfp -1 lit asrt_eq
+		1 lit 0 lit onrem  0A000202 lit BA5E lit 101 lit onfp -1 lit asrt_eq
+		0A000202 lit BA5E lit 100 lit onfp 0 lit asrt_eq  0A000202 lit BA5E lit 102 lit onfp 2 lit asrt_eq
+		\ and by where one goes on to; freed, found neither way
+		0A000009 lit 2 lit onc 10 lit + !  F0B lit 2 lit onc 14 lit + !  7 lit 2 lit onc 18 lit + !  1 lit 2 lit onc 1C lit + !
+		2 lit 1 lit onins  0A000009 lit F0B lit 7 lit onfn 2 lit asrt_eq
+		2 lit onfree  0A000009 lit F0B lit 7 lit onfn -1 lit asrt_eq  0A000202 lit BA5E lit 102 lit onfp -1 lit asrt_eq
+		0 lit onfree  1 lit onc 80 lit nzero
+		\ a handshake buffer: one per circuit, free again after
+		5 lit onpget dup 0= 0= assert  5 lit onpget asrt_eq  5 lit onc 68 lit + @ 0= 0= assert
+		5 lit onprel  5 lit onc 68 lit + @ 0 lit asrt_eq
+		\ the CREATE limit: 4 at once, then no more for a while
+		0 lit tqgc !  4 lit 0 lit do tqgc 7D0 lit 1770 lit ongcra assert loop  tqgc 7D0 lit 1770 lit ongcra 0= assert
+		\ padding: a power of two of parts
+		1 lit ocpw 1 lit asrt_eq  3 lit ocpw 4 lit asrt_eq  4 lit ocpw 4 lit asrt_eq  28 lit ocpw 40 lit asrt_eq
+		\ a mixing delay: a cell passed on is held, then sent when due
+		2 lit ondly !  1F lit 0A000202 lit BA5E lit 1 lit onfwd  onqn @ 1 lit asrt_eq
+		pms begin pms over - 5 lit u> until drop  onflush  onqn @ 0 lit asrt_eq  0 lit ondly !
+	}
+}

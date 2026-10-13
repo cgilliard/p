@@ -203,7 +203,7 @@ after the name's `/`, if one is given (the defaults give none: no addresses
 are built in, so the seeds can move, and a DNS server must answer) -- and
 hourly after that (every minute while lookups fail). Each address a name
 has (up to 4) is a seed; one it stops having is an ordinary host from then
-on. The gateways, when taken from the seeds, follow them. The Rust node
+on. The relays, when taken from the seeds, follow them. The Rust node
 looks the same names up with the system's resolver (`--seed
 HOST:PORT[/IPV4]`), likewise at the start and hourly. A forged answer can
 only point a node at hosts that aren't the seeds, whose chain is checked
@@ -303,10 +303,10 @@ CLI finalizing the S2 downloaded, sending (the Rust CLI answering the S1)
 and finalizing the answer -- both payments mined.
 
 The payment network's cryptography (person-to-person payments: slates
-between wallets, through gateways -- the seed nodes by default -- and later
-onion routing) is post-quantum like the rest: Kyber-512 (ML-KEM-512, FIPS
+between wallets, through relays -- the seed nodes by default -- and later
+onion routing: `../docs/RELAYS.md`) is post-quantum like the rest: Kyber-512 (ML-KEM-512, FIPS
 203: `src/kyber.fam`) to agree a session's key, Dilithium2 (ML-DSA-44, FIPS
-204: `src/dilithium.fam`) to sign the gateways' records, ChaCha20-Poly1305
+204: `src/dilithium.fam`) to sign the relays' records, ChaCha20-Poly1305
 (RFC 8439: `src/chacha.fam`) to encrypt, and Keccak (FIPS 202:
 `src/keccak.fam`; SHA3-256/512, SHAKE128/256) under both. The hot loops are
 RV32I assembly, written by `tools/keccak_s.py`, `tools/chacha_s.py` and
@@ -321,25 +321,52 @@ little-endian u32 (0, for now); the address is SHA3-256 of the two public
 keys, in Bech32m (BIP 350) -- `tab1…` on the main network, `tabdev1…` on dev,
 a version symbol first -- 63 characters. The node logs it at the start;
 `status` returns it, the web wallet shows it (Receive), `tools/wallet
-address` prints it. Gateways (`src/gateway.fam`) find a payment address: a wallet registers a
+address` prints it. Relays (`src/relay.fam`; called gateways before) find a payment address: a wallet registers a
 record with them -- its two public keys, a sequence (the time) and an expiry
-(6 hours), signed with Dilithium -- every hour, and a gateway keeps each
+(6 hours), signed with Dilithium -- every hour, and a relay keeps each
 address's newest (B+tree 10, the record in two pages) with the ip:port it
 came from (so a wallet behind NAT is found where its NAT shows it). A sender
 asks for an address and checks what comes back itself: the keys hash to
-the address, the signature holds, it hasn't expired -- a lying gateway can
+the address, the signature holds, it hasn't expired -- a lying relay can
 only misroute. Records (4.6 KB) go in parts of 1 KB, new packet types the
-Rust node ignores; a gateway answers only an asker quoting the cookie it
+Rust node ignores; a relay answers only an asker quoting the cookie it
 issued that address (no amplification), and takes a registration from an IP
 at most every 10 s, 10,000 in all. A node serves as one with `node.sh
---gateway` (the seeds); a wallet uses `usegw=` settings, or the seeds.
+--relay` (the seeds; `--gateway` too); a wallet uses `userelay=` settings
+(or `usegw=`), else the seeds. The wire format is as it was.
+Which relays: the relay list (`../docs/RELAYS.md`, phase 1). Blocks vote
+for a `consensus.txt` -- relays' signed entries -- as the left branch of
+the tree under their `aux_hash` (a Rust miner's `--consensus-file`); the
+node fetches the trees and files from peers by hash (`src/auxtree.fam`),
+the window's headers too when it fast-synced past them, and the file with
+the most votes in the epoch's window is the list (`src/rlist.fam`). With
+one (and 3 live relays on dev, 8 on main), each address has 3 home
+relays -- the node registers with its own, and looks up and pays through
+the receiver's; without, the seeds, as before. `tools/wallet relay-entry
+IP PORT` prints a relay's signed line, `tools/consensus` assembles them;
+`status` reports the list (`relay_list`); the setting `seedmode` keeps a
+node on the seeds, for testing. In listed mode a lookup and a payment's
+messages go by circuit (`src/onion.fam`, phase 2): guard, middle, then the
+receiver's home relay, which does the lookup and relays the parts itself;
+each hop a Kyber handshake (with a one-time key: forward secret), each
+cell sealed for the end and layered with ChaCha20 for the hops before it.
+No relay sees both the sender and the receiver. The receiver, too, keeps a
+circuit to each of its home relays (phase 3): it registers along it and
+its payments come back along it, so no relay holds its IP but its guard,
+and a lookup gives none out. Phase 4 hardened it: a relay keeps up to 4096
+circuits, limits new ones per IP and in all, rotates its onion key with
+each new entry, and can hold cells a random while (`mixdelay=`); messages
+are padded; a wallet notices a dead circuit or guard and builds around
+it. Under QEMU a circuit is built in about 1.7 s, and a payment by address
+took about 7.5 s end to end (about 10 s with 300 ms mixing delays); the
+setting `direct` turns circuits off, for testing.
 `tools/wallet lookup ADDRESS` (the API's `lookup`) asks; `status` says how
-many gateways hold our record. Tried with three nodes under QEMU: two
-wallets registered with a gateway and found each other.
+many relays hold our record. Tried with three nodes under QEMU: two
+wallets registered with a relay and found each other.
 
 Paying an address (`src/pay.fam`; `tools/wallet pay ADDRESS AMOUNT`, the
 API's `pay` and `payment`, the web wallet's Send) is one round trip, end to
-end, relayed by the gateways (RELAY in, DELIVER out, to where the address
+end, relayed by the relays (RELAY in, DELIVER out, to where the address
 was heard; they read nothing, and pass at most 256 KB a second an IP). PAY1:
 a one-time Kyber key pair, a key encapsulated to the receiver's Kyber key,
 and a ChaCha20-Poly1305 box with the sender's address and S1. The receiver
@@ -348,10 +375,10 @@ S2 (or why not); the sender finalizes, and the transaction goes out. The
 boxes' keys are SHAKE256 of the secrets and a hash of the exchange, so S2 is
 forward secret (the one-time key is gone); a PAY1 sent again gets the same
 PAY2, not a second slate, and a receiver answers a new one at most every
-2 s. A wallet keeps its way open with a KEEP to each gateway every 20 s.
+2 s. A wallet keeps its way open with a KEEP to each relay every 20 s.
 Failed or unanswered (a minute), the payment's slate is cancelled and its
 coins are free again. Tried under QEMU on a private dev chain with real
-proofs: a Rust miner, a Forth gateway, two Forth wallets -- the first funded
+proofs: a Rust miner, a Forth relay, two Forth wallets -- the first funded
 by the Rust wallet, then paying the second by address, and the second paying
 back from the web wallet, every payment mined.
 

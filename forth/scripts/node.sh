@@ -5,7 +5,8 @@
 #
 #   node.sh [--recover] [--passphrase] [--api-key]
 #           [--log-dest webui|console|both] [--log-max-entries N]
-#           [--debug-disable-verification] [--gateway]
+#           [--debug-disable-verification] [--relay] [--mix-delay MS]
+#           [--direct] [--seed-mode]
 #
 #   --recover     restore the wallet from its 24 backup words, typed when the
 #                 node asks (on a disk without a wallet: a new data/disk.img)
@@ -18,9 +19,18 @@
 #   --log-max-entries N
 #                 the most log lines kept for the Log tab, the oldest dropped
 #                 as new ones come (default 10000; at most 1000000)
-#   --gateway     serve as a payment gateway: keep wallets' records (their
-#                 payment addresses' keys, where they're reached) and answer
-#                 lookups -- for the seed nodes (src/gateway.fam)
+#   --relay       serve as a payment relay: keep wallets' records (their
+#                 payment addresses' keys, where they're reached), answer
+#                 lookups and relay their messages -- for the seed nodes
+#                 (src/relay.fam; --gateway, its old name, works too)
+#   --mix-delay MS
+#                 a relay: hold each cell it passes on a random 0 .. MS ms
+#                 first (at most 10000), so cells in and out are harder to
+#                 match by time (docs/RELAYS.md)
+#   --direct      testing: no circuits -- lookups and payments go straight to
+#                 the receiver's home relays
+#   --seed-mode   testing: the seeds (or relays set) as relays, even when the
+#                 chain lists relays
 #   --debug-disable-verification
 #                 don't check blocks' proofs (everything else is checked), to
 #                 time what a big block costs: only with a private network --
@@ -88,9 +98,12 @@ APIKEY=""
 LOGDEST=""
 LOGMAX=""
 NOVERIFY=""
-GATEWAY=""
+RELAY=""
+MIXDELAY=""
+DIRECT=""
+SEEDMODE=""
 usage() {
-	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N] [--debug-disable-verification] [--gateway]" >&2
+	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N] [--debug-disable-verification] [--relay] [--mix-delay MS] [--direct] [--seed-mode]" >&2
 	exit 1
 }
 while [ $# -gt 0 ]; do
@@ -103,7 +116,11 @@ while [ $# -gt 0 ]; do
 		--log-max-entries=*) LOGMAX=${1#*=} ;;
 		--log-max-entries) [ $# -ge 2 ] || usage; LOGMAX=$2; shift ;;
 		--debug-disable-verification) NOVERIFY=1 ;;
-		--gateway) GATEWAY=1 ;;
+		--relay|--gateway) RELAY=1 ;;
+		--mix-delay=*) MIXDELAY=${1#*=} ;;
+		--mix-delay) [ $# -ge 2 ] || usage; MIXDELAY=$2; shift ;;
+		--direct) DIRECT=1 ;;
+		--seed-mode) SEEDMODE=1 ;;
 		*) usage ;;
 	esac
 	shift
@@ -111,6 +128,11 @@ done
 case "$LOGDEST" in
 	""|webui|console|both) ;;
 	*) echo "node.sh: --log-dest: webui, console or both" >&2; exit 1 ;;
+esac
+case "$MIXDELAY" in
+	"") ;;
+	*[!0-9]*) echo "node.sh: --mix-delay: a number of ms, 0 to 10000" >&2; exit 1 ;;
+	*) [ "$MIXDELAY" -le 10000 ] || { echo "node.sh: --mix-delay: at most 10000" >&2; exit 1; } ;;
 esac
 case "$LOGMAX" in
 	"") ;;
@@ -148,10 +170,11 @@ echo "node.sh: the web wallet: http://127.0.0.1:$API/ (once the node is up)" >&2
 # timeout, network, and the seeds it would fetch the node from if the disk's
 # copy were bad), then the node's own (src/full_node.fam).
 settings() {
-	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s%s%s%s\004' \
+	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s%s%s%s%s%s%s\004' \
 		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
 		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}" "${PERIP:+ perip=$PERIP}" \
-		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${GATEWAY:+ gateway}" "${DNS:+ dns=$DNS}"
+		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${RELAY:+ relay}" "${DNS:+ dns=$DNS}" \
+		"${MIXDELAY:+ mixdelay=$MIXDELAY}" "${DIRECT:+ direct}" "${SEEDMODE:+ seedmode}"
 }
 # QEMU's output goes through a pipe (| cat): QEMU makes its output
 # non-blocking, and on a terminal that would be the keyboard's too.

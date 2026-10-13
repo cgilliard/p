@@ -17,17 +17,23 @@
 \                           phase; 0: none), peers, network, wallet ("none",
 \                           "open", "restoring"), passphrase, next_key,
 \                           address (the payment address: src/address.fam),
-\                           gateways (how many hold our record)
+\                           relays (how many hold our record), relay_list
+\                           {mode ("seed", "listed", "unknown"), epoch,
+\                           window, voted, for_list, unresolved,
+\                           listed_relays} (src/rlist.fam)
 \   pay address amount [fee]   pay a payment address (src/pay.fam): {}
 \                           (follow it with payment)
 \   payment                 the payment's progress: {state: "none",
 \                           "finding", "sending", "paid" (txid) or "failed"
 \                           (error)}
-\   lookup address          a payment address's record, from the gateways:
+\   lookup address          a payment address's record, from the relays:
 \                           {status: "looking"} until it's in, then
 \                           {status: "found", ip, port, expires_in (s)} or
 \                           {status: "not found"}; a different address
 \                           starts a new lookup
+\   relayentry ip port [days]   {line, id}: this node's signed entry as a
+\                           relay at ip:port, good for days (7; 1 to 30) --
+\                           a consensus.txt line (src/consensus.fam)
 \   balance                 spendable, immature, pending, locked, held,
 \                           held_until, height
 \   outputs                 [ {commitment, key, amount, status, origin,
@@ -402,7 +408,12 @@
 	"passphrase" jkey wl? if wlflags 1 lit and else 0 lit then if "true" else "false" then js
 	"next_key" jkey wares C lit + be32 jdec
 	"address" jkey wl? if jaddr dup paaddr jstr else "null" js then
-	"gateways" jkey 0 lit gwgn @ ?dup if 0 lit do i gwg 8 lit + @ if 1 lit + then loop then jdec
+	"relays" jkey 0 lit rlgn @ ?dup if 0 lit do i rlg 8 lit + @ if 1 lit + then loop then jdec
+	"relay_list" jkey jobj
+	"mode" jkey rqst @ 2 lit = if "\"listed\"" else rqst @ if "\"seed\"" else "\"unknown\"" then then js
+	"epoch" jkey rqepn @ jdec  "window" jkey rqwb @ rqwa @ - jdec  "voted" jkey rqvoted @ jdec
+	"for_list" jkey rqfor @ jdec  "unresolved" jkey rqunres @ jdec  "listed_relays" jkey rqlive @ jdec
+	7D lit jc
 	jdone jdone
 ;
 
@@ -528,14 +539,14 @@
 : jlookup ( -- )
 	"address" jget 1 lit = if jla pahash else 2drop 0 lit then
 	0= if "address: a payment address (tab1..., tabdev1... on dev)" jerr else
-		jla gwla 20 lit mcmp 0= gwlst @ and 0= if jla gwlook then
+		jla rlla 20 lit mcmp 0= rllst @ and 0= if jla rqtgt  jla rllook then
 		-1 lit jhead jobj "status" jkey
-		gwlst @ 1 lit = if "\"looking\"" js else
-		gwlst @ 3 lit = if "\"not found\"" js else
-			"\"found\"" js  "ip" jkey 22 lit jc gwip @ 18 lit rshift jdec 2E lit jc gwip @ 10 lit rshift FF lit and jdec 2E lit jc
-			gwip @ 8 lit rshift FF lit and jdec 2E lit jc gwip @ FF lit and jdec 22 lit jc
-			"port" jkey gwport @ jdec
-			"expires_in" jkey gwrec 10 lit + qbe@ gwnow d- drop 3E8 lit / jdec
+		rllst @ 1 lit = if "\"looking\"" js else
+		rllst @ 3 lit = if "\"not found\"" js else
+			"\"found\"" js  "ip" jkey 22 lit jc rlip @ 18 lit rshift jdec 2E lit jc rlip @ 10 lit rshift FF lit and jdec 2E lit jc
+			rlip @ 8 lit rshift FF lit and jdec 2E lit jc rlip @ FF lit and jdec 22 lit jc
+			"port" jkey rlport @ jdec
+			"expires_in" jkey rlrec 10 lit + qbe@ rlnow d- drop 3E8 lit / jdec
 		then then
 		jdone jdone
 	then
@@ -572,6 +583,37 @@
 
 \ apirun ( a n auth -- auth' )
 : jau variable ;
+\ jipp ( a n -- ip ok )   A.B.C.D.
+: jipv variable ;  : jipn variable ;  : jipd variable ;  : jipk variable ;
+: jipp ( a n -- ip ok )
+	0 lit jipv !  0 lit jipn !  0 lit jipd !  0 lit jipk !  -1 lit jnok !
+	?dup if 0 lit do
+		dup i + c@
+		dup 2E lit = if
+			drop jipd @ 0= if 0 lit jnok ! then
+			jipv @ 8 lit lshift jipn @ or jipv !  0 lit jipn !  0 lit jipd !  jipk @ 1 lit + jipk !
+		else dup jdig? if
+			F lit and jipn @ A lit * + dup FF lit u> if 0 lit jnok ! then jipn !  jipd @ 1 lit + jipd !
+		else drop 0 lit jnok ! then then
+	loop then drop
+	jipd @ 0= jipk @ 3 lit = 0= or if 0 lit jnok ! then
+	jipv @ 8 lit lshift jipn @ or  jnok @
+;
+
+\ jrentry ( -- )   relayentry: our entry as a relay, a consensus.txt line.
+: jrip variable ;
+: jrentry ( -- )
+	"ip" jget 1 lit = if jipp else 2drop 0 lit 0 lit then  jsok ! jrip !
+	"port" 0 lit jnum  "days" 7 lit jnum
+	over 1 lit - FFFF lit u< jsok @ and  over 1 lit - 1E lit u< and if
+		jrip @ -rot cnmake
+		-1 lit jhead jobj
+		"line" jkey 22 lit jc "relay " js cne cnlen jhex 22 lit jc
+		"id" jkey cne jabuf cnid jabuf 20 lit jqhex
+		jdone jdone
+	else 2drop "ip (A.B.C.D, the relay's public address), port, days (1 to 30)" jerr then
+;
+
 : apirun ( a n auth -- auth' )
 	jau ! jinn ! jin !  0 lit jscn !
 	"id" jget dup jidk ! if dup 40 lit u> if 2drop 0 lit jidk ! else dup jidn ! jidb swap tcpy then else 2drop then
@@ -593,8 +635,9 @@
 		2dup "finalize" jis if 2drop jfinal else
 		2dup "cancel" jis if 2drop jcancel else
 		2dup "slates" jis if 2drop jslates else
+		2dup "relayentry" jis if 2drop jrentry else
 		2drop "unknown command" jerr
-		then then then then then then then then then then then then then then then then
+		then then then then then then then then then then then then then then then then then
 	else 2drop "not a request: {\"id\":..,\"cmd\":\"...\"}" jerr then
 	jau @
 ;

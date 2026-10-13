@@ -42,7 +42,7 @@ Test {
 		dnqb 1E lit + c@ 0 lit asrt_eq  dnqb 1F lit + nb16@ 1 lit asrt_eq  dnqb 21 lit + nb16@ 1 lit asrt_eq
 	}
 	dns_answer_taken {
-		A000203 lit dnsv !  0 lit gwset !
+		A000203 lit dnsv !  0 lit rlset !
 		0 lit dnpk !  1234 lit 0 lit 3 lit tzans
 		5 lit 2 lit tzrr C00C lit swap nb16!                              \ a CNAME: skipped
 		1 lit 4 lit tzrr 9F36ACBE lit swap be!

@@ -124,6 +124,9 @@ impl<E> From<transfer::Error> for NodeError<E> {
     }
 }
 
+/// The most `AUX` chunks one `GET_AUX` gets (as `GET_CHUNKS`'s window).
+const AUX_WINDOW: usize = 32;
+
 /// `Node::peer_height`'s value before any peer has reported its tip.
 pub const NO_PEER_HEIGHT: u64 = u64::MAX;
 
@@ -148,6 +151,9 @@ pub struct Node<T: Transport> {
     /// reported (`NO_PEER_HEIGHT` until one has) -- how the node, on
     /// another thread, tells whether it has caught up.
     pub peer_height: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// The aux tree this node's blocks root (`--consensus-file`): its
+    /// bytes answer `GET_AUX`.
+    pub aux: Option<std::sync::Arc<crate::auxtree::AuxTree>>,
     transport: T,
     tick_interval_ms: u64,
     next_tick_ms: Option<u64>,
@@ -180,6 +186,7 @@ impl<T: Transport> Node<T> {
             state_reader,
             log: None,
             peer_height: None,
+            aux: None,
             transport,
             tick_interval_ms,
             next_tick_ms: None,
@@ -188,6 +195,44 @@ impl<T: Transport> Node<T> {
             // silently truncated into something that parses.
             buf: vec![0u8; MAX_PACKET + 1],
         }
+    }
+
+    /// `GET_AUX`: chunks of our aux tree's bytes (at most a window's
+    /// worth); nothing if the hash isn't ours.
+    fn serve_aux(&self, to: SocketAddrV4, hash: [u8; 32], first: u32, count: u16) -> Vec<Outgoing> {
+        let Some(bytes) = self.aux.as_ref().and_then(|aux| aux.bytes(&hash)) else {
+            return Vec::new();
+        };
+        let chunks = crate::wire::chunk_count(bytes.len()).max(1);
+        let end = (first as usize).saturating_add((count as usize).min(AUX_WINDOW)).min(chunks);
+        (first as usize..end)
+            .map(|index| Outgoing {
+                to,
+                bytes: Message::Aux {
+                    hash,
+                    total: bytes.len() as u32,
+                    index: index as u32,
+                    data: bytes[(index * crate::wire::CHUNK_LEN).min(bytes.len())..((index + 1) * crate::wire::CHUNK_LEN).min(bytes.len())].to_vec(),
+                }
+                .encode(),
+            })
+            .collect()
+    }
+
+    /// `GET_HDRS`: the active chain's headers from `first` on, as many as
+    /// we have in a row (at most `MAX_HDRS`); nothing if we have none.
+    fn serve_headers(&self, to: SocketAddrV4, first: u32, count: u16) -> Vec<Outgoing> {
+        let mut headers = Vec::new();
+        for height in (first as u64)..(first as u64 + (count as usize).min(crate::wire::MAX_HDRS) as u64) {
+            let Some(hash) = self.reader.active_hash_at(height).ok().flatten() else { break };
+            let Some((_, bytes)) = self.reader.block_range(hash, 0, crate::block::HEADER_LEN).ok().flatten() else { break };
+            let Ok(header) = <[u8; crate::block::HEADER_LEN]>::try_from(bytes.as_slice()) else { break };
+            headers.push(header);
+        }
+        if headers.is_empty() {
+            return Vec::new();
+        }
+        vec![Outgoing { to, bytes: Message::Hdrs { first, headers }.encode() }]
     }
 
     fn send_all(&mut self, out: Vec<Outgoing>) {
@@ -282,6 +327,21 @@ impl<T: Transport> Node<T> {
                         self.delivered_txs.extend(step.delivered);
                         step.packets
                     }
+                    Message::GetAux { cookie, hash, first, count } => {
+                        if self.discovery.check_cookie(from, cookie) {
+                            self.serve_aux(from, hash, first, count)
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    Message::GetHdrs { cookie, first, count } => {
+                        if self.discovery.check_cookie(from, cookie) {
+                            self.serve_headers(from, first, count)
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    Message::Aux { .. } | Message::Hdrs { .. } => Vec::new(),
                     Message::GetSyncPoint { .. } | Message::SyncPoint { .. } | Message::GetPiece { .. } | Message::PieceChunk { .. } => {
                         let step = self.statesync.handle(from, &message, &self.discovery, &self.state_reader, now_ms);
                         self.sync_events.extend(step.events);
@@ -663,6 +723,65 @@ mod tests {
             b.step();
             assert!(Instant::now() < deadline, "B never caught up to A");
         }
+    }
+
+    /// A miner backing a relay list answers GET_AUX with its tree's bytes,
+    /// in chunks, and GET_HDRS with its chain's headers -- only to an asker
+    /// quoting the cookie it issued.
+    #[test]
+    fn a_miner_serves_its_aux_tree_and_headers() {
+        let (socket_a, addr_a) = bind();
+        let (asker, addr_b) = bind();
+        let mut a = test_node(vec![], socket_a, 1);
+        let file = vec![b'x'; 3000];
+        let tree = std::sync::Arc::new(crate::auxtree::AuxTree::backing(&file));
+        a.node.aux = Some(tree.clone());
+        for _ in 0..3 {
+            let unproven = a.chain.build_block(&[]).unwrap();
+            let target = unproven.target;
+            let mut block = unproven.finish(crate::prover::Proof::placeholder());
+            assert!(crate::block::mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+            a.chain.apply_block(&block).unwrap();
+        }
+        let cookie = a.node.discovery.issue_cookie(addr_b);
+        let ask = |a: &mut TestNode, message: Message| -> Vec<Message> {
+            asker.send_to(&message.encode(), addr_a).unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 2048];
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                a.step();
+                if let Ok((n, _)) = asker.recv_from(&mut buf) {
+                    got.extend(Message::decode(&buf[..n]));
+                }
+            }
+            got
+        };
+
+        // The root's 65 bytes, then the leaf (3,001 bytes: 3 chunks).
+        let got = ask(&mut a, Message::GetAux { cookie, hash: tree.root(), first: 0, count: 32 });
+        assert_eq!(got, vec![Message::Aux { hash: tree.root(), total: 65, index: 0, data: tree.bytes(&tree.root()).unwrap().to_vec() }]);
+        let got = ask(&mut a, Message::GetAux { cookie, hash: tree.leaf(), first: 0, count: 32 });
+        let mut leaf = Vec::new();
+        for (i, message) in got.iter().enumerate() {
+            let Message::Aux { total, index, data, .. } = message else { panic!("{message:?}") };
+            assert_eq!((*total, *index as usize), (3001, i));
+            leaf.extend_from_slice(data);
+        }
+        assert_eq!(leaf, tree.bytes(&tree.leaf()).unwrap());
+        assert!(ask(&mut a, Message::GetAux { cookie: cookie ^ 1, hash: tree.root(), first: 0, count: 1 }).is_empty());
+        assert!(ask(&mut a, Message::GetAux { cookie, hash: [9; 32], first: 0, count: 1 }).is_empty());
+
+        // Heights 1.. on (the chain is heights 0..2): as many as there are.
+        let got = ask(&mut a, Message::GetHdrs { cookie, first: 1, count: 6 });
+        let [Message::Hdrs { first: 1, headers }] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!(headers.len(), 2);
+        for (i, header) in headers.iter().enumerate() {
+            let hash = a.node.reader.active_hash_at(i as u64 + 1).unwrap().unwrap();
+            assert_eq!(crate::block::BlockHeader::from_bytes(header).unwrap().hash(), hash);
+            assert_eq!(&header[100..132], &[0u8; 32]);
+        }
+        assert!(ask(&mut a, Message::GetHdrs { cookie, first: 9, count: 6 }).is_empty());
     }
 
     /// A real signed transaction (one input: about 4 KB, several chunks).

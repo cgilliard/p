@@ -1,0 +1,160 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/consensus.fam — the relay list (docs/RELAYS.md): a relay's entry, the
+\ consensus.txt that lists them, and the aux tree a block's aux_hash roots.
+\
+\ A relay's keys come from its wallet's seed, as the payment address's do
+\ (src/address.fam), under their own tags: Dilithium's ξ = SHAKE256(
+\ "tabernacle-relay-dilithium-v1" ‖ seed ‖ 0, 32); its relay id is
+\ SHA3-256 of the Dilithium key.  The onion key, Kyber's (d, z) =
+\ SHAKE256("tabernacle-relay-kyber-v1" ‖ seed ‖ g, 64), g the entry's
+\ expiry's low 32 bits (big-endian): each new entry, a new onion key.
+\
+\ An entry (0x11CC bytes, numbers big-endian): 0 "RLY1"  4 the network
+\ (u32: 0 main, 1 dev)  8 IP (4)  C port (2)  E zeros (2)  10 expiry (ms
+\ since the epoch, u64)  18 Kyber's key (0x320, its onion key)  338
+\ Dilithium's (0x520)  858 the signature (Dilithium, of bytes 0 .. 858).
+\
+\ consensus.txt: the line "tabernacle-consensus 1 main" ("dev" on dev),
+\ then a line "relay <an entry in hex>" for each relay, sorted by relay id,
+\ every line ending in a newline.  Anything else -- a bad line, a bad
+\ signature, another network's entry, out of order -- and it's not valid.
+\ (Expiry is no part of validity: where the list is used, an expired entry
+\ is skipped.)
+\
+\ The aux tree: a node's bytes are 0x01 ‖ left ‖ right, a leaf's 0x00 ‖
+\ its content; each hash is SHA-256 of those bytes.  The root's left child
+\ is the leaf of the consensus.txt the block backs (zeros: none).
+\
+\   cnkeys ( -- )               the relay's keys: cnek, cnpk (cndk, cnsk)
+\   cnonion ( g ek dk -- )      its onion key for g
+\   cnmake ( ip port days -- )  our entry, good for that many days (1 to
+\                               30), at cne
+\   cncheck ( e -- ok )         an entry's form, network and signature
+\   cnid ( e out -- )           its relay id
+\   cnparse ( a n -- ok )       a consensus.txt: then cnn entries, the
+\                               k-th at cnent k, its id at cnids k
+\   cnleaf ( a n out -- )       a leaf's hash
+\   cnnode ( l r out -- )       a node's hash
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: cnlen ( -- n )   11CC lit ;                             \ an entry
+: cnsgn ( -- n )   858 lit ;                              \ the part signed
+: cnmax ( -- n )   40 lit ;                               \ entries a file may hold
+
+\ ── The relay's keys ──
+
+: cnekv variable ;  : cnek ( -- a )  cnekv 320 lit lazy ;   \ Kyber's public key
+: cndkv variable ;  : cndk ( -- a )  cndkv 660 lit lazy ;   \ its secret key
+: cnpkv variable ;  : cnpk ( -- a )  cnpkv 520 lit lazy ;   \ Dilithium's public key
+: cnskv variable ;  : cnsk ( -- a )  cnskv A00 lit lazy ;   \ its secret key
+: cnok variable ;   \ the keys are made
+
+: cnkeys ( -- )
+	cnok @ 0= if
+		"tabernacle-relay-kyber-v1" 19 lit pab 40 lit pader  pab cnek cndk kykeys
+		"tabernacle-relay-dilithium-v1" 1D lit pab 20 lit pader  pab cnpk cnsk dikeys
+		-1 lit cnok !
+	then
+;
+
+\ cnonion ( g ek dk -- )
+: cngv variable ;  : cng ( -- a )  cngv 4 lit lazy ;
+: cnonion ( g ek dk -- )
+	rot cng be!
+	88 lit 1F lit kbeg  "tabernacle-relay-kyber-v1" 19 lit kabs  wlseed 20 lit kabs  cng 4 lit kabs  kend  pab 40 lit ksqz
+	pab -rot kykeys
+;
+
+\ ── Entries ──
+
+: cnev variable ;  : cne ( -- a )  cnev 1200 lit lazy ;   \ ours
+: cnrv variable ;  : cnrnd ( -- a )  cnrv 20 lit lazy ;
+: cnip variable ;  : cnpo variable ;  : cndy variable ;
+
+\ cnmake ( ip port days -- )
+: cnmake ( ip port days -- )
+	cndy ! cnpo ! cnip !
+	cnkeys  cne cnlen nzero
+	524C5931 lit cne be!                                              \ "RLY1"
+	bnet @ 1 lit and cne 4 lit + be!
+	cnip @ cne 8 lit + be!  cnpo @ cne C lit + nb16!
+	hnow cndy @ 5265C00 lit * 0 lit wlq+ cne 10 lit + qbe!            \ days of ms
+	cne 10 lit + qbe@ drop cnek cndk cnonion                              \ its onion key
+	cnek cne 18 lit + 320 lit ncpy  cnpk cne 338 lit + 520 lit ncpy
+	cnrnd 20 lit rnget 0= if cnrnd 20 lit nzero then                  \ hedged; else deterministic
+	cnsk cne cnsgn cnrnd cne cnsgn + disign
+;
+
+\ cncheck ( e -- ok )
+: cncheck ( e -- ok )
+	dup be32 524C5931 lit =
+	over 4 lit + be32 bnet @ 1 lit and = and
+	over 8 lit + be32 0= 0= and  over C lit + nb16@ 0= 0= and  over E lit + nb16@ 0= and
+	if dup 338 lit + over cnsgn 3 lit pick cnsgn + diverify else 0 lit then
+	nip
+;
+
+\ cnid ( e out -- )
+: cnid ( e out -- )   swap 338 lit + 520 lit rot sha3256 ;
+
+\ ── consensus.txt ──
+
+: cnlv variable ;  : cnent ( k -- a )  cnlen * cnlv cnmax cnlen * lazy + ;
+: cniv variable ;  : cnids ( k -- a )  5 lit lshift cniv cnmax 5 lit lshift lazy + ;
+: cnn variable ;
+
+: cnhead ( -- s )   bnet @ if "tabernacle-consensus 1 dev\n" else "tabernacle-consensus 1 main\n" then ;
+
+\ cnhv ( c -- v | -1 )   a hex digit's value (either case).
+: cnhv ( c -- v | -1 )
+	dup 30 lit - A lit u< if 30 lit - else
+	20 lit or dup 61 lit - 6 lit u< if 57 lit - else drop -1 lit then then
+;
+
+\ cnunhex ( a out n -- ok )   2n hex digits at a as n bytes at out.
+: cnhok variable ;
+: cnunhex ( a out n -- ok )
+	-1 lit cnhok !
+	0 lit do
+		over i 1 lit lshift + dup c@ cnhv swap 1 lit + c@ cnhv
+		2dup or 0< if 2drop 0 lit cnhok ! else swap 4 lit lshift or over i + c! then
+	loop 2drop cnhok @
+;
+
+\ cnparse ( a n -- ok )
+: cnpa variable ;  : cnpe variable ;  : cnpok variable ;
+: cnparse ( a n -- ok )
+	over + cnpe !  cnpa !  0 lit cnn !
+	cnhead strlen  cnpe @ cnpa @ - over u< 0=  if
+		cnpa @ cnhead 2 lit pick mcmp 0= cnpok !  cnpa @ + cnpa !
+	else drop 0 lit cnpok ! then
+	begin cnpok @ cnpa @ cnpe @ u< and while
+		cnpe @ cnpa @ - cnlen 1 lit lshift 7 lit + u< 0=                   \ "relay ", the hex, "\n"
+		cnn @ cnmax u< and
+		cnpa @ "relay " 6 lit mcmp 0= and
+		cnpa @ cnlen 1 lit lshift 6 lit + + c@ A lit = and if
+			cnpa @ 6 lit + cnn @ cnent cnlen cnunhex
+			cnn @ cnent cncheck and if
+				cnn @ cnent cnn @ cnids cnid
+				cnn @ if cnn @ 1 lit - cnids cnn @ cnids 20 lit mcmp 0< else -1 lit then    \ in order
+				if cnn @ 1 lit + cnn !  cnpa @ cnlen 1 lit lshift 7 lit + + cnpa !
+				else 0 lit cnpok ! then
+			else 0 lit cnpok ! then
+		else 0 lit cnpok ! then
+	repeat
+	cnpok @
+;
+
+\ ── The aux tree ──
+
+: cnbv variable ;  : cnb ( -- a )  cnbv 4 lit lazy ;
+: cnout variable ;  : cnl variable ;  : cnr variable ;
+
+\ cnleaf ( a n out -- )
+: cnleaf ( a n out -- )   cnout !  shinit  0 lit cnb c!  cnb 1 lit shupd  shupd  cnout @ shfin ;
+
+\ cnnode ( l r out -- )
+: cnnode ( l r out -- )
+	cnout ! cnr ! cnl !
+	shinit  1 lit cnb c!  cnb 1 lit shupd  cnl @ 20 lit shupd  cnr @ 20 lit shupd  cnout @ shfin
+;

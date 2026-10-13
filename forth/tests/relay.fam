@@ -1,0 +1,63 @@
+\ tests/relay.fam — the payment relays (src/relay.fam): records made,
+\ checked and refused; a relay's directory keeping the newest, and the way
+\ back to it (an IP, or a circuit's, which it never gives out).
+
+: tzgv variable ;  : tzg ( -- a )  tzgv 1200 lit lazy ;     \ a record kept aside
+: tzpv variable ;  : tzp ( -- a )  tzpv 500 lit lazy ;     \ a part's body
+\ tzput ( id k parts n -- msg n | 0 )   part k of a message: n bytes, each
+\        its part number, then reassembled.
+: tzn variable ;
+: tzput ( id k parts n -- msg n | 0 )
+	tzn !  tzp 5 lit + c!  dup tzp 4 lit + c!
+	tzp 6 lit + tzn @ 0 lit do over over i + c! loop 2drop  tzp be!
+	tzp pbd !  tzn @ 6 lit + pbn !  pzpart
+;
+: tzgvv variable ;  : tzval ( -- a )  tzgvv 20 lit lazy ;
+
+Test {
+	relay_record {
+		20 lit 0 lit do i 7 lit * 3 lit + wlseed i + c! loop  0 lit paok !  0 lit bnet !
+		rlmake
+		rlmy rlcheck assert  rlh paid 20 lit mcmp 0= assert                \ its address: ours
+		rlmy tzg rllen ncpy
+		\ a key's byte, the sequence, or the network changed: refused
+		tzg 20 lit + dup c@ 1 lit xor swap c!  tzg rlcheck 0= assert  tzg 20 lit + dup c@ 1 lit xor swap c!
+		tzg F lit + dup c@ 1 lit xor swap c!  tzg rlcheck 0= assert  tzg F lit + dup c@ 1 lit xor swap c!
+		1 lit bnet !  tzg rlcheck 0= assert  0 lit bnet !
+		tzg rlcheck assert
+	}
+	relay_directory {
+		\ kept; the same again: not newer; a newer one: kept in its place
+		A000202 lit rlrip !  4D2 lit rlrpt !
+		pgop rlcnt @ tzval !                                                  \ the count before
+		tzg rlkeep 0 lit asrt_eq
+		tzg rlkeep 2 lit asrt_eq
+		pgop rlcnt @ tzval @ 1 lit + asrt_eq
+		rlmake  rlmy rlkeep 0 lit asrt_eq                                     \ a later sequence
+		pgop rlcnt @ tzval @ 1 lit + asrt_eq                                  \ the same address: one entry
+		rldir paid rlv btget assert
+		rlv 8 lit + qbe@ rlmy 10 lit + qbe@ rot = -rot = and assert           \ its expiry
+		rlv 10 lit + @ A000202 lit asrt_eq  rlv 14 lit + @ 4D2 lit asrt_eq  \ where it was heard
+		rlv 18 lit + @ pgget rlmy 1000 lit mcmp 0= assert                    \ its bytes
+		rlv 1C lit + @ pgget rlmy 1000 lit + rllen 1000 lit - mcmp 0= assert
+		tzg rlkeep 2 lit asrt_eq                                               \ the older one: refused
+		rlvia? 0= assert  tzval rlhrd  tzval be32 A000202 lit asrt_eq  tzval 4 lit + nb16@ 4D2 lit asrt_eq
+		\ registered by circuit (src/onion.fam): the way back kept, no IP given out
+		C0FFEE lit rlrip !  FFFF0005 lit rlrpt !  rlmake  rlmy rlkeep 0 lit asrt_eq
+		rldir paid rlv btget assert  rlvia? assert  rlv 10 lit + @ C0FFEE lit asrt_eq
+		tzval rlhrd  tzval be32 0 lit asrt_eq  tzval 4 lit + nb16@ 0 lit asrt_eq
+	}
+	payment_parts {
+		\ 3 parts, out of order, one twice: whole once all are in, in order
+		7 lit 2 lit 3 lit 10 lit tzput 0 lit asrt_eq
+		7 lit 0 lit 3 lit 3E0 lit tzput 0 lit asrt_eq
+		7 lit 0 lit 3 lit 3E0 lit tzput 0 lit asrt_eq
+		7 lit 1 lit 3 lit 3E0 lit tzput  7D0 lit asrt_eq                      \ 2 x 0x3E0 + 0x10
+		dup c@ 0 lit asrt_eq  dup 3E0 lit + c@ 1 lit asrt_eq  dup 7C0 lit + c@ 2 lit asrt_eq  7CF lit + c@ 2 lit asrt_eq
+		\ 33 parts: the second mask word
+		21 lit 0 lit do 9 lit i 21 lit 3E0 lit tzput i 20 lit = if 7FE0 lit asrt_eq drop else 0 lit asrt_eq then loop
+		\ a part number past the parts, or too many parts: refused
+		5 lit 3 lit 3 lit 10 lit tzput 0 lit asrt_eq
+		5 lit 0 lit 29 lit 10 lit tzput 0 lit asrt_eq
+	}
+}

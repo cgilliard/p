@@ -1,0 +1,65 @@
+\ tests/rlist.fam — the relay list's tally (src/rlist.fam), on dev (3 relays
+\ at least): a window of 12 blocks -- 6 for a file that isn't valid (its
+\ relays out of order), 4 for a valid one, an abstention, a tree given up on
+\ -- goes to the valid one, listed mode; votes that can't be counted yet
+\ hold the decision.  After tests/consensus.fam (its helpers write files).
+
+: tqrev variable ;  : tqre ( k -- a )  1200 lit * tqrev 3600 lit lazy + ;   \ 3 entries, by id
+: tqriv variable ;  : tqri ( k -- a )  5 lit lshift tqriv 60 lit lazy + ;
+: tqrtv variable ;  : tqrt ( -- a )  tqrtv 1200 lit lazy ;
+: tqrhv variable ;  : tqrh ( -- a )  tqrhv 100 lit lazy ;     \ a header
+: tqrzv variable ;  : tqrz ( -- a )  tqrzv 20 lit lazy ;      \ zeros
+: tqrav variable ;  : tqra ( k -- a )  5 lit lshift tqrav 80 lit lazy + ;   \ roots: 0 valid, 1 not
+: tqrlv variable ;  : tqrl ( k -- a )  5 lit lshift tqrlv 80 lit lazy + ;   \ leaves
+
+\ tqrswap ( i j -- )   entries i and j (and their ids) change places.
+: tqrswap ( i j -- )
+	over tqre tqrt cnlen ncpy  dup tqre 2 lit pick tqre cnlen ncpy  tqrt over tqre cnlen ncpy
+	over tqri tqrt 20 lit ncpy  dup tqri 2 lit pick tqri 20 lit ncpy  tqrt swap tqri 20 lit ncpy  drop
+;
+: tqrord ( i j -- )   over tqri over tqri 20 lit mcmp 0 lit > if tqrswap else 2drop then ;
+
+\ tqrkeep ( k -- )   file tjf (tjfn bytes) kept in slot k, with root k: its
+\        leaf on the left, zeros on the right.
+: tqrkeep ( k -- )
+	0 lit over axfb c!  tjf over axfb 1 lit + tjfn @ ncpy  tjfn @ 1 lit + over axflen !
+	tjf tjfn @ 2 lit pick tqrl cnleaf  dup tqrl over axfhash 20 lit ncpy
+	dup tqrl tqrz 2 lit pick tqra cnnode
+	dup tqra swap tqrl tqrz axnput
+;
+
+\ tqrblock ( root h -- )   a header at h whose aux_hash is root (0: zeros), now.
+: tqrblock ( root h -- )
+	tqrh BC lit nzero  swap ?dup if tqrh 64 lit + 20 lit ncpy then
+	hnow tqrh 94 lit + be!  tqrh 98 lit + be!
+	tqrh tqrz 2 lit pick rqset drop
+;
+
+Test {
+	rlist_tally {
+		wlseed tjsave 20 lit ncpy  1 lit bnet !
+		3 lit 0 lit do i 11 lit + tjrelay  cne i tqre cnlen ncpy  i tqre i tqri cnid loop
+		0 lit 1 lit tqrord  1 lit 2 lit tqrord  0 lit 1 lit tqrord              \ by id
+		tqrz 20 lit nzero  0 lit axpin !  0 lit rqbn !  0 lit axqn !  0 lit axwk !
+		tjhead  0 lit tqre tjline 1 lit tqre tjline 2 lit tqre tjline  0 lit tqrkeep
+		tjhead  1 lit tqre tjline 0 lit tqre tjline 2 lit tqre tjline  1 lit tqrkeep   \ out of order
+		\ the window: heights 100 .. 111
+		64 lit rqwa !  70 lit rqwb !
+		6 lit 0 lit do 1 lit tqra 64 lit i + tqrblock loop                     \ 6 for the bad file
+		4 lit 0 lit do 0 lit tqra 6A lit i + tqrblock loop                     \ 4 for the good one
+		0 lit 6E lit tqrblock                                                   \ abstains
+		tqrz 1 lit over c!  6F lit tqrblock  tqrz axgive  0 lit tqrz c!          \ a tree given up on
+		rqcount  rqvoted @ A lit asrt_eq  rqunres @ 1 lit asrt_eq  rqpend @ 0 lit asrt_eq
+		rqwinner rqc 1 lit tqrl 20 lit mcmp 0 lit asrt_eq                       \ the bad file leads ...
+		rqwinner dup rqc rqwin 20 lit ncpy  rqc 20 lit + @ rqfor !  rqwfile
+		rqst @ 0 lit asrt_eq  1 lit tqrl rqbad? assert                          \ ... and isn't valid
+		rqcount  rqvoted @ 4 lit asrt_eq
+		rqwinner dup rqc rqwin 20 lit ncpy  rqc 20 lit + @ rqfor !  rqwfile
+		rqst @ 2 lit asrt_eq  rqfor @ 4 lit asrt_eq  rqlive @ 3 lit asrt_eq  cnn @ 3 lit asrt_eq
+		rqwin 0 lit tqrl 20 lit mcmp 0 lit asrt_eq  axpin @ 1 lit asrt_eq
+		\ a tree not kept yet: wanted, and the decision waits for it
+		tqrz 2 lit over c!  6E lit tqrblock  0 lit tqrz c!
+		rqcount  rqpend @ 1 lit asrt_eq  axqn @ 1 lit asrt_eq
+		0 lit axqn !  0 lit bnet !  tjsave wlseed 20 lit ncpy  0 lit cnok !
+	}
+}

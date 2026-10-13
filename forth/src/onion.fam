@@ -1,0 +1,926 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/onion.fam — circuits (docs/RELAYS.md, phases 2 and 3): in listed mode
+\ a sender reaches the receiver's home relay through a guard and a middle
+\ relay, and the home relay does the lookup and relays the payment's parts
+\ at the circuit's end; the receiver keeps a circuit of its own to each of
+\ its home relays, registers through it, and is delivered to back along it.
+\ No relay sees both ends, and none learns the receiver's IP but its guard.
+\
+\   0x1B CREATE1  circuit id (4), ct1 (0x300): to the relay's onion key
+\   0x1C CREATE2  circuit id (4), a one-time Kyber key (0x320)
+\   0x1D CREATED  circuit id (4), ct2 (0x300), confirmation (16)
+\   0x1E CELL     circuit id (4), nonce (12), body (0x450): towards the end
+\   0x1F BCELL    circuit id (4), nonce (12), body (0x450): back
+\
+\ Keys: SHAKE256("tabernacle-circuit-v1" ‖ k1 ‖ k2 ‖ SHA3-256(ct1 ‖ key ‖
+\ ct2), 0x50): forward, backward, the confirmation.  A body: the 0x440
+\ bytes inside sealed (ChaCha20-Poly1305) under the end hop's key, then
+\ ChaCha20 under each hop before it; each hop takes its layer off with the
+\ cell's nonce, the end checks the tag.  Back: the end seals, each hop adds
+\ a layer, the client takes them off.  Inside: a command, a length (2), the
+\ bytes, zeros:
+\   1 EXTEND1 ip, port, ct1   2 EXTEND2 the one-time key   3 ASK address
+\   4 RELAY address, a part   5 EXTENDED ct2, confirmation
+\   6 FOUND part, parts, bytes (the record, then ip and port: zeros for
+\     one reached by circuit)   7 NOTFOUND
+\   8 REGISTER part, parts, bytes (our record)   9 REGISTERED status (as
+\     src/relay.fam's ACK), the address   A DELIVER a part, as 0x15 carries
+\     it   B KEEP (keeps the circuit from going idle; the end answers it
+\     the same)
+\
+\ A relay (the `relay` setting) keeps up to 64 circuits (idle 10 minutes:
+\ gone), starts at most one from an IP every 2 s (but a listed relay's: a
+\ guard extends many).  A record registered by circuit is kept with the
+\ circuit as the way back (src/relay.fam: rlkeep), one a circuit every 10 s.
+\
+\ The client's circuits: 0 for sending (a lookup and a payment), 1 + g for
+\ receiving through relay g of rlg (our home relays) -- a KEEP down it every
+\ 4 minutes (unanswered for 20 s: built anew), one to the guard every 20 s
+\ for our NAT, built anew hourly; a
+\ new one makes a new record (src/relay.fam: rlregs), registered along
+\ every circuit.  One is built at a time (sending first): the guard the
+\ live relay with the highest SHA3-256(
+\ "tabernacle-guard-v1" ‖ the wallet's seed ‖ the period ‖ its id) -- a
+\ period: 2^32 ms, about 50 days -- the middle at random, the home the
+\ target; three different relays, none of our own home relays and (main)
+\ no two in one /16 when the list leaves room.  A step not answered in
+\ 1.5 s is sent again, a circuit not built in 6 s built anew (twice for a
+\ home relay; then the next).
+\
+\   oncirc ( -- f )        lookups and messages go by circuit (listed mode,
+\                          no userelay=, not `direct`, a wallet)
+\   onsend ( msg n dest -- )   a message's parts, RELAYed by circuit to
+\                          one of dest's relays (rlt: rqtgt)
+\   onin ( -- f )          a datagram of ours (0x1B .. 0x1F): handled
+\   ontick ( -- )
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: oninn ( -- n )   440 lit ;                                \ a cell's contents
+: onbody ( -- n )  450 lit ;                                \ sealed
+: ondirect variable ;                                       \ the setting `direct`
+
+\ ── Keys and layers ──
+
+: onthv variable ;  : onth ( -- a )  onthv 20 lit lazy ;
+: onk1 variable ;  : onk2 variable ;  : onc1 variable ;  : onek variable ;  : onc2 variable ;  : onout variable ;
+
+\ onkdf ( k1 k2 ct1 ek ct2 out -- )   the circuit's keys (0x50 bytes).
+: onkdf ( k1 k2 ct1 ek ct2 out -- )
+	onout ! onc2 ! onek ! onc1 ! onk2 ! onk1 !
+	88 lit 6 lit kbeg  onc1 @ 300 lit kabs  onek @ 320 lit kabs  onc2 @ 300 lit kabs  kend  onth 20 lit ksqz
+	88 lit 1F lit kbeg  "tabernacle-circuit-v1" 15 lit kabs  onk1 @ 20 lit kabs  onk2 @ 20 lit kabs
+	onth 20 lit kabs  kend  onout @ 50 lit ksqz
+;
+
+\ onrand ( a n -- )   random bytes (from the clock's nonces, if no device).
+: onrand ( a n -- )   2dup rnget if 2drop else 0 lit do pnonce drop over i + c! loop drop then ;
+
+: onzv variable ;  : onz ( -- a )  onzv 4 lit lazy ;
+: onss variable ;  : onsd variable ;
+\ onseal ( key nonce src dst -- )   0x440 bytes sealed: 0x450.
+: onseal ( key nonce src dst -- )   onsd ! onss !  onz 0 lit onss @ oninn onsd @ aeseal ;
+\ onopen ( key nonce src dst -- ok )
+: onopen ( key nonce src dst -- ok )   onsd ! onss !  onz 0 lit onss @ oninn onsd @ aeopen ;
+\ onxor ( key nonce buf -- )   a layer on or off.
+: onxb variable ;
+: onxor ( key nonce buf -- )   onxb !  1 lit onxb @ onxb @ onbody chacha ;
+
+: oniv variable ;  : oni ( -- a )  oniv 440 lit lazy ;     \ contents
+: onbv variable ;  : onb ( -- a )  onbv 460 lit lazy ;     \ a body
+: onnv variable ;  : onn ( -- a )  onnv 10 lit lazy ;      \ a nonce
+
+\ oncmd ( cmd a n -- )   the contents: cmd, n, the bytes, zeros.
+: oncmd ( cmd a n -- )
+	oni oninn nzero  dup oni 1 lit + nb16!  oni 3 lit + swap ncpy  oni c!
+;
+
+: ocmap ( i -- ip )   cnent 8 lit + be32 dup 18 lit rshift 7F lit = if drop A000202 lit then ;
+: ocport ( i -- port )   cnent C lit + nb16@ ;
+
+\ onrly? ( -- f )   the datagram comes from a listed relay.
+: onrly? ( -- f )   0 lit cnn @ ?dup if 0 lit do i ocmap nsrc @ = i ocport nsport @ = and or loop then ;
+
+\ ── A relay's circuits ──
+\ Up to onmax (4096), each 0x80 bytes:
+\ 0 state (0 free, 1 being made, 2 made)  4 back: ip  8 port  C circuit id
+\ 10 on: ip  14 port  18 circuit id  1C on: 0 none, 1 extending, 2 extended
+\ 20 forward key  40 backward key  60 last used  64 halves had (1 ct1,
+\ 2 the one-time key; 4 its handshake buffer holds CREATED)  68 its
+\ handshake buffer (j + 1, 0 none)  6C, 70 the next in its chain, back and
+\ on (k + 1)  74, 78 the relay to extend to  7C the last registration.
+\ Found by hash chains, by where a circuit comes from (back) and where it
+\ goes on to (on).  A handshake's bytes (CREATE's halves, then CREATED's;
+\ or an EXTEND's) are in one of 16 buffers, while it's under way.
+
+: onmax ( -- n )   1000 lit ;                              \ a power of two
+: oncv variable ;  : onc ( k -- a )  7 lit lshift oncv 80000 lit lazy + ;
+
+\ onhash ( ip port cid -- b )   a chain (0 .. 0x3FF).
+: onhash ( ip port cid -- b )   xor xor dup 10 lit rshift xor dup 8 lit rshift xor 3FF lit and ;
+: onhdv variable ;
+\ onhead ( b w -- a )   chain b's first link, back (w 0) or on (w 1).
+: onhead ( b w -- a )   A lit lshift + 2 lit lshift onhdv 2000 lit lazy + ;
+: onkf ( w -- off )   C lit * 4 lit + ;                   \ where its ip, port, id are
+: onnx ( w -- off )   2 lit lshift 6C lit + ;             \ its link
+: onbkt ( k w -- b )   onkf swap onc + dup @ over 4 lit + @ rot 8 lit + @ onhash ;
+
+: onxk variable ;  : onxw variable ;
+\ onins ( k w -- )   circuit k into its chain.
+: onins ( k w -- )
+	onxw ! onxk !
+	onxk @ onxw @ onbkt onxw @ onhead
+	dup @ onxk @ onc onxw @ onnx + !  onxk @ 1 lit + swap !
+;
+\ onrem ( k w -- )   circuit k out of its chain.
+: onrem ( k w -- )
+	onxw ! onxk !
+	onxk @ onxw @ onbkt onxw @ onhead
+	begin dup @ dup 0= 0= swap onxk @ 1 lit + = 0= and while dup @ 1 lit - onc onxw @ onnx + repeat
+	dup @ if onxk @ onc onxw @ onnx + @ swap ! else drop then
+;
+
+\ onfind ( ip port cid w -- k | -1 )   by where it comes from (w 0) or goes
+\        on to (w 1).
+: onfi variable ;  : onfo variable ;  : onfd variable ;
+: onfind ( ip port cid w -- k | -1 )
+	onxw ! onfd ! onfo ! onfi !
+	-1 lit  onfi @ onfo @ onfd @ onhash onxw @ onhead @
+	begin dup while
+		1 lit - onxk !
+		onxk @ onc onxw @ onkf + dup @ onfi @ =  over 4 lit + @ onfo @ = and  swap 8 lit + @ onfd @ = and
+		onxk @ onc @ 0= 0= and
+		if drop onxk @ 0 lit else onxk @ onc onxw @ onnx + @ then
+	repeat drop
+;
+: onfp ( ip port cid -- k | -1 )   0 lit onfind ;
+: onfn ( ip port cid -- k | -1 )   1 lit onfind dup 0< 0= if dup onc @ 2 lit = 0= if drop -1 lit then then ;
+
+\ ── Handshake buffers ──
+\ 16, each 0 ct1 (then ct2)  300 the one-time key (then the confirmation)
+\ 620 its circuit (k + 1, 0 free)  624 when taken.
+: onplv variable ;  : onpl ( j -- a )  630 lit * onplv 6300 lit lazy + ;
+\ onhs ( k -- a )   circuit k's buffer (it has one).
+: onhs ( k -- a )   onc 68 lit + @ 1 lit - onpl ;
+\ onprel ( k -- )   its buffer, free again.
+: onprel ( k -- )   onc 68 lit + dup @ ?dup if 1 lit - onpl 620 lit + 0 lit swap ! then 0 lit swap ! ;
+\ onpget ( k -- a | 0 )   its buffer, one taken if it has none (free, or
+\        held 30 s: that handshake's given up on).
+: onpget ( k -- a | 0 )
+	dup onc 68 lit + @ ?dup if nip 1 lit - onpl else
+		-1 lit  10 lit 0 lit do dup 0< if i onpl 620 lit + @ 0=  i onpl 624 lit + @ pago 7530 lit u> or if drop i then then loop
+		dup 0< if 2drop 0 lit else
+			dup onpl 620 lit + @ ?dup if 1 lit - onc 68 lit + 0 lit swap ! then
+			over 1 lit + over onpl 620 lit + !  pms over onpl 624 lit + !
+			dup 1 lit + rot onc 68 lit + !  onpl
+		then
+	then
+;
+
+\ onfree ( k -- )   circuit k gone: out of its chains, its buffer free.
+: onfree ( k -- )
+	dup onc @ if dup 0 lit onrem then  dup onc 1C lit + @ if dup 1 lit onrem then
+	dup onprel  onc 80 lit nzero
+;
+
+\ onslot ( -- k | -1 )   a free one (or idle 10 minutes), freed.
+: onsc variable ;
+: onslot ( -- k | -1 )
+	-1 lit  onmax 0 lit do
+		dup 0< if
+			onsc @ 1 lit + onmax 1 lit - and dup onsc !
+			dup onc @ 0=  over onc 60 lit + @ pago 927C0 lit u> or if nip else drop then
+		then
+	loop
+	dup 0< 0= if dup onfree then
+;
+
+\ ── Limits ──
+\ A CREATE that starts a circuit: from an IP, 4 at once, then one every 2 s
+\ (but a listed relay's: a guard extends many); in all, 10 at once, then
+\ one every 100 ms (each costs a decapsulation and an encapsulation).
+\ ongcra ( a iv lim -- ok )   one more, if the one at a (its "theoretical
+\        arrival time") is no more than lim ahead; then iv more.
+: ona variable ;  : ongiv variable ;  : onlm variable ;
+: ongcra ( a iv lim -- ok )
+	onlm ! ongiv ! ona !
+	ona @ @ pms -  dup 0< over onlm @ ongiv @ + > or if drop 0 lit then
+	dup onlm @ > if drop 0 lit else ongiv @ + pms + ona @ ! -1 lit then
+;
+: onrv variable ;  : onrt ( -- a )  onrv 80 lit lazy ;
+: onall variable ;
+: onlim? ( -- ok )
+	onrly? if -1 lit else nsrc @ dup 10 lit rshift xor 1F lit and 2 lit lshift onrt + 7D0 lit 1770 lit ongcra then
+	dup if drop onall 64 lit 384 lit ongcra then
+;
+
+\ ── Our onion key ──
+\ The Kyber key of our entry in the list in use: made from the seed and the
+\ entry's expiry (src/consensus.fam: cnonion), so a new entry brings a new
+\ key.  Not listed: the expiry's 0.
+: onmiv variable ;  : onmid ( -- a )  onmiv 20 lit lazy ;   \ our relay id
+: onkiv variable ;  : onkid ( -- a )  onkiv 20 lit lazy ;   \ the id the key's for
+: onkev variable ;  : onke ( -- a )  onkev 320 lit lazy ;
+: onkdv variable ;  : onkd ( -- a )  onkdv 660 lit lazy ;
+: ongen variable ;  : ongok variable ;
+\ onmyk ( -- dk )
+: onmyk ( -- dk )
+	cnkeys  88 lit 6 lit kbeg  cnpk 520 lit kabs  kend  onmid 20 lit ksqz
+	0 lit  cnn @ ?dup if 0 lit do i cnids onmid 20 lit mcmp 0= if drop i cnent 10 lit + qbe@ drop then loop then
+	dup ongen @ = ongok @ and  onkid onmid 20 lit mcmp 0= and if drop else
+		dup ongen !  onke onkd cnonion  onmid onkid 20 lit ncpy  -1 lit ongok !
+	then
+	onkd
+;
+
+\ ── Links ──
+
+\ onlink ( type ip port cid a n -- )   a message on a link: the id, n bytes.
+: onlt variable ;  : onli variable ;  : onlo variable ;  : onld variable ;  : onla variable ;  : onln variable ;
+: onlink ( type ip port cid a n -- )
+	onln ! onla ! onld ! onlo ! onli !
+	phdr  onld @ over be!  onla @ swap 4 lit + onln @ ncpy
+	onli @ onlo @ onln @ A lit + nsend drop
+;
+\ oncell ( type ip port cid -- )   a cell: the id, the nonce at onn, the body at onb.
+: oncell ( type ip port cid -- )
+	onld ! onlo ! onli !
+	phdr  onld @ over be!  onn over 4 lit + C lit ncpy  onb swap 10 lit + onbody ncpy
+	onli @ onlo @ onbody 16 lit + nsend drop
+;
+
+\ ── Mixing delays ──
+\ The setting mixdelay=MS: a cell this relay passes on (either way) is held
+\ a random 0 .. MS first.  Up to 32 held, each 0 when due  4 type  8 ip
+\ C port  10 circuit id  14 nonce (12)  20 body (0x450); full: sent now.
+: ondly variable ;
+: onqv variable ;  : onq ( j -- a )  470 lit * onqv 470 lit 20 lit * lazy + ;
+: onqn variable ;   \ held
+\ onfwd ( type ip port cid -- )   the cell at onn, onb, on (now or later).
+: onfwd ( type ip port cid -- )
+	ondly @ 0= onqn @ 20 lit = or if oncell else
+		-1 lit  20 lit 0 lit do dup 0< i onq 4 lit + @ 0= and if drop i then loop    ( type ip port cid j )
+		onq  tuck 10 lit + !  tuck C lit + !  tuck 8 lit + !  tuck 4 lit + !
+		pnonce drop ondly @ % pms + over !
+		onn over 14 lit + C lit ncpy  onb swap 20 lit + onbody ncpy  onqn @ 1 lit + onqn !
+	then
+;
+\ onflush ( -- )   the cells held that are due, sent.
+: onflush ( -- )
+	onqn @ if 20 lit 0 lit do
+		i onq 4 lit + @ if i onq @ pms - 0< if
+			i onq 14 lit + onn C lit ncpy  i onq 20 lit + onb onbody ncpy
+			i onq 4 lit + @ i onq 8 lit + @ i onq C lit + @ i onq 10 lit + @ oncell
+			0 lit i onq 4 lit + !  onqn @ 1 lit - onqn !
+		then then
+	loop then
+;
+
+\ onback ( k cmd a n -- )   back to the client, from the circuit's end.
+: onbk variable ;
+: onback ( k cmd a n -- )
+	oncmd  onbk !  onn C lit onrand
+	onbk @ onc 40 lit + onn oni onb onseal
+	1F lit  onbk @ onc 4 lit + @  onbk @ onc 8 lit + @  onbk @ onc C lit + @  oncell
+;
+
+\ oncrtd ( k -- )   CREATED (again), as made -- while its buffer holds it.
+: oncrtd ( k -- )
+	dup onc 64 lit + @ 4 lit and if
+		dup onhs  1D lit phdr  2 lit pick onc C lit + @ over be!
+		over over 4 lit + 300 lit ncpy  swap 300 lit + over 304 lit + 10 lit ncpy  drop
+		onc dup 4 lit + @ swap 8 lit + @ 31A lit nsend drop
+	else drop then
+;
+
+\ onresp ( k -- )   both halves in: the keys, CREATED.
+: onrk variable ;
+: onkv variable ;  : onkb ( -- a )  onkv 60 lit lazy ;     \ 0 k1  20 k2  40 m
+: onctv variable ;  : onct2 ( -- a )  onctv 300 lit lazy ;
+: onokv variable ;  : onok ( -- a )  onokv 50 lit lazy ;
+: onresp ( k -- )
+	onrk !
+	onmyk  onrk @ onhs  onkb kydecap drop                                     \ k1
+	onkb 40 lit + 20 lit onrand
+	onrk @ onhs 300 lit +  onkb 40 lit +  onkb 20 lit +  onct2 kyencap if     \ k2, ct2
+		onkb  onkb 20 lit +  onrk @ onhs  onrk @ onhs 300 lit +  onct2 onok onkdf
+		onok onrk @ onc 20 lit + 40 lit ncpy
+		onct2 onrk @ onhs 300 lit ncpy  onok 40 lit + onrk @ onhs 300 lit + 10 lit ncpy
+		2 lit onrk @ onc !  0 lit onrk @ onc 1C lit + !  4 lit onrk @ onc 64 lit + !
+		pms onrk @ onc 60 lit + !
+		"circuit: a hop for " lputs onrk @ onc 4 lit + @ fnip. 3A lit lputc onrk @ onc 8 lit + @ fndec A lit lputc
+		onrk @ oncrtd
+	else onrk @ onfree then
+;
+
+\ oncrin ( half -- )   CREATE1 (1) or CREATE2 (2), to a relay.
+: onh variable ;
+: oncrin ( half -- )
+	onh !
+	pbn @  onh @ 1 lit = if 304 lit else 324 lit then =  rlserve @ and if
+		nsrc @ nsport @ pbd @ be32 onfp
+		dup 0< if drop onlim? if onslot dup 0< 0= if
+			1 lit over onc !  nsrc @ over onc 4 lit + !  nsport @ over onc 8 lit + !
+			pbd @ be32 over onc C lit + !  pms over onc 60 lit + !  dup 0 lit onins
+		then else -1 lit then then
+		dup 0< if drop else
+			dup onc @ 2 lit = if oncrtd else
+				dup onpget ?dup 0= if onfree else
+					pbd @ 4 lit + swap  onh @ 1 lit = if 300 lit else 300 lit + 320 lit then ncpy
+					dup onc 64 lit + dup @ onh @ or swap !
+					dup onc 64 lit + @ 3 lit = if onresp else drop then
+				then
+			then
+		then
+	then
+;
+
+\ onxsend ( k -- )   CREATE1 and CREATE2 to the relay it extends to.
+: onxsend ( k -- )
+	dup onhs  over onc                                                        ( k hs c )
+	1B lit over 10 lit + @ 2 lit pick 14 lit + @ 3 lit pick 18 lit + @ 5 lit pick 300 lit onlink
+	1C lit over 10 lit + @ 2 lit pick 14 lit + @ 3 lit pick 18 lit + @ 5 lit pick 300 lit + 320 lit onlink
+	drop 2drop
+;
+
+\ onask ( k -- )   ASK at the end: the record, in parts, or NOTFOUND.
+: onpv variable ;  : onpt ( -- a )  onpv 440 lit lazy ;
+: onask ( k -- )
+	oni 3 lit + rlh 20 lit ncpy
+	rldir rlh rlv btget dup if drop rlv 8 lit + qbe@ rlnow du< 0= then if
+		rlv 18 lit + @ pgget rlo 1000 lit ncpy  rlv 1C lit + @ pgget rlo 1000 lit + rllen 1000 lit - ncpy
+		rlo rllen + rlhrd
+		5 lit 0 lit do                                                         \ 0x11D2 bytes: 5 parts
+			i onpt c!  5 lit onpt 1 lit + c!
+			rllen 6 lit + i 438 lit * - 438 lit pumin                                ( k len )
+			rlo i 438 lit * + onpt 2 lit + 2 lit pick ncpy
+			over 6 lit onpt 3 lit pick 2 lit + onback  drop
+		loop drop
+	else 7 lit onz 0 lit onback then
+;
+
+\ ondvia ( n -- )   the part (n bytes, with the address) DELIVERed back along
+\        the receiver's circuit, the one rlv names, if it's still there.
+: ondvia ( n -- )
+	20 lit -  oni 23 lit + onpt 2 lit pick ncpy
+	rlv 14 lit + @ FFFF lit and                                             ( n k )
+	dup onmax u< if dup onc @ 2 lit =  over onc C lit + @ rlv 10 lit + @ = and  over onc 1C lit + @ 0= and else 0 lit then
+	if A lit onpt 3 lit pick onback drop else 2drop then
+;
+
+\ ondeliv ( k -- )   RELAY at the end: delivered where the address was heard,
+\        or along its circuit.
+: ondeliv ( k -- )
+	drop  oni 1 lit + nb16@ dup 26 lit u< 0= if
+		rldir oni 3 lit + rlv btget if rlv 8 lit + qbe@ rlnow du< 0= if
+			rlvia? if ondvia else
+				15 lit phdr  oni 23 lit + swap 2 lit pick 20 lit - ncpy
+				rlv 10 lit + @ rlv 14 lit + @ rot 20 lit - 6 lit + nsend drop
+			then
+		else drop then else drop then
+	else drop then
+;
+
+\ Registrations by circuit, reassembled: 4 slots, each 0 the circuit (k + 1,
+\ 0: free), 4 its id, 8 the parts had (bits), C when begun, 10 the record.
+: onrgv variable ;  : onrg ( j -- a )  1210 lit * onrgv 4840 lit lazy + ;
+: onrj variable ;
+
+\ onreg ( k -- )   REGISTER at the end: a part of a record; whole, kept (the
+\        way back: this circuit), answered REGISTERED.
+: onreg ( k -- )
+	oni 3 lit + c@ 5 lit u<  oni 4 lit + c@ 5 lit = and  oni 1 lit + nb16@ 2 lit - 439 lit u< and if
+		-1 lit onrj !
+		4 lit 0 lit do i onrg @ over 1 lit + =  i onrg 4 lit + @ 2 lit pick onc C lit + @ = and if i onrj ! then loop
+		onrj @ 0< if                                                            \ the oldest slot
+			0 lit  4 lit 1 lit do i onrg C lit + @ over onrg C lit + @ - 0< if drop i then loop onrj !
+			onrj @ onrg 10 lit nzero  dup 1 lit + onrj @ onrg !  dup onc C lit + @ onrj @ onrg 4 lit + !
+			pms onrj @ onrg C lit + !
+		then
+		oni 5 lit +  onrj @ onrg 10 lit + oni 3 lit + c@ 438 lit * +  oni 1 lit + nb16@ 2 lit - ncpy
+		1 lit oni 3 lit + c@ lshift onrj @ onrg 8 lit + @ or dup onrj @ onrg 8 lit + !
+		1F lit = if
+			0 lit onrj @ onrg !
+			dup onc 7C lit + @ dup 0= swap pago 2710 lit u> or if
+				pms over onc 7C lit + !
+				dup onc C lit + @ rlrip !  dup FFFF0000 lit or rlrpt !
+				onrj @ onrg 10 lit + rlkeep
+			else 4 lit then
+			onpt c!  rlh onpt 1 lit + 20 lit ncpy  9 lit onpt 21 lit onback
+		else drop then
+	else drop then
+;
+
+\ onend ( k -- )   a cell for the end of its circuit (here).
+: onend ( k -- )
+	oni c@  dup 1 lit = over 2 lit = or if
+		drop  dup onc 1C lit + @ if dup onc 68 lit + @ if onxsend else drop then else    \ extending: again
+			dup onpget ?dup 0= if drop else                                         ( k hs )
+				oni c@ 1 lit = if
+					oni 3 lit + be32 2 lit pick onc 74 lit + !  oni 7 lit + nb16@ 2 lit pick onc 78 lit + !
+					oni 9 lit + swap 300 lit ncpy  dup onc 64 lit + dup @ 1 lit or swap !
+				else oni 3 lit + swap 300 lit + 320 lit ncpy  dup onc 64 lit + dup @ 2 lit or swap ! then
+				dup onc 64 lit + @ 3 lit and 3 lit = if
+					dup onc 18 lit + 4 lit onrand
+					dup onc 74 lit + @ over onc 10 lit + !  dup onc 78 lit + @ over onc 14 lit + !
+					1 lit over onc 1C lit + !  dup 1 lit onins  onxsend
+				else drop then
+			then
+		then
+	else
+		dup 3 lit = if drop onask else
+		dup 4 lit = if drop ondeliv else
+		dup 8 lit = if drop onreg else
+		B lit = if B lit onz 0 lit onback else drop then then then then          \ KEEP: answered
+	then
+;
+
+\ ── The client's circuits ──
+\ 9 slots: 0 ours for sending, 1 + g for receiving through relay g (rlg).
+\ Each: 0 state (0 none, 1 being built, 2 built, 3 wanted: waiting its turn)
+\ 4 hops with keys  8 circuit id  C a step sent  10 begun  14 last used
+\ 18 tries  1C the target (rlt; sending)  20 the hops: 0 guard 1 middle
+\ 2 home, each 0 ip 4 port 8 its entry (cnent)  50 their keys: forward,
+\ backward  110 built  118 the home's ip  11C port  120 failed  124 a KEEP
+\ sent, not answered yet.
+\ The words below act on the slot occ names.
+
+: occ variable ;
+: ocav variable ;  : ocab ( j -- a )  130 lit * ocav 130 lit 9 lit * lazy + ;
+: oca ( -- a )   occ @ ocab ;
+: ocst ( -- a )   oca ;
+: ochn ( -- a )   oca 4 lit + ;
+: ocid ( -- a )   oca 8 lit + ;
+: oct ( -- a )    oca C lit + ;
+: oct0 ( -- a )   oca 10 lit + ;
+: ocuse ( -- a )  oca 14 lit + ;
+: octry ( -- a )  oca 18 lit + ;
+: octi ( -- a )   oca 1C lit + ;
+: ocp ( h -- a )  4 lit lshift oca + 20 lit + ;
+: ock ( h -- a )  6 lit lshift oca + 50 lit + ;
+: ocbt ( -- a )   oca 110 lit + ;
+: ochi ( -- a )   oca 118 lit + ;
+: ochp ( -- a )   oca 11C lit + ;
+: ocft ( -- a )   oca 120 lit + ;
+: ockp ( -- a )   oca 124 lit + ;
+\ the handshake under way (one at a time)
+: ocekv variable ;  : ocek ( -- a )  ocekv 320 lit lazy ;
+: ocdkv variable ;  : ocdk ( -- a )  ocdkv 660 lit lazy ;
+: occtv variable ;  : occt ( -- a )  occtv 300 lit lazy ;
+: ocwv variable ;  : ocw ( -- a )  ocwv 80 lit lazy ;      \ 0 seed (64)  40 m  60 k1
+: ocxv variable ;  : ocx ( -- a )  ocxv 440 lit lazy ;     \ a command's bytes
+: ocrnew variable ;   \ a circuit for receiving built: a new record wanted
+: ocgf variable ;  : ocgbt variable ;     \ the guard's failures running; when it's passed over
+: ocgbv variable ;  : ocgbd ( -- a )  ocgbv 20 lit lazy ;   \ its relay id
+
+\ ocbusy? ( -- f )   a circuit is being built.
+: ocbusy? ( -- f )   0 lit 9 lit 0 lit do i ocab @ 1 lit = or loop ;
+
+\ ocmine? ( -- f )   the datagram is one of our circuits' (from its guard,
+\        its id): occ set to it.
+: ocmine? ( -- f )
+	-1 lit  9 lit 0 lit do
+		i ocab @ dup 1 lit = swap 2 lit = or  nsrc @ i ocab 20 lit + @ = and  nsport @ i ocab 24 lit + @ = and
+		pbd @ be32 i ocab 8 lit + @ = and
+		if drop i then
+	loop
+	dup 0< if drop 0 lit else occ ! -1 lit then
+;
+
+\ ocsendc ( cmd a n -- )   to the circuit's end.
+: ocsendc ( cmd a n -- )
+	oncmd  onn C lit onrand
+	ochn @ 1 lit - dup ock onn oni onb onseal
+	begin dup while 1 lit - dup ock onn onb onxor repeat drop
+	1E lit 0 lit ocp @ 0 lit ocp 4 lit + @ ocid @ oncell
+	pms ocuse !
+;
+
+\ ocstep ( -- )   the step under way: sent (again).
+: ocstep ( -- )
+	ochn @ 0= if
+		1B lit 0 lit ocp @ 0 lit ocp 4 lit + @ ocid @ occt 300 lit onlink
+		1C lit 0 lit ocp @ 0 lit ocp 4 lit + @ ocid @ ocek 320 lit onlink
+	else
+		ochn @ ocp @ ocx be!  ochn @ ocp 4 lit + @ ocx 4 lit + nb16!  occt ocx 6 lit + 300 lit ncpy
+		1 lit ocx 306 lit ocsendc  2 lit ocek 320 lit ocsendc
+	then
+	pms oct !
+;
+
+\ ochop ( -- )   the next hop's handshake begun.
+: ochop ( -- )
+	ocw 40 lit onrand  ocw ocek ocdk kykeys
+	ocw 40 lit + 20 lit onrand
+	ochn @ ocp 8 lit + @ cnent 18 lit +  ocw 40 lit +  ocw 60 lit +  occt kyencap drop
+	ocstep
+;
+
+\ ochere ( -- )   the log's ip:port of the circuit's home.
+: ochere ( -- )   2 lit ocp @ fnip. 3A lit lputc 2 lit ocp 4 lit + @ fndec ;
+
+\ ocfin ( ct2 conf -- )   the hop's answer: its keys, then the next hop.
+: ocfin ( ct2 conf -- )
+	swap ocdk over onkb 20 lit + kydecap drop                               ( conf ct2 )
+	ocw 60 lit +  onkb 20 lit +  occt ocek  4 lit pick  onok onkdf  drop
+	onok 40 lit + swap 10 lit mcmp 0= if
+		onok ochn @ ock 40 lit ncpy  ochn @ 1 lit + ochn !
+		ochn @ 3 lit = if
+			2 lit ocst !  pms ocbt !  pms ocuse !  0 lit ocgf !
+			occ @ if -1 lit ocrnew !  "circuit: built, for receiving, to " else "circuit: built, to " then
+			lputs ochere A lit lputc
+		else ochop then
+	then
+;
+
+\ ── Paths ──
+
+\ A guard that doesn't answer 3 circuits running is passed over for 30
+\ minutes (the next by its score stands in).
+: ocdown? ( i -- f )   cnids ocgbd 20 lit mcmp 0=  ocgbt @ pago 1B7740 lit u< and ;
+
+\ ocown? ( i -- f )   one of our own relays.
+: ocown? ( i -- f )
+	dup ocmap swap ocport  0 lit rlgn @ ?dup if 0 lit do i rlg @ 3 lit pick = i rlg 4 lit + @ 3 lit pick = and or loop then nip nip
+;
+\ ocfree? ( i h lvl -- f )   relay i for hop h (0 the guard, 1 the
+\        middle): live, not the home (nor, for the middle, the guard); at
+\        level 1 not one of our own relays either; at 2 (main) not in the
+\        home's (or the guard's) /16.
+: ocfi variable ;  : ocfn variable ;  : ocfl variable ;
+: ocfree? ( i h lvl -- f )
+	ocfl ! ocfn ! ocfi !
+	ocfi @ rqlive?  ocfi @ 2 lit ocp 8 lit + @ = 0= and  ocfi @ ocdown? 0= and
+	ocfn @ 1 lit = if ocfi @ 0 lit ocp 8 lit + @ = 0= and then
+	ocfl @ 2 lit = bnet @ 0= and if
+		2 lit ocp @ 10 lit rshift  ocfi @ ocmap 10 lit rshift = 0= and
+		ocfn @ 1 lit = if 0 lit ocp @ 10 lit rshift  ocfi @ ocmap 10 lit rshift = 0= and then
+	then
+	ocfl @ if ocfi @ ocown? 0= and then
+;
+
+\ ocpick ( h -- ok )   hop h from the list, at the strictest level that
+\        has one: the guard by its score, the middle at random.  The
+\        guard's period: 2^32 ms (about 50 days), offset by the wallet's own
+\        SHA3-256("tabernacle-guard-offset-v1" ‖ seed), so not every
+\        wallet's guard changes at once.
+: och variable ;  : ocbest variable ;  : ocsc variable ;
+: ocbv variable ;  : ocb ( -- a )  ocbv 48 lit lazy ;      \ 0 the period  4 a score  24 the best
+: ocper ( -- )
+	88 lit 6 lit kbeg  "tabernacle-guard-offset-v1" 1A lit kabs  wlseed 20 lit kabs  kend  ocb 4 lit + 20 lit ksqz
+	hnow ocb 4 lit + be32 0 lit wlq+ nip ocb be!
+;
+: ocpick ( h -- ok )
+	och !  -1 lit ocbest !  ocper
+	3 lit 0 lit do
+		ocbest @ 0< if
+			0 lit ocsc !
+			cnn @ ?dup if 0 lit do
+				i och @ 2 lit j - ocfree? if
+					och @ 0= if
+						88 lit 6 lit kbeg  "tabernacle-guard-v1" 13 lit kabs  wlseed 20 lit kabs
+						ocb 4 lit kabs  i cnids 20 lit kabs  kend  ocb 4 lit + 20 lit ksqz
+						ocbest @ 0< if -1 lit else ocb 4 lit + ocb 24 lit + 20 lit mcmp 0 lit > then
+						if i ocbest !  ocb 4 lit + ocb 24 lit + 20 lit ncpy then
+					else
+						ocsc @ 1 lit + ocsc !  pnonce drop ocsc @ % 0= if i ocbest ! then
+					then
+				then
+			loop then
+		then
+	loop
+	ocbest @ dup 0< if drop 0 lit else
+		och @ ocp  over ocmap over !  over ocport over 4 lit + !  8 lit + !  -1 lit
+	then
+;
+
+\ ochome ( -- k | -1 )   the circuit's home (ochi, ochp) in the list, live.
+: ochome ( -- k | -1 )
+	-1 lit  cnn @ ?dup if 0 lit do
+		i ocmap ochi @ =  i ocport ochp @ = and i rqlive? and if drop i then
+	loop then
+;
+
+\ ocnone ( -- )   no path: given up on for now (a lookup: not found).
+: ocnone ( -- )
+	"circuit: no path (too few relays)\n" lputs  0 lit ocst !  pms ocft !
+	occ @ 0= rllst @ 1 lit = and if 3 lit rllst ! then
+;
+
+\ ocgo ( -- )   the circuit begun: the path, then the guard.
+: ocgo ( -- )
+	0 lit ocst !
+	ochome dup 0< if drop ocnone else
+		2 lit ocp  over ocmap over !  over ocport over 4 lit + !  8 lit + !
+		0 lit ocpick 1 lit ocpick and if
+			ocid 4 lit onrand  0 lit ochn !  1 lit ocst !  pms oct0 !  0 lit ockp !
+			occ @ if "circuit: building one for receiving, to " else "circuit: building one to " then lputs
+			ochere ", by " lputs 0 lit ocp @ fnip. 3A lit lputc 0 lit ocp 4 lit + @ fndec
+			" and " lputs 1 lit ocp @ fnip. 3A lit lputc 1 lit ocp 4 lit + @ fndec A lit lputc
+			ochop
+		else ocnone then
+	then
+;
+
+\ ocstart ( -- )   ours for sending: to target octi (rlt), if there's one left.
+: ocstart ( -- )
+	octi @ rltn @ u< if octi @ rlt @ ochi !  octi @ rlt 4 lit + @ ochp !  ocgo else
+		0 lit ocst !  "circuit: none could be built\n" lputs
+		rllst @ 1 lit = if 3 lit rllst ! then
+	then
+;
+
+\ ocfail ( -- )   the circuit didn't come.  Ours for sending: again, then
+\        the next home relay; for receiving: again in 30 s.
+: ocfail ( -- )
+	"circuit: no answer from hop " lputs ochn @ fndec A lit lputc
+	ochn @ 0= if
+		ocgf @ 1 lit + dup ocgf !  3 lit u< 0= if
+			0 lit ocgf !  0 lit ocp 8 lit + @ cnids ocgbd 20 lit ncpy  pms ocgbt !
+			"circuit: our guard isn't answering: another for 30 minutes\n" lputs
+		then
+	then
+	occ @ if 0 lit ocst !  pms ocft ! else
+		octry @ 1 lit + dup octry !  2 lit u< 0= if 0 lit octry !  octi @ 1 lit + octi ! then
+		3 lit ocst !
+	then
+;
+
+\ ocsched ( -- )   one circuit built at a time: ours for sending first.
+: ocsched ( -- )
+	ocbusy? 0= if
+		0 lit ocab @ 3 lit = if 0 lit occ ! ocstart else
+			0 lit  9 lit 1 lit do dup 0= i ocab @ 3 lit = and if drop i then loop
+			?dup if occ ! ocgo then
+		then
+	then
+;
+
+\ ── The client's cells ──
+
+: ocrv variable ;  : ocrec ( -- a )  ocrv 1200 lit lazy ;   \ a FOUND's parts
+: ocpb variable ;   \ the parts had (bits)
+: ondbv variable ;  : ondb ( -- a )  ondbv 440 lit lazy ;   \ a DELIVERed part
+: ondn variable ;   \ its bytes (0: none): src/pay.fam's
+
+\ ocfound ( -- )   FOUND: a part of the record; whole: checked, then found.
+: ocfound ( -- )
+	rllst @ 1 lit = if
+		oni 3 lit + c@  dup 5 lit u<  oni 4 lit + c@ 5 lit = and if
+			oni 5 lit + over 438 lit * ocrec + oni 1 lit + nb16@ 2 lit - ncpy
+			1 lit swap lshift ocpb @ or dup ocpb !
+			1F lit = if
+				0 lit ocpb !  ocrec rlrec rllen ncpy
+				rlrec rlcheck rlh rlla 20 lit mcmp 0= and if
+					ocrec rllen + be32 rlip !  ocrec rllen + 4 lit + nb16@ rlport !  2 lit rllst !
+				then
+			then
+		else drop then
+	then
+;
+
+\ ocregd ( -- )   REGISTERED, along a circuit for receiving.
+: ocregd ( -- )
+	occ @ 1 lit - rlg  oni 3 lit + c@                                       ( g status )
+	dup 0= over 2 lit = or if
+		over 8 lit + @ 0= if "relays: registered, by circuit, with " lputs ochere A lit lputc then
+		-1 lit 2 lit pick 8 lit + !
+	then
+	1 lit = if "relays: " lputs ochere " refused our record" lputs A lit lputc then
+	drop
+;
+
+\ ocback ( -- )   BCELL to us: the layers off, the end's seal checked.
+: ocback ( -- )
+	pbd @ 4 lit + onn C lit ncpy  pbd @ 10 lit + onb onbody ncpy
+	ochn @ ?dup if
+		1 lit - 0 lit  begin 2dup u> while dup ock 20 lit + onn onb onxor 1 lit + repeat drop
+		ock 20 lit + onn onb oni onopen if
+			pms ocuse !  oni c@
+			dup 5 lit = ocst @ 1 lit = and if oni 3 lit + oni 303 lit + ocfin then
+			occ @ 0= if
+				dup 6 lit = if ocfound then
+				dup 7 lit = rllst @ 1 lit = and if 3 lit rllst ! then
+			else
+				dup 9 lit = if ocregd then
+				dup A lit = if oni 3 lit + ondb oni 1 lit + nb16@ dup ondn ! ncpy then
+			then
+			dup B lit = if 0 lit ockp ! then
+			drop
+		then
+	then
+;
+
+\ ── Using it ──
+
+\ oncirc ( -- f )
+: oncirc ( -- f )   rqst @ 2 lit =  rlset @ 0= and  ondirect @ 0= and  wl? and ;
+
+\ ocfor? ( -- f )   ours for sending (built or coming) ends at one of rlt.
+: ocfor? ( -- f )
+	ocst @ if
+		0 lit  rltn @ ?dup if 0 lit do i rlt @ ochi @ = i rlt 4 lit + @ ochp @ = and or loop then
+	else 0 lit then
+;
+\ ocnew ( -- )   ours for sending wanted, to rlt's first.
+: ocnew ( -- )
+	0 lit octi !  0 lit octry !  0 lit ocpb !  0 lit ocst !
+	rltn @ if 0 lit rlt @ ochi !  0 lit rlt 4 lit + @ ochp !  3 lit ocst ! then
+;
+
+\ oclook ( -- )   a lookup under way: ASK by circuit, every 2 s, 5 times.
+: oclook ( -- )
+	0 lit occ !
+	rllst @ 1 lit = if
+		ocfor? 0= if ocnew else
+		ocst @ 2 lit = if rllt @ pago 7D0 lit u> if
+			rlln @ 5 lit u< if 3 lit rlla 20 lit ocsendc  pms rllt !  rlln @ 1 lit + rlln !
+			else 3 lit rllst !  0 lit ocst ! then                                \ no answer at all: the circuit's gone
+		then then then
+	then
+;
+
+\ onsend ( msg n dest id -- )   by circuit: each part, RELAYed at the end,
+\        and a KEEP, to know the circuit's still there (unanswered in 10 s:
+\        built anew); if the circuit isn't there yet, it's begun (the message
+\        is sent again: src/pay.fam retries).  Padded to a power of two of parts,
+\        with parts numbered 0xFF (delivered like any, dropped by the
+\        receiver), so the cells' count says less of a message's size.
+: ocpw ( n -- m )   1 lit begin 2dup u> while 1 lit lshift repeat nip ;
+: onm variable ;  : onmn variable ;  : onmd variable ;  : onmp variable ;  : onml variable ;  : onmi variable ;
+: onsend ( msg n dest id -- )
+	onmi ! onmd ! onmn ! onm !
+	0 lit occ !  onmd @ rqtgt
+	ocfor? 0= if ocnew else
+	ocst @ 2 lit = if
+		onmn @ 3DF lit + 3E0 lit / onmp !
+		onmp @ 0 lit do
+			onmd @ ocx 20 lit ncpy  onmi @ ocx 20 lit + be!  i ocx 24 lit + c!  onmp @ ocx 25 lit + c!
+			onmn @ i 3E0 lit * - 3E0 lit pumin onml !
+			onm @ i 3E0 lit * + ocx 26 lit + onml @ ncpy
+			4 lit ocx onml @ 26 lit + ocsendc
+		loop
+		onmp @ ocpw onmp @ - ?dup if 0 lit do
+			onmd @ ocx 20 lit ncpy  onmi @ ocx 20 lit + be!  FF lit ocx 24 lit + c!  onmp @ ocx 25 lit + c!
+			ocx 26 lit + 3E0 lit nzero  4 lit ocx 406 lit ocsendc
+		loop then
+		ockp @ 0= if B lit onz 0 lit ocsendc  pms ockp ! then                     \ is it still there?
+	then then
+;
+
+\ ── Receiving by circuit ──
+
+\ ocregs ( -- )   our record along the circuit in hand (for relay occ - 1),
+\        every 5 s until REGISTERED.
+: ocregs ( -- )
+	occ @ 1 lit - rlg  dup 8 lit + @ 0=  over C lit + @ pago 1388 lit u> and  rlmat @ and if
+		5 lit 0 lit do
+			i onpt c!  5 lit onpt 1 lit + c!
+			rllen i 438 lit * - 438 lit pumin
+			rlmy i 438 lit * + onpt 2 lit + 2 lit pick ncpy
+			8 lit onpt rot 2 lit + ocsendc
+		loop
+		pms swap C lit + !
+	else drop then
+;
+
+\ ocfh ( ip port -- m | 0 )   the slot for receiving whose home that is.
+: ocfh ( ip port -- m | 0 )
+	0 lit  9 lit 1 lit do i ocab 118 lit + @ 3 lit pick =  i ocab 11C lit + @ 3 lit pick = and if drop i then loop nip nip
+;
+\ ocin? ( m -- f )   slot m's home is one of our relays (rlg).
+: ocin? ( m -- f )
+	ocab dup 118 lit + @ swap 11C lit + @
+	0 lit  rlgn @ ?dup if 0 lit do i rlg @ 3 lit pick = i rlg 4 lit + @ 3 lit pick = and or loop then nip nip
+;
+\ ocgone ( -- m | 0 )   a slot for receiving whose home isn't ours any more.
+: ocgone ( -- m | 0 )   0 lit  9 lit 1 lit do dup 0= i ocin? 0= and if drop i then loop ;
+\ ocswap ( j m -- )   two slots change places.
+: ocswv variable ;  : ocsw ( -- a )  ocswv 130 lit lazy ;
+: ocswap ( j m -- )
+	over ocab ocsw 130 lit ncpy  dup ocab 2 lit pick ocab 130 lit ncpy  ocsw swap ocab 130 lit ncpy  drop
+;
+
+\ ocrecv ( -- )   a circuit for receiving to each of our relays (rlg):
+\        wanted when the relay is new (one to a relay we had stays: the
+\        slots follow rlg), 30 s after one failed, or an hour old; built
+\        ones kept from going idle, and registered along.
+: ocrecv ( -- )
+	9 lit 1 lit do
+		i occ !
+		i 1 lit - rlgn @ u< if
+			i 1 lit - rlg @ ochi @ =  i 1 lit - rlg 4 lit + @ ochp @ = and 0= if
+				i 1 lit - rlg @ i 1 lit - rlg 4 lit + @ ocfh ?dup if i swap ocswap else
+					ocgone ?dup if i swap ocswap then                               \ what's here may be wanted
+					i 1 lit - rlg @ ochi !  i 1 lit - rlg 4 lit + @ ochp !  0 lit ocft !  3 lit ocst !
+				then
+			else
+				ocst @ 0= ocft @ pago 7530 lit u> and if 3 lit ocst ! then
+				ocst @ 2 lit = ocbt @ pago 36EE80 lit u> and if 3 lit ocst ! then
+				ocst @ 2 lit = ockp @ and if ockp @ pago 4E20 lit u> if          \ no answer down it: gone
+					"circuit: no answer down it, to " lputs ochere A lit lputc  0 lit ockp !  3 lit ocst !
+				then then
+				ocst @ 2 lit = if
+					ocuse @ pago 3A980 lit u> if B lit onz 0 lit ocsendc  pms ockp ! then
+					ocregs
+				then
+			then
+		else 0 lit ocst !  0 lit ochi ! then
+	loop
+	0 lit occ !
+;
+
+\ ocnat ( -- )   KEEP to our guard every 20 s, while a circuit for
+\        receiving is built: our NAT keeps the way open for its cells.
+: ockt variable ;
+: ocnat ( -- )
+	ockt @ pago 4E20 lit u> if
+		pms ockt !
+		0 lit  9 lit 1 lit do i ocab @ 2 lit = if drop i then loop
+		?dup if
+			ocab 20 lit + dup @ swap 4 lit + @ 2dup pfind dup 0< if drop padd drop else
+				dup pp 8 lit + @ 2 lit = if
+					nip nip  16 lit phdr  over pp C lit + @ 2 lit pick pp 10 lit + @ rot qbe!  E lit psendk
+				else drop 2drop then
+			then
+		then
+	then
+;
+
+\ ── At a relay: the links ──
+
+\ oncrd ( -- )   CREATED: our circuit's first hop, or a circuit we extend.
+: oncrd ( -- )
+	pbn @ 314 lit = if
+		ocmine? ocst @ 1 lit = and ochn @ 0= and if pbd @ 4 lit + pbd @ 304 lit + ocfin else
+		rlserve @ if nsrc @ nsport @ pbd @ be32 onfn dup 0< if drop else
+			dup onc 1C lit + @ 1 lit = if 2 lit over onc 1C lit + !  dup onprel  5 lit pbd @ 4 lit + 310 lit onback else drop then
+		then then then
+	then
+;
+
+\ oncelli ( -- )   CELL: our layer off; on, or ours to act on.
+: oncelli ( -- )
+	pbn @ 460 lit = rlserve @ and if
+		nsrc @ nsport @ pbd @ be32 onfp dup 0< if drop else
+			dup onc @ 2 lit = if
+				pms over onc 60 lit + !
+				dup onc 64 lit + @ 4 lit and if dup onprel  0 lit over onc 64 lit + ! then   \ the client has CREATED
+				pbd @ 4 lit + onn C lit ncpy  pbd @ 10 lit + onb onbody ncpy
+				dup onc 1C lit + @ 2 lit = if
+					dup onc 20 lit + onn onb onxor
+					1E lit over onc 10 lit + @ 2 lit pick onc 14 lit + @ 3 lit pick onc 18 lit + @ onfwd drop
+				else
+					dup onc 20 lit + onn onb oni onopen if onend else drop then
+				then
+			else drop then
+		then
+	then
+;
+
+\ onbcelli ( -- )   BCELL: ours (our circuit), or our layer on, back.
+: onbcelli ( -- )
+	pbn @ 460 lit = if
+		ocmine? if ocback else
+		rlserve @ if nsrc @ nsport @ pbd @ be32 onfn dup 0< if drop else
+			pms over onc 60 lit + !
+			pbd @ 4 lit + onn C lit ncpy  pbd @ 10 lit + onb onbody ncpy
+			dup onc 40 lit + onn onb onxor
+			1F lit over onc 4 lit + @ 2 lit pick onc 8 lit + @ 3 lit pick onc C lit + @ onfwd drop
+		then then then
+	then
+;
+
+\ onin ( -- f )
+: onin ( -- f )
+	pok? if npay @ 5 lit + c@ 1B lit - 5 lit u< else 0 lit then
+	dup if
+		npay @ 6 lit + pbody npn @ 6 lit - ncpy  pbody pbd !  npn @ 6 lit - pbn !
+		npay @ 5 lit + c@
+		dup 1B lit = if 1 lit oncrin then
+		dup 1C lit = if 2 lit oncrin then
+		dup 1D lit = if oncrd then
+		dup 1E lit = if oncelli then
+		1F lit = if onbcelli then
+	then
+;
+
+\ ontick ( -- )
+: ontick ( -- )
+	oncirc rlcirc !
+	9 lit 0 lit do
+		i occ !  ocst @ 1 lit = if
+			oct0 @ pago 1770 lit u> if ocfail else oct @ pago 5DC lit u> if ocstep then then
+		then
+	loop
+	0 lit occ !  ocst @ 2 lit = if                                             \ ours for sending:
+		ocuse @ pago 1D4C0 lit u> if 0 lit ocst ! then                           \ idle 2 minutes: built anew
+		ockp @ if ockp @ pago 2710 lit u> if                                   \ its KEEP unanswered 10 s: gone
+			"circuit: no answer down it, to " lputs ochere A lit lputc  0 lit ocst !  0 lit ockp !
+		then then
+	then
+	rlcirc @ if
+		oclook  ocrecv  ocnat
+		ocrnew @ ocbusy? 0= and if 0 lit ocrnew !  0 lit rlmat ! then        \ a new record, for the new circuits
+	else 9 lit 1 lit do 0 lit i ocab ! loop then
+	ocsched  onflush
+;

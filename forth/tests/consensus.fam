@@ -1,0 +1,70 @@
+\ tests/consensus.fam — the relay list (src/consensus.fam): entries made,
+\ checked and refused; consensus.txt read and refused; the aux tree's
+\ hashes (against Python's hashlib).
+
+: tjsv variable ;  : tjsave ( -- a )  tjsv 20 lit lazy ;     \ the wallet's seed, put back after
+: tj1v variable ;  : tje1 ( -- a )  tj1v 1200 lit lazy ;     \ two relays' entries,
+: tj2v variable ;  : tje2 ( -- a )  tj2v 1200 lit lazy ;     \ tje1's id the smaller
+: tjiv variable ;  : tjid ( -- a )  tjiv 40 lit lazy ;
+: tjfv variable ;  : tjf ( -- a )  tjfv 6000 lit lazy ;     \ a file being written
+: tjfn variable ;  : tjpn variable ;
+: tjov variable ;  : tjo ( -- a )  tjov 40 lit lazy ;
+
+: tjput ( a n -- )   tjpn !  tjf tjfn @ + tjpn @ ncpy  tjfn @ tjpn @ + tjfn ! ;
+: tjc ( c -- )   tjf tjfn @ + c!  tjfn @ 1 lit + tjfn ! ;
+: tjnib ( n -- c )   F lit and dup A lit u< if 30 lit + else 57 lit + then ;
+\ tjline ( e -- )   "relay <hex>\n"
+: tjline ( e -- )   "relay " 6 lit tjput  cnlen 0 lit do dup i + c@ dup 4 lit rshift tjnib tjc tjnib tjc loop drop  A lit tjc ;
+\ tjhead ( -- )   a new file: its first line.
+: tjhead ( -- )   0 lit tjfn !  cnhead dup strlen tjput ;
+
+\ tjrelay ( k -- )   a relay's keys (a seed of its own) and its entry, at cne.
+: tjrelay ( k -- )
+	20 lit 0 lit do dup i 7 lit * + 3 lit + wlseed i + c! loop drop  0 lit cnok !
+	0A000202 lit E99 lit 7 lit cnmake
+;
+
+Test {
+	consensus_entry {
+		wlseed tjsave 20 lit ncpy  0 lit bnet !
+		1 lit tjrelay  cne tje1 cnlen ncpy
+		2 lit tjrelay  cne tje2 cnlen ncpy
+		tje1 tjid cnid  tje2 tjid 20 lit + cnid
+		tjid tjid 20 lit + 20 lit mcmp 0< 0= if                              \ tje1: the smaller id
+			tje1 tjf cnlen ncpy  tje2 tje1 cnlen ncpy  tjf tje2 cnlen ncpy
+			tje1 tjid cnid  tje2 tjid 20 lit + cnid
+		then
+		tje1 cncheck assert  tje2 cncheck assert
+		tje1 be32 524C5931 lit asrt_eq  tje1 8 lit + be32 0A000202 lit asrt_eq  tje1 C lit + nb16@ E99 lit asrt_eq
+		\ a byte of its key, the network, the zeros, or the signature changed: refused
+		tje1 20 lit + dup c@ 1 lit xor swap c!  tje1 cncheck 0= assert  tje1 20 lit + dup c@ 1 lit xor swap c!
+		1 lit bnet !  tje1 cncheck 0= assert  0 lit bnet !
+		1 lit tje1 F lit + c!  tje1 cncheck 0= assert  0 lit tje1 F lit + c!
+		tje1 900 lit + dup c@ 1 lit xor swap c!  tje1 cncheck 0= assert  tje1 900 lit + dup c@ 1 lit xor swap c!
+		tje1 cncheck assert
+		tjsave wlseed 20 lit ncpy  0 lit cnok !
+	}
+	consensus_file {
+		tjhead  tjf tjfn @ cnparse assert  cnn @ 0 lit asrt_eq           \ no relays: valid
+		tjhead tje1 tjline tje2 tjline
+		tjf tjfn @ cnparse assert  cnn @ 2 lit asrt_eq
+		0 lit cnids tjid 20 lit mcmp 0 lit asrt_eq  1 lit cnids tjid 20 lit + 20 lit mcmp 0 lit asrt_eq
+		1 lit cnent tje2 cnlen mcmp 0 lit asrt_eq
+		\ out of order, twice, the other network, a byte more, a bad digit: not valid
+		tjhead tje2 tjline tje1 tjline  tjf tjfn @ cnparse 0= assert
+		tjhead tje1 tjline tje1 tjline  tjf tjfn @ cnparse 0= assert
+		1 lit bnet !  tjhead 0 lit bnet !  tje1 tjline  tjf tjfn @ cnparse 0= assert
+		tjhead tje1 tjline  20 lit tjc  tjf tjfn @ cnparse 0= assert
+		tjhead tje1 tjline  67 lit tjf 40 lit + c!  tjf tjfn @ cnparse 0= assert
+		tjhead tje1 tjline  tjf tjfn @ 1 lit - cnparse 0= assert             \ no newline at the end
+		tjhead tje1 tjline  tjf tjfn @ cnparse assert
+	}
+	consensus_aux_tree {
+		tjf 0 lit tjo cnleaf  tjo 20 lit "6E340B9CFFB37A989CA544E6BB780A2C78901D3FB33738768511A30617AFA01D" twhex assert
+		"abc" 3 lit tjo cnleaf  tjo 20 lit "609F6E36D2405585188D5CFD761F407C7CC46A7D3F314C88270469DDE315FCD1" twhex assert
+		tjf 40 lit nzero  tjf tjf 20 lit + tjo cnnode
+		tjo 20 lit "AE0798D0ECAED2B778EDDEBF18F071A561C53658C05E76CEDECC27CAFBDBC577" twhex assert
+		40 lit 0 lit do i tjf i + c! loop  tjf tjf 20 lit + tjo cnnode
+		tjo 20 lit "1A378704C17DA31E2D05B6D121C2BB2C7D76F6EE6FA8F983E596C2D034963C57" twhex assert
+	}
+}
