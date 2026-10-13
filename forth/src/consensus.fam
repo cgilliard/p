@@ -31,6 +31,11 @@
 \                               30), at cne
 \   cncheck ( e -- ok )         an entry's form, network and signature
 \   cnid ( e out -- )           its relay id
+\   cnauto ( -- )               our entry for the relayaddr= setting (cnmaddr,
+\                               our port), good for 30 days, at cnmine; said
+\                               in the log, the line itself on the console
+\   cnrenew? ( -- f )           whether that's due: none yet, or under 7
+\                               days left
 \   cnparse ( a n -- ok )       a consensus.txt: then cnn entries, the
 \                               k-th at cnent k, its id at cnids k
 \   cnleaf ( a n out -- )       a leaf's hash
@@ -96,6 +101,30 @@
 
 \ cnid ( e out -- )
 : cnid ( e out -- )   swap 338 lit + 520 lit rot sha3256 ;
+
+\ ── Our entry, made by the node (the relayaddr= setting) ──
+\ The consensus.txt line is too long for the log (src/log.fam): it goes on
+\ the console alone, "relay <hex>", and the web wallet and the API's
+\ relayentry (with no address) give it too.
+
+: cnmaddr variable ;  : cnmh variable ;                  \ our public IP; made
+: cnmv variable ;  : cnmine ( -- a )  cnmv 1200 lit lazy ;
+: cnmiv variable ;  : cnmid ( -- a )  cnmiv 20 lit lazy ;   \ its relay id
+
+: cnnb ( n -- )   F lit and dup A lit u< if 30 lit + else 57 lit + then lputc ;
+: cnauto ( -- )
+	cnmaddr @ nport @ 1E lit cnmake  cne cnmine cnlen ncpy  cnmine cnmid cnid  -1 lit cnmh !
+	"relay: our entry, for consensus.txt: " lputs  cnmaddr @ fnip. 3A lit lputc nport @ fndec
+	", relay id " lputs  20 lit 0 lit do cnmid i + c@ dup 4 lit rshift cnnb cnnb loop
+	", good for 30 days (the line: on the console, in the web wallet, tools/wallet relay-entry)\n" lputs
+	"relay " puts  cnmine cnlen wlhex  A lit putc
+;
+
+: cnrenew? ( -- f )
+	cnmaddr @ 0= if 0 lit else cnmh @ 0= if -1 lit else
+		cnmine 10 lit + qbe@  hnow 240C8400 lit 0 lit wlq+ du<            \ under 7 days
+	then then
+;
 
 \ ── consensus.txt ──
 

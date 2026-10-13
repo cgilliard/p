@@ -5,7 +5,8 @@
 #
 #   node.sh [--recover] [--passphrase] [--api-key]
 #           [--log-dest webui|console|both] [--log-max-entries N]
-#           [--debug-disable-verification] [--relay] [--mix-delay MS]
+#           [--debug-disable-verification] [--relay] [--relay-addr IP]
+#           [--mix-delay MS]
 #           [--direct] [--seed-mode]
 #
 #   --recover     restore the wallet from its 24 backup words, typed when the
@@ -23,6 +24,13 @@
 #                 payment addresses' keys, where they're reached), answer
 #                 lookups and relay their messages -- for the seed nodes
 #                 (src/relay.fam; --gateway, its old name, works too)
+#   --relay-addr IP
+#                 a relay (as --relay) reached at this public IPv4 address,
+#                 on PORT: the node makes its own signed entry for
+#                 consensus.txt (good for 30 days, made again with 7 left)
+#                 and prints the line on the console, alone, starting
+#                 "relay " -- also in the web wallet, and from
+#                 `tools/wallet relay-entry` (docs/RELAYS.md)
 #   --mix-delay MS
 #                 a relay: hold each cell it passes on a random 0 .. MS ms
 #                 first (at most 10000), so cells in and out are harder to
@@ -100,10 +108,11 @@ LOGMAX=""
 NOVERIFY=""
 RELAY=""
 MIXDELAY=""
+RELAYADDR=""
 DIRECT=""
 SEEDMODE=""
 usage() {
-	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N] [--debug-disable-verification] [--relay] [--mix-delay MS] [--direct] [--seed-mode]" >&2
+	echo "usage: $0 [--recover] [--passphrase] [--api-key] [--log-dest webui|console|both] [--log-max-entries N] [--debug-disable-verification] [--relay] [--relay-addr IP] [--mix-delay MS] [--direct] [--seed-mode]" >&2
 	exit 1
 }
 while [ $# -gt 0 ]; do
@@ -117,6 +126,8 @@ while [ $# -gt 0 ]; do
 		--log-max-entries) [ $# -ge 2 ] || usage; LOGMAX=$2; shift ;;
 		--debug-disable-verification) NOVERIFY=1 ;;
 		--relay|--gateway) RELAY=1 ;;
+		--relay-addr=*) RELAYADDR=${1#*=}; RELAY=1 ;;
+		--relay-addr) [ $# -ge 2 ] || usage; RELAYADDR=$2; RELAY=1; shift ;;
 		--mix-delay=*) MIXDELAY=${1#*=} ;;
 		--mix-delay) [ $# -ge 2 ] || usage; MIXDELAY=$2; shift ;;
 		--direct) DIRECT=1 ;;
@@ -129,6 +140,14 @@ case "$LOGDEST" in
 	""|webui|console|both) ;;
 	*) echo "node.sh: --log-dest: webui, console or both" >&2; exit 1 ;;
 esac
+# --relay-addr: A.B.C.D, each part 0 to 255; not 0.x, nor 10.0.2.x (QEMU's
+# own network, which the node sees: never the public address).  127.x is
+# this machine, for a test network on one host.
+if [ -n "$RELAYADDR" ]; then
+	ok=$(echo "$RELAYADDR" | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit; print "y" }')
+	case "$RELAYADDR" in 0.*|10.0.2.*) ok="" ;; esac
+	[ -n "$ok" ] || { echo "node.sh: --relay-addr: the relay's public IPv4 address, A.B.C.D" >&2; exit 1; }
+fi
 case "$MIXDELAY" in
 	"") ;;
 	*[!0-9]*) echo "node.sh: --mix-delay: a number of ms, 0 to 10000" >&2; exit 1 ;;
@@ -173,7 +192,7 @@ settings() {
 	printf '%s 0 10000 %s %s\004%sdepth=%s port=%s api=%s net=%s%s%s%s%s%s%s%s%s%s%s%s%s\004' \
 		"$PORT" "$([ "$NET" = dev ] && echo 1 || echo 0)" "$BOOT" "$(for s in $SEED; do printf 'seed=%s ' "$s"; done)" "$DEPTH" "$PORT" "$API" "$NET" "$WALLET" \
 		"${PEERS:+ peers=$PEERS}" "${PROBE:+ probe=$PROBE}" "${PERIP:+ perip=$PERIP}" \
-		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${RELAY:+ relay}" "${DNS:+ dns=$DNS}" \
+		"${LOGDEST:+ log=$LOGDEST}" "${LOGMAX:+ logmax=$LOGMAX}" "${NOVERIFY:+ noverify}" "${RELAY:+ relay}${RELAYADDR:+ relayaddr=$RELAYADDR}" "${DNS:+ dns=$DNS}" \
 		"${MIXDELAY:+ mixdelay=$MIXDELAY}" "${DIRECT:+ direct}" "${SEEDMODE:+ seedmode}"
 }
 # QEMU's output goes through a pipe (| cat): QEMU makes its output

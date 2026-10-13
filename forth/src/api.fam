@@ -414,6 +414,10 @@
 	"epoch" jkey rqepn @ jdec  "window" jkey rqwb @ rqwa @ - jdec  "voted" jkey rqvoted @ jdec
 	"for_list" jkey rqfor @ jdec  "unresolved" jkey rqunres @ jdec  "listed_relays" jkey rqlive @ jdec
 	7D lit jc
+	"relay_entry" jkey cnmh @ if
+		jobj "addr" jkey 22 lit jc  4 lit 0 lit do cnmaddr @ 18 lit i 3 lit lshift - rshift FF lit and jdec  i 3 lit u< if 2E lit jc then loop
+		3A lit jc nport @ jdec 22 lit jc  "id" jkey cnmid 20 lit jqhex  7D lit jc
+	else "null" js then
 	jdone jdone
 ;
 
@@ -600,18 +604,25 @@
 	jipv @ 8 lit lshift jipn @ or  jnok @
 ;
 
-\ jrentry ( -- )   relayentry: our entry as a relay, a consensus.txt line.
+\ jrentry ( -- )   relayentry: our entry as a relay, a consensus.txt line --
+\        made for ip, port, days; with no ip, the one the node made
+\        (relayaddr=: src/consensus.fam).
 : jrip variable ;
-: jrentry ( -- )
+: jrline ( e -- )
+	-1 lit jhead jobj
+	"line" jkey 22 lit jc "relay " js dup cnlen jhex 22 lit jc
+	"id" jkey jabuf cnid jabuf 20 lit jqhex
+	jdone jdone
+;
+: jrmake ( -- )
 	"ip" jget 1 lit = if jipp else 2drop 0 lit 0 lit then  jsok ! jrip !
 	"port" 0 lit jnum  "days" 7 lit jnum
 	over 1 lit - FFFF lit u< jsok @ and  over 1 lit - 1E lit u< and if
-		jrip @ -rot cnmake
-		-1 lit jhead jobj
-		"line" jkey 22 lit jc "relay " js cne cnlen jhex 22 lit jc
-		"id" jkey cne jabuf cnid jabuf 20 lit jqhex
-		jdone jdone
+		jrip @ -rot cnmake  cne jrline
 	else 2drop "ip (A.B.C.D, the relay's public address), port, days (1 to 30)" jerr then
+;
+: jrentry ( -- )
+	"ip" jget nip nip 0= cnmh @ and if cnmine jrline else jrmake then
 ;
 
 : apirun ( a n auth -- auth' )

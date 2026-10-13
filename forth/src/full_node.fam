@@ -36,6 +36,11 @@
 \                       wallets' records, answer lookups, relay their
 \                       messages (the seed nodes); `gateway`, its old name,
 \                       too
+\   relayaddr=A.B.C.D   a relay (as `relay`) reached at this public address,
+\                       on our port: the node makes its signed entry for
+\                       consensus.txt (good for 30 days, made again with 7
+\                       left), says so in the log and puts the line on the
+\                       console, the web wallet and the API (src/consensus.fam)
 \   userelay=A.B.C.D:PORT  a relay to register with and ask (any number;
 \                       the seeds, if none); `usegw=`, its old name, too
 \   logmax=N            the most log lines kept for the Log tab (10,000; at
@@ -138,9 +143,10 @@
 	else "seedmode" fnpre? if -1 lit rqforce !
 	else "direct" fnpre? if -1 lit ondirect !
 	else "mixdelay=" fnpre? if fnnum 2710 lit pumin ondly !
+	else "relayaddr=" fnpre? if fnip4 cnmaddr !  -1 lit rlserve !
 	else "relay" fnpre? "gateway" fnpre? or if -1 lit rlserve !
 	else "userelay=" fnpre? "usegw=" fnpre? or if fnip over 18 lit rshift 7F lit = if nip A000202 lit swap then rluse  -1 lit rlset !
-	else 0 lit fnok ! then then then then then then then then then then then
+	else 0 lit fnok ! then then then then then then then then then then then then
 	fnok @
 ;
 
@@ -289,6 +295,13 @@
 	bye
 ;
 
+\ fnrent ( -- )   our relay entry (relayaddr=): made once the wallet is open,
+\        made again with under 7 days left (checked each minute).
+: fnrt variable ;
+: fnrent ( -- )
+	wl? if fnrt @ 0= fnrt @ pago EA60 lit u> or if pms fnrt !  cnrenew? if cnauto then then then
+;
+
 \ fnmain ( -- )
 : fnmain ( -- )
 	fnclean
@@ -307,6 +320,7 @@
 	"node: " lputs  bnet @ if "dev" else "main" then lputs  " network, UDP port " lputs nport @ fndec
 	", fast sync depth " lputs pfdep @ fndec  ", wallet API port " lputs naport @ fndec A lit lputc
 	rlserve @ if "node: a payment relay: keeping wallets' records\n" lputs then
+	cnmaddr @ if "node: the relay's public address: " lputs cnmaddr @ fnip. 3A lit lputc nport @ fndec A lit lputc then
 	bnover @ if "node: noverify: blocks' proofs are NOT checked (a debugging aid, for a private network)\n" lputs then
 	acopen 0= if
 		dbwrong @ if "node: the disk holds the other network's chain (rm data/disk.img to start over)"
@@ -324,7 +338,7 @@
 	0 lit ppn 0 lit do i pp 8 lit + @ i pp 38 lit + @ 0= and if 1 lit + then loop
 	?dup if "node: hosts known from before: " lputs fndec A lit lputc then
 	-1 lit fnlive !                                   \ yields may answer the network now
-	begin fnstep fnsay wltick lgsave 0 lit until
+	begin fnstep fnsay wltick fnrent lgsave 0 lit until
 ;
 
 ntext                 \ first: find the Bible text, keep the heap off it (src/text.fam)

@@ -20,11 +20,13 @@ Commands:
                             signs it and announces it to its peers
   cancel ID                 undo a payment that was never finalized
   slates                    payments, and where they've got to
-  relay-entry IP PORT [DAYS]
-                            this node's signed entry as a relay reached at
+  relay-entry [IP PORT [DAYS]]
+                            this node's signed entry as a relay, a
+                            consensus.txt line (tools/consensus assembles
+                            them): with no address, the one the node made
+                            itself (node.sh --relay-addr); else one for
                             IP:PORT (its public address), good for DAYS (7;
-                            1 to 30): a consensus.txt line (tools/consensus
-                            assembles them)
+                            1 to 30)
   key                       enter the API key again
 
 Payments are slates exchanged as files, as with the Rust node's wallet (the
@@ -65,6 +67,10 @@ FAST_SYNC = {0: "no", 1: "waiting for a peer's height", 2: "fetching blocks", 3:
 
 
 class Failure(Exception):
+    pass
+
+
+class KeyRefused(Failure):
     pass
 
 
@@ -191,7 +197,7 @@ class Node:
         if not m.get("ok"):
             error = m.get("error", "the node refused")
             if cmd == "auth":
-                error = "the node didn't accept the API key (run `tools/wallet key` to enter it again)"
+                raise KeyRefused("the node didn't accept the API key")
             raise Failure(error)
         return m.get("result")
 
@@ -208,6 +214,9 @@ def show_status(node):
     print(f"next key:     {s['next_key']}")
     if s.get("address"):
         print(f"address:      {s['address']}")
+    if s.get("relay_entry"):
+        e = s["relay_entry"]
+        print(f"relay entry:  {e['addr']}, relay id {e['id'][:16]} (the line: relay-entry)")
 
 
 def do_pay(node, args):
@@ -250,9 +259,16 @@ def do_lookup(node, args):
 
 
 def do_relay_entry(node, args):
-    if len(args) not in (2, 3) or not args[1].isdigit() or (len(args) == 3 and not args[2].isdigit()):
-        raise Failure("usage: relay-entry IP PORT [DAYS]")
-    r = node.call("relayentry", ip=args[0], port=int(args[1]), days=int(args[2]) if len(args) == 3 else 7)
+    if not args:
+        try:
+            r = node.call("relayentry")
+        except Failure:
+            raise Failure("the node made no entry of its own (start it with node.sh --relay-addr IP), "
+                          "so give one: relay-entry IP PORT [DAYS]")
+    else:
+        if len(args) not in (2, 3) or not args[1].isdigit() or (len(args) == 3 and not args[2].isdigit()):
+            raise Failure("usage: relay-entry [IP PORT [DAYS]]")
+        r = node.call("relayentry", ip=args[0], port=int(args[1]), days=int(args[2]) if len(args) == 3 else 7)
     print(f"relay id {r['id']}", file=sys.stderr)
     print(r["line"])
 
@@ -381,7 +397,15 @@ def main():
             ask_key(args.key_file)
             return 0
         key = read_key(args.key_file) or ask_key(args.key_file)
-        node = Node(host or "127.0.0.1", int(port), key)
+        try:
+            node = Node(host or "127.0.0.1", int(port), key)
+        except KeyRefused:
+            # the wrong key kept: ask again (on a terminal), and keep the new one
+            if not sys.stdin.isatty():
+                raise KeyRefused(f"the node didn't accept the API key in {os.path.normpath(args.key_file)} "
+                                 f"(run `tools/wallet --key-file {args.key_file} key` to enter it again)")
+            print(f"The node didn't accept the API key in {os.path.normpath(args.key_file)}.")
+            node = Node(host or "127.0.0.1", int(port), ask_key(args.key_file))
         if args.command in ("status", "address", "balance", "outputs"):
             {"status": show_status, "address": show_address, "balance": show_balance, "outputs": show_outputs}[args.command](node)
         else:

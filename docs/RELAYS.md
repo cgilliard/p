@@ -330,7 +330,11 @@ Steps, each tested before the next:
 1. **Entries and the file** (Forth): make and check an entry; read and
    check `consensus.txt`; the aux tree's hashing. The API's `relayentry
    ip port days` and `tools/wallet relay-entry` print a relay's signed
-   line; `tools/consensus` assembles lines into a sorted file.
+   line; `tools/consensus` assembles lines into a sorted file. Later, a
+   relay started with `node.sh --relay-addr IP` makes its own entry (for
+   that address and its port, 30 days, made again with 7 left) and prints
+   the line on the console, in the web wallet, and from `tools/wallet
+   relay-entry` with no address: the operator only collects the lines.
 2. **The miner** (Rust): `--consensus-file PATH` sets `aux_hash` to
    `SHA-256(0x01 ‖ leaf ‖ 32 zeros)`; it answers GET_AUX for its tree and
    file, and GET_HDRS from its chain.

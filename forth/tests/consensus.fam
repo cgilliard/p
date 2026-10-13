@@ -44,6 +44,23 @@ Test {
 		tje1 cncheck assert
 		tjsave wlseed 20 lit ncpy  0 lit cnok !
 	}
+	consensus_auto {
+		\ relayaddr=: our entry made, for that address and our port, 30 days;
+		\ due again with under 7 days left; none without the setting
+		wlseed tjsave 20 lit ncpy  3 lit tjrelay  0 lit bnet !
+		10000000 lit hnov !  19A lit hnoh !  0 lit cnmh !
+		0 lit cnmaddr !  cnrenew? 0= assert
+		3ED2A3AB lit cnmaddr !  nport @ tjfn !  E99 lit nport !
+		cnrenew? assert  cnauto
+		cnmine cncheck assert  cnmine 8 lit + be32 3ED2A3AB lit asrt_eq  cnmine C lit + nb16@ E99 lit asrt_eq
+		cnmine 10 lit + qbe@ 19A lit asrt_eq AA7EC800 lit asrt_eq
+		cnmine tjo cnid  tjo cnmid 20 lit mcmp 0 lit asrt_eq
+		cnrenew? 0= assert
+		814BE800 lit hnov !  cnrenew? 0= assert                              \ 8 days left
+		8B98A000 lit hnov !  cnrenew? assert                                  \ 6
+		0 lit hnov !  0 lit hnoh !  0 lit cnmaddr !  0 lit cnmh !  tjfn @ nport !
+		tjsave wlseed 20 lit ncpy  0 lit cnok !
+	}
 	consensus_file {
 		tjhead  tjf tjfn @ cnparse assert  cnn @ 0 lit asrt_eq           \ no relays: valid
 		tjhead tje1 tjline tje2 tjline
