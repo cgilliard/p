@@ -5,7 +5,9 @@ describes (`forth/src/relay.fam`, `forth/src/pay.fam`), which is the
 fallback mode below; phase 0 (the rename); and phase 1 (the list, home
 relays: `forth/src/consensus.fam`, `auxtree.fam`, `rlist.fam`;
 `rust/src/auxtree.rs`); phase 2 (sender circuits: `forth/src/onion.fam`);
-phase 3 (receiver circuits, the same file); and phase 4 (hardening).
+phase 3 (receiver circuits, the same file); phase 4 (hardening); the
+list without expiry (relays' lines are address and id only); and
+transactions submitted by circuit.
 
 ## Goals
 
@@ -109,25 +111,38 @@ and then the file-based ways to pay (below) are what to rely on.
 
 ### consensus.txt
 
-The relay list: one entry for each relay, each signed by the relay
-itself --
+The relay list: one line for each relay, where it's reached and who it
+is --
 
-| Field | |
-|---|---|
-| magic, version | `"RLY1"` |
-| network | 0 main, 1 dev |
-| expiry | when the entry stops being good |
-| Dilithium public key | its identity; its **relay id** = SHA3-256 of it |
-| Kyber public key | its onion key (circuits) |
-| IP, port | where it's reached |
-| signature | the relay's (Dilithium), over all of the above |
+```
+tabernacle-consensus 2 main
+relay 62.210.163.171:3737 a538231a3692878a4be8ad4f1207ab504c2767bf0433632992f59a9f07895a0e
+```
 
--- about 4.6 KB an entry, sorted by relay id. The relay's own signature
-means no one can list someone else's address (and point the network's
-traffic at a victim), and wallets can authenticate each relay. The file
-holds everything a node needs: there's nothing else to fetch. A relay
-that moves needs a new entry, in the next version of the file; a new
-entry also brings a new onion key (phase 4).
+-- its IP and port, and its **relay id**: SHA3-256 of its onion key (a
+Kyber key, from its wallet's seed). Lines are sorted by id. Nothing
+expires: a line changes only when its relay's address changes or its
+operator cycles its key.
+
+**The process.** A volunteer runs a relay with `node.sh --relay-addr IP`
+(its public address); the node logs its line at start-up. The volunteer
+sends the line to whoever keeps the network's list -- the dev team, or
+one person for the pools taking part -- who adds it (`tools/consensus`)
+and sends the file to the pools and large solo miners, who back it
+(`--consensus-file`). Miners don't edit the file. If a relay's key is
+stolen, its operator tells the keeper, who removes the line, and adds the
+new one the operator sends after cycling the key (`--relay-key N`). The
+key comes from the wallet's seed, so the backup words restore it; but a
+stolen relay key may mean a stolen seed, and then the wallet's funds
+should be moved too.
+
+**The keys** aren't in the file: a node fetches each listed relay's key
+from its peers (GET_RKEY; any node that has it serves it, a relay its
+own) and keeps it only if it hashes to the listed id -- so no one can
+stand in for a listed relay, and a key can't be swapped on the way. A
+relay whose key a node doesn't have yet isn't used in its circuits (it's
+still a home relay: those depend on the list alone, so sender and receiver
+agree).
 
 **The file with the most votes in the window wins, however few they
 are.**
@@ -139,7 +154,7 @@ are.**
 | Epoch | 144 blocks (a day) |
 | Window | the 144 blocks ending 12 blocks (about 2 hours) before the epoch starts |
 | The list | the `consensus.txt` backed by the most blocks in the window, however few (1% wins if it's the most); a tie goes to the file whose latest vote is newest |
-| Enough relays | the file lists at least 8 with entries not expired (a path needs 5 distinct ones) |
+| Enough relays | the file lists at least 8 (a path needs 5 distinct ones) |
 
 For example, epoch 10 is heights 1,440–1,583; its window is heights
 1,284–1,427. The 12-block margin means the window's newest block has 12
@@ -296,23 +311,19 @@ miner's tree and file and checked the relays' signatures; the wallets
 registered with their home relays; one looked the other up (1.4 s) and
 paid it by address (3.2 s), mined. Epoch 2: 12 of 12 voted.
 
-Decided for phase 1 (changeable):
+Decided for phase 1 (changeable; the key and the file as revised after
+phase 4 -- see "The list without expiry" below):
 
-- **A relay's keys** come from its wallet's seed, as the payment address's
-  do, under their own tags: Dilithium's ξ = SHAKE256("tabernacle-relay-
-  dilithium-v1" ‖ seed ‖ 0, 32), and its relay id is SHA3-256 of the
-  Dilithium key. The onion key: Kyber's (d, z) = SHAKE256("tabernacle-
-  relay-kyber-v1" ‖ seed ‖ g, 64), g the entry's expiry's low 32 bits
-  (phase 4; 0 before).
-- **An entry** (0x11CC bytes, laid out like a wallet's record): 0 "RLY1"
-  4 the network (u32) 8 IP (4) 0C port (2) 0E zeros (2) 10 expiry (ms
-  since the epoch, u64) 18 Kyber's key (0x320) 338 Dilithium's (0x520)
-  858 the signature (Dilithium, over bytes 0 .. 858). Numbers big-endian.
-- **`consensus.txt`** is text: a first line `tabernacle-consensus 1 main`
-  (or `dev`), then one line `relay <the entry, in hex>` per relay, sorted
-  by relay id, each line ending in a newline. A file that breaks any rule
-  -- a bad line, a bad signature, another network, unsorted -- is not
-  valid, and backs nothing. Expired entries are skipped, not fatal.
+- **A relay's key** is its onion key, from its wallet's seed as the
+  payment address's keys are: Kyber's (d, z) = SHAKE256("tabernacle-
+  relay-kyber-v1" ‖ seed ‖ n, 64), n the key number (`relaykey=`, a
+  u32, big-endian; 0). Its relay id is SHA3-256 of the public key.
+- **`consensus.txt`** is text: a first line `tabernacle-consensus 2 main`
+  (or `dev`), then one line `relay A.B.C.D:PORT ID` per relay -- decimal
+  numbers without leading zeros, the id in lower-case hex -- sorted by
+  id, each line ending in a newline, at most 64 relays. A file that
+  breaks any rule -- a bad line, an id twice, another network, unsorted
+  -- is not valid, and backs nothing.
 - **The aux tree's bytes:** a node's bytes are `0x01 ‖ left ‖ right` (65)
   and a leaf's `0x00 ‖ its content`; every hash is SHA-256 of those bytes,
   so the aux exchange is purely "the bytes whose SHA-256 is this".
@@ -322,19 +333,18 @@ Decided for phase 1 (changeable):
   - `0x19 GET_HDRS`: cookie (8), first height (u32), count (u16, up to 6:
     a datagram holds at most 1,200 bytes)
   - `0x1A HDRS`: first height (u32), count (u16), that many 188-byte headers
+  - `0x20 GET_RKEY`: cookie (8), a relay id (32)
+  - `0x21 RKEY`: the relay's key (0x320)
 - **Dev parameters**, so a test needs minutes, not days: an epoch of 12
   blocks, a margin of 2, at least 3 relays. Main: 144, 12, 8.
 
 Steps, each tested before the next:
 
 1. **Entries and the file** (Forth): make and check an entry; read and
-   check `consensus.txt`; the aux tree's hashing. The API's `relayentry
-   ip port days` and `tools/wallet relay-entry` print a relay's signed
-   line; `tools/consensus` assembles lines into a sorted file. Later, a
-   relay started with `node.sh --relay-addr IP` makes its own entry (for
-   that address and its port, 30 days, made again with 7 left), says so in
-   its log, and gives the line to `tools/wallet relay-entry` (no address)
-   and the web wallet: the operator only collects the lines.
+   check `consensus.txt`; the aux tree's hashing. `tools/consensus`
+   assembles relays' lines into a sorted file. (Since revised: a relay's
+   line is now just its address and id, which `node.sh --relay-addr IP`
+   logs at start-up.)
 2. **The miner** (Rust): `--consensus-file PATH` sets `aux_hash` to
    `SHA-256(0x01 ‖ leaf ‖ 32 zeros)`; it answers GET_AUX for its tree and
    file, and GET_HDRS from its chain.
@@ -508,13 +518,9 @@ home relays) still down, w2 paid w1 in 11.3 s, mined.
   anew. Sending a message also sends a KEEP, and a sending circuit whose
   KEEP goes unanswered for 10 s, or that's been idle 2 minutes, is built
   anew -- so a dead hop costs one retry of the message, not the payment.
-- **Onion keys rotate with entries.** The onion key comes from the seed
-  and the entry's expiry, so each new entry (an operator must renew it
-  within 30 days) brings a new key. The relay uses the key of its entry in
-  the list in use, so no new field or message is needed. Forward secrecy
-  doesn't depend on this (the one-time key gives it). Rotation limits how
-  long a leaked onion key can be used to impersonate the relay -- though,
-  derived from the seed, it doesn't help if the seed itself leaks.
+- **Onion keys rotated with entries** (since dropped, with expiry: see
+  below). Forward secrecy never depended on it: the one-time key in each
+  handshake gives it.
 - **Padding.** A message sent by circuit is padded to a power of two of
   parts with parts numbered 0xFF, which travel the whole way (DELIVERed
   like any) and are dropped by the receiver. So the number of cells says
@@ -526,6 +532,79 @@ home relays) still down, w2 paid w1 in 11.3 s, mined.
   default.
 - **Settings** for testing are now in `node.sh` too: `--direct`,
   `--seed-mode`.
+
+## Transactions by circuit (done 2026-10-13)
+
+A payment by address hid who paid whom, until the finalized transaction
+went out: the payer's node announced it to every peer, so anyone watching
+many nodes saw which IP announced it first -- and, by its timing, could
+tie that IP to the payment the receiver's home relay had just carried.
+
+Now, in listed mode, the payer's node never announces its own transaction
+first:
+
+- **SUBMIT** (cell command C: part, parts, up to 0x438 bytes; up to 64
+  parts, 0x10000 bytes in all; padded to a power of two of parts with
+  parts numbered 0xFF) carries it along a circuit of its own (client slot
+  9) to a relay chosen at random among those whose keys it has -- not
+  one of the receiver's home relays, when the list has another -- so no
+  relay sees both the payment arrive and the transaction leave.
+- **The relay** reassembles it (2 at a time, by circuit), takes it into
+  its pool as any transaction from a peer, announces it, and answers
+  **SUBMITTED** (D: status 0 taken, 1 not -- known, invalid, or no room).
+- **The payer's node** waits to hear it back: a peer's announcement, which
+  it fetches and takes into its pool like any other. Not heard in a
+  minute, it's sent again by a new circuit (another relay at random).
+- **At a start**, the wallet's unconfirmed transactions wait until the
+  relay list's mode is known, then go the same way (listed mode) or into
+  the pool as before.
+- **Unchanged:** out of listed mode, with `userelay=` or `direct`, it's
+  announced directly (those don't hide IPs anyway); and a slate file
+  finalized by hand (the Slates tab, `tools/wallet finalize`) is announced
+  directly, so that way of paying doesn't depend on the relays.
+
+Tried live on a private dev chain (4 relays, 2 wallets): w1 paid w2 by
+address in 8.3 s; w1 built a circuit to relay 3851 (not one of w2's home
+relays), submitted the 4,276-byte transaction, and heard it back from a
+peer 0.2 s later; the miner's mempool had it from the relay, and it was
+mined.
+
+## The list without expiry (done 2026-10-13)
+
+Entries that expired after at most 30 days meant someone rebuilding and
+redistributing the file every month, or the network falling back to seed
+mode. So the file now says only who the relays are and where, and changes
+only when that does:
+
+- **A line** is `relay A.B.C.D:PORT ID`, the id SHA3-256 of the relay's
+  onion key; no signature, no expiry, no keys in the file (`consensus.txt`
+  above). The header is now `tabernacle-consensus 2` (the Rust miner
+  checks it).
+- **The relay's key** is its onion key, Kyber's from the seed and a key
+  number (`relaykey=`, `node.sh --relay-key N`; 0): the backup words bring
+  it back, and a new N cycles it (a new id, so a new line). The Dilithium
+  key the entries were signed with is gone: the id binds the key, and
+  the address is the keeper's to check.
+- **Keys over the network:** GET_RKEY / RKEY (0x20, 0x21), asked of a peer
+  every 0.5 s while a listed relay's key is missing (each relay's every
+  2 s at most; every 4th time, the relay itself is made a peer), served by
+  any node that has the key, and kept only if it hashes to the id.
+  `status` reports `keys_known`.
+- **Listed mode** needs only enough lines (8; dev 3). Home relays are
+  chosen from all the listed relays; circuits use those whose keys are
+  known.
+- **A relay's line:** `node.sh --relay-addr IP` logs it at start-up
+  (`relay: for consensus.txt: relay IP:PORT ID`), and `tools/wallet
+  relay-entry`, `status` and the web wallet give it too.
+  `tools/consensus` takes lines (whole log lines are fine), drops a relay
+  with `--remove ID`, and refuses two relays at one address.
+
+Tried live on a private dev chain: a Rust miner, 4 Forth relays started
+with `--relay-addr 127.0.0.1`, 2 wallets. The relays logged their lines
+about a second after starting; `tools/consensus` built the file from
+the log lines; once backed, every node went to listed mode with 4 relays,
+fetched the keys from peers, and built its circuits. w1 paid w2 by
+address in 7.3 s, mined.
 
 ## Fallbacks for a user
 
@@ -562,9 +641,9 @@ other.
   in phases 1--3, open to change before launch.
 - How many circuits a relay holds (4096) and the CREATE limits: to tune
   once relays' real load is known.
-- How long an entry in `consensus.txt` lives (now up to 30 days), which
-  is also how often onion keys rotate; and onion keys made at random and
-  kept on the relay's disk, rather than from the seed.
+- Whether relays' onion keys should also rotate on a schedule (signed by
+  a long-lived identity key), now that a key changes only when its
+  operator cycles it.
 - Whether mixing delays should be on by default once there are enough
   users to mix with.
 - Receiving as an opt-in setting (only nodes accepting payments register

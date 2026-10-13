@@ -9,6 +9,14 @@
 : tcibv variable ;  : tcib ( -- a )  tcibv 460 lit lazy ;   \ contents, kept
 : tqgc variable ;
 : tcipv variable ;  : tcip ( -- a )  tcipv 480 lit lazy ;   \ a BCELL's body: id, nonce, body
+\ tcsub ( part parts n -- )   a SUBMIT's part at the end of circuit 0: n
+\        bytes, each the part's number.
+: tcsn variable ;
+: tcsub ( part parts n -- )
+	tcsn !  oni 4 lit + c!  dup oni 3 lit + c!
+	tcsn @ 0 lit do dup oni 5 lit + i + c! loop drop
+	tcsn @ 2 lit + oni 1 lit + nb16!  C lit oni c!  0 lit onsubm
+;
 
 Test {
 	onion_handshake {
@@ -92,5 +100,23 @@ Test {
 		\ a mixing delay: a cell passed on is held, then sent when due
 		2 lit ondly !  1F lit 0A000202 lit BA5E lit 1 lit onfwd  onqn @ 1 lit asrt_eq
 		pms begin pms over - 5 lit u> until drop  onflush  onqn @ 0 lit asrt_eq  0 lit ondly !
+	}
+	onion_submit {
+		\ 3 parts, out of order, one twice, a padding part: whole once all are in
+		0 lit onc 80 lit nzero  2 lit 0 lit onc !  1234 lit 0 lit onc C lit + !
+		0 lit onsb 20 lit nzero  1 lit onsb 20 lit nzero
+		2 lit 3 lit 10 lit tcsub  0 lit 3 lit 438 lit tcsub  0 lit 3 lit 438 lit tcsub  FF lit 3 lit 438 lit tcsub
+		0 lit onsb @ 1 lit asrt_eq  0 lit onsb 4 lit + @ 1234 lit asrt_eq  0 lit onsb 1C lit + @ 0 lit asrt_eq
+		1 lit 3 lit 438 lit tcsub
+		0 lit onsb 1C lit + @ 0= 0= assert  0 lit onsb 18 lit + @ 880 lit asrt_eq
+		0 lit onsb 20 lit + c@ 0 lit asrt_eq  0 lit onsb 458 lit + c@ 1 lit asrt_eq  0 lit onsb 88F lit + c@ 1 lit asrt_eq  0 lit onsb 890 lit + c@ 2 lit asrt_eq
+		0 lit 0 lit onsb !  0 lit 0 lit onsb 1C lit + !                          \ (taken up)
+		\ more than 64 parts, a part past the parts, or past 0x10000 bytes: not taken
+		0 lit 41 lit 10 lit tcsub  0 lit onsb @ 0 lit asrt_eq
+		3 lit 3 lit 10 lit tcsub  0 lit onsb @ 0 lit asrt_eq
+		3C lit 3D lit 438 lit tcsub  0 lit onsb @ 0 lit asrt_eq
+		\ 34 parts: the second mask word
+		22 lit 0 lit do i 22 lit 10 lit tcsub loop  0 lit onsb 1C lit + @ 0= 0= assert  0 lit onsb 18 lit + @ 8B48 lit asrt_eq
+		0 lit onsb 20 lit nzero  1 lit onsb 20 lit nzero  0 lit onc 80 lit nzero
 	}
 }

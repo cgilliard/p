@@ -335,7 +335,7 @@ at most every 10 s, 10,000 in all. A node serves as one with `node.sh
 --relay` (the seeds; `--gateway` too); a wallet uses `userelay=` settings
 (or `usegw=`), else the seeds. The wire format is as it was.
 Which relays: the relay list (`../docs/RELAYS.md`, phase 1). Blocks vote
-for a `consensus.txt` -- relays' signed entries -- as the left branch of
+for a `consensus.txt` -- relays' addresses and ids -- as the left branch of
 the tree under their `aux_hash` (a Rust miner's `--consensus-file`); the
 node fetches the trees and files from peers by hash (`src/auxtree.fam`),
 the window's headers too when it fast-synced past them, and the file with
@@ -343,10 +343,11 @@ the most votes in the epoch's window is the list (`src/rlist.fam`). With
 one (and 3 live relays on dev, 8 on main), each address has 3 home
 relays -- the node registers with its own, and looks up and pays through
 the receiver's; without, the seeds, as before. A relay started with
-`node.sh --relay-addr IP` (its public address) makes its own signed line,
-good for 30 days and made again with 7 left, and gives it to `tools/wallet
-relay-entry` and the web wallet;
-`tools/consensus` assembles the lines;
+`node.sh --relay-addr IP` (its public address) logs its line for the list,
+`relay IP:PORT ID` (the id: a hash of its key, from the wallet's seed and
+`--relay-key N`), which never expires; nodes fetch listed relays' keys
+from peers and check them against the ids. `tools/consensus` assembles
+the lines;
 `status` reports the list (`relay_list`); the setting `seedmode` keeps a
 node on the seeds, for testing. In listed mode a lookup and a payment's
 messages go by circuit (`src/onion.fam`, phase 2): guard, middle, then the

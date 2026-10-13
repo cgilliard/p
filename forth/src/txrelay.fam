@@ -654,5 +654,8 @@
 	txwhen @ 0= txwhen @ pago 7530 lit u> or if pms 1 lit or txwhen ! txannall then
 ;
 
-\ txstart ( -- )   at the start, once the wallet is open.
-: txstart ( -- )   wl? if trmine then ;
+\ txstart ( -- )   at the start, once the wallet is open: its unconfirmed
+\        transactions, taken up again once the relay list's mode is known
+\        (src/pay.fam: by circuit, or into the pool as trmine does).
+: trmn variable ;   \ the wallet's to take up again, once the mode's known (src/pay.fam)
+: txstart ( -- )   wl? if -1 lit trmn ! then ;

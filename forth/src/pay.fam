@@ -32,6 +32,19 @@
 \   pzcin ( -- f )       a circuit's datagram (src/onion.fam), a DELIVER
 \                        along one of ours handled
 \   pztick ( -- )
+\
+\ Our transaction, in listed mode (circuits), never goes out from this node
+\ first: it's SUBMITted (src/onion.fam) through a circuit of its own to a
+\ relay chosen at random -- not one of the receiver's home relays, when the
+\ list has another -- which takes it into its pool and announces it as any.
+\ It's done once a peer announces it to us; not heard of in a minute, sent
+\ again, by another circuit.  Out of listed mode (or with userelay=,
+\ `direct`) it's announced as before.  A finalized slate file's transaction
+\ (src/api.fam) is announced as before; at a start, the wallet's unconfirmed
+\ ones go as by-address payments' do.
+\   SUBMIT (C)     part, parts, up to 0x438 bytes of the transaction
+\   SUBMITTED (D)  status: 0 taken into the pool, 1 not (known, invalid, no
+\                  room)
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : pzmax ( -- n )   A000 lit ;                              \ a message, at most
@@ -144,6 +157,124 @@
 
 : pzmsg variable ;  : pzok variable ;  : pzl variable ;  : pzlat variable ;
 
+\ ── Submitting by circuit ──
+\ 4 waiting, each 0 state (0 free, 1 to send, 2 sent)  4 its bytes  8 when
+\ sent  C tries  10 the receiver's address (zeros: none)  30 its id  50 the
+\ transaction.
+
+: psqv variable ;  : psq ( j -- a )  10050 lit * psqv 40140 lit lazy + ;
+: psj variable ;  : pso variable ;
+: psrv variable ;  : psrb ( -- a )  psrv 4 lit lazy ;
+
+\ psid ( a n out -- )   a transaction's id.
+: psid ( a n out -- )   pso !  tkst -rot p2hashb  tkst pso @ 8 lit cpy ;
+
+\ pssub ( a n dest -- )   a transaction to submit (dest: the receiver's
+\        address, or 0).
+: pssub ( a n dest -- )
+	-1 lit psj !  4 lit 0 lit do psj @ 0< i psq @ 0= and if i psj ! then loop
+	psj @ 0< if drop 2drop "transaction: too many waiting to be submitted\n" lputs else
+		psj @ psq 10 lit + over if 20 lit ncpy else nip 20 lit nzero then
+		2dup psj @ psq 30 lit + psid
+		dup psj @ psq 4 lit + !  psj @ psq 50 lit + swap ncpy
+		1 lit psj @ psq !  0 lit psj @ psq 8 lit + !  0 lit psj @ psq C lit + !
+	then
+;
+
+\ pstarg ( j -- )   circuit 9 wanted, to a relay whose key we have: at
+\        random, not one of slot j's receiver's home relays if there's another.
+: psqn variable ;  : psqk variable ;
+: psok? ( i -- f )
+	dup cnhas? if
+		dup ocmap swap ocport  0 lit  rqdn @ ?dup if 0 lit do i rqd @ 3 lit pick = i rqd 4 lit + @ 3 lit pick = and or loop then
+		nip nip 0=
+	else drop 0 lit then
+;
+: pstarg ( j -- )
+	0 lit rqdn !  psq 10 lit + dup 20 lit rqzero? if drop else rqseed rqhome then
+	0 lit psqn !  cnn @ ?dup if 0 lit do i psok? if psqn @ 1 lit + psqn ! then loop then
+	psqn @ 0= if 0 lit rqdn !  cnn @ ?dup if 0 lit do i psok? if psqn @ 1 lit + psqn ! then loop then then
+	psqn @ if
+		pnonce drop 1 lit rshift psqn @ % psqk !  -1 lit
+		cnn @ 0 lit do dup 0< i psok? and if psqk @ if psqk @ 1 lit - psqk ! else drop i then then loop
+		9 lit occ !  dup ocmap ochi !  ocport ochp !  0 lit ocft !  3 lit ocst !  0 lit occ !
+	then
+;
+
+\ pssend ( j -- )   its parts, SUBMITted along circuit 9 (padded to a power
+\        of two, with parts numbered 0xFF).
+: psqp variable ;  : psql variable ;
+: pssend ( j -- )
+	9 lit occ !
+	dup psq 4 lit + @ 437 lit + 438 lit / psqp !
+	psqp @ 0 lit do
+		i ocx c!  psqp @ ocx 1 lit + c!
+		dup psq 4 lit + @ i 438 lit * - 438 lit pumin psql !
+		dup psq 50 lit + i 438 lit * + ocx 2 lit + psql @ ncpy
+		C lit ocx psql @ 2 lit + ocsendc
+	loop
+	psqp @ ocpw psqp @ - ?dup if 0 lit do
+		FF lit ocx c!  psqp @ ocx 1 lit + c!  ocx 2 lit + 438 lit nzero  C lit ocx 43A lit ocsendc
+	loop then
+	dup psq C lit + @ 1 lit + over psq C lit + !
+	"transaction: submitted by circuit, to " lputs ochere " (try " lputs psq C lit + @ fndec ")" lputs A lit lputc
+	0 lit occ !
+;
+
+\ psadm ( j -- )   a whole one, at a relay: into the pool, announced; the
+\        circuit answered (if it's still there).
+: psadm ( j -- )
+	dup onsb 20 lit + over onsb 18 lit + @ txadmit
+	dup 0< if drop 1 lit else -1 lit txskip ! txann 0 lit then  psrb c!
+	"circuit: a transaction submitted (" lputs dup onsb 18 lit + @ fndec " bytes): " lputs
+	psrb c@ if "not taken" else "taken, announced" then lputs A lit lputc
+	dup onsb @ 1 lit -  dup onmax u< if dup onc @ 2 lit =  over onc C lit + @ 3 lit pick onsb 4 lit + @ = and else 0 lit then
+	if D lit psrb 1 lit onback else drop then
+	0 lit over onsb !  0 lit swap onsb 1C lit + !
+;
+
+\ psmine ( -- )   at a start, once the mode's known: the wallet's signed,
+\        unconfirmed transactions, submitted (listed mode) or into the pool.
+: psmine ( -- )
+	trk 20 lit nzero
+	begin treach while
+		trpend? if
+			wsr 10 lit + @ wtx sbget wtn !
+			oncirc if wtx wtn @ 0 lit pssub else wtx wtn @ txadmit drop then
+		then
+	repeat
+;
+
+\ pstick ( -- )
+: psone ( j -- )
+	dup psq 30 lit + txhas 0< 0= if
+		"transaction: on the network (a peer announced it to us)\n" lputs  0 lit swap psq !
+	else oncirc 0= rqst @ and if
+		dup psq 50 lit + over psq 4 lit + @ txadmit dup 0< if drop else -1 lit txskip ! txann then
+		"transaction: announced to our peers (no circuits)\n" lputs  0 lit swap psq !
+	else drop then then
+;
+: pstick ( -- )
+	2 lit 0 lit do i onsb 1C lit + @ if i psadm then loop
+	trmn @ rqst @ and if 0 lit trmn !  psmine then
+	onsubr @ ?dup if
+		0 lit onsubr !  1 lit - if "transaction: the relay didn't take it (it may have it already)" else
+		"transaction: the relay took it, and announced it" then lputs A lit lputc
+	then
+	4 lit 0 lit do i psq @ if i psone then loop
+	oncirc if
+		-1 lit  4 lit 0 lit do dup 0< i psq @ and if drop i then loop
+		dup 0< if drop  9 lit ocab @ 2 lit = if 0 lit 9 lit ocab ! then else
+			dup psq @ 2 lit =  over psq 8 lit + @ pago EA60 lit u> and if 1 lit over psq !  0 lit 9 lit ocab ! then
+			dup psq @ 1 lit = if
+				9 lit ocab @ 2 lit = if dup pssend  2 lit over psq !  pms over psq 8 lit + ! else
+				9 lit ocab @ 0=  9 lit ocab 120 lit + @ pago 1388 lit u> and if dup pstarg then then
+			then
+			drop
+		then
+	then
+;
+
 \ pzpay1 ( msg n -- )   a PAY1: opened, S1 answered (or refused), PAY2 back
 \        -- a new one at most every 2 s (each makes a slate's record).
 : pzpay1 ( msg n -- )
@@ -202,7 +333,8 @@
 				pzwb pzfail
 			else
 				pzpt 1 lit +  pzn @ 31D lit -  wsfin if
-					0 lit pzslm !  trsoon  wtid pztxid 20 lit ncpy  3 lit pzst !
+					0 lit pzslm !  oncirc if wtx wtn @ pzdest pssub else trsoon then
+					wtid pztxid 20 lit ncpy  3 lit pzst !
 					"payment: paid, the transaction sent: to " pzdest pzlog
 				else wserr @ ?dup 0= if "the answer didn't finalize" then pzfail then
 			then
@@ -241,6 +373,7 @@
 ;
 
 : pztick ( -- )
+	pstick
 	pzst @ 1 lit = if
 		rllst @ 3 lit = if "the address isn't registered with our relays" pzfail else
 		rlfound rlla pzdest 20 lit mcmp 0= and pzregd and if pzbuild else

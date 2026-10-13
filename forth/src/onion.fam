@@ -26,7 +26,9 @@
 \   8 REGISTER part, parts, bytes (our record)   9 REGISTERED status (as
 \     src/relay.fam's ACK), the address   A DELIVER a part, as 0x15 carries
 \     it   B KEEP (keeps the circuit from going idle; the end answers it
-\     the same)
+\     the same)   C SUBMIT part, parts, up to 0x438 bytes of a transaction
+\     (src/pay.fam: taken into the end's pool and announced)   D SUBMITTED
+\     status (0 taken, 1 not)
 \
 \ A relay (the `relay` setting) keeps up to 64 circuits (idle 10 minutes:
 \ gone), starts at most one from an IP every 2 s (but a listed relay's: a
@@ -396,6 +398,55 @@
 	else drop then
 ;
 
+\ Transactions SUBMITted by circuit, reassembled: 2 slots, each 0 the
+\ circuit (k + 1; 0 free)  4 its id  8, C the parts had (bits)  10 when
+\ begun  14 the parts  18 the bytes so far (the furthest end)  1C whole
+\ (src/pay.fam takes it into the pool, and answers SUBMITTED)  20 the
+\ transaction (up to 0x10000).
+: onsbv variable ;  : onsb ( j -- a )  10020 lit * onsbv 20040 lit lazy + ;
+: onsj variable ;
+
+\ onsbits ( n -- lo hi )   the mask of parts 0 .. n - 1.
+: onsbits ( n -- lo hi )
+	dup 20 lit u< if 1 lit swap lshift 1 lit - 0 lit else
+		20 lit - dup 20 lit u< if 1 lit swap lshift 1 lit - else drop -1 lit then  -1 lit swap
+	then
+;
+
+\ onsubm ( k -- )   SUBMIT at the end: part, parts, up to 0x438 bytes.
+: onsubm ( k -- )
+	oni 3 lit + c@  oni 4 lit + c@  over over u<  over 41 lit u< and  oni 1 lit + nb16@ 2 lit - 439 lit u< and
+	2 lit pick 438 lit * oni 1 lit + nb16@ 2 lit - + 10001 lit u< and if                \ within 0x10000
+		-1 lit onsj !
+		2 lit 0 lit do i onsb @ 3 lit pick 1 lit + =  i onsb 4 lit + @ 4 lit pick onc C lit + @ = and if i onsj ! then loop
+		onsj @ 0< if                                                            \ a free slot, else one not whole
+			2 lit 0 lit do onsj @ 0< i onsb @ 0= and if i onsj ! then loop
+			onsj @ 0< if 0 lit onsb 1C lit + @ if 1 lit else 0 lit then onsj ! then
+			onsj @ onsb 20 lit nzero  2 lit pick 1 lit + onsj @ onsb !  2 lit pick onc C lit + @ onsj @ onsb 4 lit + !
+			pms onsj @ onsb 10 lit + !  dup onsj @ onsb 14 lit + !
+		then
+		onsj @ onsb 1C lit + @ 0=  over onsj @ onsb 14 lit + @ = and if
+			drop                                                                    ( k part )
+			oni 5 lit +  over 438 lit * onsj @ onsb 20 lit + +  oni 1 lit + nb16@ 2 lit - ncpy
+			dup 438 lit * oni 1 lit + nb16@ 2 lit - +  onsj @ onsb 18 lit + @  2dup u< if nip else drop then  onsj @ onsb 18 lit + !
+			dup 20 lit u< if 1 lit over lshift onsj @ onsb 8 lit + else dup 20 lit - 1 lit swap lshift onsj @ onsb C lit + then
+			dup @ rot or swap !
+			onsj @ onsb 14 lit + @ onsbits  onsj @ onsb C lit + @ =  swap onsj @ onsb 8 lit + @ = and
+			if -1 lit onsj @ onsb 1C lit + ! then
+			2drop
+		else 2drop drop then
+	else 2drop drop then
+;
+
+\ onend2 ( k cmd -- )   the end's commands but the handshake's.
+: onend2 ( k cmd -- )
+	dup 3 lit = if drop onask else
+	dup 4 lit = if drop ondeliv else
+	dup 8 lit = if drop onreg else
+	dup C lit = if drop onsubm else
+	B lit = if B lit onz 0 lit onback else drop then then then then then          \ KEEP: answered
+;
+
 \ onend ( k -- )   a cell for the end of its circuit (here).
 : onend ( k -- )
 	oni c@  dup 1 lit = over 2 lit = or if
@@ -412,16 +463,12 @@
 				else drop then
 			then
 		then
-	else
-		dup 3 lit = if drop onask else
-		dup 4 lit = if drop ondeliv else
-		dup 8 lit = if drop onreg else
-		B lit = if B lit onz 0 lit onback else drop then then then then          \ KEEP: answered
-	then
+	else onend2 then
 ;
 
 \ ── The client's circuits ──
-\ 9 slots: 0 ours for sending, 1 + g for receiving through relay g (rlg).
+\ 10 slots: 0 ours for sending, 1 + g for receiving through relay g (rlg),
+\ 9 for submitting a transaction (src/pay.fam: to a relay it chooses).
 \ Each: 0 state (0 none, 1 being built, 2 built, 3 wanted: waiting its turn)
 \ 4 hops with keys  8 circuit id  C a step sent  10 begun  14 last used
 \ 18 tries  1C the target (rlt; sending)  20 the hops: 0 guard 1 middle
@@ -431,7 +478,7 @@
 \ The words below act on the slot occ names.
 
 : occ variable ;
-: ocav variable ;  : ocab ( j -- a )  130 lit * ocav 130 lit 9 lit * lazy + ;
+: ocav variable ;  : ocab ( j -- a )  130 lit * ocav 130 lit A lit * lazy + ;
 : oca ( -- a )   occ @ ocab ;
 : ocst ( -- a )   oca ;
 : ochn ( -- a )   oca 4 lit + ;
@@ -459,12 +506,12 @@
 : ocgbv variable ;  : ocgbd ( -- a )  ocgbv 20 lit lazy ;   \ its relay id
 
 \ ocbusy? ( -- f )   a circuit is being built.
-: ocbusy? ( -- f )   0 lit 9 lit 0 lit do i ocab @ 1 lit = or loop ;
+: ocbusy? ( -- f )   0 lit A lit 0 lit do i ocab @ 1 lit = or loop ;
 
 \ ocmine? ( -- f )   the datagram is one of our circuits' (from its guard,
 \        its id): occ set to it.
 : ocmine? ( -- f )
-	-1 lit  9 lit 0 lit do
+	-1 lit  A lit 0 lit do
 		i ocab @ dup 1 lit = swap 2 lit = or  nsrc @ i ocab 20 lit + @ = and  nsport @ i ocab 24 lit + @ = and
 		pbd @ be32 i ocab 8 lit + @ = and
 		if drop i then
@@ -512,7 +559,8 @@
 		onok ochn @ ock 40 lit ncpy  ochn @ 1 lit + ochn !
 		ochn @ 3 lit = if
 			2 lit ocst !  pms ocbt !  pms ocuse !  0 lit ocgf !
-			occ @ if -1 lit ocrnew !  "circuit: built, for receiving, to " else "circuit: built, to " then
+			occ @ 9 lit = if "circuit: built, for submitting, to " else
+			occ @ if -1 lit ocrnew !  "circuit: built, for receiving, to " else "circuit: built, to " then then
 			lputs ochere A lit lputc
 		else ochop then
 	then
@@ -599,7 +647,8 @@
 		2 lit ocp  over ocmap over !  over ocport over 4 lit + !  8 lit + !
 		0 lit ocpick 1 lit ocpick and if
 			ocid 4 lit onrand  0 lit ochn !  1 lit ocst !  pms oct0 !  0 lit ockp !
-			occ @ if "circuit: building one for receiving, to " else "circuit: building one to " then lputs
+			occ @ 9 lit = if "circuit: building one for submitting, to " else
+			occ @ if "circuit: building one for receiving, to " else "circuit: building one to " then then lputs
 			ochere ", by " lputs 0 lit ocp @ fnip. 3A lit lputc 0 lit ocp 4 lit + @ fndec
 			" and " lputs 1 lit ocp @ fnip. 3A lit lputc 1 lit ocp 4 lit + @ fndec A lit lputc
 			ochop
@@ -635,13 +684,15 @@
 : ocsched ( -- )
 	ocbusy? 0= if
 		0 lit ocab @ 3 lit = if 0 lit occ ! ocstart else
-			0 lit  9 lit 1 lit do dup 0= i ocab @ 3 lit = and if drop i then loop
+			0 lit  A lit 1 lit do dup 0= i ocab @ 3 lit = and if drop i then loop
 			?dup if occ ! ocgo then
 		then
 	then
 ;
 
 \ ── The client's cells ──
+
+: onsubr variable ;   \ SUBMITTED's answer, + 1 (0: none yet): src/pay.fam's
 
 : ocrv variable ;  : ocrec ( -- a )  ocrv 1200 lit lazy ;   \ a FOUND's parts
 : ocpb variable ;   \ the parts had (bits)
@@ -691,6 +742,7 @@
 				dup A lit = if oni 3 lit + ondb oni 1 lit + nb16@ dup ondn ! ncpy then
 			then
 			dup B lit = if 0 lit ockp ! then
+			dup D lit = occ @ 9 lit = and if oni 3 lit + c@ 1 lit + onsubr ! then
 			drop
 		then
 	then
@@ -893,7 +945,7 @@
 \ ontick ( -- )
 : ontick ( -- )
 	oncirc rlcirc !
-	9 lit 0 lit do
+	A lit 0 lit do
 		i occ !  ocst @ 1 lit = if
 			oct0 @ pago 1770 lit u> if ocfail else oct @ pago 5DC lit u> if ocstep then then
 		then
@@ -907,6 +959,6 @@
 	rlcirc @ if
 		oclook  ocrecv  ocnat
 		ocrnew @ ocbusy? 0= and if 0 lit ocrnew !  0 lit rlmat ! then        \ a new record, for the new circuits
-	else 9 lit 1 lit do 0 lit i ocab ! loop then
+	else A lit 1 lit do 0 lit i ocab ! loop then
 	ocsched  onflush
 ;
